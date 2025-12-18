@@ -988,18 +988,33 @@ ApplicationWindow {
             Layout.fillHeight: true
             currentIndex: currentTabIndex === 2 ? 1 : 0
 
-            // Regular Dockable Workspace (for STS and SNOM tabs)
-            DockableWorkspace {
+            // Unified Workspace (for STS and SNOM tabs)
+            UnifiedWorkspace {
                 id: workspace
+                currentMode: currentTabIndex === 0 ? "sts" : "snom"
+
+                // Panel visibility for STS/SNOM modes
+                showLeftPanel: false  // ProjectBrowser is in outer SplitView
+                showRightPanel: false
+                showTopPanel: false
+                showBottomPanel: false
 
                 // Listen to backend tool open signals
                 Connections {
                     target: backend
                     function onToolOpened(toolName) {
-                        // Dock tool to selected position
-                        var dockPos = dockPositionCombo.currentText.toLowerCase()
-                        workspace.dockTool(toolName, dockPos)
+                        console.log("Tool opened signal received:", toolName)
+                        // In future: create floating entity for the tool
                     }
+                }
+
+                // Handle canvas interactions
+                onFloatingEntityAdded: function(entity) {
+                    console.log("Floating entity added:", entity.id, entity.type)
+                }
+
+                onFloatingEntityRemoved: function(entityId) {
+                    console.log("Floating entity removed:", entityId)
                 }
             }
 

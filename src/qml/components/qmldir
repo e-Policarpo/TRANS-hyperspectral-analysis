@@ -5,3 +5,8 @@ DockableWorkspaceAdvanced 1.0 DockableWorkspaceAdvanced.qml
 DockableToolItem 1.0 DockableToolItem.qml
 DockArea 1.0 DockArea.qml
 DebugConsole 1.0 DebugConsole.qml
+DockPanel 1.0 DockPanel.qml
+WorkspaceCanvas 1.0 WorkspaceCanvas.qml
+UnifiedWorkspace 1.0 UnifiedWorkspace.qml
+DatasetComboBox 1.0 DatasetComboBox.qml
+DraggableWindow 1.0 DraggableWindow.qml
