@@ -90,6 +90,7 @@ class AppBackend(ToolImplementations, QObject):
         # Data storage
         self._datasets: Dict[str, SpectralData] = {}
         self._active_dataset: Optional[str] = None
+        self._workflow_mode: bool = False  # When True, suppress dataLoaded emission for intermediate results
 
         # Imported map data (for Map Editor)
         self._imported_map_data: Optional[np.ndarray] = None
@@ -2294,7 +2295,9 @@ class AppBackend(ToolImplementations, QObject):
 
             # Store only with friendly name (no duplicates)
             self._datasets[friendly_name] = integrated_spectral_data
-            self.dataLoaded.emit(friendly_name)
+            # Only emit to browser when not in workflow mode (intermediate results shouldn't appear)
+            if not self._workflow_mode:
+                self.dataLoaded.emit(friendly_name)
 
             # Status update will be handled by callback in main thread
             logger.info(f"Integration results saved to {output_path}: {len(integration_results)} intervals")
@@ -3220,7 +3223,9 @@ class AppBackend(ToolImplementations, QObject):
             # Add to datasets with only friendly name (no duplicates)
             friendly_name = f"{base_name} - Truncated ({min_val:.1f} to {max_val:.1f})"
             self._datasets[friendly_name] = truncated_data
-            self.dataLoaded.emit(friendly_name)
+            # Only emit to browser when not in workflow mode (intermediate results shouldn't appear)
+            if not self._workflow_mode:
+                self.dataLoaded.emit(friendly_name)
 
             logger.info(f"Truncated data saved to {output_path}")
             logger.info(f"Original points: {spectral_data.num_points}, Truncated points: {truncated_data.num_points}")

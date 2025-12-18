@@ -16,6 +16,19 @@ import "../components"
 Item {
     id: truncateTool
 
+    // Theme colors - reactive bindings to parent DraggableWindow
+    property var parentWindow: Window.window
+    property color bgDark: parentWindow ? parentWindow.bgDark : "#1a1a2e"
+    property color bgMedium: parentWindow ? parentWindow.bgMedium : "#2a2a3e"
+    property color bgLight: parentWindow ? parentWindow.bgLight : "#3a3a4e"
+    property color accentPink: parentWindow ? parentWindow.accentPink : "#F5A9B8"
+    property color accentBlue: parentWindow ? parentWindow.accentBlue : "#5BCEFA"
+    property color accentMagenta: parentWindow ? parentWindow.accentMagenta : "#D60270"
+    property color accentPurple: parentWindow ? parentWindow.accentPurple : "#9B4F96"
+    property color textLight: parentWindow ? parentWindow.textLight : "#ffffff"
+    property color textMuted: parentWindow ? parentWindow.textMuted : "#cccccc"
+    property color successColor: parentWindow ? parentWindow.successColor : "#2ECC71"
+
     ColumnLayout {
         anchors.fill: parent
         spacing: 10
@@ -24,13 +37,14 @@ Item {
             text: "Truncate Data Range"
             font.pixelSize: 18
             font.bold: true
+            color: textLight
         }
 
         Label {
             text: "Truncate spectral data to a specific range of the independent variable (e.g., voltage, wavenumber)."
             wrapMode: Text.Wrap
             Layout.fillWidth: true
-            color: "#9B4F96"
+            color: accentPurple
         }
 
         GroupBox {
@@ -52,7 +66,7 @@ Item {
                     id: datasetInfo
                     text: getDatasetInfoText()
                     font.pixelSize: 10
-                    color: "#666666"
+                    color: textMuted
                     wrapMode: Text.Wrap
                     Layout.fillWidth: true
                 }
@@ -103,7 +117,7 @@ Item {
                     id: rangeValidationLabel
                     Layout.columnSpan: 2
                     font.pixelSize: 10
-                    color: isRangeValid() ? "#00aa00" : "#D60270"
+                    color: isRangeValid() ? successColor : accentMagenta
                     text: getRangeValidationText()
                     visible: minValueField.text !== "" && maxValueField.text !== ""
                 }
@@ -123,14 +137,14 @@ Item {
                     id: currentRangeLabel
                     text: getCurrentRangeText()
                     font.pixelSize: 11
-                    color: "#666666"
+                    color: textMuted
                 }
 
                 Label {
                     text: "Preview: This will select data points within the specified range"
                     font.pixelSize: 10
                     font.italic: true
-                    color: "#B0A0B8"
+                    color: textMuted
                 }
             }
         }
@@ -178,7 +192,7 @@ Item {
             Layout.fillWidth: true
             text: ""
             font.pixelSize: 10
-            color: "#0066cc"
+            color: accentBlue
             visible: text !== ""
             wrapMode: Text.Wrap
         }
@@ -191,14 +205,14 @@ Item {
         function onToolCompleted(toolName, outputPath) {
             if (toolName === "Truncate Data") {
                 statusLabel.text = "✓ Data truncated successfully: " + outputPath
-                statusLabel.color = "#00aa00"
+                statusLabel.color = successColor
             }
         }
 
         function onErrorOccurred(title, message) {
             if (title.includes("Truncate")) {
                 statusLabel.text = "✗ Error: " + message
-                statusLabel.color = "#D60270"
+                statusLabel.color = accentMagenta
             }
         }
     }
@@ -280,7 +294,7 @@ Item {
         console.log("Truncating dataset:", datasetName, "to range [", minVal, ",", maxVal, "]")
 
         statusLabel.text = "Truncating data..."
-        statusLabel.color = "#0066cc"
+        statusLabel.color = accentBlue
 
         // Call backend truncation method
         backend.truncateData(datasetName, minVal, maxVal)

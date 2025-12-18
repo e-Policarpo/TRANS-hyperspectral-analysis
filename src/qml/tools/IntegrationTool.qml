@@ -17,15 +17,18 @@ import "../components"
 Item {
     id: root
 
-    // Theme colors - reactive bindings to main window
-    property var mainWin: ApplicationWindow.window
-    property color bgDark: mainWin ? mainWin.bgDark : "#1a1a2e"
-    property color bgMedium: mainWin ? mainWin.bgMedium : "#2a2a3e"
-    property color bgLight: mainWin ? mainWin.bgLight : "#3a3a4e"
-    property color accentPink: mainWin ? mainWin.accentPink : "#F5A9B8"
-    property color accentBlue: mainWin ? mainWin.accentBlue : "#5BCEFA"
-    property color textLight: mainWin ? mainWin.textLight : "#ffffff"
-    property color textMuted: mainWin ? mainWin.textMuted : "#cccccc"
+    // Theme colors - reactive bindings to parent DraggableWindow
+    property var parentWindow: Window.window
+    property color bgDark: parentWindow ? parentWindow.bgDark : "#1a1a2e"
+    property color bgMedium: parentWindow ? parentWindow.bgMedium : "#2a2a3e"
+    property color bgLight: parentWindow ? parentWindow.bgLight : "#3a3a4e"
+    property color accentPink: parentWindow ? parentWindow.accentPink : "#F5A9B8"
+    property color accentBlue: parentWindow ? parentWindow.accentBlue : "#5BCEFA"
+    property color accentMagenta: parentWindow ? parentWindow.accentMagenta : "#D60270"
+    property color accentPurple: parentWindow ? parentWindow.accentPurple : "#9B4F96"
+    property color textLight: parentWindow ? parentWindow.textLight : "#ffffff"
+    property color textMuted: parentWindow ? parentWindow.textMuted : "#cccccc"
+    property color successColor: parentWindow ? parentWindow.successColor : "#2ECC71"
 
     ColumnLayout {
         anchors.fill: parent
@@ -160,8 +163,8 @@ Item {
                         onClicked: intervalsModel.clear()
 
                         background: Rectangle {
-                            color: parent.pressed ? "#D60270" : (parent.hovered ? bgLight : bgMedium)
-                            border.color: "#D60270"
+                            color: parent.pressed ? accentMagenta : (parent.hovered ? bgLight : bgMedium)
+                            border.color: accentMagenta
                             radius: 4
                         }
                         contentItem: Text {
@@ -227,8 +230,8 @@ Item {
                         delegate: Rectangle {
                             width: ListView.view.width - 10
                             height: 45
-                            color: model.selected ? Qt.rgba(accentPink.r, accentPink.g, accentPink.b, 0.1) : bgLight
-                            border.color: model.selected ? accentPink : bgMedium
+                            color: model.selected ? Qt.rgba(root.accentPink.r, root.accentPink.g, root.accentPink.b, 0.1) : bgLight
+                            border.color: model.selected ? root.accentPink : bgMedium
                             border.width: 1
                             radius: 4
 
@@ -291,12 +294,12 @@ Item {
                                     onClicked: intervalsModel.remove(index)
 
                                     background: Rectangle {
-                                        color: parent.hovered ? "#D60270" : "transparent"
+                                        color: parent.hovered ? root.accentMagenta : "transparent"
                                         radius: 3
                                     }
                                     contentItem: Text {
                                         text: parent.text
-                                        color: "#D60270"
+                                        color: root.accentMagenta
                                         horizontalAlignment: Text.AlignHCenter
                                     }
                                 }

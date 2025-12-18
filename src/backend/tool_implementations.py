@@ -173,7 +173,9 @@ class ToolImplementations:
             smoothed_spectral_data = SpectralData(smoothed_df, metadata)
             # Store only with friendly name (no duplicates)
             self._datasets[friendly_name] = smoothed_spectral_data
-            self.dataLoaded.emit(friendly_name)  # Emit signal to update browser
+            # Only emit to browser when not in workflow mode (intermediate results shouldn't appear)
+            if not self._workflow_mode:
+                self.dataLoaded.emit(friendly_name)
 
             # Status update will be handled by callback in main thread
             logger.info(f"Smoothed data saved to {output_path}")
@@ -365,7 +367,9 @@ class ToolImplementations:
             deriv_spectral_data = SpectralData(deriv_df, metadata)
             # Store only with friendly name (no duplicates)
             self._datasets[friendly_name] = deriv_spectral_data
-            self.dataLoaded.emit(friendly_name)  # Emit signal to update browser
+            # Only emit to browser when not in workflow mode (intermediate results shouldn't appear)
+            if not self._workflow_mode:
+                self.dataLoaded.emit(friendly_name)
 
             # Status update will be handled by callback in main thread
             logger.info(f"Derivative saved to {output_path}")
@@ -727,6 +731,9 @@ class ToolImplementations:
             fit_params_list = []
             corrected_spectra = []
 
+            # Storage for baseline diagnostics
+            baseline_values = []
+
             # Fit each spectrum
             for i, spectrum in enumerate(spectra.T):
                 if task.cancelled:
@@ -803,9 +810,24 @@ class ToolImplementations:
                 else:
                     raise ValueError(f"Unknown fit type: {fit_type}")
 
+                # Track baseline statistics for diagnostics
+                baseline_values.append({
+                    'spectrum_index': i,
+                    'baseline_mean': np.mean(baseline),
+                    'baseline_std': np.std(baseline),
+                    'baseline_min': np.min(baseline),
+                    'baseline_max': np.max(baseline)
+                })
+
                 # Subtract baseline
                 corrected = spectrum - baseline
                 corrected_spectra.append(corrected)
+
+            # Log baseline variance across spectra to diagnose "all same amount" issue
+            baseline_means = [b['baseline_mean'] for b in baseline_values]
+            baseline_variance = np.var(baseline_means)
+            logger.info(f"BaselineCorrection: Baseline mean variance across {len(baseline_means)} spectra: {baseline_variance:.6e}")
+            logger.info(f"BaselineCorrection: Baseline means range: {np.min(baseline_means):.6e} to {np.max(baseline_means):.6e}")
 
             # Debug logging for output
             corrected_array = np.array(corrected_spectra).T
@@ -819,6 +841,12 @@ class ToolImplementations:
             params_df = pd.DataFrame(fit_params_list)
             params_path = self._ensure_output_dir('fitted') / f"{file_safe_name}_FitParams_{fit_type}.csv"
             params_df.to_csv(params_path, index=False)
+
+            # Save baseline diagnostics for debugging
+            baseline_df = pd.DataFrame(baseline_values)
+            baseline_diag_path = self._ensure_output_dir('fitted') / f"{file_safe_name}_BaselineDiagnostics_{fit_type}.csv"
+            baseline_df.to_csv(baseline_diag_path, index=False)
+            logger.info(f"Baseline diagnostics saved to: {baseline_diag_path}")
 
             # Save corrected spectra
             corrected_df = pd.DataFrame(corrected_array, columns=spectral_data.spectra.columns)
@@ -842,7 +870,9 @@ class ToolImplementations:
             corrected_spectral_data = SpectralData(corrected_df, metadata)
             # Store only with friendly name (no duplicates)
             self._datasets[friendly_name] = corrected_spectral_data
-            self.dataLoaded.emit(friendly_name)
+            # Only emit to browser when not in workflow mode (intermediate results shouldn't appear)
+            if not self._workflow_mode:
+                self.dataLoaded.emit(friendly_name)
 
             logger.info(f"Fit results saved to {params_path} and {corrected_path}")
 
@@ -982,7 +1012,9 @@ class ToolImplementations:
         import tifffile
 
         # Save as 16-bit TIFF (preserving more precision than 8-bit)
-        tiff_path = output_base.with_suffix('.tiff')
+        # Use string concatenation instead of with_suffix() to avoid issues
+        # when basename contains dots (e.g., "Map_-0.500_-0.300" would have .300 treated as suffix)
+        tiff_path = Path(str(output_base) + '.tiff')
         # Normalize to 16-bit range for TIFF
         if np.ptp(map_data) > 0:
             normalized_map = 65535 * (map_data - np.min(map_data)) / np.ptp(map_data)
@@ -993,9 +1025,15 @@ class ToolImplementations:
         logger.info(f"TIFF saved to: {tiff_path}")
 
         # Save as CSV for raw data
-        csv_path = output_base.with_suffix('.csv')
+        csv_path = Path(str(output_base) + '.csv')
         np.savetxt(str(csv_path), map_data, delimiter=',', fmt='%.6e')
         logger.info(f"CSV saved to: {csv_path}")
+
+        # Verify files were created
+        if not tiff_path.exists():
+            logger.error(f"TIFF file was not created at: {tiff_path}")
+        if not csv_path.exists():
+            logger.error(f"CSV file was not created at: {csv_path}")
 
     def generate_all_maps(self, task, flat_dataset_name: str) -> list:
         """
@@ -1040,9 +1078,15 @@ class ToolImplementations:
                 if map_path:
                     # The path is a base without extension - TIFF is what we want
                     tiff_path = f"{map_path}.tiff"
-                    generated_maps.append(tiff_path)
+                    # Verify the file was actually created
+                    from pathlib import Path
+                    if Path(tiff_path).exists():
+                        generated_maps.append(tiff_path)
+                        logger.info(f"Map verified at: {tiff_path}")
+                    else:
+                        logger.error(f"Map file not found after generation: {tiff_path}")
 
-            logger.info(f"Generated {len(generated_maps)} maps from {flat_dataset_name}")
+            logger.info(f"Generated {len(generated_maps)} verified maps from {flat_dataset_name}")
             return generated_maps
 
         except Exception as e:

@@ -16,6 +16,17 @@ import "../components"
 Item {
     id: root
 
+    // Theme colors - reactive bindings to parent DraggableWindow
+    property var parentWindow: Window.window
+    property color bgDark: parentWindow ? parentWindow.bgDark : "#1a1a2e"
+    property color bgMedium: parentWindow ? parentWindow.bgMedium : "#2a2a3e"
+    property color bgLight: parentWindow ? parentWindow.bgLight : "#3a3a4e"
+    property color accentPink: parentWindow ? parentWindow.accentPink : "#F5A9B8"
+    property color accentBlue: parentWindow ? parentWindow.accentBlue : "#5BCEFA"
+    property color accentPurple: parentWindow ? parentWindow.accentPurple : "#9B4F96"
+    property color textLight: parentWindow ? parentWindow.textLight : "#ffffff"
+    property color textMuted: parentWindow ? parentWindow.textMuted : "#cccccc"
+
     ColumnLayout {
         anchors.fill: parent
         spacing: 10
@@ -24,13 +35,14 @@ Item {
             text: "Map Generator"
             font.pixelSize: 18
             font.bold: true
+            color: textLight
         }
 
         Label {
             text: "Generate spatial maps from flat data (integrated values, peak heights, etc.)."
             wrapMode: Text.Wrap
             Layout.fillWidth: true
-            color: "#9B4F96"
+            color: accentPurple
         }
 
         GroupBox {
@@ -51,7 +63,7 @@ Item {
                 Label {
                     text: "Flat datasets have one value per spatial point (e.g., integrated data)"
                     font.pixelSize: 10
-                    color: "#666666"
+                    color: textMuted
                 }
             }
         }
@@ -96,7 +108,7 @@ Item {
                         Label {
                             visible: valuesRepeater.count === 0
                             text: "Select a dataset to see available values"
-                            color: "#B0A0B8"
+                            color: textMuted
                             font.italic: true
                         }
                     }
@@ -136,7 +148,7 @@ Item {
                 Label {
                     text: "Maps will be saved to: outputs/maps/"
                     font.pixelSize: 10
-                    color: "#666666"
+                    color: textMuted
                 }
             }
         }
@@ -160,7 +172,7 @@ Item {
 
             Label {
                 text: getSelectedValuesCount() + " value(s) selected"
-                color: "#666666"
+                color: textMuted
             }
 
             Item { Layout.fillWidth: true }

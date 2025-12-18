@@ -504,6 +504,104 @@ class TestExecutorNodeExecution:
         assert isinstance(inputs['in'], list)
         assert len(inputs['in']) == 2
 
+    def test_gather_inputs_multi_with_ordering(self, executor_with_data):
+        """Test that multi-inputs are ordered according to input_queue parameter."""
+        executor = executor_with_data
+
+        executor.node_outputs['source1'] = {'out': 'value1'}
+        executor.node_outputs['source2'] = {'out': 'value2'}
+        executor.node_outputs['source3'] = {'out': 'value3'}
+
+        workflow = Workflow(id='test', name='Test')
+
+        source1 = WorkflowNode(
+            id='source1', tool_name='S1', display_name='Source 1',
+            outputs=[Port('out', 'Out', PortType.ANY, False)]
+        )
+        source2 = WorkflowNode(
+            id='source2', tool_name='S2', display_name='Source 2',
+            outputs=[Port('out', 'Out', PortType.ANY, False)]
+        )
+        source3 = WorkflowNode(
+            id='source3', tool_name='S3', display_name='Source 3',
+            outputs=[Port('out', 'Out', PortType.ANY, False)]
+        )
+        # Target node with input_queue parameter specifying order: source3, source1, source2
+        target = WorkflowNode(
+            id='target', tool_name='T', display_name='T',
+            inputs=[Port('in', 'In', PortType.ANY, True, multi_input=True)],
+            parameters={
+                'input_queue': [
+                    {'source_node_id': 'source3', 'enabled': True},
+                    {'source_node_id': 'source1', 'enabled': True},
+                    {'source_node_id': 'source2', 'enabled': True}
+                ]
+            }
+        )
+
+        workflow.add_node(source1)
+        workflow.add_node(source2)
+        workflow.add_node(source3)
+        workflow.add_node(target)
+        # Add connections in different order than queue
+        workflow.add_connection(Connection('c1', 'source1', 'out', 'target', 'in'))
+        workflow.add_connection(Connection('c2', 'source2', 'out', 'target', 'in'))
+        workflow.add_connection(Connection('c3', 'source3', 'out', 'target', 'in'))
+
+        inputs = executor._gather_inputs(target, workflow)
+
+        assert 'in' in inputs
+        assert isinstance(inputs['in'], list)
+        assert len(inputs['in']) == 3
+        # Verify ordering matches input_queue (source3, source1, source2)
+        assert inputs['in'][0]['source_node_id'] == 'source3'
+        assert inputs['in'][1]['source_node_id'] == 'source1'
+        assert inputs['in'][2]['source_node_id'] == 'source2'
+
+    def test_gather_inputs_multi_disabled_filtering(self, executor_with_data):
+        """Test that disabled inputs in input_queue are still gathered but can be filtered."""
+        executor = executor_with_data
+
+        executor.node_outputs['source1'] = {'out': 'value1'}
+        executor.node_outputs['source2'] = {'out': 'value2'}
+
+        workflow = Workflow(id='test', name='Test')
+
+        source1 = WorkflowNode(
+            id='source1', tool_name='S1', display_name='Source 1',
+            outputs=[Port('out', 'Out', PortType.ANY, False)]
+        )
+        source2 = WorkflowNode(
+            id='source2', tool_name='S2', display_name='Source 2',
+            outputs=[Port('out', 'Out', PortType.ANY, False)]
+        )
+        # Target with source1 disabled in queue
+        target = WorkflowNode(
+            id='target', tool_name='T', display_name='T',
+            inputs=[Port('in', 'In', PortType.ANY, True, multi_input=True)],
+            parameters={
+                'input_queue': [
+                    {'source_node_id': 'source2', 'enabled': True},
+                    {'source_node_id': 'source1', 'enabled': False}  # Disabled
+                ]
+            }
+        )
+
+        workflow.add_node(source1)
+        workflow.add_node(source2)
+        workflow.add_node(target)
+        workflow.add_connection(Connection('c1', 'source1', 'out', 'target', 'in'))
+        workflow.add_connection(Connection('c2', 'source2', 'out', 'target', 'in'))
+
+        inputs = executor._gather_inputs(target, workflow)
+
+        # _gather_inputs still returns all values (ordering only)
+        # Filtering of disabled inputs happens in the node execution handler
+        assert 'in' in inputs
+        assert len(inputs['in']) == 2
+        # But ordering should reflect queue order (source2 first)
+        assert inputs['in'][0]['source_node_id'] == 'source2'
+
     def test_format_output_name(self, executor_with_data):
         """Test output naming format."""
         executor = executor_with_data

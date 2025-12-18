@@ -14,6 +14,21 @@ import "../components"
 
 // Spatial Average Utility Tool
 Item {
+    id: root
+
+    // Theme colors - reactive bindings to parent DraggableWindow
+    property var parentWindow: Window.window
+    property color bgDark: parentWindow ? parentWindow.bgDark : "#1a1a2e"
+    property color bgMedium: parentWindow ? parentWindow.bgMedium : "#2a2a3e"
+    property color bgLight: parentWindow ? parentWindow.bgLight : "#3a3a4e"
+    property color accentPink: parentWindow ? parentWindow.accentPink : "#F5A9B8"
+    property color accentBlue: parentWindow ? parentWindow.accentBlue : "#5BCEFA"
+    property color accentPurple: parentWindow ? parentWindow.accentPurple : "#9B4F96"
+    property color textLight: parentWindow ? parentWindow.textLight : "#ffffff"
+    property color textMuted: parentWindow ? parentWindow.textMuted : "#cccccc"
+    property color successColor: parentWindow ? parentWindow.successColor : "#2ECC71"
+    property color borderColor: parentWindow ? parentWindow.borderColor : "#8B4F86"
+
     ColumnLayout {
         anchors.fill: parent
         spacing: 10
@@ -23,13 +38,14 @@ Item {
             text: "Spatial Average Utility"
             font.pixelSize: 18
             font.bold: true
+            color: textLight
         }
 
         Label {
             text: "Transform hyperspectral grid by averaging spectra in discrete spatial blocks.\nThis creates a lower-resolution grid where each point is the average of multiple spectra."
             wrapMode: Text.Wrap
             Layout.fillWidth: true
-            color: "#9B4F96"
+            color: accentPurple
         }
 
         // Dataset selection
@@ -52,7 +68,7 @@ Item {
                     id: datasetInfo
                     text: getDatasetInfo()
                     font.pixelSize: 10
-                    color: "#666666"
+                    color: textMuted
                     wrapMode: Text.Wrap
                     Layout.fillWidth: true
                 }
@@ -77,14 +93,14 @@ Item {
                 Label {
                     id: originalGridLabel
                     text: getOriginalGridSize()
-                    color: "#0066cc"
+                    color: accentBlue
                 }
 
                 Rectangle {
                     Layout.fillWidth: true
                     Layout.columnSpan: 2
                     height: 1
-                    color: "#dddddd"
+                    color: borderColor
                 }
 
                 Label {
@@ -115,7 +131,7 @@ Item {
                     Layout.fillWidth: true
                     Layout.columnSpan: 2
                     height: 1
-                    color: "#dddddd"
+                    color: borderColor
                 }
 
                 Label {
@@ -125,7 +141,7 @@ Item {
                 Label {
                     id: resultGridLabel
                     text: calculateResultGrid()
-                    color: "#009933"
+                    color: successColor
                 }
 
                 Label {
@@ -134,7 +150,7 @@ Item {
                 Label {
                     id: blockSizeLabel
                     text: calculateBlockSize()
-                    color: "#666666"
+                    color: textMuted
                 }
 
                 Label {
@@ -143,7 +159,7 @@ Item {
                 Label {
                     id: spectraPerBlockLabel
                     text: calculateSpectraPerBlock()
-                    color: "#666666"
+                    color: textMuted
                 }
             }
         }
@@ -156,8 +172,8 @@ Item {
 
             Rectangle {
                 anchors.fill: parent
-                color: "#f5f5f5"
-                border.color: "#cccccc"
+                color: bgLight
+                border.color: borderColor
                 border.width: 1
 
                 Column {
@@ -178,15 +194,15 @@ Item {
                         Rectangle {
                             width: 60
                             height: 60
-                            color: "#0066cc"
+                            color: accentBlue
                             opacity: 0.3
-                            border.color: "#0066cc"
+                            border.color: accentBlue
                             border.width: 2
 
                             Text {
                                 anchors.centerIn: parent
                                 text: getOriginalGridSize()
-                                color: "#0066cc"
+                                color: accentBlue
                                 font.bold: true
                             }
                         }
@@ -194,21 +210,22 @@ Item {
                         Text {
                             text: "→"
                             font.pixelSize: 24
+                            color: textLight
                             anchors.verticalCenter: parent.verticalCenter
                         }
 
                         Rectangle {
                             width: 60
                             height: 60
-                            color: "#009933"
+                            color: successColor
                             opacity: 0.3
-                            border.color: "#009933"
+                            border.color: successColor
                             border.width: 2
 
                             Text {
                                 anchors.centerIn: parent
                                 text: calculateResultGrid()
-                                color: "#009933"
+                                color: successColor
                                 font.bold: true
                             }
                         }

@@ -64,44 +64,51 @@ class WorkflowExecutor:
 
         logger.info(f"Executing workflow '{workflow.name}' with {total_nodes} nodes")
 
-        for i, node_id in enumerate(execution_order):
-            if self.cancelled:
-                errors.append("Workflow execution cancelled")
-                break
+        # Enable workflow mode to suppress intermediate dataset additions to project browser
+        self.app_backend._workflow_mode = True
 
-            node = workflow.get_node(node_id)
-            if not node:
-                continue
+        try:
+            for i, node_id in enumerate(execution_order):
+                if self.cancelled:
+                    errors.append("Workflow execution cancelled")
+                    break
 
-            # Skip comment nodes - they are just for annotations
-            if node.tool_name == "CommentNode":
-                logger.debug(f"Skipping comment node: {node.display_name}")
-                continue
+                node = workflow.get_node(node_id)
+                if not node:
+                    continue
 
-            if progress_callback:
-                progress_callback(i + 1, total_nodes, f"Executing: {node.display_name}")
+                # Skip comment nodes - they are just for annotations
+                if node.tool_name == "CommentNode":
+                    logger.debug(f"Skipping comment node: {node.display_name}")
+                    continue
 
-            try:
-                # Gather inputs for this node
-                node_inputs = self._gather_inputs(node, workflow)
+                if progress_callback:
+                    progress_callback(i + 1, total_nodes, f"Executing: {node.display_name}")
 
-                # Execute the node
-                node_result = self._execute_node(node, node_inputs)
+                try:
+                    # Gather inputs for this node
+                    node_inputs = self._gather_inputs(node, workflow)
 
-                # Store outputs
-                self.node_outputs[node_id] = node_result
+                    # Execute the node
+                    node_result = self._execute_node(node, node_inputs)
 
-                # If this is an output node, add to results
-                if node.tool_name in ['DatasetOutput', 'MapOutput', 'ImageOutput', 'TableOutput', 'FlatDataOutput']:
-                    output_name = node.parameters.get('output_name', f'output_{node_id}')
-                    results[output_name] = node_result
+                    # Store outputs
+                    self.node_outputs[node_id] = node_result
 
-                logger.info(f"Node '{node.display_name}' executed successfully")
+                    # If this is an output node, add to results
+                    if node.tool_name in ['DatasetOutput', 'MapOutput', 'ImageOutput', 'TableOutput', 'FlatDataOutput']:
+                        output_name = node.parameters.get('output_name', f'output_{node_id}')
+                        results[output_name] = node_result
 
-            except Exception as e:
-                error_msg = f"Error executing '{node.display_name}': {str(e)}"
-                logger.error(error_msg, exc_info=True)
-                errors.append(error_msg)
+                    logger.info(f"Node '{node.display_name}' executed successfully")
+
+                except Exception as e:
+                    error_msg = f"Error executing '{node.display_name}': {str(e)}"
+                    logger.error(error_msg, exc_info=True)
+                    errors.append(error_msg)
+        finally:
+            # Always disable workflow mode when done
+            self.app_backend._workflow_mode = False
 
         success = len(errors) == 0
         return {
@@ -113,6 +120,9 @@ class WorkflowExecutor:
     def _gather_inputs(self, node: WorkflowNode, workflow: Workflow) -> Dict[str, Any]:
         """Gather input values for a node from connected outputs"""
         inputs = {}
+
+        # Get input_queue for ordering multi-inputs (if available)
+        input_queue = node.parameters.get('input_queue', [])
 
         for input_port in node.inputs:
             # Find all connections to this input
@@ -138,6 +148,15 @@ class WorkflowExecutor:
                                 'source_node_name': source_name,
                                 'source_port_id': conn.source_port_id
                             })
+
+                    # Sort values according to input_queue order if available
+                    if input_queue:
+                        # Create order map from queue (source_node_id -> index)
+                        order_map = {q.get('source_node_id'): i for i, q in enumerate(input_queue)}
+                        # Sort values: queued items first (by queue order), then unqueued items
+                        values.sort(key=lambda v: order_map.get(v['source_node_id'], len(order_map)))
+                        logger.debug(f"Multi-input values sorted according to input_queue: {[v['source_node_name'] for v in values]}")
+
                     inputs[input_port.id] = values
                 else:
                     # Single connection - just get the value
@@ -318,6 +337,7 @@ class WorkflowExecutor:
 
         elif tool_name == "SpatialAverage":
             # Support multiple dataset and flat_data inputs
+            # Note: inputs are already sorted by _gather_inputs according to input_queue order
             datasets_input = inputs.get('datasets', [])  # List of {value, source_node_id, ...}
             flat_data_inputs = inputs.get('flat_data_inputs', [])  # List of {value, source_node_id, ...}
 
@@ -328,17 +348,24 @@ class WorkflowExecutor:
             block_x = params.get('block_x', 2)
             block_y = params.get('block_y', 2)
 
-            # Get input queue (ordered list of inputs to process)
+            # Get input queue for enabled/disabled filtering
             input_queue = params.get('input_queue', [])
+            # Create quick lookup for enabled status
+            enabled_map = {q.get('source_node_id'): q.get('enabled', True) for q in input_queue}
 
-            # Process datasets
+            # Process datasets (already in queue order from _gather_inputs)
             averaged_datasets = []
+            processing_order = []
             for input_info in datasets_input:
-                # Check if this input is enabled in the queue
-                queue_entry = next((q for q in input_queue if q.get('source_node_id') == input_info.get('source_node_id')), None)
-                if input_queue and queue_entry and not queue_entry.get('enabled', True):
+                source_node_id = input_info.get('source_node_id')
+                source_name = input_info.get('source_node_name', 'Unknown')
+
+                # Check if this input is disabled in the queue
+                if input_queue and source_node_id in enabled_map and not enabled_map[source_node_id]:
+                    logger.debug(f"SpatialAverage: Skipping disabled input from {source_name}")
                     continue  # Skip disabled inputs
 
+                processing_order.append(source_name)
                 dataset = input_info.get('value') if isinstance(input_info, dict) else input_info
                 if dataset:
                     dataset_name = self._get_temp_dataset_name(dataset)
@@ -354,17 +381,21 @@ class WorkflowExecutor:
                     if result:
                         averaged_datasets.append({
                             'value': result,
-                            'source_name': input_info.get('source_node_name', 'Unknown')
+                            'source_name': source_name
                         })
 
-            # Process flat data
+            # Process flat data (already in queue order from _gather_inputs)
             averaged_flat_data = []
             for input_info in flat_data_inputs:
-                # Check if this input is enabled in the queue
-                queue_entry = next((q for q in input_queue if q.get('source_node_id') == input_info.get('source_node_id')), None)
-                if input_queue and queue_entry and not queue_entry.get('enabled', True):
+                source_node_id = input_info.get('source_node_id')
+                source_name = input_info.get('source_node_name', 'Unknown')
+
+                # Check if this input is disabled in the queue
+                if input_queue and source_node_id in enabled_map and not enabled_map[source_node_id]:
+                    logger.debug(f"SpatialAverage: Skipping disabled flat_data input from {source_name}")
                     continue  # Skip disabled inputs
 
+                processing_order.append(source_name)
                 flat_data = input_info.get('value') if isinstance(input_info, dict) else input_info
                 if flat_data:
                     flat_name = self._get_temp_dataset_name(flat_data)
@@ -380,12 +411,14 @@ class WorkflowExecutor:
                     if result_flat:
                         averaged_flat_data.append({
                             'value': result_flat,
-                            'source_name': input_info.get('source_node_name', 'Unknown')
+                            'source_name': source_name
                         })
 
             outputs['averaged_datasets'] = averaged_datasets
             outputs['averaged_flat_data'] = averaged_flat_data
             logger.info(f"SpatialAverage processed {len(averaged_datasets)} datasets and {len(averaged_flat_data)} flat data inputs")
+            if processing_order:
+                logger.info(f"SpatialAverage processing order: {' -> '.join(processing_order)}")
 
         elif tool_name == "TruncateData":
             dataset = inputs.get('dataset')
@@ -596,14 +629,22 @@ class WorkflowExecutor:
 
                     # Handle both single paths and lists of paths
                     if isinstance(map_path, list):
-                        # Open each map in the list
+                        # Open each map in the list, checking existence first
+                        from pathlib import Path
                         for i, path in enumerate(map_path):
+                            if not Path(path).exists():
+                                logger.error(f"Map file not found: {path}")
+                                continue
                             map_name = f"{output_name}_{i+1}" if len(map_path) > 1 else output_name
                             self.app_backend._open_map_window(str(path), f"wf_map_{node.id}_{i}", map_name)
                             logger.info(f"Map displayed as: {map_name}")
                     else:
-                        self.app_backend._open_map_window(str(map_path), f"wf_map_{node.id}", output_name)
-                        logger.info(f"Map displayed as: {output_name}")
+                        from pathlib import Path
+                        if Path(map_path).exists():
+                            self.app_backend._open_map_window(str(map_path), f"wf_map_{node.id}", output_name)
+                            logger.info(f"Map displayed as: {output_name}")
+                        else:
+                            logger.error(f"Map file not found: {map_path}")
 
         elif tool_name == "ImageOutput":
             image_path = inputs.get('image')

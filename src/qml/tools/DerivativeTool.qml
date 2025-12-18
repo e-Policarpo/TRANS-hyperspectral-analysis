@@ -14,6 +14,19 @@ import "../components"
 
 // Derivative Calculator Tool
 Item {
+    id: root
+
+    // Theme colors - reactive bindings to parent DraggableWindow
+    property var parentWindow: Window.window
+    property color bgDark: parentWindow ? parentWindow.bgDark : "#1a1a2e"
+    property color bgMedium: parentWindow ? parentWindow.bgMedium : "#2a2a3e"
+    property color bgLight: parentWindow ? parentWindow.bgLight : "#3a3a4e"
+    property color accentPink: parentWindow ? parentWindow.accentPink : "#F5A9B8"
+    property color accentBlue: parentWindow ? parentWindow.accentBlue : "#5BCEFA"
+    property color accentPurple: parentWindow ? parentWindow.accentPurple : "#9B4F96"
+    property color textLight: parentWindow ? parentWindow.textLight : "#ffffff"
+    property color textMuted: parentWindow ? parentWindow.textMuted : "#cccccc"
+
     ColumnLayout {
         anchors.fill: parent
         spacing: 10
@@ -22,13 +35,14 @@ Item {
             text: "Derivative Calculator"
             font.pixelSize: 18
             font.bold: true
+            color: textLight
         }
 
         Label {
             text: "Calculate numerical derivatives of spectral data (dI/dV or d²I/dV²)."
             wrapMode: Text.Wrap
             Layout.fillWidth: true
-            color: "#9B4F96"
+            color: accentPurple
         }
 
         GroupBox {
@@ -86,7 +100,7 @@ Item {
                       "Output will be saved as new dataset with prefix dIdV_ or d2IdV2_"
                 wrapMode: Text.Wrap
                 font.pixelSize: 10
-                color: "#666666"
+                color: textMuted
             }
         }
 

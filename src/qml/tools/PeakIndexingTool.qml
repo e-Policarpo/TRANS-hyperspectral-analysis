@@ -14,6 +14,19 @@ import "../components"
 
 // Peak Indexing Tool
 Item {
+    id: root
+
+    // Theme colors - reactive bindings to parent DraggableWindow
+    property var parentWindow: Window.window
+    property color bgDark: parentWindow ? parentWindow.bgDark : "#1a1a2e"
+    property color bgMedium: parentWindow ? parentWindow.bgMedium : "#2a2a3e"
+    property color bgLight: parentWindow ? parentWindow.bgLight : "#3a3a4e"
+    property color accentPink: parentWindow ? parentWindow.accentPink : "#F5A9B8"
+    property color accentBlue: parentWindow ? parentWindow.accentBlue : "#5BCEFA"
+    property color accentPurple: parentWindow ? parentWindow.accentPurple : "#9B4F96"
+    property color textLight: parentWindow ? parentWindow.textLight : "#ffffff"
+    property color textMuted: parentWindow ? parentWindow.textMuted : "#cccccc"
+
     ColumnLayout {
         anchors.fill: parent
         spacing: 10
@@ -22,13 +35,14 @@ Item {
             text: "Peak Indexing Utility"
             font.pixelSize: 18
             font.bold: true
+            color: textLight
         }
 
         Label {
             text: "Automatically find and index peaks in spectral data, including position and FWHM."
             wrapMode: Text.Wrap
             Layout.fillWidth: true
-            color: "#9B4F96"
+            color: accentPurple
         }
 
         GroupBox {
@@ -47,7 +61,7 @@ Item {
                 Label {
                     text: "Tip: Use baseline-corrected data (NoBaseline_...) for best results"
                     font.pixelSize: 10
-                    color: "#666666"
+                    color: textMuted
                     wrapMode: Text.Wrap
                 }
             }
@@ -89,7 +103,7 @@ Item {
                     text: "\nProminence: How much peak stands out from surroundings\n" +
                           "Min Distance: Minimum spacing between peaks"
                     font.pixelSize: 10
-                    color: "#666666"
+                    color: textMuted
                     wrapMode: Text.Wrap
                     Layout.fillWidth: true
                 }
@@ -109,7 +123,7 @@ Item {
                       "Saved as CSV with one row per peak"
                 wrapMode: Text.Wrap
                 font.pixelSize: 10
-                color: "#666666"
+                color: textMuted
             }
         }
 

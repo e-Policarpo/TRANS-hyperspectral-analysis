@@ -25,6 +25,7 @@ class TestToolImplementationsSetup:
     def tool_impl(self, tmp_path):
         """Create a mock ToolImplementations instance."""
         from src.backend.tool_implementations import ToolImplementations
+        import re
 
         class MockBackend(ToolImplementations):
             def __init__(self):
@@ -33,6 +34,7 @@ class TestToolImplementationsSetup:
                 self._output_base_dir.mkdir(exist_ok=True)
                 self.errorOccurred = Mock()
                 self.dataLoaded = Mock()
+                self._workflow_mode = False
 
             def _ensure_output_dir(self, subdir):
                 path = self._output_base_dir / subdir
@@ -40,7 +42,23 @@ class TestToolImplementationsSetup:
                 return path
 
             def _sanitize_filename(self, name):
-                return "".join(c for c in name if c.isalnum() or c in (' ', '-', '_')).strip()
+                """Sanitize filename for safe file creation."""
+                safe = "".join(c for c in name if c.isalnum() or c in (' ', '-', '_', '.')).strip()
+                safe = safe.replace(' ', '_')
+                if len(safe) > 50:
+                    safe = safe[:50]
+                return safe if safe else "unnamed"
+
+            def _extract_clean_base_name(self, name):
+                """Extract clean base name from dataset name."""
+                # Handle workflow temp names
+                wf_match = re.match(r'^_wf_(.+?)(?:_(?:integrate|derivative|smooth|truncate|baseline|discretize))?_[a-f0-9]{6}$', name)
+                if wf_match:
+                    name = wf_match.group(1)
+                # Replace underscores with spaces and clean up
+                name = name.replace('_', ' ')
+                name = ' '.join(name.split())
+                return name
 
         return MockBackend()
 
@@ -303,6 +321,93 @@ class TestDataManipulation(TestToolImplementationsSetup):
             # Should not execute dangerous code
 
 
+class TestBaselineCorrection(TestToolImplementationsSetup):
+    """Tests for baseline correction with diagnostics."""
+
+    def test_fit_curves_als_creates_diagnostics(self, tool_impl, sample_spectral_data):
+        """TI-40: ALS baseline creates diagnostics file."""
+        tool_impl._datasets['test'] = sample_spectral_data
+        tool_impl._workflow_mode = False
+        task = MockTask()
+
+        result = tool_impl.fit_curves(
+            task, 'test',
+            fit_type='als',
+            als_lambda=1e5,
+            als_p=0.01
+        )
+
+        assert result != ""
+        # Check that diagnostics file was created
+        fitted_dir = tool_impl._output_base_dir / "fitted"
+        diag_files = list(fitted_dir.glob("*BaselineDiagnostics*.csv"))
+        assert len(diag_files) >= 1
+
+    def test_fit_curves_endpoints_creates_diagnostics(self, tool_impl, sample_spectral_data):
+        """TI-41: Endpoint baseline creates diagnostics file."""
+        tool_impl._datasets['test'] = sample_spectral_data
+        tool_impl._workflow_mode = False
+        task = MockTask()
+
+        result = tool_impl.fit_curves(
+            task, 'test',
+            fit_type='endpoints',
+            degree=1
+        )
+
+        assert result != ""
+        # Check diagnostics file
+        fitted_dir = tool_impl._output_base_dir / "fitted"
+        diag_files = list(fitted_dir.glob("*BaselineDiagnostics*.csv"))
+        assert len(diag_files) >= 1
+
+    def test_fit_curves_diagnostics_per_spectrum(self, tool_impl, sample_spectral_data):
+        """TI-42: Diagnostics contain per-spectrum baseline statistics."""
+        tool_impl._datasets['test'] = sample_spectral_data
+        tool_impl._workflow_mode = False
+        task = MockTask()
+
+        tool_impl.fit_curves(
+            task, 'test',
+            fit_type='linear'
+        )
+
+        # Read the diagnostics file
+        fitted_dir = tool_impl._output_base_dir / "fitted"
+        diag_files = list(fitted_dir.glob("*BaselineDiagnostics*.csv"))
+        assert len(diag_files) >= 1
+
+        diag_df = pd.read_csv(diag_files[0])
+        # Should have one row per spectrum
+        assert len(diag_df) == sample_spectral_data.spectra.shape[1]
+        # Should have baseline statistics columns
+        assert 'spectrum_index' in diag_df.columns
+        assert 'baseline_mean' in diag_df.columns
+        assert 'baseline_std' in diag_df.columns
+
+    def test_fit_curves_baseline_variance(self, tool_impl, sample_spectral_data):
+        """TI-43: Verify baseline variance is computed correctly."""
+        tool_impl._datasets['test'] = sample_spectral_data
+        tool_impl._workflow_mode = False
+        task = MockTask()
+
+        tool_impl.fit_curves(
+            task, 'test',
+            fit_type='polynomial',
+            degree=2
+        )
+
+        # Read diagnostics
+        fitted_dir = tool_impl._output_base_dir / "fitted"
+        diag_files = list(fitted_dir.glob("*BaselineDiagnostics*.csv"))
+        diag_df = pd.read_csv(diag_files[0])
+
+        # Baseline means should vary across spectra (not all identical)
+        baseline_means = diag_df['baseline_mean'].values
+        # For random data, there should be some variance
+        assert np.std(baseline_means) > 0 or len(baseline_means) == 1
+
+
 class TestTruncateData(TestToolImplementationsSetup):
     """Tests for data truncation."""
 
@@ -352,6 +457,97 @@ class TestHelperMethods(TestToolImplementationsSetup):
         path = tool_impl._ensure_output_dir("test_subdir")
         assert path.exists()
         assert path.is_dir()
+
+
+class TestMapGeneration(TestToolImplementationsSetup):
+    """Tests for map generation with path validation."""
+
+    @pytest.fixture
+    def integrated_spectral_data(self, tmp_path):
+        """Create integrated spectral data with intervals metadata."""
+        # Create flat data (one value per spectrum)
+        num_spectra = 25  # 5x5 grid
+        df = pd.DataFrame({
+            'Spectrum_Index': range(num_spectra),
+            'Interval_-0.5_-0.3': np.random.rand(num_spectra) * 10,
+            'Interval_0.2_0.5': np.random.rand(num_spectra) * 10,
+        })
+        metadata = SpectralMetadata(
+            source_type='integrated',
+            dimensions=(5, 5),
+            scan_mode='forward',
+            units={'x': 'index', 'y': 'integrated'},
+            additional_info={
+                'intervals': [(-0.5, -0.3), (0.2, 0.5)]  # Numeric tuples
+            }
+        )
+        return SpectralData(data=df, metadata=metadata)
+
+    def test_generate_map_creates_verified_files(self, tool_impl, integrated_spectral_data):
+        """TI-50: Map generation verifies file creation."""
+        tool_impl._datasets['integrated'] = integrated_spectral_data
+        task = MockTask()
+
+        # Generate single map
+        result = tool_impl.generate_map(task, 'integrated', value_index=0)
+
+        assert result is not None
+        assert result != ""
+        # The TIFF file should exist
+        tiff_path = Path(f"{result}.tiff")
+        assert tiff_path.exists(), f"TIFF file not created at {tiff_path}"
+
+    def test_generate_all_maps_returns_only_existing_files(self, tool_impl, integrated_spectral_data):
+        """TI-51: generate_all_maps only returns paths to files that exist."""
+        tool_impl._datasets['integrated'] = integrated_spectral_data
+        task = MockTask()
+
+        # Generate all maps
+        map_paths = tool_impl.generate_all_maps(task, 'integrated')
+
+        assert isinstance(map_paths, list)
+        # All returned paths should exist
+        for path in map_paths:
+            assert Path(path).exists(), f"Returned path does not exist: {path}"
+
+    def test_generate_map_with_interval_naming(self, tool_impl, integrated_spectral_data):
+        """TI-52: Map filenames include interval values from metadata."""
+        tool_impl._datasets['integrated'] = integrated_spectral_data
+        task = MockTask()
+
+        map_paths = tool_impl.generate_all_maps(task, 'integrated')
+
+        # Check that filenames contain interval values
+        assert len(map_paths) >= 1
+        # At least one should contain interval-like pattern
+        has_interval_name = any('-0.5' in p or '0.2' in p for p in map_paths)
+        assert has_interval_name, "Map filenames should contain interval values"
+
+    def test_generate_map_without_intervals_uses_index(self, tool_impl):
+        """TI-53: Maps without interval metadata use value index in filename."""
+        # Create data without intervals
+        num_spectra = 16
+        df = pd.DataFrame({
+            'Spectrum_Index': range(num_spectra),
+            'Value_0': np.random.rand(num_spectra),
+            'Value_1': np.random.rand(num_spectra),
+        })
+        metadata = SpectralMetadata(
+            source_type='flat',
+            dimensions=(4, 4),
+            scan_mode='forward',
+            units={'x': 'index', 'y': 'value'}
+            # No intervals in additional_info
+        )
+        flat_data = SpectralData(data=df, metadata=metadata)
+        tool_impl._datasets['flat'] = flat_data
+        task = MockTask()
+
+        result = tool_impl.generate_map(task, 'flat', value_index=0)
+
+        assert result is not None
+        # Should use 'val0' format when no intervals
+        assert 'val0' in result or 'Map' in result
 
 
 class TestImageDiscretizer(TestToolImplementationsSetup):

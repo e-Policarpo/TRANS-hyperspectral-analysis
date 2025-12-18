@@ -38,15 +38,20 @@ Window {
 
     Component.onCompleted: findMainWindow()
 
+    // Theme colors - reactive bindings from mainWin (MainWindow)
     property color bgDark: mainWin ? mainWin.bgDark : "#1a1a2e"
     property color bgDarker: mainWin ? mainWin.bgDarker : "#0d0d1a"
     property color bgMedium: mainWin ? mainWin.bgMedium : "#2a2a3e"
     property color bgLight: mainWin ? mainWin.bgLight : "#3a3a4e"
     property color accentPink: mainWin ? mainWin.accentPink : "#F5A9B8"
     property color accentBlue: mainWin ? mainWin.accentBlue : "#5BCEFA"
+    property color accentMagenta: mainWin ? mainWin.accentMagenta : "#D60270"
+    property color accentPurple: mainWin ? mainWin.accentPurple : "#9B4F96"
+    property color accentOrange: mainWin ? mainWin.accentOrange : "#FF9B55"
     property color textLight: mainWin ? mainWin.textLight : "#e8e8e8"
     property color textMuted: mainWin ? mainWin.textMuted : "#a0a0a0"
     property color borderColor: mainWin ? mainWin.borderColor : "#8B4F86"
+    property color successColor: "#2ECC71"  // Emerald green for success states
 
     width: 600
     height: 500

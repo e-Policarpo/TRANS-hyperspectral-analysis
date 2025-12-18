@@ -18,6 +18,17 @@ import "../components"
 Item {
     id: root
 
+    // Theme colors - reactive bindings to parent DraggableWindow
+    property var parentWindow: Window.window
+    property color bgDark: parentWindow ? parentWindow.bgDark : "#1a1a2e"
+    property color bgMedium: parentWindow ? parentWindow.bgMedium : "#2a2a3e"
+    property color bgLight: parentWindow ? parentWindow.bgLight : "#3a3a4e"
+    property color accentPink: parentWindow ? parentWindow.accentPink : "#F5A9B8"
+    property color accentBlue: parentWindow ? parentWindow.accentBlue : "#5BCEFA"
+    property color accentPurple: parentWindow ? parentWindow.accentPurple : "#9B4F96"
+    property color textLight: parentWindow ? parentWindow.textLight : "#ffffff"
+    property color textMuted: parentWindow ? parentWindow.textMuted : "#cccccc"
+
     FileDialog {
         id: imageFileDialog
         title: "Select Map/Image File"
@@ -42,13 +53,14 @@ Item {
             text: "Map Processing"
             font.pixelSize: 18
             font.bold: true
+            color: textLight
         }
 
         Label {
             text: "Apply processing operations to map/image data: filtering, leveling, normalization."
             wrapMode: Text.Wrap
             Layout.fillWidth: true
-            color: "#9B4F96"
+            color: accentPurple
         }
 
         // Input Selection
@@ -152,7 +164,7 @@ Item {
                         Label {
                             text: "Higher sigma = more smoothing"
                             Layout.columnSpan: 2
-                            color: "#666666"
+                            color: textMuted
                             font.pixelSize: 10
                         }
                     }
@@ -174,7 +186,7 @@ Item {
                         Label {
                             text: "Odd values only (3, 5, 7...)"
                             Layout.columnSpan: 2
-                            color: "#666666"
+                            color: textMuted
                             font.pixelSize: 10
                         }
                     }
@@ -182,21 +194,21 @@ Item {
                     // Plane Level - no parameters
                     Label {
                         text: "Fits and subtracts a plane from the image.\nNo additional parameters required."
-                        color: "#666666"
+                        color: textMuted
                         wrapMode: Text.Wrap
                     }
 
                     // Row Align - no parameters
                     Label {
                         text: "Aligns rows by subtracting median of each row.\nNo additional parameters required."
-                        color: "#666666"
+                        color: textMuted
                         wrapMode: Text.Wrap
                     }
 
                     // Normalize - no parameters
                     Label {
                         text: "Normalizes values to [0, 1] range.\nNo additional parameters required."
-                        color: "#666666"
+                        color: textMuted
                         wrapMode: Text.Wrap
                     }
 
@@ -216,7 +228,7 @@ Item {
                         Label {
                             text: "Higher order = more flexible background fit"
                             Layout.columnSpan: 2
-                            color: "#666666"
+                            color: textMuted
                             font.pixelSize: 10
                         }
                     }
@@ -253,7 +265,7 @@ Item {
 
                 Label {
                     text: "Output will be saved to: outputs/maps/"
-                    color: "#666666"
+                    color: textMuted
                     font.pixelSize: 10
                 }
             }
