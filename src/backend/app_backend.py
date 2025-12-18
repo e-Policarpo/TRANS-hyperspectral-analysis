@@ -1,0 +1,3775 @@
+"""
+Application Backend Bridge
+Connects QML UI to Python data processing logic with full tool implementations
+T.R.A.N.S. - Tools for Research and Analysis for Nano Spectroscopy
+Made by Eduarda Policarpo, with love 🩵🩷🤍🩷🩵
+Contact: eduardapolicarpo.fisica@gmail.com
+Date: December 2025
+License: GPL
+"""
+
+import logging
+import sys
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from typing import Optional, Dict, List, Tuple, Any
+from PySide6.QtCore import QObject, Signal, Slot, Property, QUrl
+from PySide6.QtWidgets import QFileDialog, QApplication
+from PySide6.QtGui import QDesktopServices
+
+from src.models.spectral_data import SpectralData, SpectralMetadata
+from src.models.topography_data import TopographyData
+from src.models.discretizer import Discretizer
+from src.data_loaders.nanosurf_sts_enhanced import NanosurfSTSEnhancedLoader
+from src.data_loaders.neaspec_snom_enhanced import NeaSpecSNOMEnhancedLoader
+from src.data_loaders.omicron_mtrx_loader import OmicronMatrixSTSLoader
+from src.data_loaders.omicron_flat_loader import OmicronFlatLoader
+from src.backend.tool_implementations import ToolImplementations
+from src.backend.worker import WorkerManager
+from src.backend.project_manager import ProjectManager
+from src.backend.dock_manager import DockManager
+from src.backend.workflow_manager import WorkflowManager
+from src.backend.preferences_manager import PreferencesManager
+
+logger = logging.getLogger(__name__)
+
+
+class AppBackend(ToolImplementations, QObject):
+    """
+    Main application backend that bridges QML UI to Python logic.
+    Includes full implementation of all analysis tools.
+    """
+
+    # Signals
+    statusChanged = Signal(str)
+    progressChanged = Signal(int, int, str)
+    dataLoaded = Signal(str)
+    errorOccurred = Signal(str, str)
+    toolOpened = Signal(str)
+    toolCompleted = Signal(str, str)  # tool_name, output_path
+    projectLoaded = Signal(str)  # project_path
+    projectSaved = Signal(str)  # project_path
+    projectModifiedChanged = Signal(bool)  # is_modified
+    projectReadyChanged = Signal(bool)  # project is set up and ready
+    tableCreated = Signal(str, str)  # table_id, table_title
+    graphCreated = Signal(str, str)  # graph_id, graph_title
+    mapCreated = Signal(str, str)  # map_id, map_title
+    mapDeleted = Signal(str)  # map_path - emitted when a map is deleted
+    imageImported = Signal(str, str, str)  # map_name, file_path, map_id - opens in Map Editor tab
+    windowClosed = Signal(str, str)  # window_type, window_id
+    outputCreated = Signal(str, str, str)  # output_id, tool_name, file_path
+    isBusyChanged = Signal(bool)  # worker is processing tasks
+    applicationClosing = Signal()  # emitted when main window is closing - all windows should close
+    largeDatasetConfirmation = Signal(str, int, int)  # dataset_name, num_spectra, num_points - prompt user before opening large dataset
+    datasetDeleted = Signal(str)  # dataset_name - emitted when a dataset is deleted
+    datasetRenamed = Signal(str, str)  # old_name, new_name - emitted when a dataset is renamed
+    activeDatasetChanged = Signal(str)  # active dataset name changed
+    projectPathChanged = Signal(str)  # project path changed
+    namingConventionChanged = Signal(str)  # naming convention pattern changed
+    loadMapInEditor = Signal(str)  # map_path - request to load map in the map editor
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        # Application state
+        self._status = "Ready"
+        self._current_tab = 0
+        self._project_ready = False
+        self._project_name = ""
+        self._project_path: Optional[Path] = None
+        self._outputs_created = False  # Track if any outputs have been saved
+
+        # Naming convention for output files
+        # Default: "[dataset_name]" (required token)
+        self._naming_convention = "[dataset_name]"
+        self._naming_index_start = 1  # Starting index for [index] token
+        self._naming_date_format = "dd-mm-yyyy"  # Date format: "dd-mm-yyyy" or "mm-dd-yyyy"
+        self._current_file_index = 1  # Current index counter for this session
+
+        # Data storage
+        self._datasets: Dict[str, SpectralData] = {}
+        self._active_dataset: Optional[str] = None
+
+        # Imported map data (for Map Editor)
+        self._imported_map_data: Optional[np.ndarray] = None
+        self._imported_map_name: str = ""
+        self._imported_map_path: str = ""
+
+        # Output management - will be set when project is created/opened
+        self._output_base_dir: Optional[Path] = None
+        self._recent_projects: List[Dict] = []
+        self._load_recent_projects()
+
+        # Initialize loaders
+        try:
+            self.nanosurf_loader = NanosurfSTSEnhancedLoader()
+            logger.info("Nanosurf loader initialized")
+        except Exception as e:
+            logger.warning(f"Could not initialize Nanosurf loader: {e}")
+            self.nanosurf_loader = None
+
+        try:
+            self.neaspec_loader = NeaSpecSNOMEnhancedLoader()
+            logger.info("NeaSpec loader initialized")
+        except Exception as e:
+            logger.warning(f"Could not initialize NeaSpec loader: {e}")
+            self.neaspec_loader = None
+
+        # Initialize Omicron loaders
+        try:
+            self.omicron_sts_loader = OmicronMatrixSTSLoader()
+            logger.info("Omicron Matrix STS loader initialized")
+        except Exception as e:
+            logger.warning(f"Could not initialize Omicron STS loader: {e}")
+            self.omicron_sts_loader = None
+
+        try:
+            self.omicron_flat_loader = OmicronFlatLoader()
+            logger.info("Omicron Flat image loader initialized")
+        except Exception as e:
+            logger.warning(f"Could not initialize Omicron Flat loader: {e}")
+            self.omicron_flat_loader = None
+
+        # Initialize discretizer for spatial averaging
+        self.discretizer = Discretizer()
+
+        # Initialize worker manager for multithreading
+        self.worker_manager = WorkerManager(max_concurrent=3)
+        self.worker_manager.worker_started.connect(self._on_worker_started)
+        self.worker_manager.worker_completed.connect(self._on_worker_completed)
+        self.worker_manager.worker_failed.connect(self._on_worker_failed)
+        self.worker_manager.worker_cancelled.connect(self._on_worker_cancelled)
+
+        # Initialize project manager
+        self.project_manager = ProjectManager()
+
+        # Initialize dock manager
+        self.dock_manager = DockManager()
+
+        # Initialize workflow manager
+        self.workflow_manager = WorkflowManager(self)
+
+        # Initialize preferences manager
+        self._preferences_manager = PreferencesManager(self)
+
+        # Keep references to open windows with metadata
+        self.open_windows = []
+        self.open_tables = []  # List of {'window': TableWindow, 'title': str, 'id': str}
+        self.open_graphs = []  # List of {'window': PlotWindow, 'title': str, 'id': str}
+        self.open_map_windows = []  # List of {'window': MapWindow, 'title': str, 'id': str, 'path': str}
+        self._window_id_counter = 0
+
+        # Track maps and output files from tools
+        self.maps = []  # List of {'id': str, 'title': str, 'path': str, 'timestamp': str}
+        self._map_id_counter = 0
+        self.output_files = []  # List of {'id': str, 'tool': str, 'path': str, 'timestamp': str}
+        self._output_id_counter = 0
+
+        logger.info("AppBackend initialized with all tools")
+
+    def _create_output_directories(self):
+        """Create organized output directory structure (lazy - only when needed)."""
+        if self._output_base_dir is None:
+            logger.warning("Cannot create output directories: no project set")
+            return
+
+        subdirs = ['curves', 'derivatives', 'fft', 'integrated', 'maps',
+                   'smoothed', 'fitted', 'peaks', 'discretized', 'workflows']
+        for subdir in subdirs:
+            (self._output_base_dir / subdir).mkdir(parents=True, exist_ok=True)
+
+        self._outputs_created = True
+        logger.info(f"Output directories created in {self._output_base_dir}")
+
+    def _ensure_output_dir(self, subdir: str) -> Path:
+        """
+        Ensure output subdirectory exists, creating project structure if needed.
+        This implements lazy directory creation - only create when actually saving.
+        """
+        if self._output_base_dir is None:
+            raise ValueError("No project set. Please create or open a project first.")
+
+        # Create the project directory and subdirectory only when needed
+        output_path = self._output_base_dir / subdir
+        if not output_path.exists():
+            output_path.mkdir(parents=True, exist_ok=True)
+            self._outputs_created = True
+            logger.info(f"Created output directory: {output_path}")
+
+        return output_path
+
+    def _sanitize_filename(self, name: str) -> str:
+        """
+        Sanitize a string for use as a filename.
+        Removes/replaces special characters that are problematic in file paths.
+        """
+        import re
+        # Replace spaces with underscores
+        safe = name.replace(" ", "_")
+        # Remove or replace problematic characters
+        safe = re.sub(r'[<>:"/\\|?*]', '', safe)
+        # Remove parentheses and brackets
+        safe = re.sub(r'[\(\)\[\]\{\}]', '', safe)
+        # Collapse multiple underscores
+        safe = re.sub(r'_+', '_', safe)
+        # Remove leading/trailing underscores
+        safe = safe.strip('_')
+        # Limit length
+        if len(safe) > 50:
+            safe = safe[:50]
+        return safe
+
+    def _format_user_friendly_name(self, base_name: str, operation: str,
+                                    source_dataset: str = None) -> str:
+        """
+        Format a user-friendly output name.
+
+        Examples:
+            - "STS_Sample1_Smoothed" -> "STS Sample1 - Smoothed"
+            - "_wf_STS_hyperspec_MnBi2Te4_abc123" -> "STS hyperspec MnBi2Te4 - <operation>"
+        """
+        # Use the clean base name helper
+        display_name = self._extract_clean_base_name(base_name)
+
+        # Format as "Source - Operation"
+        if operation:
+            return f"{display_name} - {operation}"
+        return display_name
+
+    def _load_recent_projects(self):
+        """Load recent projects from settings file."""
+        import json
+        settings_path = Path.home() / ".trans_qml" / "recent_projects.json"
+
+        if settings_path.exists():
+            try:
+                with open(settings_path, 'r') as f:
+                    self._recent_projects = json.load(f)
+                logger.info(f"Loaded {len(self._recent_projects)} recent projects")
+            except Exception as e:
+                logger.warning(f"Could not load recent projects: {e}")
+                self._recent_projects = []
+        else:
+            self._recent_projects = []
+
+    def _save_recent_projects(self):
+        """Save recent projects to settings file."""
+        import json
+        settings_dir = Path.home() / ".trans_qml"
+        settings_dir.mkdir(exist_ok=True)
+        settings_path = settings_dir / "recent_projects.json"
+
+        try:
+            # Keep only last 10 projects
+            self._recent_projects = self._recent_projects[:10]
+            with open(settings_path, 'w') as f:
+                json.dump(self._recent_projects, f, indent=2)
+            logger.info(f"Saved {len(self._recent_projects)} recent projects")
+        except Exception as e:
+            logger.warning(f"Could not save recent projects: {e}")
+
+    def _add_to_recent_projects(self, project_path: str, project_name: str):
+        """Add a project to the recent projects list."""
+        from datetime import datetime
+
+        # Remove if already exists
+        self._recent_projects = [p for p in self._recent_projects
+                                  if p.get('path') != project_path]
+
+        # Add to front
+        self._recent_projects.insert(0, {
+            'name': project_name,
+            'path': project_path,
+            'lastOpened': datetime.now().strftime("%Y-%m-%d %H:%M")
+        })
+
+        self._save_recent_projects()
+
+    # Properties
+    @Property(str, notify=statusChanged)
+    def status(self):
+        return self._status
+
+    @status.setter
+    def status(self, value):
+        if self._status != value:
+            self._status = value
+            self.statusChanged.emit(value)
+
+    @Property(int)
+    def currentTab(self):
+        return self._current_tab
+
+    @currentTab.setter
+    def currentTab(self, value):
+        self._current_tab = value
+
+    @Property(str, notify=activeDatasetChanged)
+    def activeDataset(self):
+        return self._active_dataset or ""
+
+    @Property(QObject, constant=True)
+    def dockManager(self):
+        """Expose dock manager to QML."""
+        return self.dock_manager
+
+    @Property(QObject, constant=True)
+    def workflowManager(self):
+        """Expose workflow manager to QML."""
+        return self.workflow_manager
+
+    @Property(QObject, constant=True)
+    def preferencesManager(self):
+        """Expose preferences manager to QML."""
+        return self._preferences_manager
+
+    @Property(bool, notify=projectReadyChanged)
+    def projectReady(self):
+        """Whether a project is set up and ready for use."""
+        return self._project_ready
+
+    @Property(str)
+    def projectName(self):
+        """Current project name."""
+        return self._project_name
+
+    @Property(str, notify=projectPathChanged)
+    def projectPath(self):
+        """Current project path."""
+        return str(self._project_path) if self._project_path else ""
+
+    @Property(str, notify=namingConventionChanged)
+    def namingConvention(self):
+        """Get current naming convention pattern."""
+        return self._naming_convention
+
+    @Slot(str, result=bool)
+    def setNamingConvention(self, pattern: str) -> bool:
+        """
+        Set the naming convention pattern.
+
+        Available tokens:
+        - [dataset_name] - Required. The name of the dataset being processed.
+        - [index] - Auto-incrementing index (001, 002, etc.)
+        - [date] - Current date in the configured format
+        - [time] - Current time (HH-MM-SS)
+        - [string:text] - Custom string (e.g., [string:MyExperiment])
+
+        Returns True if pattern is valid (contains [dataset_name]), False otherwise.
+        """
+        # Validate that pattern contains required [dataset_name] token
+        if "[dataset_name]" not in pattern.lower():
+            logger.warning(f"Naming convention must contain [dataset_name] token: {pattern}")
+            self.errorOccurred.emit("Invalid Pattern",
+                "The naming convention must include [dataset_name] token.")
+            return False
+
+        # Normalize the pattern
+        normalized = pattern.replace("[dataset_name]", "[dataset_name]")
+        normalized = normalized.replace("[DATASET_NAME]", "[dataset_name]")
+
+        self._naming_convention = normalized
+        self.namingConventionChanged.emit(normalized)
+        logger.info(f"Naming convention set to: {normalized}")
+        return True
+
+    @Slot(int)
+    def setNamingIndexStart(self, start: int):
+        """Set the starting index for the [index] token."""
+        self._naming_index_start = max(0, start)
+        self._current_file_index = self._naming_index_start
+        logger.info(f"Naming index start set to: {self._naming_index_start}")
+
+    @Slot(str)
+    def setNamingDateFormat(self, format_str: str):
+        """Set the date format: 'dd-mm-yyyy' or 'mm-dd-yyyy'."""
+        if format_str in ["dd-mm-yyyy", "mm-dd-yyyy"]:
+            self._naming_date_format = format_str
+            logger.info(f"Naming date format set to: {format_str}")
+
+    @Slot(result=int)
+    def getNamingIndexStart(self) -> int:
+        """Get the starting index for the [index] token."""
+        return self._naming_index_start
+
+    @Slot(result=str)
+    def getNamingDateFormat(self) -> str:
+        """Get the current date format."""
+        return self._naming_date_format
+
+    @Slot()
+    def resetNamingIndex(self):
+        """Reset the file index counter to the starting value."""
+        self._current_file_index = self._naming_index_start
+        logger.info(f"Naming index reset to: {self._current_file_index}")
+
+    @Slot(str, result=str)
+    def previewNamingConvention(self, dataset_name: str) -> str:
+        """
+        Preview what a filename would look like with the current naming convention.
+
+        Parameters:
+        -----------
+        dataset_name : str
+            Sample dataset name to use in preview
+
+        Returns:
+        --------
+        str : Formatted filename preview
+        """
+        return self._apply_naming_convention(dataset_name, preview=True)
+
+    def _apply_naming_convention(self, dataset_name: str, operation: str = "",
+                                  preview: bool = False) -> str:
+        """
+        Apply the naming convention to create a filename.
+
+        Parameters:
+        -----------
+        dataset_name : str
+            The dataset name to use
+        operation : str
+            Optional operation suffix (e.g., "Smoothed", "Integrated")
+        preview : bool
+            If True, don't increment the index counter
+
+        Returns:
+        --------
+        str : Formatted filename (without extension)
+        """
+        from datetime import datetime
+
+        pattern = self._naming_convention
+
+        # Clean the dataset name using the helper
+        clean_name = self._extract_clean_base_name(dataset_name)
+
+        # Replace [dataset_name] token
+        result = pattern.replace("[dataset_name]", clean_name)
+
+        # Replace [index] token with zero-padded number
+        if "[index]" in result:
+            index_str = f"{self._current_file_index:03d}"
+            result = result.replace("[index]", index_str)
+            if not preview:
+                self._current_file_index += 1
+
+        # Replace [date] token
+        if "[date]" in result:
+            now = datetime.now()
+            if self._naming_date_format == "dd-mm-yyyy":
+                date_str = now.strftime("%d-%m-%Y")
+            else:
+                date_str = now.strftime("%m-%d-%Y")
+            result = result.replace("[date]", date_str)
+
+        # Replace [time] token
+        if "[time]" in result:
+            time_str = datetime.now().strftime("%H-%M-%S")
+            result = result.replace("[time]", time_str)
+
+        # Replace [string:xxx] tokens
+        import re
+        string_pattern = r'\[string:([^\]]+)\]'
+        result = re.sub(string_pattern, r'\1', result)
+
+        # Add operation suffix if provided
+        if operation:
+            result = f"{result}_{operation}"
+
+        # Sanitize for filesystem
+        result = self._sanitize_filename(result)
+
+        return result
+
+    @Slot(result=str)
+    def getDefaultProjectsPath(self):
+        """Get the default location for new projects."""
+        default_path = Path.home() / "Documents" / "TRANS_QML_Projects"
+        return str(default_path)
+
+    @Slot(result='QVariantList')
+    def getRecentProjects(self):
+        """Get list of recent projects for QML."""
+        return self._recent_projects
+
+    @Slot(str, str)
+    def createProject(self, project_path: str, project_name: str):
+        """
+        Create a new project. Does NOT create directories until outputs are saved.
+        Use saveProjectFile() to save the project state to a .hrt file.
+        """
+        logger.info(f"Creating project: {project_name} at {project_path}")
+
+        self._project_path = Path(project_path)
+        self._project_name = project_name
+        # Create project-specific output folder using sanitized project name
+        safe_project_name = self._sanitize_filename(project_name)
+        self._output_base_dir = self._project_path / f"{safe_project_name}_outputs"
+        self._outputs_created = False
+
+        # Clear any existing data
+        self._datasets.clear()
+        self._active_dataset = None
+        self.maps.clear()
+        self.output_files.clear()
+
+        # Add to recent projects
+        self._add_to_recent_projects(project_path, project_name)
+
+        # Mark project as ready
+        self._project_ready = True
+        self.projectReadyChanged.emit(True)
+        self.projectPathChanged.emit(project_path)
+        self.projectLoaded.emit(project_path)
+
+        self.status = f"Project '{project_name}' created"
+        logger.info(f"Project created: {project_name} (directories will be created on first output)")
+
+    @Slot(str, str)
+    def openProject(self, project_path: str, project_name: str):
+        """
+        Open an existing project by folder path.
+        If a .hrt file exists in the folder, it will be loaded to restore datasets.
+        """
+        logger.info(f"Opening project: {project_name} at {project_path}")
+
+        project_path = Path(project_path)
+
+        # Check if there's a .hrt file in the project folder
+        hrt_file = project_path / f"{project_name}.hrt"
+        if not hrt_file.exists():
+            # Try to find any .hrt file in the folder
+            hrt_files = list(project_path.glob("*.hrt"))
+            if hrt_files:
+                hrt_file = hrt_files[0]  # Use the first one found
+
+        # If a .hrt file exists, use openProjectFile to load complete state
+        if hrt_file.exists():
+            logger.info(f"Found .hrt file: {hrt_file}, loading project data")
+            self.openProjectFile(str(hrt_file))
+            return
+
+        # No .hrt file found - open as empty project folder
+        logger.info(f"No .hrt file found, opening as folder-based project")
+
+        self._project_path = project_path
+        self._project_name = project_name
+        # Create project-specific output folder using sanitized project name
+        safe_project_name = self._sanitize_filename(project_name)
+        self._output_base_dir = self._project_path / f"{safe_project_name}_outputs"
+
+        # Check if outputs directory exists (also check legacy "outputs" folder)
+        self._outputs_created = self._output_base_dir.exists()
+        if not self._outputs_created:
+            # Check for legacy "outputs" folder and migrate if found
+            legacy_outputs = self._project_path / "outputs"
+            if legacy_outputs.exists():
+                self._output_base_dir = legacy_outputs
+                self._outputs_created = True
+                logger.info(f"Using legacy outputs folder: {legacy_outputs}")
+
+        # Clear any existing data
+        self._datasets.clear()
+        self._active_dataset = None
+        self.maps.clear()
+        self.output_files.clear()
+
+        # Scan for existing outputs if the project has them
+        if self._outputs_created:
+            self._scan_existing_outputs()
+
+        # Add to recent projects
+        self._add_to_recent_projects(str(project_path), project_name)
+
+        # Mark project as ready
+        self._project_ready = True
+        self.projectReadyChanged.emit(True)
+        self.projectPathChanged.emit(str(project_path))
+        self.projectLoaded.emit(str(project_path))
+
+        self.status = f"Project '{project_name}' opened"
+        logger.info(f"Project opened: {project_name}")
+
+    def _scan_existing_outputs(self):
+        """Scan for existing output files in the project."""
+        if not self._output_base_dir or not self._output_base_dir.exists():
+            return
+
+        # Scan for maps
+        maps_dir = self._output_base_dir / "maps"
+        if maps_dir.exists():
+            for file in maps_dir.glob("*.png"):
+                if "_colormap" not in file.name:
+                    self._map_id_counter += 1
+                    self.maps.append({
+                        'id': f"map_{self._map_id_counter}",
+                        'title': file.stem,
+                        'path': str(file),
+                        'timestamp': ""
+                    })
+
+        logger.info(f"Scanned existing outputs: {len(self.maps)} maps found")
+
+    @Slot()
+    def closeProject(self):
+        """Close the current project."""
+        if not self._project_ready:
+            return
+
+        logger.info(f"Closing project: {self._project_name}")
+
+        # Clear project state
+        self._project_path = None
+        self._project_name = ""
+        self._output_base_dir = None
+        self._outputs_created = False
+        self._project_ready = False
+
+        # Clear data
+        self._datasets.clear()
+        self._active_dataset = None
+        self.maps.clear()
+        self.output_files.clear()
+
+        self.projectReadyChanged.emit(False)
+        self.status = "No project open"
+
+    @Slot(result=str)
+    def getProjectOutputPath(self):
+        """Get the current project's output path."""
+        if self._output_base_dir:
+            return str(self._output_base_dir)
+        return ""
+
+    @Slot(str, result=bool)
+    def openProjectFile(self, file_path: str) -> bool:
+        """
+        Open a project from a .hrt file using the ProjectManager.
+        This loads the complete project state including datasets and window configurations.
+        """
+        file_path = Path(file_path)
+
+        if not file_path.exists():
+            logger.error(f"Project file not found: {file_path}")
+            self.errorOccurred.emit("Open Error", f"Project file not found: {file_path}")
+            return False
+
+        if file_path.suffix.lower() != '.hrt':
+            logger.error(f"Invalid project file: {file_path}")
+            self.errorOccurred.emit("Open Error", "Invalid project file. Expected .hrt extension.")
+            return False
+
+        try:
+            # Use ProjectManager to load the project
+            project_data = self.project_manager.load_project(file_path)
+
+            if project_data is None:
+                self.errorOccurred.emit("Open Error", "Failed to load project file")
+                return False
+
+            # Extract project info from metadata
+            metadata = project_data.get('metadata', {})
+            project_name = metadata.get('name', file_path.stem)
+
+            # Use the directory containing the .hrt file as project path
+            actual_project_path = file_path.parent
+
+            logger.info(f"Opening project from file: {project_name} at {actual_project_path}")
+
+            # Set up project state
+            self._project_path = actual_project_path
+            self._project_name = project_name
+            # Create project-specific output folder using sanitized project name
+            safe_project_name = self._sanitize_filename(project_name)
+            self._output_base_dir = actual_project_path / f"{safe_project_name}_outputs"
+            self._outputs_created = self._output_base_dir.exists()
+
+            # Check for legacy "outputs" folder and use if new folder doesn't exist
+            if not self._outputs_created:
+                legacy_outputs = actual_project_path / "outputs"
+                if legacy_outputs.exists():
+                    self._output_base_dir = legacy_outputs
+                    self._outputs_created = True
+                    logger.info(f"Using legacy outputs folder: {legacy_outputs}")
+
+            # Clear any existing data and load from project file
+            self._datasets.clear()
+            self._active_dataset = None
+            self.maps.clear()
+            self.output_files.clear()
+
+            # Load datasets from project file
+            loaded_datasets = project_data.get('datasets', {})
+            for name, dataset in loaded_datasets.items():
+                self._datasets[name] = dataset
+                logger.info(f"Loaded dataset: {name}")
+
+            # Set first dataset as active if any
+            if self._datasets:
+                self._active_dataset = list(self._datasets.keys())[0]
+                self.dataLoaded.emit(self._active_dataset)
+
+            # Scan for additional outputs in the outputs directory
+            if self._outputs_created:
+                self._scan_existing_outputs()
+
+            # Add to recent projects
+            self._add_to_recent_projects(str(actual_project_path), project_name)
+
+            # Mark project as ready
+            self._project_ready = True
+            self.projectReadyChanged.emit(True)
+            self.projectPathChanged.emit(str(actual_project_path))
+            self.projectLoaded.emit(str(actual_project_path))
+
+            self.status = f"Project '{project_name}' opened with {len(self._datasets)} dataset(s)"
+            logger.info(f"Project opened from file: {project_name}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error opening project: {e}", exc_info=True)
+            self.errorOccurred.emit("Open Error", f"Could not open project: {e}")
+            return False
+
+    @Slot(str, result=bool)
+    def saveProjectFile(self, file_path: str = "") -> bool:
+        """
+        Save project to a .hrt file using the ProjectManager.
+        If file_path is not provided, saves to the project directory.
+        """
+        if not self._project_ready or not self._project_path:
+            logger.warning("Cannot save project: no project is open")
+            return False
+
+        # Determine save path
+        if file_path:
+            save_path = Path(file_path)
+        else:
+            save_path = self._project_path / f"{self._project_name}.hrt"
+
+        # Build project data for ProjectManager
+        project_data = {
+            'metadata': {
+                'name': self._project_name,
+                'description': ''
+            },
+            'datasets': self._datasets,
+            'tables': [],  # TODO: serialize open tables
+            'graphs': [],  # TODO: serialize open graphs
+            'workspace': {}
+        }
+
+        # Use ProjectManager to save
+        success = self.project_manager.save_project(save_path, project_data)
+
+        if success:
+            self.projectSaved.emit(str(save_path))
+            self.status = f"Project saved: {save_path.name}"
+        else:
+            self.errorOccurred.emit("Save Error", "Failed to save project file")
+
+        return success
+
+    @Slot(result=str)
+    def getProjectFilePath(self) -> str:
+        """Get the path to the current project's .hrt file."""
+        if self._project_path and self._project_name:
+            return str(self._project_path / f"{self._project_name}.hrt")
+        return ""
+
+    @Property(bool, notify=isBusyChanged)
+    def isBusy(self):
+        """Check if worker is currently processing tasks."""
+        return self.worker_manager.is_busy()
+
+    # File Operations
+    @Slot()
+    def importMeasurement(self):
+        """Open custom import dialog (handled in QML)."""
+        logger.info(f"Import measurement requested for tab {self._current_tab}")
+        # Dialog will be opened from QML, which will call importFromFiles or importFromFolder
+
+    @Slot('QVariantList')
+    def importFromFiles(self, file_paths):
+        """Import from a list of file paths."""
+        logger.info(f"Importing {len(file_paths)} file(s)")
+        self.status = f"Importing {len(file_paths)} file(s)..."
+
+        for file_path in file_paths:
+            filepath = Path(str(file_path))
+            self._import_single_file_path(filepath)
+
+    @Slot(str)
+    def importFromFolder(self, folder_path):
+        """Import from a folder path."""
+        logger.info(f"Importing folder: {folder_path}")
+        self.status = f"Importing folder: {Path(folder_path).name}..."
+        self._import_folder_path(Path(folder_path))
+
+    def _import_single_file_path(self, filepath: Path):
+        """Import a single data file from given path (submits to worker)."""
+        logger.info(f"Importing file: {filepath}")
+
+        # Submit to worker for background loading
+        self.worker_manager.submit(
+            name=f"Load {filepath.name}",
+            operation=self._do_load_file,
+            filepath=filepath,
+            on_finished=self._on_file_loaded,
+            on_error=None,  # Will use default worker_failed handler
+            on_progress=self._progress_callback
+        )
+
+    def _do_load_file(self, task, filepath: Path, progress_callback=None):
+        """
+        Actual file loading logic executed in background thread.
+
+        Parameters:
+        -----------
+        task : Task
+            Task object for cancellation checking
+
+        Returns:
+        --------
+        dict with 'datasets' and 'active_dataset' keys
+        """
+        result = {'datasets': {}, 'active_dataset': None}
+
+        # Check if cancelled before starting
+        if task.cancelled:
+            logger.info("File load cancelled before starting")
+            return None
+
+        if filepath.suffix == '.nid':
+            if not self.nanosurf_loader:
+                raise RuntimeError("Nanosurf loader not available")
+
+            spectral_data, topography = self.nanosurf_loader.load_from_directory(
+                filepath.parent,
+                progress_callback=progress_callback
+            )
+
+            channels = spectral_data.metadata.additional_info.get('channels', {})
+            for channel_name, channel_data in channels.items():
+                dataset_name = f"{filepath.stem}_{channel_name}"
+                result['datasets'][dataset_name] = channel_data
+                logger.info(f"Loaded dataset: {dataset_name}")
+
+            result['active_dataset'] = f"{filepath.stem}_Mixed"
+
+        elif filepath.suffix in ['.txt', '.dat']:
+            if not self.neaspec_loader:
+                raise RuntimeError("NeaSpec loader not available")
+
+            spectral_data_dict = self.neaspec_loader.load_single_file(filepath)
+
+            for key, data in spectral_data_dict.items():
+                dataset_name = f"{filepath.stem}_{key}"
+                result['datasets'][dataset_name] = data
+                logger.info(f"Loaded dataset: {dataset_name}")
+
+            first_key = list(spectral_data_dict.keys())[0]
+            result['active_dataset'] = f"{filepath.stem}_{first_key}"
+
+        elif filepath.name.endswith('.I(V)_mtrx'):
+            # Omicron Matrix I(V) spectroscopy file
+            if not self.omicron_sts_loader:
+                raise RuntimeError("Omicron STS loader not available")
+
+            spectral_data = self.omicron_sts_loader.load_single_file(filepath)
+
+            # Create three separate datasets from sweep channels (Forward, Backward, Mixed)
+            base_name = self._apply_naming_convention(
+                filepath.stem.replace('.I(V)', ''), 'IV')
+
+            sweep_channels = spectral_data.metadata.additional_info.get('sweep_channels', {})
+
+            if sweep_channels:
+                # Create individual datasets for each sweep direction
+                for sweep_name, sweep_df in sweep_channels.items():
+                    dataset_name = f"{base_name}_{sweep_name}"
+                    # Create new SpectralData for each channel
+                    channel_metadata = self.omicron_sts_loader.create_metadata(
+                        dimensions=spectral_data.metadata.dimensions,
+                        scan_mode=spectral_data.metadata.scan_mode,
+                        units=spectral_data.metadata.units,
+                        source_file=str(filepath),
+                        instrument="Omicron Matrix",
+                        sweep_direction=sweep_name
+                    )
+                    channel_data = SpectralData(sweep_df, channel_metadata)
+                    result['datasets'][dataset_name] = channel_data
+                    logger.info(f"Loaded Omicron I(V) {sweep_name} dataset: {dataset_name}")
+
+                # Set Mixed as active by default
+                result['active_dataset'] = f"{base_name}_Mixed"
+            else:
+                # Fallback: no sweep channels, use original data
+                result['datasets'][base_name] = spectral_data
+                result['active_dataset'] = base_name
+                logger.info(f"Loaded Omicron I(V) dataset: {base_name}")
+
+        elif filepath.name.endswith('.Z_flat') or filepath.name.endswith('.I_flat'):
+            # Omicron Matrix flat (image) file
+            if not self.omicron_flat_loader:
+                raise RuntimeError("Omicron Flat loader not available")
+
+            topography = self.omicron_flat_loader.load_topography(filepath)
+
+            # Store topography as a map
+            map_name = self._apply_naming_convention(
+                filepath.stem.replace('.Z_flat', '').replace('.I_flat', ''), 'topo')
+            self._store_map(map_name, topography.data, 'topography')
+            logger.info(f"Loaded Omicron flat image as map: {map_name}")
+
+            # No spectral data for pure image files
+            result['active_dataset'] = None
+
+        else:
+            raise ValueError(f"Cannot load {filepath.suffix} files")
+
+        return result
+
+    def _on_file_loaded(self, result: dict):
+        """Handle file loading completion in main thread."""
+        # Add datasets to application state
+        self._datasets.update(result['datasets'])
+
+        # Set active dataset
+        if result['active_dataset']:
+            self._active_dataset = result['active_dataset']
+            self.dataLoaded.emit(self._active_dataset)
+
+        self.status = f"Loaded {len(result['datasets'])} datasets"
+        logger.info(f"File loading complete: {len(result['datasets'])} datasets")
+
+        # Process events to keep UI responsive during batch imports
+        app = QApplication.instance()
+        if app:
+            app.processEvents()
+
+    def _import_folder_path(self, dirpath: Path):
+        """Import all files from a folder path (submits to worker)."""
+        logger.info(f"Importing folder: {dirpath}")
+
+        # Submit to worker for background loading
+        self.worker_manager.submit(
+            name=f"Load {dirpath.name}",
+            operation=self._do_load_folder,
+            dirpath=dirpath,
+            on_finished=self._on_folder_loaded,
+            on_error=None,  # Will use default worker_failed handler
+            on_progress=self._progress_callback
+        )
+
+    def _do_load_folder(self, task, dirpath: Path, progress_callback=None):
+        """
+        Actual folder loading logic executed in background thread.
+
+        Parameters:
+        -----------
+        task : Task
+            Task object for cancellation checking
+
+        Returns:
+        --------
+        dict with 'datasets' and 'active_dataset' keys
+        """
+        result = {'datasets': {}, 'active_dataset': None}
+
+        # Check if cancelled before starting
+        if task.cancelled:
+            logger.info("Folder load cancelled before starting")
+            return None
+
+        nid_files = list(dirpath.glob("*.nid"))
+        txt_files = list(dirpath.glob("*.txt"))
+        iv_mtrx_files = [f for f in dirpath.iterdir() if f.name.endswith('.I(V)_mtrx')]
+        flat_files = [f for f in dirpath.iterdir()
+                      if f.name.endswith('.Z_flat') or f.name.endswith('.I_flat')]
+
+        if nid_files:
+            if not self.nanosurf_loader:
+                raise RuntimeError("Nanosurf loader not available")
+
+            spectral_data, topography = self.nanosurf_loader.load_from_directory(
+                dirpath,
+                progress_callback=progress_callback
+            )
+
+            channels = spectral_data.metadata.additional_info.get('channels', {})
+            for channel_name, channel_data in channels.items():
+                dataset_name = f"{dirpath.name}_{channel_name}"
+                result['datasets'][dataset_name] = channel_data
+                logger.info(f"Loaded dataset: {dataset_name}")
+
+            result['active_dataset'] = f"{dirpath.name}_Mixed"
+
+        elif txt_files:
+            if not self.neaspec_loader:
+                raise RuntimeError("NeaSpec loader not available")
+
+            spectral_data_dict, topography = self.neaspec_loader.load_from_directory(
+                dirpath,
+                progress_callback=progress_callback
+            )
+
+            for key, data in spectral_data_dict.items():
+                dataset_name = f"{dirpath.name}_{key}"
+                result['datasets'][dataset_name] = data
+                logger.info(f"Loaded dataset: {dataset_name}")
+
+            first_key = list(spectral_data_dict.keys())[0]
+            result['active_dataset'] = f"{dirpath.name}_{first_key}"
+
+        elif iv_mtrx_files:
+            # Omicron Matrix I(V) files
+            if not self.omicron_sts_loader:
+                raise RuntimeError("Omicron STS loader not available")
+
+            spectral_data, topography = self.omicron_sts_loader.load_from_directory(
+                dirpath,
+                progress_callback=progress_callback
+            )
+
+            # Create three separate datasets from sweep channels (Forward, Backward, Mixed)
+            base_name = self._apply_naming_convention(dirpath.name, 'IV')
+
+            sweep_channels = spectral_data.metadata.additional_info.get('sweep_channels', {})
+
+            if sweep_channels:
+                # Create individual datasets for each sweep direction
+                for sweep_name, sweep_df in sweep_channels.items():
+                    dataset_name = f"{base_name}_{sweep_name}"
+                    # Create new SpectralData for each channel
+                    channel_metadata = self.omicron_sts_loader.create_metadata(
+                        dimensions=spectral_data.metadata.dimensions,
+                        scan_mode=spectral_data.metadata.scan_mode,
+                        units=spectral_data.metadata.units,
+                        source_directory=str(dirpath),
+                        instrument="Omicron Matrix",
+                        sweep_direction=sweep_name,
+                        n_files=spectral_data.metadata.additional_info.get('n_files', 0)
+                    )
+                    channel_data = SpectralData(
+                        sweep_df, channel_metadata,
+                        topography.data if topography else None
+                    )
+                    result['datasets'][dataset_name] = channel_data
+                    logger.info(f"Loaded Omicron I(V) {sweep_name} dataset: {dataset_name}")
+
+                # Set Mixed as active by default
+                result['active_dataset'] = f"{base_name}_Mixed"
+            else:
+                # Fallback: no sweep channels, use original data
+                result['datasets'][base_name] = spectral_data
+                result['active_dataset'] = base_name
+                logger.info(f"Loaded Omicron I(V) dataset: {base_name}")
+
+        elif flat_files:
+            # Omicron Matrix flat (image) files
+            if not self.omicron_flat_loader:
+                raise RuntimeError("Omicron Flat loader not available")
+
+            # Load each flat file as a map
+            for flat_file in flat_files:
+                topography = self.omicron_flat_loader.load_topography(flat_file)
+                map_name = self._apply_naming_convention(
+                    flat_file.stem.replace('.Z_flat', '').replace('.I_flat', ''), 'topo')
+                self._store_map(map_name, topography.data, 'topography')
+                logger.info(f"Loaded Omicron flat image as map: {map_name}")
+
+            # No spectral data for pure image files
+            result['active_dataset'] = None
+
+        else:
+            raise ValueError("No supported data files found in directory")
+
+        return result
+
+    def _on_folder_loaded(self, result: dict):
+        """Handle folder loading completion in main thread."""
+        # Add datasets to application state
+        self._datasets.update(result['datasets'])
+
+        # Set active dataset
+        if result['active_dataset']:
+            self._active_dataset = result['active_dataset']
+            self.dataLoaded.emit(self._active_dataset)
+
+        self.status = f"Loaded {len(result['datasets'])} datasets"
+        logger.info(f"Folder loading complete: {len(result['datasets'])} datasets")
+
+        # Process events to keep UI responsive
+        app = QApplication.instance()
+        if app:
+            app.processEvents()
+
+    def _progress_callback(self, current: int, total: int, message: str):
+        """Progress callback for data loading."""
+        self.progressChanged.emit(current, total, message)
+
+    # Worker callbacks
+    def _on_worker_started(self, operation_name: str):
+        """Called when a worker starts."""
+        self.status = f"Running: {operation_name}..."
+        logger.info(f"Worker started: {operation_name}")
+        self.isBusyChanged.emit(True)
+
+    def _on_worker_completed(self, operation_name: str):
+        """Called when a worker completes."""
+        self.status = f"Completed: {operation_name}"
+        logger.info(f"Worker completed: {operation_name}")
+        self.isBusyChanged.emit(self.worker_manager.is_busy())
+
+    def _on_worker_failed(self, operation_name: str, error_message: str):
+        """Called when a worker fails."""
+        self.status = f"Failed: {operation_name}"
+        self.errorOccurred.emit(f"{operation_name} Error", error_message)
+        logger.error(f"Worker failed: {operation_name} - {error_message}")
+        self.isBusyChanged.emit(self.worker_manager.is_busy())
+
+    def _on_worker_cancelled(self, operation_name: str):
+        """Called when a worker is cancelled."""
+        self.status = f"Cancelled: {operation_name}"
+        logger.info(f"Worker cancelled: {operation_name}")
+        self.isBusyChanged.emit(self.worker_manager.is_busy())
+
+    @Slot()
+    def cancelCurrentOperation(self):
+        """Cancel the currently running operation."""
+        if self.worker_manager.cancel_current():
+            logger.info("Current operation cancelled by user")
+        else:
+            logger.info("No operation to cancel")
+
+    @Slot(result=str)
+    def getCurrentOperation(self):
+        """Get the name of the currently running operation."""
+        return self.worker_manager.get_current_operation()
+
+    # Dataset Management
+    @Slot(result='QVariantList')
+    def getDatasetList(self):
+        """Get list of loaded datasets."""
+        dataset_list = list(self._datasets.keys())
+        logger.debug(f"getDatasetList() called, returning {len(dataset_list)} datasets: {dataset_list}")
+        return dataset_list
+
+    @Slot(result='QVariantList')
+    def getTableList(self):
+        """Get list of open tables with metadata."""
+        return [{'id': t['id'], 'title': t['title']} for t in self.open_tables]
+
+    @Slot(result='QVariantList')
+    def getGraphList(self):
+        """Get list of open graphs with metadata."""
+        return [{'id': g['id'], 'title': g['title']} for g in self.open_graphs]
+
+    @Slot(result='QVariantList')
+    def getMapList(self):
+        """Get list of generated maps with metadata."""
+        return [{'id': m['id'], 'title': m['title'], 'path': m['path']} for m in self.maps]
+
+    @Slot(str, result='QVariant')
+    def getDataset(self, dataset_name: str):
+        """Get a dataset by name for use in Map Editor linking."""
+        if dataset_name in self._datasets:
+            return self._datasets[dataset_name]
+        return None
+
+    @Slot(result='QVariantList')
+    def getDatasetListWithInfo(self):
+        """
+        Get list of datasets with additional info for Map Editor dropdown.
+        Prioritizes truncated datasets, then regular spectral datasets.
+        Excludes integrated datasets since they don't contain actual spectra (just datapoints).
+        Includes discretized datasets.
+        """
+        dataset_info = []
+        for name, data in self._datasets.items():
+            # Check if this is an integrated dataset (has intervals in additional_info)
+            # These don't contain actual spectra, just integrated values - exclude them
+            is_integrated = 'intervals' in data.metadata.additional_info
+            if is_integrated:
+                continue  # Skip integrated datasets - they don't have spectra to display
+
+            # Check for discretized datasets
+            is_discretized = 'discretized' in name.lower() or 'Discretized' in name
+
+            info = {
+                'name': name,
+                'num_spectra': data.num_spectra,
+                'num_points': data.num_points,
+                'independent_var': data.independent_var_name,
+                'is_truncated': 'truncated' in name.lower() or 'T_' in name,
+                'is_discretized': is_discretized,
+                'is_integrated': False,  # We've excluded integrated datasets
+                'dimensions': list(data.metadata.dimensions)
+            }
+            dataset_info.append(info)
+
+        # Sort: truncated first, then discretized, then regular, then alphabetically
+        # Priority: truncated spectral > discretized > regular spectral
+        dataset_info.sort(key=lambda x: (
+            not x['is_truncated'],  # Truncated first
+            not x['is_discretized'],  # Discretized second
+            x['name']
+        ))
+        return dataset_info
+
+    @Slot(result='QVariantList')
+    def getOutputList(self):
+        """Get list of output files with metadata."""
+        return [{'id': o['id'], 'tool': o['tool'], 'path': o['path'], 'filename': Path(o['path']).name}
+                for o in self.output_files]
+
+    @Slot(str, result='QVariantList')
+    def loadIntervalsFromFile(self, file_path: str) -> list:
+        """
+        Load intervals from a Peak Finder JSON file.
+
+        Parameters:
+        -----------
+        file_path : str
+            Path to Intervals_*.json file from Peak Finder
+
+        Returns:
+        --------
+        list of [start, end] intervals
+        """
+        try:
+            import json
+            with open(file_path, 'r') as f:
+                data = json.load(f)
+
+            intervals = data.get('intervals', [])
+            logger.info(f"Loaded {len(intervals)} intervals from {file_path}")
+            return intervals
+
+        except Exception as e:
+            logger.error(f"Error loading intervals from {file_path}: {e}")
+            self.errorOccurred.emit("Load Error", f"Could not load intervals: {e}")
+            return []
+
+    @Slot(str)
+    def openMap(self, map_id: str):
+        """Load a map into the Map Editor tab."""
+        for map_info in self.maps:
+            if map_info['id'] == map_id:
+                map_path = Path(map_info['path'])
+                # Try different formats
+                for ext in ['.tiff', '.tif', '.png', '.gsf', '']:
+                    check_path = map_path.with_suffix(ext) if ext else map_path
+                    if check_path.exists():
+                        # Emit signal to load in map editor
+                        self.loadMapInEditor.emit(str(check_path))
+                        logger.info(f"Requested map load in editor: {check_path}")
+                        return
+                logger.warning(f"Map file not found for: {map_path}")
+                return
+        logger.warning(f"Map ID not found: {map_id}")
+
+    @Slot(str)
+    def requestLoadMapInEditor(self, map_path: str):
+        """Request to load a map file in the Map Editor (callable from QML)."""
+        self.loadMapInEditor.emit(map_path)
+        logger.info(f"Requested map load in editor: {map_path}")
+
+    @Slot(str)
+    def openTable(self, table_id: str):
+        """Bring a table window to the front."""
+        for table_info in self.open_tables:
+            if table_info['id'] == table_id:
+                window = table_info['window']
+                window.raise_()
+                window.activateWindow()
+                logger.info(f"Brought table to front: {table_info['title']}")
+                return
+        logger.warning(f"Table ID not found: {table_id}")
+
+    @Slot(str)
+    def openGraph(self, graph_id: str):
+        """Bring a graph window to the front."""
+        for graph_info in self.open_graphs:
+            if graph_info['id'] == graph_id:
+                window = graph_info['window']
+                window.raise_()
+                window.activateWindow()
+                logger.info(f"Brought graph to front: {graph_info['title']}")
+                return
+        logger.warning(f"Graph ID not found: {graph_id}")
+
+    @Slot(str)
+    def setActiveDataset(self, dataset_name: str):
+        """Set the active dataset."""
+        if dataset_name in self._datasets:
+            old_value = self._active_dataset
+            self._active_dataset = dataset_name
+            if old_value != dataset_name:
+                self.activeDatasetChanged.emit(dataset_name)
+            logger.info(f"Active dataset: {dataset_name}")
+        else:
+            logger.warning(f"Dataset not found: {dataset_name}")
+
+    @Slot(str, result='QVariantMap')
+    def getDatasetInfo(self, dataset_name: str):
+        """Get information about a dataset."""
+        if dataset_name not in self._datasets:
+            logger.warning(f"getDatasetInfo() called for non-existent dataset: {dataset_name}")
+            return {}
+
+        data = self._datasets[dataset_name]
+        info = {
+            'name': dataset_name,
+            'type': data.metadata.source_type,
+            'dimensions': list(data.metadata.dimensions),
+            'num_spectra': data.num_spectra,
+            'num_points': data.num_points,
+            'independent_var': data.independent_var_name
+        }
+        logger.debug(f"getDatasetInfo({dataset_name}): {info}")
+        return info
+
+    @Slot(str, result=bool)
+    def deleteDataset(self, dataset_name: str) -> bool:
+        """Delete a dataset from the project.
+
+        Args:
+            dataset_name: Name of the dataset to delete
+
+        Returns:
+            True if deleted successfully, False otherwise
+        """
+        if dataset_name not in self._datasets:
+            logger.warning(f"Cannot delete: dataset '{dataset_name}' not found")
+            return False
+
+        # Remove from datasets
+        del self._datasets[dataset_name]
+        logger.info(f"Deleted dataset: {dataset_name}")
+
+        # If this was the active dataset, clear it
+        if self._active_dataset == dataset_name:
+            self._active_dataset = None
+
+        # Emit signal for UI update
+        self.datasetDeleted.emit(dataset_name)
+        self.projectModifiedChanged.emit(True)
+
+        return True
+
+    @Slot(str, str, result=bool)
+    def renameDataset(self, old_name: str, new_name: str) -> bool:
+        """Rename a dataset in the project.
+
+        Args:
+            old_name: Current name of the dataset
+            new_name: New name for the dataset
+
+        Returns:
+            True if renamed successfully, False otherwise
+        """
+        # Validate inputs
+        if not old_name or not new_name:
+            logger.warning("Cannot rename: empty name provided")
+            return False
+
+        if old_name not in self._datasets:
+            logger.warning(f"Cannot rename: dataset '{old_name}' not found")
+            return False
+
+        if new_name in self._datasets:
+            logger.warning(f"Cannot rename: dataset '{new_name}' already exists")
+            return False
+
+        # Perform the rename
+        self._datasets[new_name] = self._datasets.pop(old_name)
+        logger.info(f"Renamed dataset: {old_name} -> {new_name}")
+
+        # Update active dataset if it was renamed
+        if self._active_dataset == old_name:
+            self._active_dataset = new_name
+
+        # Emit signal for UI update
+        self.datasetRenamed.emit(old_name, new_name)
+        self.projectModifiedChanged.emit(True)
+
+        return True
+
+    # ========================================================================
+    # Delete/Rename for Maps, Tables, Graphs, Outputs
+    # ========================================================================
+
+    @Slot(str, result=bool)
+    def deleteMap(self, map_path: str) -> bool:
+        """Delete a map file and its associated datasets.
+
+        Args:
+            map_path: Path to the map file to delete
+
+        Returns:
+            True if deleted successfully, False otherwise
+        """
+        try:
+            path = Path(map_path)
+            map_name = path.stem  # Get map name without extension
+
+            if path.exists():
+                path.unlink()
+                logger.info(f"Deleted map: {map_path}")
+
+                # Also delete related files (colormap, CSV, TIFF variants)
+                related_patterns = [
+                    f"{map_name}_colormap.png",
+                    f"{map_name}.csv",
+                    f"{map_name}.tiff",
+                    f"{map_name}.tif",
+                ]
+                for pattern in related_patterns:
+                    related_path = path.with_name(pattern)
+                    if related_path.exists():
+                        related_path.unlink()
+                        logger.info(f"Deleted related file: {related_path}")
+
+                # Remove from internal maps dict if present
+                for map_id, stored_path in list(self.maps.items()):
+                    if stored_path == map_path or str(stored_path) == map_path:
+                        del self.maps[map_id]
+                        break
+
+                # Clean up associated datasets
+                # Look for datasets that reference this map in their name
+                datasets_to_delete = []
+                for dataset_name in list(self._datasets.keys()):
+                    # Check if dataset name contains map name pattern
+                    if map_name in dataset_name:
+                        datasets_to_delete.append(dataset_name)
+                        logger.info(f"Found associated dataset: {dataset_name}")
+
+                # Delete the associated datasets
+                for dataset_name in datasets_to_delete:
+                    del self._datasets[dataset_name]
+                    self.datasetDeleted.emit(dataset_name)
+                    logger.info(f"Deleted associated dataset: {dataset_name}")
+
+                self.mapDeleted.emit(map_path)
+                self.projectModifiedChanged.emit(True)
+                return True
+            else:
+                logger.warning(f"Map file not found: {map_path}")
+                return False
+        except Exception as e:
+            logger.error(f"Error deleting map: {e}")
+            return False
+
+    @Slot(str, str, result=bool)
+    def renameMap(self, old_path: str, new_name: str) -> bool:
+        """Rename a map file.
+
+        Args:
+            old_path: Current path to the map file
+            new_name: New name for the map (without extension)
+
+        Returns:
+            True if renamed successfully, False otherwise
+        """
+        try:
+            old_file = Path(old_path)
+            if not old_file.exists():
+                logger.warning(f"Map file not found: {old_path}")
+                return False
+
+            new_file = old_file.parent / f"{new_name}{old_file.suffix}"
+            if new_file.exists():
+                logger.warning(f"Cannot rename: target file already exists: {new_file}")
+                return False
+
+            old_file.rename(new_file)
+            logger.info(f"Renamed map: {old_path} -> {new_file}")
+
+            # Also rename related files (colormap, etc.)
+            old_colormap = old_file.with_name(f"{old_file.stem}_colormap.png")
+            if old_colormap.exists():
+                new_colormap = new_file.with_name(f"{new_name}_colormap.png")
+                old_colormap.rename(new_colormap)
+
+            self.projectModifiedChanged.emit(True)
+            return True
+        except Exception as e:
+            logger.error(f"Error renaming map: {e}")
+            return False
+
+    @Slot(str, result=bool)
+    def deleteTable(self, table_path: str) -> bool:
+        """Delete a table file.
+
+        Args:
+            table_path: Path to the table file to delete
+
+        Returns:
+            True if deleted successfully, False otherwise
+        """
+        try:
+            path = Path(table_path)
+            if path.exists():
+                path.unlink()
+                logger.info(f"Deleted table: {table_path}")
+                self.projectModifiedChanged.emit(True)
+                return True
+            else:
+                logger.warning(f"Table file not found: {table_path}")
+                return False
+        except Exception as e:
+            logger.error(f"Error deleting table: {e}")
+            return False
+
+    @Slot(str, str, result=bool)
+    def renameTable(self, old_path: str, new_name: str) -> bool:
+        """Rename a table file.
+
+        Args:
+            old_path: Current path to the table file
+            new_name: New name for the table (without extension)
+
+        Returns:
+            True if renamed successfully, False otherwise
+        """
+        try:
+            old_file = Path(old_path)
+            if not old_file.exists():
+                logger.warning(f"Table file not found: {old_path}")
+                return False
+
+            new_file = old_file.parent / f"{new_name}{old_file.suffix}"
+            if new_file.exists():
+                logger.warning(f"Cannot rename: target file already exists: {new_file}")
+                return False
+
+            old_file.rename(new_file)
+            logger.info(f"Renamed table: {old_path} -> {new_file}")
+            self.projectModifiedChanged.emit(True)
+            return True
+        except Exception as e:
+            logger.error(f"Error renaming table: {e}")
+            return False
+
+    @Slot(str, result=bool)
+    def deleteGraph(self, graph_path: str) -> bool:
+        """Delete a graph file.
+
+        Args:
+            graph_path: Path to the graph file to delete
+
+        Returns:
+            True if deleted successfully, False otherwise
+        """
+        try:
+            path = Path(graph_path)
+            if path.exists():
+                path.unlink()
+                logger.info(f"Deleted graph: {graph_path}")
+                self.projectModifiedChanged.emit(True)
+                return True
+            else:
+                logger.warning(f"Graph file not found: {graph_path}")
+                return False
+        except Exception as e:
+            logger.error(f"Error deleting graph: {e}")
+            return False
+
+    @Slot(str, str, result=bool)
+    def renameGraph(self, old_path: str, new_name: str) -> bool:
+        """Rename a graph file.
+
+        Args:
+            old_path: Current path to the graph file
+            new_name: New name for the graph (without extension)
+
+        Returns:
+            True if renamed successfully, False otherwise
+        """
+        try:
+            old_file = Path(old_path)
+            if not old_file.exists():
+                logger.warning(f"Graph file not found: {old_path}")
+                return False
+
+            new_file = old_file.parent / f"{new_name}{old_file.suffix}"
+            if new_file.exists():
+                logger.warning(f"Cannot rename: target file already exists: {new_file}")
+                return False
+
+            old_file.rename(new_file)
+            logger.info(f"Renamed graph: {old_path} -> {new_file}")
+            self.projectModifiedChanged.emit(True)
+            return True
+        except Exception as e:
+            logger.error(f"Error renaming graph: {e}")
+            return False
+
+    @Slot(str, result=bool)
+    def deleteOutput(self, output_path: str) -> bool:
+        """Delete an output file.
+
+        Args:
+            output_path: Path to the output file to delete
+
+        Returns:
+            True if deleted successfully, False otherwise
+        """
+        try:
+            path = Path(output_path)
+            if path.exists():
+                path.unlink()
+                logger.info(f"Deleted output: {output_path}")
+                self.projectModifiedChanged.emit(True)
+                return True
+            else:
+                logger.warning(f"Output file not found: {output_path}")
+                return False
+        except Exception as e:
+            logger.error(f"Error deleting output: {e}")
+            return False
+
+    @Slot(result=str)
+    def getOutputDirectory(self):
+        """Get the output base directory."""
+        return str(self._output_base_dir.absolute())
+
+    # Project Management
+    @Slot()
+    def newProject(self):
+        """Create a new project (clears current state)."""
+        logger.info("Creating new project")
+        # TODO: Prompt to save if current project is modified
+        self._datasets.clear()
+        self._active_dataset = None
+        self.project_manager.close_project()
+        self.status = "New project created"
+        self.projectModifiedChanged.emit(False)
+
+    def _get_projects_directory(self) -> str:
+        """Get the default projects directory path."""
+        # Get the application root directory (where run.py is)
+        app_dir = Path(__file__).parent.parent.parent
+        projects_dir = app_dir / "projects"
+        # Create if it doesn't exist
+        projects_dir.mkdir(exist_ok=True)
+        return str(projects_dir)
+
+    @Slot()
+    def openProject(self):
+        """Open existing project from .HRT file."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            None,
+            "Open Project",
+            self._get_projects_directory(),
+            "TRANS Project Files (*.hrt);;All Files (*)"
+        )
+
+        if not file_path:
+            return
+
+        project_path = Path(file_path)
+        project_data = self.project_manager.load_project(project_path)
+
+        if project_data:
+            # Close existing windows first
+            self.closeAllWindows()
+
+            # Restore datasets
+            self._datasets = project_data.get('datasets', {})
+
+            # Emit dataLoaded for each dataset to update UI
+            for dataset_name in self._datasets.keys():
+                self.dataLoaded.emit(dataset_name)
+
+            # Restore workspace state
+            workspace = project_data.get('workspace', {})
+            if workspace:
+                self._active_dataset = workspace.get('active_dataset')
+                self._current_tab = workspace.get('current_tab', 0)
+                self._window_id_counter = workspace.get('window_counter', 0)
+
+            # Restore table windows
+            for table_state in project_data.get('tables', []):
+                self._restore_table_window(table_state)
+
+            # Restore graph windows
+            for graph_state in project_data.get('graphs', []):
+                self._restore_graph_window(graph_state)
+
+            self.status = f"Project loaded: {project_path.name}"
+            self.projectPathChanged.emit(str(project_path))
+            self.projectLoaded.emit(str(project_path))
+            self.projectModifiedChanged.emit(False)
+            logger.info(f"Project loaded: {project_path} with {len(self._datasets)} datasets")
+        else:
+            self.errorOccurred.emit("Load Error", f"Failed to load project: {project_path}")
+
+    @Slot()
+    def saveProject(self):
+        """Save current project to existing .HRT file."""
+        project_path = self.project_manager.get_current_project_path()
+
+        if not project_path:
+            # No current project, use Save As
+            self.saveProjectAs()
+            return
+
+        logger.info(f"Submitting project save to worker: {project_path}")
+        self.status = "Saving project..."
+        self.worker_manager.submit(
+            name=f"Save Project",
+            operation=self._do_save_project,
+            project_path=project_path,
+            on_finished=lambda _: self._on_project_saved(project_path)
+        )
+
+    @Slot()
+    def saveProjectAs(self):
+        """Save current project to new .HRT file."""
+        logger.info("saveProjectAs() called")
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            None,
+            "Save Project As",
+            self._get_projects_directory(),
+            "TRANS Project Files (*.hrt);;All Files (*)"
+        )
+
+        if not file_path:
+            logger.info("Save cancelled by user")
+            return
+
+        project_path = Path(file_path)
+        logger.info(f"Submitting project save to worker: {project_path}")
+        self.status = "Saving project..."
+        self.worker_manager.submit(
+            name=f"Save Project",
+            operation=self._do_save_project,
+            project_path=project_path,
+            on_finished=lambda _: self._on_project_saved(project_path)
+        )
+
+    def _do_save_project(self, task, project_path: Path):
+        """Internal method to save project (runs in worker thread)."""
+        from datetime import datetime
+        from src.backend.project_manager import serialize_plot_state, serialize_table_state
+
+        # Check if cancelled
+        if task.cancelled:
+            logger.info("Project save cancelled")
+            return None
+
+        # Serialize window states
+        table_states = []
+        for table_info in self.open_tables:
+            try:
+                state = serialize_table_state(table_info['window'])
+                state['id'] = table_info['id']
+                table_states.append(state)
+            except Exception as e:
+                logger.warning(f"Could not serialize table {table_info['id']}: {e}")
+
+        graph_states = []
+        for graph_info in self.open_graphs:
+            try:
+                state = serialize_plot_state(graph_info['window'])
+                state['id'] = graph_info['id']
+                graph_states.append(state)
+            except Exception as e:
+                logger.warning(f"Could not serialize graph {graph_info['id']}: {e}")
+
+        # Gather project data
+        project_data = {
+            'created': datetime.now().isoformat(),
+            'metadata': {
+                'name': project_path.stem,
+                'description': 'TRANS-QML Project'
+            },
+            'datasets': self._datasets,
+            'tables': table_states,
+            'graphs': graph_states,
+            'workspace': {
+                'active_dataset': self._active_dataset,
+                'current_tab': self._current_tab,
+                'window_counter': self._window_id_counter
+            }
+        }
+
+        success = self.project_manager.save_project(project_path, project_data)
+
+        if not success:
+            raise Exception(f"Failed to save project: {project_path}")
+
+        logger.info(f"Project saved: {project_path}")
+        return str(project_path)
+
+    def _on_project_saved(self, project_path: Path):
+        """Called when project save completes."""
+        self.status = f"Project saved: {project_path.name}"
+        self.projectSaved.emit(str(project_path))
+        self.projectModifiedChanged.emit(False)
+        logger.info(f"Project save completed: {project_path}")
+
+    @Slot(result=bool)
+    def hasProject(self):
+        """Check if a project is currently loaded."""
+        return self.project_manager.get_current_project_path() is not None
+
+    @Slot(result=bool)
+    def hasDatasets(self):
+        """Check if any datasets are loaded."""
+        return len(self._datasets) > 0
+
+    # Tool Opening
+    @Slot(str)
+    def openTool(self, tool_name: str):
+        """Open a specific tool window."""
+        logger.info(f"Opening tool: {tool_name}")
+        self.toolOpened.emit(tool_name)
+
+    @Slot()
+    def newPlot(self):
+        """Create a new enhanced plot window."""
+        from src.widgets.enhanced_plot_window import EnhancedPlotWindow
+
+        logger.info("Creating new plot window")
+        self._window_id_counter += 1
+        graph_id = f"graph_{self._window_id_counter}"
+        graph_title = f"Graph {self._window_id_counter}"
+
+        plot_window = EnhancedPlotWindow(datasets=self._datasets)
+        plot_window.setWindowTitle(graph_title)
+
+        # Track in both general windows list and graphs-specific list
+        self.open_windows.append(plot_window)
+        graph_info = {
+            'window': plot_window,
+            'id': graph_id,
+            'title': graph_title
+        }
+        self.open_graphs.append(graph_info)
+
+        # Connect close signal to remove from both lists
+        plot_window.closed.connect(lambda: self._remove_graph(graph_id))
+
+        plot_window.show()
+        self.status = f"{graph_title} created"
+        self.graphCreated.emit(graph_id, graph_title)
+        logger.info(f"Plot window created: {graph_title} (ID: {graph_id})")
+
+    @Slot()
+    def newTable(self):
+        """Create a new enhanced table window."""
+        from src.widgets.enhanced_table_window import EnhancedTableWindow
+
+        logger.info("Creating new table window")
+        self._window_id_counter += 1
+        table_id = f"table_{self._window_id_counter}"
+        table_title = f"Table {self._window_id_counter}"
+
+        table_window = EnhancedTableWindow()
+        table_window.setWindowTitle(table_title)
+
+        # Track in both general windows list and tables-specific list
+        self.open_windows.append(table_window)
+        table_info = {
+            'window': table_window,
+            'id': table_id,
+            'title': table_title
+        }
+        self.open_tables.append(table_info)
+
+        # Connect close signal to remove from both lists
+        table_window.closed.connect(lambda: self._remove_table(table_id))
+
+        table_window.show()
+        self.status = f"{table_title} created"
+        self.tableCreated.emit(table_id, table_title)
+        logger.info(f"Table window created: {table_title} (ID: {table_id})")
+
+    @Slot(str)
+    def openWorkflow(self, workflow_name: str):
+        """Open a workflow editor window."""
+        from PySide6.QtQml import QQmlComponent, QQmlEngine
+        from PySide6.QtCore import QUrl
+
+        logger.info(f"Opening workflow: {workflow_name}")
+
+        # Create workflow using the workflow manager
+        workflow_id = self.workflow_manager.createWorkflow(workflow_name)
+
+        # The workflow window will be created from QML
+        # This slot triggers the QML to create a WorkflowWindow
+        self.status = f"Workflow '{workflow_name}' opened"
+        logger.info(f"Workflow created with ID: {workflow_id}")
+
+        # Return the workflow_id so QML can use it
+        return workflow_id
+
+    def _remove_window(self, window):
+        """Remove window from tracking list."""
+        if window in self.open_windows:
+            self.open_windows.remove(window)
+            logger.info(f"Window closed. Remaining open windows: {len(self.open_windows)}")
+
+    def _remove_table(self, table_id: str):
+        """Remove table from tracking lists."""
+        for table_info in self.open_tables:
+            if table_info['id'] == table_id:
+                window = table_info['window']
+                if window in self.open_windows:
+                    self.open_windows.remove(window)
+                self.open_tables.remove(table_info)
+                self.windowClosed.emit('table', table_id)
+                logger.info(f"Table closed: {table_id}")
+                break
+
+    def _remove_graph(self, graph_id: str):
+        """Remove graph from tracking lists."""
+        for graph_info in self.open_graphs:
+            if graph_info['id'] == graph_id:
+                window = graph_info['window']
+                if window in self.open_windows:
+                    self.open_windows.remove(window)
+                self.open_graphs.remove(graph_info)
+                self.windowClosed.emit('graph', graph_id)
+                logger.info(f"Graph closed: {graph_id}")
+                break
+
+    def _open_map_window(self, map_path: str, map_id: str, map_title: str):
+        """Open a map visualization window."""
+        from src.widgets.map_window import MapVisualizationWindow
+
+        try:
+            logger.info(f"Opening map visualization window: {map_title}")
+
+            map_window = MapVisualizationWindow(map_path=map_path, title=map_title)
+
+            # Track window
+            self.open_windows.append(map_window)
+            map_info = {
+                'window': map_window,
+                'id': map_id,
+                'title': map_title,
+                'path': map_path
+            }
+            self.open_map_windows.append(map_info)
+
+            # Connect close signal
+            map_window.closed.connect(lambda mid=map_id: self._remove_map_window(mid))
+
+            map_window.show()
+            logger.info(f"Map window opened: {map_title}")
+
+        except Exception as e:
+            logger.error(f"Error opening map window: {e}", exc_info=True)
+            self.errorOccurred.emit("Map Error", f"Could not open map: {e}")
+
+    def _remove_map_window(self, map_id: str):
+        """Remove map window from tracking lists."""
+        for map_info in self.open_map_windows:
+            if map_info['id'] == map_id:
+                window = map_info['window']
+                if window in self.open_windows:
+                    self.open_windows.remove(window)
+                self.open_map_windows.remove(map_info)
+                self.windowClosed.emit('map', map_id)
+                logger.info(f"Map window closed: {map_id}")
+                break
+
+    @Slot(str)
+    def openMapFromPath(self, map_path: str):
+        """Open a map visualization window from a file path (for ProjectBrowser)."""
+        from pathlib import Path
+        self._map_id_counter += 1
+        map_id = f"map_{self._map_id_counter}"
+        map_title = Path(map_path).stem
+        self._open_map_window(map_path, map_id, map_title)
+
+    @Slot()
+    def closeAllWindows(self):
+        """Close all open tool, graph, and table windows. Called when main window closes."""
+        logger.info(f"Closing all windows ({len(self.open_windows)} open)")
+
+        # Emit signal so windows can prepare for closing
+        self.applicationClosing.emit()
+
+        # Close all windows - iterate over a copy since list will be modified
+        windows_to_close = list(self.open_windows)
+        for window in windows_to_close:
+            try:
+                if hasattr(window, 'close'):
+                    window.close()
+            except Exception as e:
+                logger.warning(f"Error closing window: {e}")
+
+        # Clear tracking lists
+        self.open_windows.clear()
+        self.open_tables.clear()
+        self.open_graphs.clear()
+        self.open_map_windows.clear()
+        logger.info("All windows closed")
+
+    def _restore_table_window(self, table_state: dict):
+        """Restore a table window from saved state."""
+        from src.widgets.enhanced_table_window import EnhancedTableWindow
+        from src.backend.project_manager import restore_window_geometry
+        import pandas as pd
+
+        try:
+            table_id = table_state.get('id', f"table_{self._window_id_counter + 1}")
+            table_title = table_state.get('title', 'Restored Table')
+
+            # Create table window with data
+            data = table_state.get('data', [])
+            columns = table_state.get('columns', [])
+
+            if data and columns:
+                df = pd.DataFrame(data, columns=columns)
+                table_window = EnhancedTableWindow(data=df)
+            else:
+                table_window = EnhancedTableWindow()
+
+            table_window.setWindowTitle(table_title)
+
+            # Restore geometry
+            geometry = table_state.get('geometry', {})
+            restore_window_geometry(table_window, geometry)
+
+            # Restore column widths
+            column_widths = table_state.get('column_widths', [])
+            if hasattr(table_window, 'table') and column_widths:
+                for col, width in enumerate(column_widths):
+                    if col < table_window.table.columnCount():
+                        table_window.table.setColumnWidth(col, width)
+
+            # Restore formulas
+            formulas = table_state.get('formulas', {})
+            if hasattr(table_window, 'formulas'):
+                for key, formula in formulas.items():
+                    parts = key.split(',')
+                    if len(parts) == 2:
+                        r, c = int(parts[0]), int(parts[1])
+                        table_window.formulas[(r, c)] = formula
+
+            # Track window
+            self._window_id_counter += 1
+            self.open_windows.append(table_window)
+            table_info = {
+                'window': table_window,
+                'id': table_id,
+                'title': table_title
+            }
+            self.open_tables.append(table_info)
+
+            # Connect close signal
+            table_window.closed.connect(lambda tid=table_id: self._remove_table(tid))
+
+            table_window.show()
+            self.tableCreated.emit(table_id, table_title)
+            logger.info(f"Restored table window: {table_title}")
+
+        except Exception as e:
+            logger.error(f"Error restoring table window: {e}", exc_info=True)
+
+    def _restore_graph_window(self, graph_state: dict):
+        """Restore a graph window from saved state."""
+        from src.widgets.enhanced_plot_window import EnhancedPlotWindow
+        from src.backend.project_manager import restore_window_geometry
+        import numpy as np
+
+        try:
+            graph_id = graph_state.get('id', f"graph_{self._window_id_counter + 1}")
+            graph_title = graph_state.get('title', 'Restored Graph')
+
+            # Create plot window
+            plot_window = EnhancedPlotWindow(datasets=self._datasets)
+            plot_window.setWindowTitle(graph_title)
+
+            # Restore geometry
+            geometry = graph_state.get('geometry', {})
+            restore_window_geometry(plot_window, geometry)
+
+            # Restore curves
+            curves = graph_state.get('curves', [])
+            for curve in curves:
+                x_data = curve.get('x_data')
+                y_data = curve.get('y_data')
+                if x_data is not None and y_data is not None:
+                    plot_window.canvas.add_curve(
+                        x=np.array(x_data),
+                        y=np.array(y_data),
+                        label=curve.get('label', 'Curve'),
+                        color=curve.get('color', '#ff66b2'),
+                        marker=curve.get('marker'),
+                        linestyle=curve.get('linestyle', '-'),
+                        linewidth=curve.get('linewidth', 2),
+                        alpha=curve.get('alpha', 1.0)
+                    )
+
+            # Restore axes configuration
+            axes_config = graph_state.get('axes', {})
+            if axes_config and hasattr(plot_window, 'canvas'):
+                ax = plot_window.canvas.axes
+                if axes_config.get('xlabel'):
+                    ax.set_xlabel(axes_config['xlabel'])
+                if axes_config.get('ylabel'):
+                    ax.set_ylabel(axes_config['ylabel'])
+                if axes_config.get('title'):
+                    ax.set_title(axes_config['title'])
+                if axes_config.get('xlim'):
+                    ax.set_xlim(axes_config['xlim'])
+                if axes_config.get('ylim'):
+                    ax.set_ylim(axes_config['ylim'])
+                if axes_config.get('xscale'):
+                    ax.set_xscale(axes_config['xscale'])
+                if axes_config.get('yscale'):
+                    ax.set_yscale(axes_config['yscale'])
+
+                plot_window.canvas.draw()
+
+            # Restore grid
+            if graph_state.get('grid', False) and hasattr(plot_window, 'canvas'):
+                plot_window.canvas.axes.grid(True)
+                plot_window.canvas.draw()
+
+            # Track window
+            self._window_id_counter += 1
+            self.open_windows.append(plot_window)
+            graph_info = {
+                'window': plot_window,
+                'id': graph_id,
+                'title': graph_title
+            }
+            self.open_graphs.append(graph_info)
+
+            # Connect close signal
+            plot_window.closed.connect(lambda gid=graph_id: self._remove_graph(gid))
+
+            plot_window.show()
+            self.graphCreated.emit(graph_id, graph_title)
+            logger.info(f"Restored graph window: {graph_title}")
+
+        except Exception as e:
+            logger.error(f"Error restoring graph window: {e}", exc_info=True)
+
+    # ========================================================================
+    # TOOL IMPLEMENTATIONS - Integration Utility
+    # ========================================================================
+
+    @Slot(str, 'QVariantList')
+    def integrate(self, dataset_name: str, intervals: List):
+        """QML wrapper for integration - runs in background thread."""
+        logger.info(f"Submitting integration for {dataset_name} to worker")
+        self.status = f"Integrating {dataset_name}..."
+        self.worker_manager.submit(
+            name=f"Integrate {dataset_name}",
+            operation=self._do_integrate,
+            dataset_name=dataset_name,
+            intervals=intervals,
+            on_finished=lambda path: self._on_tool_completed("Integration Utility", path)
+        )
+
+    def _do_integrate(self, task, dataset_name: str, intervals: List):
+        """
+        Perform integration over specified intervals.
+
+        Parameters:
+        -----------
+        task : Task
+            Task object for cancellation checking
+        dataset_name : str
+            Name of dataset to integrate
+        intervals : List[Dict]
+            List of intervals with 'lower' and 'upper' keys
+
+        Returns:
+        --------
+        output_path : str
+            Path to saved results
+        """
+        try:
+            # Check if cancelled
+            if task.cancelled:
+                logger.info("Integration cancelled")
+                return None
+
+            if dataset_name not in self._datasets:
+                self.errorOccurred.emit("Error", "Dataset not found")
+                return ""
+
+            spectral_data = self._datasets[dataset_name]
+            logger.info(f"Integrating {dataset_name} over {len(intervals)} intervals")
+
+            # Get independent variable and spectra
+            independent_var = spectral_data.independent_var
+            spectra = spectral_data.spectra.values
+
+            # Integrate over each interval
+            integration_results = []
+            for i, interval in enumerate(intervals):
+                # Check cancellation during loop
+                if task.cancelled:
+                    logger.info(f"Integration cancelled at interval {i+1}/{len(intervals)}")
+                    return None
+
+                # Update progress
+                task.progress = i / len(intervals)
+                start_v = float(interval['lower'])
+                end_v = float(interval['upper'])
+
+                # Create mask for interval
+                mask = (independent_var >= start_v) & (independent_var <= end_v)
+
+                if not np.any(mask):
+                    logger.warning(f"No data in interval [{start_v}, {end_v}]")
+                    continue
+
+                # Extract data in interval
+                interval_var = independent_var[mask]
+                interval_spectra = spectra[mask, :]
+
+                # Perform trapezoidal integration
+                try:
+                    # Use np.trapezoid if available (NumPy 2.0+), otherwise np.trapz
+                    if hasattr(np, 'trapezoid'):
+                        integrated = np.trapezoid(interval_spectra, x=interval_var, axis=0)
+                    else:
+                        integrated = np.trapz(interval_spectra, x=interval_var, axis=0)
+                except:
+                    integrated = np.trapz(interval_spectra, x=interval_var, axis=0)
+
+                integration_results.append({
+                    'interval': f"{start_v:.3f}_{end_v:.3f}",
+                    'interval_tuple': (start_v, end_v),  # Store numeric tuple
+                    'integrated_values': integrated
+                })
+
+            # Create output DataFrame with one column per interval
+            num_spectra = spectra.shape[1]
+            # First column should be spectrum index (as independent variable for integrated data)
+            output_df = pd.DataFrame({'Spectrum_Index': range(num_spectra)})
+
+            for result in integration_results:
+                col_name = f"Interval_{result['interval']}"
+                output_df[col_name] = result['integrated_values']
+
+            # Create user-friendly names using helper
+            base_name = self._extract_clean_base_name(dataset_name)
+            file_safe_name = self._sanitize_filename(base_name)
+
+            # Save to file with readable filename
+            output_path = self._ensure_output_dir('integrated') / f"{file_safe_name}_integrated.csv"
+            output_df.to_csv(output_path, index=False)
+
+            # Create new SpectralData object with user-friendly name
+            friendly_name = f"{base_name} - Integrated"
+            legacy_result_name = f"Integrated_{dataset_name}"
+
+            # Create metadata for the integrated data (preserve dimensions from original)
+            integrated_metadata = SpectralMetadata(
+                source_type=f"Integrated_{spectral_data.metadata.source_type}",
+                dimensions=spectral_data.metadata.dimensions,
+                scan_mode=spectral_data.metadata.scan_mode,
+                units={'independent': 'Index', 'dependent': 'Integrated Value'},
+                additional_info={
+                    'original_dataset': dataset_name,
+                    'num_intervals': len(integration_results),
+                    'intervals': [r['interval_tuple'] for r in integration_results]  # Store numeric tuples
+                }
+            )
+
+            # Create SpectralData object
+            integrated_spectral_data = SpectralData(
+                data=output_df,
+                metadata=integrated_metadata,
+                topography=spectral_data.topography  # Preserve topography if available
+            )
+
+            # Store only with friendly name (no duplicates)
+            self._datasets[friendly_name] = integrated_spectral_data
+            self.dataLoaded.emit(friendly_name)
+
+            # Status update will be handled by callback in main thread
+            logger.info(f"Integration results saved to {output_path}: {len(integration_results)} intervals")
+
+            return str(output_path)
+
+        except Exception as e:
+            logger.error(f"Integration error: {e}", exc_info=True)
+            self.errorOccurred.emit("Integration Error", str(e))
+            return ""
+
+    # ========================================================================
+    # TOOL IMPLEMENTATIONS - Spatial Average / Discretization
+    # ========================================================================
+
+    @Slot(str, int, int, bool, bool)
+    def spatialAverage(self, dataset_name: str, discrete_x: int, discrete_y: int,
+                      ignore_empty: bool, save_intermediate: bool):
+        """QML wrapper for spatial averaging - runs in background thread."""
+        logger.info(f"Submitting spatial averaging for {dataset_name} to worker")
+        self.status = f"Spatial averaging {dataset_name}..."
+        self.worker_manager.submit(
+            name=f"Spatial Average {dataset_name}",
+            operation=self._do_spatial_average,
+            dataset_name=dataset_name,
+            discrete_x=discrete_x,
+            discrete_y=discrete_y,
+            ignore_empty=ignore_empty,
+            save_intermediate=save_intermediate,
+            on_finished=lambda path: self._on_tool_completed("Spatial Average", path)
+        )
+
+    def _do_spatial_average(self, task, dataset_name: str, discrete_x: int, discrete_y: int,
+                      ignore_empty: bool, save_intermediate: bool):
+        """
+        Perform spatial averaging/discretization.
+
+        Parameters:
+        -----------
+        task : Task
+            Task object for cancellation checking
+        dataset_name : str
+            Dataset to discretize
+        discrete_x : int
+            Horizontal blocks
+        discrete_y : int
+            Vertical blocks
+        ignore_empty : bool
+            Skip empty blocks
+        save_intermediate : bool
+            Save intermediate results
+
+        Returns:
+        --------
+        output_path : str
+            Path to final results
+        """
+        try:
+            # Check if cancelled
+            if task.cancelled:
+                logger.info("Spatial averaging cancelled")
+                return None
+
+            if dataset_name not in self._datasets:
+                self.errorOccurred.emit("Error", "Dataset not found")
+                return ""
+
+            spectral_data = self._datasets[dataset_name]
+            dim_h, dim_v = spectral_data.metadata.dimensions
+
+            # Calculate block sizes
+            block_h = int(np.ceil(dim_h / discrete_x))
+            block_v = int(np.ceil(dim_v / discrete_y))
+
+            logger.info(f"Discretizing {dataset_name}: {dim_h}x{dim_v} -> {discrete_x}x{discrete_y}")
+            logger.info(f"Block size: {block_h}x{block_v}")
+
+            # Perform discretization
+            results = self.discretizer.discretize_spectral_data(
+                spectral_data=spectral_data,
+                block_h=block_h,
+                block_v=block_v,
+                ignore_empty_blocks=ignore_empty,
+                data_type='spectral'
+            )
+
+            # Create user-friendly names using helper
+            base_name = self._extract_clean_base_name(dataset_name)
+            file_safe_name = self._sanitize_filename(base_name)
+
+            # Save final results with readable filename
+            final_data = results['final']
+            output_path = self._ensure_output_dir('discretized') / f"{file_safe_name}_averaged_{discrete_x}x{discrete_y}.csv"
+            final_data.save(str(output_path))
+
+            # Add to datasets with only friendly name (no duplicates)
+            friendly_name = f"{base_name} - Spatially Averaged ({discrete_x}x{discrete_y})"
+            self._datasets[friendly_name] = final_data
+
+            # Save intermediate if requested
+            if save_intermediate:
+                intermediate_data = results['intermediate']
+                intermediate_path = self._ensure_output_dir('discretized') / f"{file_safe_name}_intermediate_{discrete_x}x{discrete_y}.csv"
+                intermediate_data.save(str(intermediate_path))
+
+            # Status update will be handled by callback in main thread
+            logger.info(f"Discretization saved to {output_path}: {final_data.num_spectra} blocks")
+
+            return str(output_path)
+
+        except Exception as e:
+            logger.error(f"Spatial average error: {e}", exc_info=True)
+            self.errorOccurred.emit("Spatial Average Error", str(e))
+            return ""
+
+    # ========================================================================
+    # TOOL IMPLEMENTATIONS - 1D FFT
+    # ========================================================================
+
+    @Slot(str)
+    def fft1D(self, dataset_name: str):
+        """QML wrapper for 1D FFT - runs in background thread."""
+        logger.info(f"Submitting 1D FFT for {dataset_name} to worker")
+        self.status = f"Computing 1D FFT for {dataset_name}..."
+        self.worker_manager.submit(
+            name=f"1D FFT {dataset_name}",
+            operation=self._do_fft1D,
+            dataset_name=dataset_name,
+            on_finished=lambda path: self._on_tool_completed("1D FFT", path)
+        )
+
+    def _do_fft1D(self, task, dataset_name: str):
+        """
+        Perform 1D FFT on spectral data.
+
+        Parameters:
+        -----------
+        task : Task
+            Task object for cancellation checking
+        dataset_name : str
+            Dataset to transform
+
+        Returns:
+        --------
+        output_path : str
+            Path to FFT results
+        """
+        try:
+            # Check if cancelled
+            if task.cancelled:
+                logger.info("1D FFT cancelled")
+                return None
+
+            if dataset_name not in self._datasets:
+                self.errorOccurred.emit("Error", "Dataset not found")
+                return ""
+
+            spectral_data = self._datasets[dataset_name]
+            logger.info(f"Performing 1D FFT on {dataset_name}")
+
+            # Get spectral data
+            spectra = spectral_data.spectra.values  # (n_points, n_spectra)
+            independent_var = spectral_data.independent_var
+
+            # Perform FFT on each spectrum
+            fft_results = np.fft.fft(spectra, axis=0)
+            fft_magnitude = np.abs(fft_results)
+            fft_phase = np.angle(fft_results)
+
+            # Create frequency axis
+            n_points = len(independent_var)
+            d = np.mean(np.diff(independent_var))  # Average spacing
+            frequencies = np.fft.fftfreq(n_points, d)
+
+            # Create DataFrames for magnitude and phase
+            mag_df = pd.DataFrame(fft_magnitude, columns=spectral_data.spectra.columns)
+            mag_df.insert(0, 'Frequency', frequencies)
+
+            phase_df = pd.DataFrame(fft_phase, columns=spectral_data.spectra.columns)
+            phase_df.insert(0, 'Frequency', frequencies)
+
+            # Create user-friendly names using helper
+            base_name = self._extract_clean_base_name(dataset_name)
+            file_safe_name = self._sanitize_filename(base_name)
+
+            # Save results using _ensure_output_dir for proper project structure
+            mag_path = self._ensure_output_dir('fft') / f"{file_safe_name}_FFT_Magnitude.csv"
+            phase_path = self._ensure_output_dir('fft') / f"{file_safe_name}_FFT_Phase.csv"
+
+            mag_df.to_csv(mag_path, index=False)
+            phase_df.to_csv(phase_path, index=False)
+
+            # Create new datasets with friendly names
+            friendly_name = f"{base_name} - FFT Magnitude"
+            mag_metadata = SpectralMetadata(
+                source_type=spectral_data.metadata.source_type,
+                dimensions=spectral_data.metadata.dimensions,
+                scan_mode=spectral_data.metadata.scan_mode,
+                units={'independent': 'Hz', 'dependent': 'a.u.'},
+                additional_info={'transform': 'FFT_magnitude', 'original': dataset_name}
+            )
+            mag_spectral_data = SpectralData(mag_df, mag_metadata)
+            # Store only with friendly name (no duplicates)
+            self._datasets[friendly_name] = mag_spectral_data
+
+            # Status update will be handled by callback in main thread
+            logger.info(f"FFT results saved to {mag_path} and {phase_path}")
+
+            return str(mag_path)
+
+        except Exception as e:
+            logger.error(f"1D FFT error: {e}", exc_info=True)
+            self.errorOccurred.emit("FFT Error", str(e))
+            return ""
+
+    # ========================================================================
+    # TOOL IMPLEMENTATIONS - 2D FFT (for maps)
+    # ========================================================================
+
+    @Slot(str)
+    def fft2D(self, image_path: str):
+        """QML wrapper for 2D FFT - runs in background thread."""
+        logger.info(f"Submitting 2D FFT to worker")
+        self.status = "Computing 2D FFT..."
+        self.worker_manager.submit(
+            name="2D FFT",
+            operation=self._do_fft2D,
+            image_path=image_path,
+            on_finished=lambda path: self._on_tool_completed("2D FFT", path)
+        )
+
+    def _do_fft2D(self, task, image_path: str):
+        """
+        Perform 2D FFT on image/map data.
+
+        Parameters:
+        -----------
+        task : Task
+            Task object for cancellation checking
+        image_path : str
+            Path to image file
+
+        Returns:
+        --------
+        output_path : str
+            Path to FFT result image
+        """
+        try:
+            # Check if cancelled
+            if task.cancelled:
+                logger.info("2D FFT cancelled")
+                return None
+
+            from PIL import Image
+
+            logger.info(f"Performing 2D FFT on {image_path}")
+
+            # Load image
+            img = Image.open(image_path).convert('L')  # Convert to grayscale
+            img_array = np.array(img)
+
+            # Perform 2D FFT
+            fft_result = np.fft.fft2(img_array)
+            fft_shifted = np.fft.fftshift(fft_result)
+            magnitude = np.abs(fft_shifted)
+            phase = np.angle(fft_shifted)
+
+            # Log scale for better visualization
+            magnitude_log = np.log(1 + magnitude)
+
+            # Normalize to 0-255
+            magnitude_norm = ((magnitude_log - magnitude_log.min()) /
+                            (magnitude_log.max() - magnitude_log.min()) * 255).astype(np.uint8)
+
+            # Save results using _ensure_output_dir for proper project structure
+            output_path = self._ensure_output_dir('fft') / f"FFT2D_{Path(image_path).stem}.png"
+            result_img = Image.fromarray(magnitude_norm)
+            result_img.save(output_path)
+
+            # Status update will be handled by callback in main thread
+            logger.info(f"2D FFT saved to {output_path}")
+
+            return str(output_path)
+
+        except Exception as e:
+            logger.error(f"2D FFT error: {e}", exc_info=True)
+            self.errorOccurred.emit("2D FFT Error", str(e))
+            return ""
+
+    # ========================================================================
+    # TOOL WRAPPERS - Exposing Tool Implementations to QML
+    # ========================================================================
+
+    @Slot(str, int, int, str)
+    def smoothCurves(self, dataset_name: str, window_size: int, poly_order: int,
+                     smoothing_type: str):
+        """QML wrapper for curve smoothing - runs in background thread."""
+        logger.info(f"Submitting curve smoothing for {dataset_name} to worker")
+        self.status = f"Smoothing curves for {dataset_name}..."
+        self.worker_manager.submit(
+            name=f"Smooth Curves {dataset_name}",
+            operation=self.smooth_curves,
+            dataset_name=dataset_name,
+            window_size=window_size,
+            poly_order=poly_order,
+            smoothing_type=smoothing_type,
+            on_finished=lambda path: self._on_tool_completed("Curve Smoothing", path)
+        )
+
+    @Slot(str, str, int)
+    def smoothImage(self, image_path: str, filter_type: str, kernel_size: int):
+        """QML wrapper for image smoothing - runs in background thread."""
+        logger.info(f"Submitting image smoothing to worker")
+        self.status = "Smoothing image..."
+        self.worker_manager.submit(
+            name="Smooth Image",
+            operation=self.smooth_image,
+            image_path=image_path,
+            filter_type=filter_type,
+            kernel_size=kernel_size,
+            on_finished=lambda path: self._on_tool_completed("Image Smoothing", path)
+        )
+
+    @Slot(str, str, str, 'QVariantMap')
+    def processMap(self, input_path: str, input_type: str, operation: str, params: Dict):
+        """
+        Process a map/image with various operations.
+
+        Parameters:
+            input_path: Path to file or name of dataset
+            input_type: 'file' or 'dataset'
+            operation: Operation name (gaussian_filter, median_filter, plane_level, row_align, normalize)
+            params: Operation parameters
+        """
+        logger.info(f"Processing map: {input_path}, operation: {operation}")
+        self.status = f"Processing map: {operation}..."
+
+        self.worker_manager.submit(
+            name=f"Map {operation}",
+            operation=self._do_process_map,
+            input_path=input_path,
+            input_type=input_type,
+            #operation=operation,
+            params=params,
+            on_finished=lambda path: self._on_map_processing_completed(operation, path, params)
+        )
+
+    def _do_process_map(self, task, input_path: str, input_type: str, operation: str, params: Dict):
+        """Background worker for map processing."""
+        from scipy import ndimage
+
+        if task.cancelled:
+            return None
+
+        try:
+            # Load the data
+            if input_type == 'file':
+                data = self._load_map_file(input_path)
+                base_name = Path(input_path).stem
+            else:
+                # Load from maps directory
+                maps_dir = self._output_base_dir / "maps"
+                # Find matching file
+                map_path = None
+                for ext in ['.tif', '.tiff', '.npy', '.png']:
+                    candidate = maps_dir / f"{input_path}{ext}"
+                    if candidate.exists():
+                        map_path = candidate
+                        break
+
+                if map_path is None:
+                    raise FileNotFoundError(f"Map not found: {input_path}")
+
+                data = self._load_map_file(str(map_path))
+                base_name = input_path
+
+            if task.cancelled:
+                return None
+
+            # Apply operation
+            if operation == 'gaussian_filter':
+                sigma = params.get('sigma', 1.0)
+                result = ndimage.gaussian_filter(data, sigma=sigma)
+                op_suffix = f"gaussian_s{sigma}"
+
+            elif operation == 'median_filter':
+                size = params.get('size', 3)
+                result = ndimage.median_filter(data, size=size)
+                op_suffix = f"median_k{size}"
+
+            elif operation == 'plane_level':
+                # Fit and subtract a plane
+                rows, cols = data.shape
+                x = np.arange(cols)
+                y = np.arange(rows)
+                X, Y = np.meshgrid(x, y)
+
+                A = np.column_stack([X.ravel(), Y.ravel(), np.ones(X.size)])
+                coeffs, _, _, _ = np.linalg.lstsq(A, data.ravel(), rcond=None)
+                plane = (coeffs[0] * X + coeffs[1] * Y + coeffs[2])
+                result = data - plane
+                op_suffix = "planelevel"
+
+            elif operation == 'row_align':
+                # Subtract row medians
+                result = data.copy()
+                for i in range(result.shape[0]):
+                    result[i] -= np.nanmedian(result[i])
+                op_suffix = "rowalign"
+
+            elif operation == 'normalize':
+                vmin = np.nanmin(data)
+                vmax = np.nanmax(data)
+                if vmax > vmin:
+                    result = (data - vmin) / (vmax - vmin)
+                else:
+                    result = np.zeros_like(data)
+                op_suffix = "norm"
+
+            elif operation == 'polynomial_bg_removal':
+                order = params.get('order', 2)
+                # Fit 2D polynomial and subtract
+                rows, cols = data.shape
+                x = np.arange(cols)
+                y = np.arange(rows)
+                X, Y = np.meshgrid(x, y)
+
+                # Build polynomial terms up to given order
+                terms = []
+                for i in range(order + 1):
+                    for j in range(order + 1 - i):
+                        terms.append((X**i * Y**j).ravel())
+
+                A = np.column_stack(terms)
+                coeffs, _, _, _ = np.linalg.lstsq(A, data.ravel(), rcond=None)
+
+                background = np.zeros_like(data)
+                idx = 0
+                for i in range(order + 1):
+                    for j in range(order + 1 - i):
+                        background += coeffs[idx] * (X**i * Y**j)
+                        idx += 1
+
+                result = data - background
+                op_suffix = f"polybg_o{order}"
+
+            else:
+                logger.error(f"Unknown operation: {operation}")
+                return None
+
+            if task.cancelled:
+                return None
+
+            # Save results
+            output_name = f"{base_name}_{op_suffix}"
+            maps_dir = self._output_base_dir / "maps"
+            maps_dir.mkdir(parents=True, exist_ok=True)
+
+            output_path = None
+
+            if params.get('save_tiff', True):
+                import tifffile
+                tiff_path = maps_dir / f"{output_name}.tif"
+                tifffile.imwrite(str(tiff_path), result.astype(np.float32))
+                output_path = str(tiff_path)
+                logger.info(f"Saved processed map: {tiff_path}")
+
+            if params.get('save_png', False):
+                import matplotlib.cm as cm
+                # Normalize for colormap
+                vmin = np.nanpercentile(result, 2)
+                vmax = np.nanpercentile(result, 98)
+                if vmax > vmin:
+                    normalized = (result - vmin) / (vmax - vmin)
+                else:
+                    normalized = np.zeros_like(result)
+                normalized = np.clip(normalized, 0, 1)
+
+                cmap = cm.get_cmap('viridis')
+                colored = cmap(normalized)
+                img_data = (colored[:, :, :3] * 255).astype(np.uint8)
+
+                png_path = maps_dir / f"{output_name}.png"
+                Image.fromarray(img_data, mode='RGB').save(png_path)
+                if output_path is None:
+                    output_path = str(png_path)
+                logger.info(f"Saved PNG: {png_path}")
+
+            return output_path
+
+        except Exception as e:
+            logger.error(f"Map processing error: {e}", exc_info=True)
+            return None
+
+    def _load_map_file(self, file_path: str) -> np.ndarray:
+        """Load a map/image file and return as 2D numpy array."""
+        path = Path(file_path)
+        extension = path.suffix.lower()
+
+        if extension in ['.tif', '.tiff']:
+            import tifffile
+            data = tifffile.imread(str(path))
+        elif extension in ['.png', '.jpg', '.jpeg', '.bmp']:
+            img = Image.open(str(path))
+            if img.mode == 'RGB' or img.mode == 'RGBA':
+                img = img.convert('L')
+            data = np.array(img, dtype=np.float64)
+        elif extension == '.npy':
+            data = np.load(str(path))
+        else:
+            raise ValueError(f"Unsupported format: {extension}")
+
+        # Ensure 2D
+        if data.ndim == 3:
+            if data.shape[2] <= 4:
+                data = np.mean(data, axis=2)
+            else:
+                data = data[0]
+
+        return data.astype(np.float64)
+
+    def _on_map_processing_completed(self, operation: str, output_path: str, params: Dict):
+        """Called when map processing completes."""
+        if output_path:
+            logger.info(f"Map processing ({operation}) completed: {output_path}")
+            self.status = f"Map {operation} complete"
+            self.toolCompleted.emit(f"Map Processing: {operation}", output_path)
+
+            # Register output
+            self._output_id_counter += 1
+            output_id = f"output_{self._output_id_counter}"
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            output_info = {
+                'id': output_id,
+                'tool': f"Map {operation}",
+                'path': output_path,
+                'timestamp': timestamp
+            }
+            self.output_files.append(output_info)
+            self.outputCreated.emit(output_id, f"Map {operation}", output_path)
+
+            # Emit map created signal
+            map_name = Path(output_path).stem
+            self._window_id_counter += 1
+            map_id = f"map_{self._window_id_counter}"
+            self.mapCreated.emit(map_id, map_name)
+
+            # Open result if requested
+            if params.get('open_result', False):
+                self._open_map_result(output_path)
+        else:
+            self.status = f"Map {operation} failed"
+            self.errorOccurred.emit("Processing Error", f"Map {operation} failed")
+
+    def _open_map_result(self, output_path: str):
+        """Open processed map in map viewer."""
+        try:
+            from src.widgets.map_window import MapVisualizationWindow
+
+            data = self._load_map_file(output_path)
+            title = Path(output_path).stem
+
+            map_window = MapVisualizationWindow(
+                data={'values': data},
+                title=title,
+                colormap='viridis'
+            )
+            map_window.show()
+            self.open_windows.append(map_window)
+
+        except Exception as e:
+            logger.error(f"Error opening map result: {e}")
+
+    @Slot(str, int, bool, bool)
+    def calculateDerivative(self, dataset_name: str, order: int,
+                           smooth_before: bool, smooth_after: bool):
+        """QML wrapper for derivative calculation - runs in background thread."""
+        logger.info(f"Submitting derivative calculation for {dataset_name} to worker")
+        self.status = f"Calculating derivative for {dataset_name}..."
+
+        # Submit to worker for background processing
+        self.worker_manager.submit(
+            name=f"Derivative {dataset_name}",
+            operation=self._do_calculate_derivative,
+            dataset_name=dataset_name,
+            order=order,
+            smooth_before=smooth_before,
+            smooth_after=smooth_after,
+            on_finished=self._on_derivative_completed,
+            on_error=None  # Will use default worker_failed handler
+        )
+
+    def _do_calculate_derivative(self, task, dataset_name: str, order: int,
+                                 smooth_before: bool, smooth_after: bool):
+        """Background worker function for derivative calculation."""
+        # Check if cancelled
+        if task.cancelled:
+            logger.info("Derivative calculation cancelled")
+            return None
+
+        return self.calculate_derivative(dataset_name, order, smooth_before, smooth_after)
+
+    def _on_derivative_completed(self, output_path: str):
+        """Called when derivative calculation completes."""
+        logger.info(f"Derivative calculation completed: {output_path}")
+        self.status = "Derivative calculation complete"
+        self.toolCompleted.emit("Derivative Calculator", output_path)
+
+    def _on_tool_completed(self, tool_name: str, output_path: str):
+        """Generic completion callback for tools."""
+        logger.info(f"{tool_name} completed: {output_path}")
+        self.status = f"{tool_name} complete"
+        self.toolCompleted.emit(tool_name, output_path)
+
+        # Track output file
+        if output_path:
+            self._output_id_counter += 1
+            output_id = f"output_{self._output_id_counter}"
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            output_info = {
+                'id': output_id,
+                'tool': tool_name,
+                'path': output_path,
+                'timestamp': timestamp
+            }
+            self.output_files.append(output_info)
+            self.outputCreated.emit(output_id, tool_name, output_path)
+            logger.info(f"Registered output file: {output_id} from {tool_name}")
+
+    def _generate_multiple_maps(self, task, flat_dataset_name: str, value_indices: list):
+        """Generate maps for multiple values from flat data (runs in worker thread)."""
+        output_paths = []
+        for idx in value_indices:
+            if task.cancelled:
+                break
+            try:
+                base_path = self.generate_map(task, flat_dataset_name, idx)
+                # generate_map returns base path without extension - use PNG for viewing
+                if base_path:
+                    png_path = f"{base_path}.png"
+                    output_paths.append(png_path)
+                    logger.info(f"Generated map for value {idx}: {png_path}")
+            except Exception as e:
+                logger.error(f"Failed to generate map for value {idx}: {e}")
+                # Continue with other values
+
+        return output_paths
+
+    def _on_maps_completed(self, output_paths: list):
+        """Called when multiple map generation completes."""
+        num_maps = len(output_paths)
+        logger.info(f"Map generation completed: {num_maps} maps created")
+        self.status = f"{num_maps} maps generated successfully"
+
+        # Register each map and open visualization window
+        from datetime import datetime
+        from pathlib import Path
+        for path in output_paths:
+            if path:
+                self._map_id_counter += 1
+                map_id = f"map_{self._map_id_counter}"
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                # Extract filename for title
+                map_filename = Path(path).stem  # Get filename without extension
+
+                map_info = {
+                    'id': map_id,
+                    'title': map_filename,
+                    'path': path,
+                    'timestamp': timestamp
+                }
+                self.maps.append(map_info)
+                self.mapCreated.emit(map_id, map_filename)
+                logger.info(f"Registered map: {map_id} - {map_filename}")
+
+                # Open visualization window for this map
+                self._open_map_window(path, map_id, map_filename)
+
+        self.toolCompleted.emit("Map Generator", f"{num_maps} maps")
+
+    @Slot(str, str)
+    def applyGradientFilter(self, image_path: str, method: str):
+        """QML wrapper for gradient filter - runs in background thread."""
+        logger.info(f"Submitting gradient filter to worker")
+        self.status = "Applying gradient filter..."
+        self.worker_manager.submit(
+            name="Gradient Filter",
+            operation=self.apply_gradient_filter,
+            image_path=image_path,
+            method=method,
+            on_finished=lambda path: self._on_tool_completed("Gradient Filter", path)
+        )
+
+    @Slot(str, str, int)
+    def fitCurves(self, dataset_name: str, fit_type: str, degree: int):
+        """QML wrapper for curve fitting - runs in background thread."""
+        logger.info(f"Submitting curve fitting for {dataset_name} to worker")
+        self.status = f"Fitting curves for {dataset_name}..."
+        self.worker_manager.submit(
+            name=f"Fit Curves {dataset_name}",
+            operation=self.fit_curves,
+            dataset_name=dataset_name,
+            fit_type=fit_type,
+            degree=degree,
+            on_finished=lambda path: self._on_tool_completed("Curve Fitting", path)
+        )
+
+    @Slot(str, result='QVariantList')
+    def getIntegrationIntervals(self, dataset_name: str):
+        """Get list of integration intervals from an integrated dataset."""
+        if dataset_name not in self._datasets:
+            return []
+
+        spectral_data = self._datasets[dataset_name]
+
+        # Check if this is an integrated dataset
+        if 'intervals' not in spectral_data.metadata.additional_info:
+            logger.warning(f"{dataset_name} does not have interval information")
+            return []
+
+        # Get intervals - could be tuples or strings
+        intervals = spectral_data.metadata.additional_info['intervals']
+
+        result = []
+        for iv in intervals:
+            if isinstance(iv, (list, tuple)) and len(iv) == 2:
+                # Numeric tuple format
+                result.append(f"{iv[0]:.3f} to {iv[1]:.3f}")
+            elif isinstance(iv, str):
+                # String format like "0.100_0.200" - convert to display format
+                parts = iv.split('_')
+                if len(parts) == 2:
+                    result.append(f"{parts[0]} to {parts[1]}")
+                else:
+                    result.append(iv)
+            else:
+                result.append(str(iv))
+
+        return result
+
+    @Slot(str, result='QVariantList')
+    def getFlatDataValues(self, dataset_name: str):
+        """
+        Get list of value columns from a flat dataset.
+
+        Flat data has one value per spatial point (e.g., integrated data, peak heights).
+        Returns a list of value column descriptions for display.
+        """
+        if dataset_name not in self._datasets:
+            return []
+
+        spectral_data = self._datasets[dataset_name]
+        data_df = spectral_data.data
+
+        # Get value columns (skip index column)
+        value_columns = [col for col in data_df.columns if col != 'Spectrum_Index']
+
+        # Check if this has interval information (integrated data)
+        if 'intervals' in spectral_data.metadata.additional_info:
+            intervals = spectral_data.metadata.additional_info['intervals']
+            result = []
+            for i, iv in enumerate(intervals):
+                if isinstance(iv, (list, tuple)) and len(iv) == 2:
+                    result.append(f"Interval {iv[0]:.3f} to {iv[1]:.3f}")
+                elif isinstance(iv, str):
+                    parts = iv.split('_')
+                    if len(parts) == 2:
+                        result.append(f"Interval {parts[0]} to {parts[1]}")
+                    else:
+                        result.append(f"Value: {iv}")
+                else:
+                    result.append(f"Value {i+1}")
+            return result
+
+        # For other flat data, use column names
+        result = []
+        for col in value_columns:
+            result.append(str(col))
+
+        return result if result else ["No values available"]
+
+    @Slot(str, 'QVariantList')
+    def generateMaps(self, flat_dataset_name: str, value_indices: list):
+        """QML wrapper for generating multiple maps from flat data - runs in background thread."""
+        logger.info(f"Submitting map generation for {len(value_indices)} values")
+        self.status = f"Generating {len(value_indices)} maps..."
+        self.worker_manager.submit(
+            name="Generate Maps",
+            operation=self._generate_multiple_maps,
+            flat_dataset_name=flat_dataset_name,
+            value_indices=value_indices,
+            on_finished=lambda paths: self._on_maps_completed(paths)
+        )
+
+    @Slot(str, int)
+    def generateMap(self, flat_dataset_name: str, value_index: int):
+        """QML wrapper for map generation from flat data - runs in background thread."""
+        logger.info(f"Submitting map generation to worker")
+        self.status = "Generating map..."
+        self.worker_manager.submit(
+            name="Generate Map",
+            operation=self.generate_map,
+            flat_dataset_name=flat_dataset_name,
+            value_index=value_index,
+            on_finished=lambda path: self._on_tool_completed("Map Generator", path)
+        )
+
+    @Slot(str, float, int)
+    def findPeaks(self, dataset_name: str, prominence: float, min_distance: int):
+        """QML wrapper for peak finding - runs in background thread."""
+        logger.info(f"Submitting peak finding for {dataset_name} to worker")
+        self.status = f"Finding peaks in {dataset_name}..."
+        self.worker_manager.submit(
+            name=f"Find Peaks {dataset_name}",
+            operation=self.find_peaks,
+            dataset_name=dataset_name,
+            prominence=prominence,
+            min_distance=min_distance,
+            on_finished=lambda path: self._on_tool_completed("Peak Finding", path)
+        )
+
+    @Slot(str, int, int)
+    def discretizeMap(self, image_path: str, target_x: int, target_y: int):
+        """QML wrapper for map discretization - runs in background thread."""
+        logger.info(f"Submitting map discretization to worker")
+        self.status = "Discretizing map..."
+        self.worker_manager.submit(
+            name="Discretize Map",
+            operation=self.discretize_map,
+            image_path=image_path,
+            target_x=target_x,
+            target_y=target_y,
+            on_finished=lambda path: self._on_tool_completed("Map Discretizer", path)
+        )
+
+    # ========================================================================
+    # TOOL IMPLEMENTATIONS - Data Truncation
+    # ========================================================================
+
+    @Slot(str, float, float)
+    def truncateData(self, dataset_name: str, min_val: float, max_val: float):
+        """QML wrapper for data truncation - runs in background thread."""
+        logger.info(f"Submitting truncation for {dataset_name} to worker")
+        self.status = f"Truncating {dataset_name}..."
+        self.worker_manager.submit(
+            name=f"Truncate {dataset_name}",
+            operation=self._do_truncate_data,
+            dataset_name=dataset_name,
+            min_val=min_val,
+            max_val=max_val,
+            on_finished=lambda path: self._on_tool_completed("Truncate Data", path)
+        )
+
+    def _do_truncate_data(self, task, dataset_name: str, min_val: float, max_val: float):
+        """
+        Truncate dataset to specified range of independent variable.
+
+        Parameters:
+        -----------
+        task : Task
+            Task object for cancellation checking
+        dataset_name : str
+            Dataset to truncate
+        min_val : float
+            Minimum value of independent variable
+        max_val : float
+            Maximum value of independent variable
+
+        Returns:
+        --------
+        output_path : str
+            Path to truncated data
+        """
+        try:
+            # Check if cancelled
+            if task.cancelled:
+                logger.info("Data truncation cancelled")
+                return None
+
+            if dataset_name not in self._datasets:
+                self.errorOccurred.emit("Error", "Dataset not found")
+                return ""
+
+            spectral_data = self._datasets[dataset_name]
+
+            # Ensure min < max (swap if needed)
+            if min_val > max_val:
+                min_val, max_val = max_val, min_val
+                logger.info(f"Swapped min/max values to ensure correct order")
+
+            # Validate range is meaningful
+            if min_val == max_val:
+                error_msg = f"Invalid range: min ({min_val}) equals max ({max_val}). Please specify different values."
+                logger.error(error_msg)
+                self.errorOccurred.emit("Truncation Error", error_msg)
+                return ""
+
+            logger.info(f"Truncating {dataset_name} to range [{min_val}, {max_val}]")
+
+            # Use the truncate_range method from SpectralData
+            truncated_data = spectral_data.truncate_range(min_val, max_val)
+
+            # Validate result has data
+            if truncated_data.num_points < 2:
+                error_msg = f"Truncation resulted in only {truncated_data.num_points} points. Adjust the range to include more data."
+                logger.error(error_msg)
+                self.errorOccurred.emit("Truncation Error", error_msg)
+                return ""
+
+            # Create user-friendly names using helper
+            base_name = self._extract_clean_base_name(dataset_name)
+            file_safe_name = self._sanitize_filename(base_name)
+
+            # Save truncated data with readable filename
+            output_path = self._ensure_output_dir('curves') / f"{file_safe_name}_truncated_{min_val:.2f}_{max_val:.2f}.csv"
+            truncated_data.save(str(output_path))
+
+            # Add to datasets with only friendly name (no duplicates)
+            friendly_name = f"{base_name} - Truncated ({min_val:.1f} to {max_val:.1f})"
+            self._datasets[friendly_name] = truncated_data
+            self.dataLoaded.emit(friendly_name)
+
+            logger.info(f"Truncated data saved to {output_path}")
+            logger.info(f"Original points: {spectral_data.num_points}, Truncated points: {truncated_data.num_points}")
+
+            return str(output_path)
+
+        except Exception as e:
+            logger.error(f"Truncation error: {e}", exc_info=True)
+            self.errorOccurred.emit("Truncation Error", str(e))
+            return ""
+    # ========================================================================
+    # FILE/DATASET OPENING - Drag & Drop Support
+    # ========================================================================
+
+    @Slot(str)
+    def openItem(self, item_name: str):
+        """
+        Open an item from the project browser in appropriate viewer.
+
+        Handles:
+        - Datasets (SpectralData) -> Enhanced Plot Window
+        - CSV/Excel files -> Enhanced Table Window
+        - Images (PNG, TIFF, etc.) -> System image viewer
+        - Text files -> System text editor
+        """
+        try:
+            # Check if it's a dataset
+            if item_name in self._datasets:
+                self._open_dataset_in_plot(item_name)
+                return
+
+            # Check if it's a file path
+            from pathlib import Path
+            item_path = Path(item_name)
+
+            if item_path.exists() and item_path.is_file():
+                self._open_file_by_type(item_path)
+                return
+
+            # Try to find it in outputs
+            output_path = self._output_base_dir / item_name
+            if output_path.exists() and output_path.is_file():
+                self._open_file_by_type(output_path)
+                return
+
+            # Search in all subdirectories
+            for subdir in ['curves', 'maps', 'smoothed', 'derivatives', 'discretized', 'fft', 'peaks']:
+                search_path = self._output_base_dir / subdir / item_name
+                if search_path.exists() and search_path.is_file():
+                    self._open_file_by_type(search_path)
+                    return
+
+            logger.warning(f"Could not find item to open: {item_name}")
+            self.errorOccurred.emit("Not Found", f"Item not found: {item_name}")
+
+        except Exception as e:
+            logger.error(f"Error opening item: {e}", exc_info=True)
+            self.errorOccurred.emit("Open Error", str(e))
+
+    # Large dataset threshold - prompt user before opening
+    LARGE_DATASET_THRESHOLD = 500  # spectra count
+
+    def _open_dataset_in_plot(self, dataset_name: str):
+        """Open a dataset in both enhanced plot and table windows"""
+        logger.info(f"Opening dataset in plot and table: {dataset_name}")
+
+        dataset = self._datasets[dataset_name]
+
+        # Check if dataset is large - prompt user first
+        num_spectra = dataset.num_spectra if hasattr(dataset, 'num_spectra') else 0
+        num_points = len(dataset.independent_var) if hasattr(dataset, 'independent_var') else 0
+
+        if num_spectra > self.LARGE_DATASET_THRESHOLD:
+            logger.info(f"Large dataset detected: {num_spectra} spectra, {num_points} points - prompting user")
+            self.largeDatasetConfirmation.emit(dataset_name, num_spectra, num_points)
+            return
+
+        # Proceed with opening
+        self._do_open_dataset_in_plot(dataset_name)
+
+    @Slot(str)
+    def confirmOpenLargeDataset(self, dataset_name: str):
+        """Called when user confirms they want to open a large dataset"""
+        logger.info(f"User confirmed opening large dataset: {dataset_name}")
+        self._do_open_dataset_in_plot(dataset_name)
+
+    @Slot(str)
+    def cancelOpenLargeDataset(self, dataset_name: str):
+        """Called when user cancels opening a large dataset"""
+        logger.info(f"User cancelled opening large dataset: {dataset_name}")
+        self.status = "Ready"
+
+    def _do_open_dataset_in_plot(self, dataset_name: str):
+        """Actually open a dataset in both enhanced plot and table windows"""
+        from src.widgets.enhanced_plot_window import EnhancedPlotWindow
+        from src.widgets.enhanced_table_window import EnhancedTableWindow
+
+        dataset = self._datasets[dataset_name]
+
+        # Create plot window
+        self._window_id_counter += 1
+        graph_id = f"graph_{self._window_id_counter}"
+
+        plot_window = EnhancedPlotWindow(datasets={dataset_name: dataset})
+        plot_window.setWindowTitle(f"Plot: {dataset_name}")
+
+        # Auto-add first curve
+        if hasattr(dataset, 'independent_var'):
+            try:
+                x = dataset.independent_var
+                y = dataset.spectra.iloc[:, 0].values if dataset.num_spectra > 0 else []
+                if len(y) > 0:
+                    plot_window.canvas.add_curve(x, y, label=dataset_name)
+                    plot_window.canvas.set_labels(
+                        xlabel=dataset.independent_var_name,
+                        ylabel='Intensity',
+                        title=dataset_name
+                    )
+            except Exception as e:
+                logger.error(f"Error auto-plotting: {e}")
+
+        self.open_windows.append(plot_window)
+        graph_info = {
+            'window': plot_window,
+            'id': graph_id,
+            'title': dataset_name
+        }
+        self.open_graphs.append(graph_info)
+
+        plot_window.closed.connect(lambda: self._remove_graph(graph_id))
+        plot_window.show()
+
+        # Create table window asynchronously to avoid UI freeze for large datasets
+        self._create_table_async(dataset_name, dataset)
+
+        logger.info(f"Opened dataset {dataset_name} in plot window, table loading...")
+
+    def _create_table_async(self, dataset_name: str, dataset):
+        """Create table window asynchronously in worker thread"""
+        from PySide6.QtWidgets import QApplication
+
+        # Update status
+        self.status = f"Loading table for {dataset_name}..."
+        QApplication.processEvents()  # Keep UI responsive
+
+        # Check dataset size - if small, create immediately
+        if hasattr(dataset, 'num_spectra') and dataset.num_spectra <= 100:
+            # Small dataset - create table immediately
+            self._create_table_window(dataset_name, dataset)
+        else:
+            # Large dataset - use worker thread
+            logger.info(f"Large dataset detected ({dataset.num_spectra} spectra), loading table in background")
+            self.worker_manager.submit(
+                name=f"Load Table {dataset_name}",
+                operation=self._do_prepare_table_data,
+                dataset_name=dataset_name,
+                dataset=dataset,
+                on_finished=lambda table_data: self._on_table_data_ready(dataset_name, table_data)
+            )
+
+    def _do_prepare_table_data(self, task, dataset_name: str, dataset):
+        """Prepare table data in worker thread"""
+        # Check if cancelled
+        if task.cancelled:
+            logger.info("Table data preparation cancelled")
+            return None
+
+        logger.info(f"Preparing table data for {dataset_name} in worker thread")
+
+        # Convert dataset to DataFrame for table
+        if hasattr(dataset, 'data'):
+            table_data = dataset.data
+        else:
+            # Fallback: create DataFrame from independent var and spectra
+            import pandas as pd
+            table_data = dataset.spectra.copy()
+            table_data.insert(0, dataset.independent_var_name, dataset.independent_var)
+
+        logger.info(f"Table data prepared: {table_data.shape}")
+        return table_data
+
+    def _create_table_window(self, dataset_name: str, dataset):
+        """Create table window immediately (for small datasets)"""
+        from src.widgets.enhanced_table_window import EnhancedTableWindow
+
+        self._window_id_counter += 1
+        table_id = f"table_{self._window_id_counter}"
+
+        # Convert dataset to DataFrame for table
+        if hasattr(dataset, 'data'):
+            table_data = dataset.data
+        else:
+            # Fallback: create DataFrame from independent var and spectra
+            table_data = dataset.spectra.copy()
+            table_data.insert(0, dataset.independent_var_name, dataset.independent_var)
+
+        table_window = EnhancedTableWindow(data=table_data)
+        table_window.setWindowTitle(f"Table: {dataset_name}")
+
+        self.open_windows.append(table_window)
+        table_info = {
+            'window': table_window,
+            'id': table_id,
+            'title': dataset_name
+        }
+        self.open_tables.append(table_info)
+
+        table_window.closed.connect(lambda: self._remove_table(table_id))
+        table_window.show()
+
+        self.status = "Ready"
+        logger.info(f"Table window created for {dataset_name}")
+
+    def _on_table_data_ready(self, dataset_name: str, table_data):
+        """Called when table data is ready from worker thread"""
+        from src.widgets.enhanced_table_window import EnhancedTableWindow
+
+        if table_data is None:
+            logger.warning(f"Table data preparation was cancelled or failed for {dataset_name}")
+            self.status = "Ready"
+            return
+
+        self._window_id_counter += 1
+        table_id = f"table_{self._window_id_counter}"
+
+        table_window = EnhancedTableWindow(data=table_data)
+        table_window.setWindowTitle(f"Table: {dataset_name}")
+
+        self.open_windows.append(table_window)
+        table_info = {
+            'window': table_window,
+            'id': table_id,
+            'title': dataset_name
+        }
+        self.open_tables.append(table_info)
+
+        table_window.closed.connect(lambda: self._remove_table(table_id))
+        table_window.show()
+
+        self.status = "Ready"
+        logger.info(f"Table window created for {dataset_name} (loaded in background)")
+
+    @Slot(str, 'QVariantList')
+    def openDatasetWithCurves(self, dataset_name: str, curve_indices: List):
+        """Open a dataset in plot and table windows with specific curves selected"""
+        from src.widgets.enhanced_plot_window import EnhancedPlotWindow
+        from src.widgets.enhanced_table_window import EnhancedTableWindow
+
+        logger.info(f"Opening dataset with selected curves: {dataset_name}, curves: {curve_indices}")
+
+        if dataset_name not in self._datasets:
+            self.errorOccurred.emit("Error", f"Dataset not found: {dataset_name}")
+            return
+
+        dataset = self._datasets[dataset_name]
+
+        # Create plot window
+        self._window_id_counter += 1
+        graph_id = f"graph_{self._window_id_counter}"
+
+        plot_window = EnhancedPlotWindow(datasets={dataset_name: dataset})
+        plot_window.setWindowTitle(f"Plot: {dataset_name}")
+
+        # Add selected curves
+        if hasattr(dataset, 'independent_var'):
+            try:
+                x = dataset.independent_var
+                for idx in curve_indices:
+                    if 0 <= idx < dataset.num_spectra:
+                        y = dataset.spectra.iloc[:, idx].values
+                        if len(y) > 0:
+                            plot_window.canvas.add_curve(
+                                x, y,
+                                label=f"{dataset_name} - Curve {idx + 1}"
+                            )
+
+                # Set labels
+                plot_window.canvas.set_labels(
+                    xlabel=dataset.independent_var_name,
+                    ylabel='Intensity',
+                    title=dataset_name
+                )
+            except Exception as e:
+                logger.error(f"Error plotting curves: {e}")
+
+        self.open_windows.append(plot_window)
+        graph_info = {
+            'window': plot_window,
+            'id': graph_id,
+            'title': dataset_name
+        }
+        self.open_graphs.append(graph_info)
+
+        plot_window.closed.connect(lambda: self._remove_graph(graph_id))
+        plot_window.show()
+
+        # Create table window asynchronously to avoid UI freeze for large datasets
+        self._create_table_async(dataset_name, dataset)
+
+        logger.info(f"Opened dataset {dataset_name} with {len(curve_indices)} curves, table loading...")
+
+    def _open_file_by_type(self, file_path: Path):
+        """Open file in appropriate viewer based on extension"""
+        from src.widgets.enhanced_table_window import EnhancedTableWindow
+        import subprocess
+        import platform
+
+        extension = file_path.suffix.lower()
+
+        # CSV/Excel -> Table
+        if extension in ['.csv', '.xlsx', '.xls']:
+            self._open_file_in_table(file_path)
+
+        # Images -> System image viewer
+        elif extension in ['.png', '.jpg', '.jpeg', '.tiff', '.tif', '.bmp', '.gif']:
+            self._open_with_system_viewer(file_path)
+
+        # Text files -> System text editor
+        elif extension in ['.txt', '.log', '.md', '.json', '.xml', '.yaml', '.yml']:
+            self._open_with_system_viewer(file_path)
+
+        else:
+            # Try to open with system default
+            self._open_with_system_viewer(file_path)
+
+    def _open_file_in_table(self, file_path: Path):
+        """Open CSV/Excel file in table window"""
+        from src.widgets.enhanced_table_window import EnhancedTableWindow
+        import pandas as pd
+
+        try:
+            # Load data
+            if file_path.suffix.lower() == '.csv':
+                data = pd.read_csv(file_path)
+            elif file_path.suffix.lower() in ['.xlsx', '.xls']:
+                data = pd.read_excel(file_path)
+            else:
+                raise ValueError(f"Unsupported file type: {file_path.suffix}")
+
+            # Create table window
+            self._window_id_counter += 1
+            table_id = f"table_{self._window_id_counter}"
+
+            table_window = EnhancedTableWindow(data=data)
+            table_window.setWindowTitle(f"Table: {file_path.name}")
+
+            self.open_windows.append(table_window)
+            table_info = {
+                'window': table_window,
+                'id': table_id,
+                'title': file_path.name
+            }
+            self.open_tables.append(table_info)
+
+            table_window.closed.connect(lambda: self._remove_table(table_id))
+            table_window.show()
+
+            logger.info(f"Opened file in table: {file_path}")
+
+        except Exception as e:
+            logger.error(f"Error opening file in table: {e}", exc_info=True)
+            self.errorOccurred.emit("Open Error", f"Failed to open file:\n{e}")
+
+    def _open_with_system_viewer(self, file_path: Path):
+        """Open file with system default application"""
+        import subprocess
+        import platform
+
+        try:
+            system = platform.system()
+
+            if system == 'Darwin':  # macOS
+                subprocess.run(['open', str(file_path)], check=True)
+            elif system == 'Windows':
+                subprocess.run(['start', '', str(file_path)], shell=True, check=True)
+            else:  # Linux
+                subprocess.run(['xdg-open', str(file_path)], check=True)
+
+            logger.info(f"Opened with system viewer: {file_path}")
+
+        except Exception as e:
+            logger.error(f"Error opening with system viewer: {e}", exc_info=True)
+            self.errorOccurred.emit("Open Error", f"Failed to open file:\n{e}")
+
+    # ========================================================================
+    # IMAGE IMPORT - For Map Editor
+    # ========================================================================
+
+    @Slot(str)
+    def importImage(self, file_path: str):
+        """
+        Import an image file (TIFF, PNG, NPY, etc.) and open it in the Map Editor.
+
+        Parameters:
+            file_path: Path to the image file
+        """
+        try:
+            path = Path(file_path)
+            if not path.exists():
+                self.errorOccurred.emit("File Not Found", f"File not found: {file_path}")
+                return
+
+            logger.info(f"Importing image: {path}")
+            self.status = f"Importing {path.name}..."
+
+            extension = path.suffix.lower()
+
+            # Load image based on format
+            if extension in ['.tif', '.tiff']:
+                import tifffile
+                data = tifffile.imread(str(path))
+            elif extension in ['.png', '.jpg', '.jpeg', '.bmp']:
+                from PIL import Image
+                img = Image.open(str(path))
+                # Convert to grayscale if RGB
+                if img.mode == 'RGB' or img.mode == 'RGBA':
+                    img = img.convert('L')
+                data = np.array(img, dtype=np.float64)
+            elif extension == '.npy':
+                data = np.load(str(path))
+            elif extension == '.gsf':
+                # Gwyddion Simple Field format - basic parser
+                data = self._load_gsf(path)
+            else:
+                self.errorOccurred.emit("Unsupported Format", f"Unsupported image format: {extension}")
+                return
+
+            # Ensure 2D
+            if data.ndim == 3:
+                # Multi-channel image - take first channel or average
+                if data.shape[2] <= 4:  # RGB(A)
+                    data = np.mean(data, axis=2)
+                elif data.shape[0] <= 4:  # Channel-first format
+                    data = np.mean(data, axis=0)
+                else:
+                    data = data[0]  # Take first slice
+
+            if data.ndim != 2:
+                self.errorOccurred.emit("Invalid Image", f"Could not convert to 2D image: shape={data.shape}")
+                return
+
+            # Create a dataset name
+            dataset_name = f"Image_{path.stem}"
+            counter = 1
+            while dataset_name in self._datasets:
+                dataset_name = f"Image_{path.stem}_{counter}"
+                counter += 1
+
+            # Store as map data in Maps list
+            self._window_id_counter += 1
+            map_id = f"map_{self._window_id_counter}"
+
+            # Copy to maps directory
+            if self._output_base_dir:
+                maps_dir = self._output_base_dir / "maps"
+                maps_dir.mkdir(parents=True, exist_ok=True)
+                dest_path = maps_dir / f"{dataset_name}{extension}"
+
+                # Save data
+                if extension in ['.tif', '.tiff']:
+                    import tifffile
+                    tifffile.imwrite(str(dest_path), data.astype(np.float32))
+                else:
+                    np.save(str(maps_dir / f"{dataset_name}.npy"), data)
+                    dest_path = maps_dir / f"{dataset_name}.npy"
+
+                # Emit map created signal
+                self.mapCreated.emit(map_id, dataset_name)
+
+            # Store map data for the Map Editor to access
+            self._imported_map_data = data
+            self._imported_map_name = dataset_name
+            self._imported_map_path = str(path)
+
+            # Emit signal to open in Map Editor tab (docked, not separate window)
+            self.imageImported.emit(dataset_name, str(path), map_id)
+
+            self.status = f"Imported: {dataset_name}"
+            logger.info(f"Image imported: {dataset_name}, shape={data.shape}")
+
+        except Exception as e:
+            logger.error(f"Error importing image: {e}", exc_info=True)
+            self.errorOccurred.emit("Import Error", f"Failed to import image:\n{e}")
+            self.status = "Ready"
+
+    @Slot(result='QVariantMap')
+    def getImportedMapData(self) -> Dict:
+        """
+        Get the most recently imported map data for the Map Editor.
+
+        Returns:
+            Dict with 'data' (as list of lists), 'name', 'path', 'rows', 'cols'
+        """
+        if self._imported_map_data is None:
+            return {'error': 'No map data available'}
+
+        return {
+            'data': self._imported_map_data.tolist(),
+            'name': self._imported_map_name,
+            'path': self._imported_map_path,
+            'rows': self._imported_map_data.shape[0],
+            'cols': self._imported_map_data.shape[1]
+        }
+
+    @Slot()
+    def clearImportedMapData(self):
+        """Clear the imported map data after it has been consumed."""
+        self._imported_map_data = None
+        self._imported_map_name = ""
+        self._imported_map_path = ""
+
+    def _load_gsf(self, path: Path) -> np.ndarray:
+        """
+        Load Gwyddion Simple Field (.gsf) format.
+        Basic implementation - extend as needed.
+        """
+        with open(path, 'rb') as f:
+            # Check magic
+            magic = f.read(4)
+            if magic != b'Gwyd':
+                raise ValueError("Not a valid GSF file")
+
+            # Read header
+            header = {}
+            while True:
+                line = b''
+                while True:
+                    char = f.read(1)
+                    if char == b'\n' or char == b'\x00':
+                        break
+                    line += char
+
+                line = line.decode('utf-8').strip()
+                if not line:
+                    break
+
+                if '=' in line:
+                    key, value = line.split('=', 1)
+                    header[key.strip()] = value.strip()
+
+            # Read data
+            xres = int(header.get('XRes', 256))
+            yres = int(header.get('YRes', 256))
+
+            # Skip to data (after null byte)
+            f.read(1)
+
+            # Read binary data
+            data = np.frombuffer(f.read(), dtype=np.float32)
+            data = data[:xres * yres].reshape((yres, xres))
+
+            return data

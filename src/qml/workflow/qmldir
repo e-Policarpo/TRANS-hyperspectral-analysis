@@ -1,0 +1,4 @@
+module workflow
+WorkflowWindow 1.0 WorkflowWindow.qml
+WorkflowNode 1.0 WorkflowNode.qml
+NodeParameterEditor 1.0 NodeParameterEditor.qml

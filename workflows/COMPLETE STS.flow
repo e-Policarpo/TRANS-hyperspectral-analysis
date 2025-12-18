@@ -1,0 +1,457 @@
+{
+  "id": "3b19d2d1",
+  "name": "COMPLETE STS",
+  "description": "",
+  "nodes": [
+    {
+      "id": "e28b6ce4",
+      "tool_name": "DatasetInput",
+      "display_name": "Dataset Input",
+      "x": 70.25530670578343,
+      "y": -244.2003291953847,
+      "inputs": [],
+      "outputs": [
+        {
+          "id": "dataset",
+          "name": "Dataset",
+          "port_type": "dataset",
+          "is_input": false,
+          "required": false,
+          "default_value": null,
+          "description": "Selected dataset",
+          "multi_input": false
+        }
+      ],
+      "parameters": {
+        "dataset_name": "STS_hyperspec_MnBi2Te4_1_Mixed"
+      }
+    },
+    {
+      "id": "4d6b3c7d",
+      "tool_name": "Derivative",
+      "display_name": "Derivative",
+      "x": 77.23238176156417,
+      "y": 135.19680031308758,
+      "inputs": [
+        {
+          "id": "dataset",
+          "name": "Dataset",
+          "port_type": "dataset",
+          "is_input": true,
+          "required": true,
+          "default_value": null,
+          "description": "",
+          "multi_input": false
+        }
+      ],
+      "outputs": [
+        {
+          "id": "derivative",
+          "name": "Derivative",
+          "port_type": "dataset",
+          "is_input": false,
+          "required": false,
+          "default_value": null,
+          "description": "Derivative data",
+          "multi_input": false
+        }
+      ],
+      "parameters": {
+        "order": 1.0,
+        "smooth_before": true,
+        "smooth_after": true
+      }
+    },
+    {
+      "id": "544671a3",
+      "tool_name": "CurveFitting",
+      "display_name": "Baseline Correction",
+      "x": 75.61554037336361,
+      "y": 242.10084970062053,
+      "inputs": [
+        {
+          "id": "dataset",
+          "name": "Dataset",
+          "port_type": "dataset",
+          "is_input": true,
+          "required": true,
+          "default_value": null,
+          "description": "",
+          "multi_input": false
+        }
+      ],
+      "outputs": [
+        {
+          "id": "corrected",
+          "name": "Corrected",
+          "port_type": "dataset",
+          "is_input": false,
+          "required": false,
+          "default_value": null,
+          "description": "Baseline-corrected data",
+          "multi_input": false
+        }
+      ],
+      "parameters": {
+        "fit_type": "endpoints",
+        "degree": 1.0,
+        "als_lambda": 100000.0,
+        "als_p": 0.01
+      }
+    },
+    {
+      "id": "4cfc9ca6",
+      "tool_name": "TruncateData",
+      "display_name": "Truncate Data",
+      "x": 80.42908588696685,
+      "y": 23.285550601179125,
+      "inputs": [
+        {
+          "id": "dataset",
+          "name": "Dataset",
+          "port_type": "dataset",
+          "is_input": true,
+          "required": true,
+          "default_value": null,
+          "description": "",
+          "multi_input": false
+        }
+      ],
+      "outputs": [
+        {
+          "id": "truncated",
+          "name": "Truncated",
+          "port_type": "dataset",
+          "is_input": false,
+          "required": false,
+          "default_value": null,
+          "description": "Truncated data",
+          "multi_input": false
+        }
+      ],
+      "parameters": {
+        "x_min": -0.4,
+        "x_max": 0.4
+      }
+    },
+    {
+      "id": "b3440456",
+      "tool_name": "Integration",
+      "display_name": "Integration",
+      "x": 488.6750506301387,
+      "y": 464.37771399232213,
+      "inputs": [
+        {
+          "id": "dataset",
+          "name": "Dataset",
+          "port_type": "dataset",
+          "is_input": true,
+          "required": true,
+          "default_value": null,
+          "description": "",
+          "multi_input": false
+        },
+        {
+          "id": "intervals",
+          "name": "Intervals",
+          "port_type": "intervals",
+          "is_input": true,
+          "required": false,
+          "default_value": null,
+          "description": "Optional intervals from Peak Finder",
+          "multi_input": false
+        }
+      ],
+      "outputs": [
+        {
+          "id": "flat_data",
+          "name": "Flat Data",
+          "port_type": "flat_data",
+          "is_input": false,
+          "required": false,
+          "default_value": null,
+          "description": "Flattened data (one value per curve)",
+          "multi_input": false
+        },
+        {
+          "id": "intervals_out",
+          "name": "Intervals",
+          "port_type": "intervals",
+          "is_input": false,
+          "required": false,
+          "default_value": null,
+          "description": "Pass-through intervals",
+          "multi_input": false
+        }
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "1c5a23d8",
+      "tool_name": "FlatDataOutput",
+      "display_name": "Flat Data Output",
+      "x": 847.0266678135398,
+      "y": 454.64206835171683,
+      "inputs": [
+        {
+          "id": "flat_data",
+          "name": "Flat Data",
+          "port_type": "flat_data",
+          "is_input": true,
+          "required": true,
+          "default_value": null,
+          "description": "",
+          "multi_input": false
+        }
+      ],
+      "outputs": [],
+      "parameters": {
+        "output_name": "Integrated dI/dV",
+        "save_csv": true
+      }
+    },
+    {
+      "id": "2a00390b",
+      "tool_name": "MapOutput",
+      "display_name": "Map Output",
+      "x": 847.537103506764,
+      "y": 563.9143774784446,
+      "inputs": [
+        {
+          "id": "map",
+          "name": "Map",
+          "port_type": "image",
+          "is_input": true,
+          "required": true,
+          "default_value": null,
+          "description": "",
+          "multi_input": false
+        }
+      ],
+      "outputs": [],
+      "parameters": {
+        "output_name": "dI/dV Map",
+        "display": true
+      }
+    },
+    {
+      "id": "ab7664f4",
+      "tool_name": "DatasetOutput",
+      "display_name": "Dataset Output",
+      "x": 834.9468882325277,
+      "y": -317.7598808412416,
+      "inputs": [
+        {
+          "id": "dataset",
+          "name": "Dataset",
+          "port_type": "dataset",
+          "is_input": true,
+          "required": true,
+          "default_value": null,
+          "description": "",
+          "multi_input": false
+        }
+      ],
+      "outputs": [],
+      "parameters": {
+        "output_name": "Truncated I-V"
+      }
+    },
+    {
+      "id": "12044daf",
+      "tool_name": "DatasetOutput",
+      "display_name": "Dataset Output",
+      "x": 832.8529724679101,
+      "y": -37.682756882893045,
+      "inputs": [
+        {
+          "id": "dataset",
+          "name": "Dataset",
+          "port_type": "dataset",
+          "is_input": true,
+          "required": true,
+          "default_value": null,
+          "description": "",
+          "multi_input": false
+        }
+      ],
+      "outputs": [],
+      "parameters": {
+        "output_name": "Truncated dI/dV"
+      }
+    },
+    {
+      "id": "aba77a07",
+      "tool_name": "MapGenerator",
+      "display_name": "Map Generator",
+      "x": 634.6033583195266,
+      "y": 602.2778396422959,
+      "inputs": [
+        {
+          "id": "flat_data",
+          "name": "Flat Dataset",
+          "port_type": "flat_data",
+          "is_input": true,
+          "required": true,
+          "default_value": null,
+          "description": "",
+          "multi_input": false
+        }
+      ],
+      "outputs": [
+        {
+          "id": "maps",
+          "name": "Maps",
+          "port_type": "any",
+          "is_input": false,
+          "required": false,
+          "default_value": null,
+          "description": "List of generated TIFF map paths",
+          "multi_input": false
+        }
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "75955e39",
+      "tool_name": "PeakFinder",
+      "display_name": "Peak Finder",
+      "x": 179.48886556636114,
+      "y": 483.51763829101014,
+      "inputs": [
+        {
+          "id": "dataset",
+          "name": "Dataset",
+          "port_type": "dataset",
+          "is_input": true,
+          "required": true,
+          "default_value": null,
+          "description": "",
+          "multi_input": false
+        }
+      ],
+      "outputs": [
+        {
+          "id": "peaks",
+          "name": "Peaks",
+          "port_type": "table",
+          "is_input": false,
+          "required": false,
+          "default_value": null,
+          "description": "Peak information table (CSV)",
+          "multi_input": false
+        },
+        {
+          "id": "intervals",
+          "name": "Peak Intervals",
+          "port_type": "intervals",
+          "is_input": false,
+          "required": false,
+          "default_value": null,
+          "description": "Non-overlapping intervals around peaks for integration",
+          "multi_input": false
+        }
+      ],
+      "parameters": {
+        "prominence": 1e-07,
+        "min_distance": 5.0,
+        "fwhm_multiplier": 1.5
+      }
+    },
+    {
+      "id": "6c54fbb5",
+      "tool_name": "DatasetOutput",
+      "display_name": "Dataset Output",
+      "x": 834.3657249079886,
+      "y": -176.20520720178507,
+      "inputs": [
+        {
+          "id": "dataset",
+          "name": "Dataset",
+          "port_type": "dataset",
+          "is_input": true,
+          "required": true,
+          "default_value": null,
+          "description": "",
+          "multi_input": false
+        }
+      ],
+      "outputs": [],
+      "parameters": {
+        "output_name": "Discrete dI/dV"
+      }
+    },
+    {
+      "id": "f85ea965",
+      "tool_name": "CommentNode",
+      "display_name": "Comment",
+      "x": 75.30693922946205,
+      "y": -106.41921582125087,
+      "inputs": [],
+      "outputs": [],
+      "parameters": {
+        "text": "INPUT AND BASIC PROCESSING",
+        "color": "yellow"
+      }
+    },
+    {
+      "id": "4444f2ba",
+      "tool_name": "SpatialAverage",
+      "display_name": "Spatial Average",
+      "x": 369.57964431771165,
+      "y": -121.344925706136,
+      "inputs": [
+        {
+          "id": "datasets",
+          "name": "Datasets",
+          "port_type": "any",
+          "is_input": true,
+          "required": false,
+          "default_value": null,
+          "description": "One or more datasets to process",
+          "multi_input": true
+        },
+        {
+          "id": "flat_data_inputs",
+          "name": "Flat Data",
+          "port_type": "any",
+          "is_input": true,
+          "required": false,
+          "default_value": null,
+          "description": "One or more flat data inputs to process",
+          "multi_input": true
+        }
+      ],
+      "outputs": [
+        {
+          "id": "averaged_datasets",
+          "name": "Averaged Datasets",
+          "port_type": "any",
+          "is_input": false,
+          "required": false,
+          "default_value": null,
+          "description": "Spatially averaged datasets (list)",
+          "multi_input": false
+        },
+        {
+          "id": "averaged_flat_data",
+          "name": "Averaged Flat Data",
+          "port_type": "any",
+          "is_input": false,
+          "required": false,
+          "default_value": null,
+          "description": "Spatially averaged flat data (list)",
+          "multi_input": false
+        }
+      ],
+      "parameters": {
+        "block_x": 2.0,
+        "block_y": 2.0,
+        "input_queue": []
+      }
+    }
+  ],
+  "connections": [],
+  "created": "2025-12-15T20:20:00.000000",
+  "modified": "2025-12-17T15:00:00.000000"
+}

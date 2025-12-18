@@ -1,0 +1,319 @@
+{
+  "id": "6a73530e",
+  "name": "New Workflow",
+  "description": "",
+  "nodes": [
+    {
+      "id": "161386e5",
+      "tool_name": "DatasetInput",
+      "display_name": "Dataset Input",
+      "x": -82.27592485649433,
+      "y": 7.3301787120691415,
+      "inputs": [],
+      "outputs": [
+        {
+          "id": "dataset",
+          "name": "Dataset",
+          "port_type": "dataset",
+          "is_input": false,
+          "required": false,
+          "default_value": null,
+          "description": "Selected dataset"
+        }
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "c6b1bde7",
+      "tool_name": "Derivative",
+      "display_name": "Derivative",
+      "x": -63.69337300857393,
+      "y": 164.69308683445283,
+      "inputs": [
+        {
+          "id": "dataset",
+          "name": "Dataset",
+          "port_type": "dataset",
+          "is_input": true,
+          "required": true,
+          "default_value": null,
+          "description": ""
+        }
+      ],
+      "outputs": [
+        {
+          "id": "derivative",
+          "name": "Derivative",
+          "port_type": "dataset",
+          "is_input": false,
+          "required": false,
+          "default_value": null,
+          "description": "Derivative data"
+        }
+      ],
+      "parameters": {
+        "order": 1,
+        "smooth_before": true,
+        "smooth_after": true
+      }
+    },
+    {
+      "id": "f857a594",
+      "tool_name": "CurveFitting",
+      "display_name": "Baseline Correction",
+      "x": 185.87052763636467,
+      "y": 71.17736226077906,
+      "inputs": [
+        {
+          "id": "dataset",
+          "name": "Dataset",
+          "port_type": "dataset",
+          "is_input": true,
+          "required": true,
+          "default_value": null,
+          "description": ""
+        }
+      ],
+      "outputs": [
+        {
+          "id": "corrected",
+          "name": "Corrected",
+          "port_type": "dataset",
+          "is_input": false,
+          "required": false,
+          "default_value": null,
+          "description": "Baseline-corrected data"
+        }
+      ],
+      "parameters": {
+        "fit_type": "polynomial",
+        "degree": 2
+      }
+    },
+    {
+      "id": "65f0326f",
+      "tool_name": "PeakFinder",
+      "display_name": "Peak Finder",
+      "x": 402.2039938712164,
+      "y": 176.08406676089123,
+      "inputs": [
+        {
+          "id": "dataset",
+          "name": "Dataset",
+          "port_type": "dataset",
+          "is_input": true,
+          "required": true,
+          "default_value": null,
+          "description": ""
+        }
+      ],
+      "outputs": [
+        {
+          "id": "peaks",
+          "name": "Peaks",
+          "port_type": "table",
+          "is_input": false,
+          "required": false,
+          "default_value": null,
+          "description": "Peak information table"
+        },
+        {
+          "id": "intervals",
+          "name": "Peak Intervals",
+          "port_type": "intervals",
+          "is_input": false,
+          "required": false,
+          "default_value": null,
+          "description": "Intervals around peaks for integration"
+        }
+      ],
+      "parameters": {
+        "prominence": 0.1,
+        "min_distance": 5,
+        "interval_width": 10.0
+      }
+    },
+    {
+      "id": "c6bb7844",
+      "tool_name": "Integration",
+      "display_name": "Integration",
+      "x": 610.12607274539,
+      "y": 23.311336590785032,
+      "inputs": [
+        {
+          "id": "dataset",
+          "name": "Dataset",
+          "port_type": "dataset",
+          "is_input": true,
+          "required": true,
+          "default_value": null,
+          "description": ""
+        },
+        {
+          "id": "intervals",
+          "name": "Intervals",
+          "port_type": "intervals",
+          "is_input": true,
+          "required": false,
+          "default_value": null,
+          "description": "Optional intervals from Peak Finder"
+        }
+      ],
+      "outputs": [
+        {
+          "id": "flat_data",
+          "name": "Flat Data",
+          "port_type": "flat_data",
+          "is_input": false,
+          "required": false,
+          "default_value": null,
+          "description": "Flattened data (one value per curve)"
+        },
+        {
+          "id": "intervals_out",
+          "name": "Intervals",
+          "port_type": "intervals",
+          "is_input": false,
+          "required": false,
+          "default_value": null,
+          "description": "Pass-through intervals"
+        }
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "c6f2a8d6",
+      "tool_name": "MapGenerator",
+      "display_name": "Map Generator",
+      "x": 893.741245114177,
+      "y": 46.74854511344492,
+      "inputs": [
+        {
+          "id": "flat_data",
+          "name": "Flat Dataset",
+          "port_type": "flat_data",
+          "is_input": true,
+          "required": true,
+          "default_value": null,
+          "description": ""
+        }
+      ],
+      "outputs": [
+        {
+          "id": "map",
+          "name": "Map",
+          "port_type": "image",
+          "is_input": false,
+          "required": false,
+          "default_value": null,
+          "description": "Generated map image"
+        }
+      ],
+      "parameters": {
+        "value_index": 0
+      }
+    },
+    {
+      "id": "5e771757",
+      "tool_name": "MapOutput",
+      "display_name": "Map Output",
+      "x": 1017.1826802936823,
+      "y": 275.9536594180872,
+      "inputs": [
+        {
+          "id": "map",
+          "name": "Map",
+          "port_type": "image",
+          "is_input": true,
+          "required": true,
+          "default_value": null,
+          "description": ""
+        }
+      ],
+      "outputs": [],
+      "parameters": {
+        "display": true
+      }
+    },
+    {
+      "id": "9f3814b4",
+      "tool_name": "DatasetOutput",
+      "display_name": "Dataset Output",
+      "x": 121.04476585708903,
+      "y": 501.8565360540488,
+      "inputs": [
+        {
+          "id": "dataset",
+          "name": "Dataset",
+          "port_type": "dataset",
+          "is_input": true,
+          "required": true,
+          "default_value": null,
+          "description": ""
+        }
+      ],
+      "outputs": [],
+      "parameters": {}
+    }
+  ],
+  "connections": [
+    {
+      "id": "d64be1bf",
+      "source_node_id": "161386e5",
+      "source_port_id": "dataset",
+      "target_node_id": "c6b1bde7",
+      "target_port_id": "dataset"
+    },
+    {
+      "id": "68c5b7dd",
+      "source_node_id": "c6b1bde7",
+      "source_port_id": "derivative",
+      "target_node_id": "f857a594",
+      "target_port_id": "dataset"
+    },
+    {
+      "id": "a92d13e4",
+      "source_node_id": "f857a594",
+      "source_port_id": "corrected",
+      "target_node_id": "65f0326f",
+      "target_port_id": "dataset"
+    },
+    {
+      "id": "1ff495e1",
+      "source_node_id": "f857a594",
+      "source_port_id": "corrected",
+      "target_node_id": "c6bb7844",
+      "target_port_id": "dataset"
+    },
+    {
+      "id": "a63ce241",
+      "source_node_id": "65f0326f",
+      "source_port_id": "intervals",
+      "target_node_id": "c6bb7844",
+      "target_port_id": "intervals"
+    },
+    {
+      "id": "ad05aa29",
+      "source_node_id": "c6bb7844",
+      "source_port_id": "flat_data",
+      "target_node_id": "c6f2a8d6",
+      "target_port_id": "flat_data"
+    },
+    {
+      "id": "1c3c83f4",
+      "source_node_id": "c6f2a8d6",
+      "source_port_id": "map",
+      "target_node_id": "5e771757",
+      "target_port_id": "map"
+    },
+    {
+      "id": "cebe9085",
+      "source_node_id": "c6b1bde7",
+      "source_port_id": "derivative",
+      "target_node_id": "9f3814b4",
+      "target_port_id": "dataset"
+    }
+  ],
+  "created": "2025-12-10T13:04:31.745768",
+  "modified": "2025-12-10T13:07:46.422760"
+}

@@ -1,0 +1,542 @@
+"""
+Project Manager for .HRT (Hyperspectral Research Tool) project files
+Handles save/load of complete project state including datasets and window configurations.
+
+File Format v2.0 (QtiPlot-inspired):
+- JSON header with metadata, window configurations, and small data
+- Binary sections for large numpy arrays (base64 encoded for JSON compatibility)
+- Efficient compression for repeated data patterns
+T.R.A.N.S. - Tools for Research and Analysis for Nano Spectroscopy
+Made by Eduarda Policarpo, with love 🩵🩷🤍🩷🩵
+Contact: eduardapolicarpo.fisica@gmail.com
+Date: December 2025
+License: GPL
+"""
+
+import json
+import logging
+import gzip
+import io
+from pathlib import Path
+from typing import Dict, Optional, Any, List
+from datetime import datetime
+import numpy as np
+import base64
+
+logger = logging.getLogger(__name__)
+
+# File format version
+FORMAT_VERSION = "2.0"
+
+
+class ProjectManager:
+    """
+    Manages .HRT project files with save/load functionality.
+
+    Format Structure (v2.0):
+    {
+        "format_version": "2.0",
+        "application": "TRANS-QML",
+        "created": ISO datetime,
+        "modified": ISO datetime,
+        "metadata": {project name, description, etc.},
+        "datasets": {
+            "name": {
+                "type": "SpectralData",
+                "metadata": {...},
+                "data_binary": base64-encoded compressed numpy array,
+                "independent_var_binary": base64-encoded numpy array
+            }
+        },
+        "windows": {
+            "tables": [{id, title, geometry, data_source, columns, formulas}],
+            "graphs": [{id, title, geometry, curves, axes_config}]
+        },
+        "workspace": {
+            "main_window": {geometry, tab_index},
+            "dock_layout": {...}
+        }
+    }
+    """
+
+    def __init__(self):
+        self.current_project_path: Optional[Path] = None
+        self.project_modified: bool = False
+
+    def save_project(self, project_path: Path, project_data: Dict[str, Any]) -> bool:
+        """
+        Save project to .HRT file with optimized binary storage.
+
+        Parameters:
+        -----------
+        project_path : Path
+            Path to save project file
+        project_data : Dict
+            Dictionary containing:
+            - datasets: Dict[str, SpectralData]
+            - tables: List of table window states
+            - graphs: List of graph window states
+            - workspace: Main window and dock layout state
+            - metadata: Project metadata
+
+        Returns:
+        --------
+        bool : Success status
+        """
+        try:
+            logger.info(f"Saving project to {project_path}")
+
+            # Ensure .hrt extension
+            if project_path.suffix.lower() != '.hrt':
+                project_path = project_path.with_suffix('.hrt')
+
+            # Create project structure
+            project_json = {
+                'format_version': FORMAT_VERSION,
+                'application': 'TRANS-QML',
+                'created': project_data.get('created', datetime.now().isoformat()),
+                'modified': datetime.now().isoformat(),
+                'metadata': project_data.get('metadata', {
+                    'name': project_path.stem,
+                    'description': ''
+                }),
+                'datasets': self._serialize_datasets(project_data.get('datasets', {})),
+                'windows': {
+                    'tables': project_data.get('tables', []),
+                    'graphs': project_data.get('graphs', []),
+                    'map_editor': project_data.get('map_editor', None)
+                },
+                'workspace': project_data.get('workspace', {})
+            }
+
+            # Save to file (compressed)
+            json_str = json.dumps(project_json, ensure_ascii=False)
+            compressed = gzip.compress(json_str.encode('utf-8'))
+
+            with open(project_path, 'wb') as f:
+                # Write magic header for format detection
+                f.write(b'HRT2')  # Magic bytes for v2.0
+                f.write(compressed)
+
+            self.current_project_path = project_path
+            self.project_modified = False
+
+            # Log file size
+            file_size = project_path.stat().st_size
+            logger.info(f"Project saved successfully: {project_path} ({file_size / 1024:.1f} KB)")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error saving project: {e}", exc_info=True)
+            return False
+
+    def load_project(self, project_path: Path) -> Optional[Dict[str, Any]]:
+        """
+        Load project from .HRT file.
+
+        Parameters:
+        -----------
+        project_path : Path
+            Path to project file
+
+        Returns:
+        --------
+        Dict or None : Project data dictionary or None if failed
+        """
+        try:
+            logger.info(f"Loading project from {project_path}")
+
+            if not project_path.exists():
+                logger.error(f"Project file not found: {project_path}")
+                return None
+
+            with open(project_path, 'rb') as f:
+                # Check magic header
+                magic = f.read(4)
+
+                if magic == b'HRT2':
+                    # v2.0 format - compressed
+                    compressed = f.read()
+                    json_str = gzip.decompress(compressed).decode('utf-8')
+                    project_json = json.loads(json_str)
+                else:
+                    # Legacy v1.0 format - plain JSON
+                    f.seek(0)
+                    project_json = json.load(f)
+
+            # Validate version
+            version = project_json.get('format_version', project_json.get('version', '1.0'))
+            logger.info(f"Loading project format version: {version}")
+
+            # Deserialize datasets
+            datasets = self._deserialize_datasets(project_json.get('datasets', {}))
+
+            # Build project data
+            windows = project_json.get('windows', {})
+            project_data = {
+                'created': project_json.get('created'),
+                'modified': project_json.get('modified'),
+                'metadata': project_json.get('metadata', {}),
+                'datasets': datasets,
+                'tables': windows.get('tables', project_json.get('tables', [])),
+                'graphs': windows.get('graphs', project_json.get('plots', [])),
+                'map_editor': windows.get('map_editor', None),
+                'workspace': project_json.get('workspace', {})
+            }
+
+            self.current_project_path = project_path
+            self.project_modified = False
+            logger.info(f"Project loaded successfully: {project_path}")
+            return project_data
+
+        except Exception as e:
+            logger.error(f"Error loading project: {e}", exc_info=True)
+            return None
+
+    def _serialize_datasets(self, datasets: Dict) -> Dict:
+        """
+        Serialize datasets with binary storage for large arrays.
+        Uses numpy's efficient binary format with gzip compression.
+        """
+        serialized = {}
+        for name, dataset in datasets.items():
+            try:
+                if hasattr(dataset, 'spectra') and hasattr(dataset, 'metadata'):
+                    # SpectralData object - use binary format for data
+
+                    # Serialize spectra DataFrame to numpy array
+                    spectra_array = dataset.spectra.values
+                    independent_var = dataset.independent_var
+
+                    # Compress and encode as base64
+                    spectra_binary = self._numpy_to_base64(spectra_array)
+                    indep_binary = self._numpy_to_base64(independent_var)
+
+                    # Get column names
+                    column_names = dataset.spectra.columns.tolist()
+
+                    # Safely serialize additional_info (filter out non-serializable items)
+                    additional_info = self._make_json_serializable(
+                        dataset.metadata.additional_info if dataset.metadata.additional_info else {}
+                    )
+
+                    # Safely serialize units
+                    units = self._make_json_serializable(
+                        dataset.metadata.units if dataset.metadata.units else {}
+                    )
+
+                    serialized[name] = {
+                        'type': 'SpectralData',
+                        'format': 'binary',
+                        'shape': list(spectra_array.shape),
+                        'columns': column_names,
+                        'data_binary': spectra_binary,
+                        'independent_var_binary': indep_binary,
+                        'independent_var_name': dataset.independent_var_name,
+                        'metadata': {
+                            'source_type': dataset.metadata.source_type,
+                            'dimensions': list(dataset.metadata.dimensions),
+                            'scan_mode': dataset.metadata.scan_mode,
+                            'units': units,
+                            'acquisition_date': dataset.metadata.acquisition_date,
+                            'additional_info': additional_info
+                        }
+                    }
+                    logger.debug(f"Serialized dataset {name}: shape={spectra_array.shape}")
+
+                elif hasattr(dataset, 'to_dict'):
+                    # DataFrame - convert to binary if large
+                    values = dataset.values
+                    if values.size > 1000:
+                        serialized[name] = {
+                            'type': 'DataFrame',
+                            'format': 'binary',
+                            'shape': list(values.shape),
+                            'columns': dataset.columns.tolist(),
+                            'data_binary': self._numpy_to_base64(values)
+                        }
+                    else:
+                        serialized[name] = {
+                            'type': 'DataFrame',
+                            'format': 'json',
+                            'data': dataset.to_dict('list')
+                        }
+                else:
+                    logger.warning(f"Skipping unsupported dataset type: {type(dataset).__name__} for {name}")
+
+            except Exception as e:
+                logger.error(f"Error serializing dataset {name}: {e}", exc_info=True)
+
+        return serialized
+
+    def _make_json_serializable(self, obj):
+        """
+        Recursively convert an object to be JSON serializable.
+        Handles numpy arrays, numpy scalars, and other common types.
+        """
+        if obj is None:
+            return None
+        elif isinstance(obj, dict):
+            return {k: self._make_json_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [self._make_json_serializable(item) for item in obj]
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, (np.integer, np.floating)):
+            return obj.item()
+        elif isinstance(obj, (np.bool_,)):
+            return bool(obj)
+        elif isinstance(obj, (str, int, float, bool)):
+            return obj
+        else:
+            # For non-serializable objects, convert to string representation
+            try:
+                # Try to convert to a basic type
+                return str(obj)
+            except:
+                logger.warning(f"Could not serialize object of type {type(obj).__name__}, skipping")
+                return None
+
+    def _deserialize_datasets(self, serialized: Dict) -> Dict:
+        """
+        Deserialize datasets from JSON/binary format.
+        """
+        import pandas as pd
+        from src.models.spectral_data import SpectralData, SpectralMetadata
+
+        datasets = {}
+        for name, data in serialized.items():
+            try:
+                dtype = data.get('type', 'unknown')
+                fmt = data.get('format', 'json')
+
+                if dtype == 'SpectralData':
+                    if fmt == 'binary':
+                        # Reconstruct from binary
+                        spectra_array = self._base64_to_numpy(data['data_binary'])
+                        independent_var = self._base64_to_numpy(data['independent_var_binary'])
+                        columns = data.get('columns', [f'Spectrum_{i}' for i in range(spectra_array.shape[1])])
+
+                        # Create DataFrame
+                        df = pd.DataFrame(spectra_array, columns=columns)
+                        indep_name = data.get('independent_var_name', 'X')
+                        df.insert(0, indep_name, independent_var)
+                    else:
+                        # Legacy JSON format
+                        df = pd.DataFrame(data['data'])
+                        independent_var = np.array(data['independent_var'])
+
+                    metadata = SpectralMetadata(
+                        source_type=data['metadata']['source_type'],
+                        dimensions=tuple(data['metadata']['dimensions']),
+                        scan_mode=data['metadata'].get('scan_mode', 'unknown'),
+                        units=data['metadata'].get('units', {}),
+                        acquisition_date=data['metadata'].get('acquisition_date'),
+                        additional_info=data['metadata'].get('additional_info', {})
+                    )
+
+                    spectral_data = SpectralData(data=df, metadata=metadata)
+                    datasets[name] = spectral_data
+                    logger.debug(f"Deserialized dataset {name}: {spectral_data.num_spectra} spectra")
+
+                elif dtype == 'DataFrame':
+                    if fmt == 'binary':
+                        values = self._base64_to_numpy(data['data_binary'])
+                        columns = data.get('columns', [f'Col_{i}' for i in range(values.shape[1])])
+                        datasets[name] = pd.DataFrame(values, columns=columns)
+                    else:
+                        datasets[name] = pd.DataFrame(data['data'])
+
+                else:
+                    logger.warning(f"Unknown dataset type: {dtype} for {name}")
+
+            except Exception as e:
+                logger.error(f"Error deserializing dataset {name}: {e}")
+
+        return datasets
+
+    def _numpy_to_base64(self, arr: np.ndarray) -> str:
+        """Convert numpy array to compressed base64 string."""
+        buffer = io.BytesIO()
+        np.save(buffer, arr, allow_pickle=False)
+        compressed = gzip.compress(buffer.getvalue())
+        return base64.b64encode(compressed).decode('ascii')
+
+    def _base64_to_numpy(self, b64_str: str) -> np.ndarray:
+        """Convert base64 string back to numpy array."""
+        compressed = base64.b64decode(b64_str)
+        decompressed = gzip.decompress(compressed)
+        buffer = io.BytesIO(decompressed)
+        return np.load(buffer, allow_pickle=False)
+
+    def mark_modified(self):
+        """Mark project as modified"""
+        self.project_modified = True
+
+    def is_modified(self) -> bool:
+        """Check if project has been modified"""
+        return self.project_modified
+
+    def get_current_project_path(self) -> Optional[Path]:
+        """Get current project file path"""
+        return self.current_project_path
+
+    def close_project(self):
+        """Close current project"""
+        self.current_project_path = None
+        self.project_modified = False
+
+
+# ============================================================================
+# Window State Serialization Helpers
+# ============================================================================
+
+def serialize_window_geometry(window) -> Dict:
+    """
+    Serialize a QWidget/QMainWindow geometry and state.
+
+    Returns:
+    --------
+    Dict with x, y, width, height, maximized, visible
+    """
+    geometry = window.geometry()
+    return {
+        'x': geometry.x(),
+        'y': geometry.y(),
+        'width': geometry.width(),
+        'height': geometry.height(),
+        'maximized': window.isMaximized(),
+        'visible': window.isVisible()
+    }
+
+
+def restore_window_geometry(window, geometry: Dict):
+    """
+    Restore a QWidget/QMainWindow geometry from serialized state.
+    """
+    if not geometry:
+        return
+
+    x = geometry.get('x', 100)
+    y = geometry.get('y', 100)
+    width = geometry.get('width', 800)
+    height = geometry.get('height', 600)
+
+    window.setGeometry(x, y, width, height)
+
+    if geometry.get('maximized', False):
+        window.showMaximized()
+    elif geometry.get('visible', True):
+        window.show()
+
+
+def serialize_plot_state(plot_window) -> Dict:
+    """
+    Serialize a plot window's complete state.
+
+    Captures:
+    - Window geometry
+    - All curves (data, labels, colors, styles)
+    - Axes configuration (labels, limits, log scale)
+    - Grid settings
+    """
+    state = {
+        'geometry': serialize_window_geometry(plot_window),
+        'title': plot_window.windowTitle(),
+        'curves': [],
+        'axes': {},
+        'grid': False
+    }
+
+    # Get canvas if available
+    if hasattr(plot_window, 'canvas'):
+        canvas = plot_window.canvas
+
+        # Serialize each curve
+        for line_id, line_info in canvas.plot_lines.items():
+            curve_state = {
+                'id': line_id,
+                'label': line_info.get('label', f'Curve {line_id}'),
+                'color': line_info.get('color', '#ff66b2'),
+                'marker': line_info.get('marker'),
+                'linestyle': line_info.get('linestyle', '-'),
+                'linewidth': line_info.get('linewidth', 2),
+                'alpha': line_info.get('alpha', 1.0),
+                'visible': line_info.get('visible', True),
+                # Store data as binary if large
+                'x_data': line_info['data'][0].tolist() if len(line_info['data'][0]) < 10000 else None,
+                'y_data': line_info['data'][1].tolist() if len(line_info['data'][1]) < 10000 else None
+            }
+            state['curves'].append(curve_state)
+
+        # Axes configuration
+        ax = canvas.axes
+        state['axes'] = {
+            'xlabel': ax.get_xlabel(),
+            'ylabel': ax.get_ylabel(),
+            'title': ax.get_title(),
+            'xlim': list(ax.get_xlim()),
+            'ylim': list(ax.get_ylim()),
+            'xscale': ax.get_xscale(),
+            'yscale': ax.get_yscale()
+        }
+
+        # Grid
+        state['grid'] = ax.xaxis.get_gridlines()[0].get_visible() if ax.xaxis.get_gridlines() else False
+
+    return state
+
+
+def serialize_table_state(table_window) -> Dict:
+    """
+    Serialize a table window's complete state.
+
+    Captures:
+    - Window geometry
+    - Table data
+    - Column headers
+    - Formulas
+    - Column widths
+    """
+    state = {
+        'geometry': serialize_window_geometry(table_window),
+        'title': table_window.windowTitle(),
+        'data': [],
+        'columns': [],
+        'formulas': {},
+        'column_widths': []
+    }
+
+    if hasattr(table_window, 'table'):
+        table = table_window.table
+
+        # Get dimensions
+        rows = table.rowCount()
+        cols = table.columnCount()
+
+        # Get headers
+        state['columns'] = []
+        for c in range(cols):
+            header = table.horizontalHeaderItem(c)
+            state['columns'].append(header.text() if header else f'Col_{c}')
+
+        # Get data
+        for r in range(rows):
+            row_data = []
+            for c in range(cols):
+                item = table.item(r, c)
+                row_data.append(item.text() if item else '')
+            state['data'].append(row_data)
+
+        # Get column widths
+        for c in range(cols):
+            state['column_widths'].append(table.columnWidth(c))
+
+        # Get formulas
+        if hasattr(table_window, 'formulas'):
+            state['formulas'] = {
+                f"{r},{c}": formula
+                for (r, c), formula in table_window.formulas.items()
+            }
+
+    return state

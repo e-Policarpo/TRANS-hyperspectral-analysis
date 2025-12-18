@@ -1,0 +1,7 @@
+module components
+ProjectBrowser 1.0 ProjectBrowser.qml
+DockableWorkspace 1.0 DockableWorkspace.qml
+DockableWorkspaceAdvanced 1.0 DockableWorkspaceAdvanced.qml
+DockableToolItem 1.0 DockableToolItem.qml
+DockArea 1.0 DockArea.qml
+DebugConsole 1.0 DebugConsole.qml

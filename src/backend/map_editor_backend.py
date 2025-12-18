@@ -1,0 +1,833 @@
+"""
+Map Editor Backend - QObject bridge for Map Editor Workstation
+Connects QML UI to MultiChannelMap data model and processing operations.
+Implements the TRANS_v3 interactive canvas paradigm in QML.
+T.R.A.N.S. - Tools for Research and Analysis for Nano Spectroscopy
+Made by Eduarda Policarpo, with love 🩵🩷🤍🩷🩵
+Contact: eduardapolicarpo.fisica@gmail.com
+Date: December 2025
+License: GPL
+"""
+
+import numpy as np
+from typing import Optional, Dict, Any, List, Tuple
+from pathlib import Path
+import logging
+
+from PySide6.QtCore import (
+    QObject, Signal, Slot, Property, QUrl
+)
+from PySide6.QtQml import QmlElement
+
+from src.models.map_channel import (
+    MultiChannelMap, MapChannel, MapMetadata, ChannelMetadata, ChannelType
+)
+from src.models.spectral_data import SpectralData
+
+logger = logging.getLogger(__name__)
+
+# QML registration
+QML_IMPORT_NAME = "TransQML"
+QML_IMPORT_MAJOR_VERSION = 1
+
+
+@QmlElement
+class MapEditorBackend(QObject):
+    """
+    Backend bridge for Map Editor Workstation.
+
+    Manages:
+    - Multi-channel map data (height, amplitude, phase, etc.)
+    - Spectral-spatial reconstruction (linking spectral cube to map)
+    - Block selection and averaging (TRANS_v3 style)
+    - Processing operations (filters, leveling, etc.)
+
+    Signals are emitted to QML for UI updates.
+    """
+
+    # Signals to QML
+    mapDataChanged = Signal()
+    channelListChanged = Signal()
+    activeChannelChanged = Signal(str, arguments=['channelName'])
+    spectralDataChanged = Signal()
+    processingStarted = Signal(str, arguments=['operation'])
+    processingFinished = Signal(str, bool, str, arguments=['operation', 'success', 'message'])
+    selectionChanged = Signal(int, arguments=['blockCount'])
+    statisticsUpdated = Signal('QVariantMap', arguments=['stats'])
+
+    # New signals for dataset linking and spectrum plotting
+    linkedDatasetsChanged = Signal()
+    spectrumReady = Signal(str, 'QVariantMap', arguments=['datasetName', 'spectrumData'])
+    openPlotWindowRequested = Signal(str, 'QVariantList', arguments=['datasetName', 'spectra'])
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        # Data
+        self._multi_channel_map: Optional[MultiChannelMap] = None
+        self._canvas = None  # Reference to QMLMapCanvas
+
+        # Linked datasets for spectrum viewing (name -> SpectralData)
+        self._linked_datasets: Dict[str, SpectralData] = {}
+        self._active_dataset: Optional[str] = None
+
+        # Cache for QML properties
+        self._channel_names: List[str] = []
+        self._active_channel_name: str = ""
+
+    # =========================================================================
+    # Properties exposed to QML
+    # =========================================================================
+
+    @Property(bool, notify=mapDataChanged)
+    def hasMapData(self) -> bool:
+        return self._multi_channel_map is not None and len(self._multi_channel_map) > 0
+
+    @Property('QVariantList', notify=channelListChanged)
+    def channelNames(self) -> List[str]:
+        if self._multi_channel_map is None:
+            return []
+        return self._multi_channel_map.channel_names
+
+    @Property(str, notify=activeChannelChanged)
+    def activeChannelName(self) -> str:
+        if self._multi_channel_map is None:
+            return ""
+        return self._multi_channel_map.active_channel_name or ""
+
+    @Property(int, notify=mapDataChanged)
+    def mapRows(self) -> int:
+        if self._multi_channel_map is None or self._multi_channel_map.shape is None:
+            return 0
+        return self._multi_channel_map.shape[0]
+
+    @Property(int, notify=mapDataChanged)
+    def mapCols(self) -> int:
+        if self._multi_channel_map is None or self._multi_channel_map.shape is None:
+            return 0
+        return self._multi_channel_map.shape[1]
+
+    @Property(bool, notify=spectralDataChanged)
+    def hasSpectralData(self) -> bool:
+        return (self._multi_channel_map is not None and
+                self._multi_channel_map.has_spectral_link)
+
+    @Property(int, notify=spectralDataChanged)
+    def spectralPoints(self) -> int:
+        if self._multi_channel_map is None:
+            return 0
+        return self._multi_channel_map.spectral_points
+
+    @Property('QVariantList', notify=linkedDatasetsChanged)
+    def linkedDatasetNames(self) -> List[str]:
+        """Get list of linked dataset names"""
+        return list(self._linked_datasets.keys())
+
+    @Property(str, notify=linkedDatasetsChanged)
+    def activeDataset(self) -> str:
+        """Get currently active dataset for spectrum viewing"""
+        return self._active_dataset or ""
+
+    # =========================================================================
+    # Dataset Linking for Spectrum Viewing
+    # =========================================================================
+
+    @Slot(str, 'QVariant')
+    def linkDataset(self, name: str, spectral_data):
+        """
+        Link a SpectralData object for spectrum viewing.
+        Each pixel maps to a column in the dataset.
+        """
+        if spectral_data is None:
+            logger.warning(f"Cannot link None dataset: {name}")
+            return
+
+        self._linked_datasets[name] = spectral_data
+
+        # Set as active if first dataset or if it has "truncated" in name
+        if self._active_dataset is None or "truncated" in name.lower():
+            self._active_dataset = name
+
+        self.linkedDatasetsChanged.emit()
+        logger.info(f"Linked dataset '{name}' with {spectral_data.num_spectra} spectra")
+
+    @Slot(str)
+    def unlinkDataset(self, name: str):
+        """Remove a linked dataset"""
+        if name in self._linked_datasets:
+            del self._linked_datasets[name]
+            if self._active_dataset == name:
+                self._active_dataset = next(iter(self._linked_datasets.keys()), None)
+            self.linkedDatasetsChanged.emit()
+
+    @Slot()
+    def clearLinkedDatasets(self):
+        """Clear all linked datasets"""
+        self._linked_datasets.clear()
+        self._active_dataset = None
+        self.linkedDatasetsChanged.emit()
+
+    @Slot(str)
+    def setActiveDataset(self, name: str):
+        """Set the active dataset for spectrum viewing"""
+        if name in self._linked_datasets:
+            self._active_dataset = name
+            self.linkedDatasetsChanged.emit()
+            logger.info(f"Active dataset set to: {name}")
+
+    @Slot(str, int, int, result='QVariantMap')
+    def getSpectrumFromDataset(self, dataset_name: str, row: int, col: int) -> Dict:
+        """
+        Get spectrum at (row, col) from a specific dataset.
+        The spectrum index is calculated as: row * num_cols + col
+
+        For integrated datasets, returns the integrated values across intervals.
+        """
+        if dataset_name not in self._linked_datasets:
+            return {'error': f'Dataset not found: {dataset_name}'}
+
+        spectral_data = self._linked_datasets[dataset_name]
+        dims = spectral_data.metadata.dimensions
+        num_cols = dims[0]  # horizontal dimension
+
+        # Calculate spectrum index
+        spectrum_idx = row * num_cols + col
+
+        if spectrum_idx >= spectral_data.num_spectra:
+            return {'error': f'Index {spectrum_idx} out of range (max: {spectral_data.num_spectra - 1})'}
+
+        try:
+            # Check if this is an integrated dataset
+            is_integrated = 'intervals' in spectral_data.metadata.additional_info
+
+            if is_integrated:
+                # For integrated datasets, the structure is different:
+                # Each row is an interval, each column is a spatial position
+                intervals = spectral_data.metadata.additional_info.get('intervals', [])
+
+                # X values are interval indices or interval labels
+                x = list(range(len(intervals)))
+                # Y values are the integrated values for this position
+                y = spectral_data.spectra.iloc[:, spectrum_idx].values.tolist()
+
+                # Create interval labels for display
+                interval_labels = []
+                for iv in intervals:
+                    if isinstance(iv, (list, tuple)) and len(iv) >= 2:
+                        interval_labels.append(f"{iv[0]:.3f}-{iv[1]:.3f}")
+                    else:
+                        interval_labels.append(str(iv))
+
+                return {
+                    'x': x,
+                    'y': y,
+                    'x_name': 'Interval Index',
+                    'y_name': 'Integrated Value',
+                    'title': f'{dataset_name} at ({row}, {col})',
+                    'row': row,
+                    'col': col,
+                    'dataset': dataset_name,
+                    'is_integrated': True,
+                    'interval_labels': interval_labels
+                }
+            else:
+                # Regular spectral dataset
+                x = spectral_data.independent_var.tolist()
+                y = spectral_data.spectra.iloc[:, spectrum_idx].values.tolist()
+
+                return {
+                    'x': x,
+                    'y': y,
+                    'x_name': spectral_data.independent_var_name,
+                    'y_name': dataset_name,
+                    'title': f'{dataset_name} at ({row}, {col})',
+                    'row': row,
+                    'col': col,
+                    'dataset': dataset_name,
+                    'is_integrated': False
+                }
+        except Exception as e:
+            logger.error(f"Error getting spectrum from {dataset_name}: {e}")
+            return {'error': str(e)}
+
+    @Slot(int, int)
+    def requestPlotAtPosition(self, row: int, col: int):
+        """
+        Request to plot spectrum at position for the active dataset.
+        Emits openPlotWindowRequested signal with spectrum data.
+        """
+        if not self._active_dataset:
+            logger.warning("No active dataset for spectrum plotting")
+            return
+
+        spectrum = self.getSpectrumFromDataset(self._active_dataset, row, col)
+        if 'error' not in spectrum:
+            self.openPlotWindowRequested.emit(self._active_dataset, [spectrum])
+
+    @Slot(str, int, int)
+    def requestPlotFromDataset(self, dataset_name: str, row: int, col: int):
+        """
+        Request to plot spectrum at position from a specific dataset.
+        Opens a new plot window.
+        """
+        spectrum = self.getSpectrumFromDataset(dataset_name, row, col)
+        if 'error' not in spectrum:
+            self.openPlotWindowRequested.emit(dataset_name, [spectrum])
+
+    @Slot(str, result='QVariantList')
+    def getSelectedSpectraFromDataset(self, dataset_name: str) -> List[Dict]:
+        """Get spectra for all selected blocks from a dataset"""
+        if dataset_name not in self._linked_datasets:
+            return []
+
+        if self._canvas is None:
+            return []
+
+        selected_blocks = self._canvas.getSelectedBlocks()
+        spectra = []
+
+        for block in selected_blocks:
+            row, col = block['row'], block['col']
+            spectrum = self.getSpectrumFromDataset(dataset_name, row, col)
+            if 'error' not in spectrum:
+                spectra.append(spectrum)
+
+        return spectra
+
+    @Slot(str)
+    def openPlotForSelectedBlocks(self, dataset_name: str):
+        """Open a plot window with all selected block spectra"""
+        spectra = self.getSelectedSpectraFromDataset(dataset_name)
+        if spectra:
+            self.openPlotWindowRequested.emit(dataset_name, spectra)
+        else:
+            logger.warning(f"No spectra to plot for dataset: {dataset_name}")
+
+    @Slot('QVariantList', int, int, result='QVariantList')
+    def getSpectraFromMultipleDatasets(self, dataset_names: List[str], row: int, col: int) -> List[Dict]:
+        """
+        Get spectra at (row, col) from multiple datasets.
+        Returns list of spectrum dicts for plotting together.
+        """
+        spectra = []
+        for name in dataset_names:
+            spectrum = self.getSpectrumFromDataset(name, row, col)
+            if 'error' not in spectrum:
+                spectra.append(spectrum)
+        return spectra
+
+    @Slot('QVariantList', int, int)
+    def requestPlotFromMultipleDatasets(self, dataset_names: List[str], row: int, col: int):
+        """
+        Request to plot spectra at position from multiple datasets.
+        Opens a combined plot window.
+        """
+        spectra = self.getSpectraFromMultipleDatasets(dataset_names, row, col)
+        if spectra:
+            combined_name = " + ".join(dataset_names)
+            self.openPlotWindowRequested.emit(combined_name, spectra)
+
+    # =========================================================================
+    # Canvas binding
+    # =========================================================================
+
+    @Slot('QVariant')
+    def setCanvas(self, canvas):
+        """Bind to a QMLMapCanvas instance"""
+        self._canvas = canvas
+        if canvas:
+            # Connect canvas signals
+            canvas.spectralDataRequested.connect(self._onSpectrumRequested)
+            canvas.blockSelectionChanged.connect(self._onBlockSelectionChanged)
+
+    # =========================================================================
+    # Data Loading
+    # =========================================================================
+
+    @Slot(str)
+    def loadMapFromFile(self, file_path: str):
+        """Load map data from a file (TIFF, GSF, etc.)"""
+        try:
+            path = Path(file_path.replace("file://", ""))
+            logger.info(f"Loading map from: {path}")
+
+            # Create new multi-channel map
+            self._multi_channel_map = MultiChannelMap()
+
+            # Load based on extension
+            if path.suffix.lower() in ['.tif', '.tiff']:
+                import tifffile
+                data = tifffile.imread(str(path))
+
+                if data.ndim == 2:
+                    # Single channel
+                    self._multi_channel_map.add_channel(
+                        path.stem, data, ChannelType.HEIGHT
+                    )
+                elif data.ndim == 3:
+                    # Multi-page TIFF - each page is a channel
+                    for i in range(data.shape[0]):
+                        self._multi_channel_map.add_channel(
+                            f"Channel_{i}", data[i], ChannelType.CUSTOM
+                        )
+
+            elif path.suffix.lower() == '.npy':
+                data = np.load(str(path))
+                self._multi_channel_map.add_channel(
+                    path.stem, data, ChannelType.CUSTOM
+                )
+
+            else:
+                raise ValueError(f"Unsupported file format: {path.suffix}")
+
+            # Update canvas
+            if self._canvas:
+                active = self._multi_channel_map.active_channel
+                if active:
+                    self._canvas.setMapData(active.data)
+
+            self.mapDataChanged.emit()
+            self.channelListChanged.emit()
+            self.activeChannelChanged.emit(self.activeChannelName)
+
+            logger.info(f"Loaded map: {self._multi_channel_map}")
+
+        except Exception as e:
+            logger.error(f"Failed to load map: {e}")
+            self.processingFinished.emit("load", False, str(e))
+
+    def setMultiChannelMap(self, mcmap: MultiChannelMap):
+        """Set map data programmatically from Python"""
+        self._multi_channel_map = mcmap
+
+        # Update canvas
+        if self._canvas and mcmap.active_channel:
+            self._canvas.setMapData(mcmap.active_channel.data)
+
+            # Link spectral data if available
+            if mcmap.has_spectral_link:
+                self._canvas.linkSpectralCube(
+                    mcmap._spectral_cube,
+                    mcmap._independent_var,
+                    mcmap._independent_var_name
+                )
+
+        self.mapDataChanged.emit()
+        self.channelListChanged.emit()
+        self.activeChannelChanged.emit(self.activeChannelName)
+        if mcmap.has_spectral_link:
+            self.spectralDataChanged.emit()
+
+    def setMapDataFromArray(self, data: np.ndarray, name: str = "Map"):
+        """Set map data from numpy array"""
+        if self._multi_channel_map is None:
+            self._multi_channel_map = MultiChannelMap()
+
+        self._multi_channel_map.add_channel(name, data, replace=True)
+
+        if self._canvas:
+            self._canvas.setMapData(data)
+
+        self.mapDataChanged.emit()
+        self.channelListChanged.emit()
+        self.activeChannelChanged.emit(name)
+
+    # =========================================================================
+    # Channel Management
+    # =========================================================================
+
+    @Slot(str)
+    def setActiveChannel(self, channel_name: str):
+        """Set the active channel for display"""
+        if self._multi_channel_map is None:
+            return
+
+        try:
+            self._multi_channel_map.set_active_channel(channel_name)
+            active = self._multi_channel_map.active_channel
+
+            if self._canvas and active:
+                self._canvas.setMapData(active.data)
+
+            self.activeChannelChanged.emit(channel_name)
+
+        except KeyError as e:
+            logger.warning(f"Channel not found: {e}")
+
+    @Slot(str, result='QVariantMap')
+    def getChannelStatistics(self, channel_name: str) -> Dict:
+        """Get statistics for a channel"""
+        if self._multi_channel_map is None:
+            return {}
+
+        try:
+            channel = self._multi_channel_map.get_channel(channel_name)
+            stats = channel.get_statistics()
+            self.statisticsUpdated.emit(stats)
+            return stats
+        except KeyError:
+            return {}
+
+    @Slot(result='QVariantMap')
+    def getActiveChannelStatistics(self) -> Dict:
+        """Get statistics for the active channel"""
+        if self._multi_channel_map is None or self._multi_channel_map.active_channel is None:
+            return {}
+        return self._multi_channel_map.active_channel.get_statistics()
+
+    # =========================================================================
+    # Spectral-Spatial Linking (TRANS_v3 core feature)
+    # =========================================================================
+
+    def linkSpectralData(self, spectral_data: SpectralData, var_name: str = None):
+        """
+        Link SpectralData for spatial-spectral reconstruction.
+        This enables clicking on the map to show the spectrum at that position.
+        """
+        if self._multi_channel_map is None:
+            logger.warning("No map data to link spectral data to")
+            return
+
+        self._multi_channel_map.link_spectral_data(spectral_data, var_name)
+
+        if self._canvas:
+            self._canvas.linkSpectralCube(
+                self._multi_channel_map._spectral_cube,
+                self._multi_channel_map._independent_var,
+                self._multi_channel_map._independent_var_name
+            )
+
+        self.spectralDataChanged.emit()
+        logger.info("Linked spectral data for spatial reconstruction")
+
+    def linkSpectralCube(self, cube: np.ndarray, independent_var: np.ndarray,
+                         var_name: str = "x"):
+        """Link a spectral cube directly"""
+        if self._multi_channel_map is None:
+            logger.warning("No map data to link spectral cube to")
+            return
+
+        self._multi_channel_map.link_spectral_cube(cube, independent_var, var_name)
+
+        if self._canvas:
+            self._canvas.linkSpectralCube(cube, independent_var, var_name)
+
+        self.spectralDataChanged.emit()
+
+    @Slot(int, int, result='QVariantMap')
+    def getSpectrumAt(self, row: int, col: int) -> Dict:
+        """Get spectrum at a spatial position"""
+        if self._multi_channel_map is None or not self._multi_channel_map.has_spectral_link:
+            return {'error': 'No spectral data linked'}
+
+        try:
+            x, y = self._multi_channel_map.get_spectrum_at(row, col)
+            return {
+                'x': x.tolist(),
+                'y': y.tolist(),
+                'x_name': self._multi_channel_map.independent_var_name,
+                'y_name': 'Intensity',
+                'title': f'Spectrum at ({row}, {col})'
+            }
+        except Exception as e:
+            return {'error': str(e)}
+
+    @Slot(result='QVariantMap')
+    def getAverageSpectrumFromSelection(self) -> Dict:
+        """Get average spectrum from selected blocks"""
+        if self._canvas is None:
+            return {'error': 'No canvas'}
+
+        return self._canvas.getAverageSpectrumFromSelection()
+
+    # =========================================================================
+    # Block Selection (TRANS_v3 style)
+    # =========================================================================
+
+    @Slot()
+    def clearSelection(self):
+        """Clear block selection"""
+        if self._canvas:
+            self._canvas.clearBlockSelection()
+
+    @Slot()
+    def selectAllBlocks(self):
+        """Select all blocks"""
+        if self._canvas:
+            self._canvas.selectAllBlocks()
+
+    @Slot(result='QVariantList')
+    def getSelectedBlocks(self) -> List[Dict]:
+        """Get list of selected blocks"""
+        if self._canvas:
+            return self._canvas.getSelectedBlocks()
+        return []
+
+    @Slot(result=int)
+    def getSelectedBlockCount(self) -> int:
+        """Get number of selected blocks"""
+        if self._canvas:
+            return self._canvas.getSelectedBlockCount()
+        return 0
+
+    def getSelectionMask(self) -> np.ndarray:
+        """Get 2D boolean mask from selection"""
+        if self._canvas:
+            return self._canvas.getSelectionMask()
+        return np.array([])
+
+    def _onBlockSelectionChanged(self):
+        """Handle block selection changes from canvas"""
+        count = self.getSelectedBlockCount()
+        self.selectionChanged.emit(count)
+
+    def _onSpectrumRequested(self, row: int, col: int):
+        """Handle spectrum request from canvas click"""
+        # This signal can be connected in QML to update a spectrum viewer
+        pass
+
+    # =========================================================================
+    # Processing Operations
+    # =========================================================================
+
+    @Slot(str, 'QVariantMap')
+    def applyProcessing(self, operation: str, params: Dict):
+        """Apply a processing operation to the active channel"""
+        if self._multi_channel_map is None or self._multi_channel_map.active_channel is None:
+            self.processingFinished.emit(operation, False, "No data loaded")
+            return
+
+        self.processingStarted.emit(operation)
+
+        try:
+            channel = self._multi_channel_map.active_channel
+            data = channel.data.copy()
+
+            if operation == "gaussian_filter":
+                from scipy.ndimage import gaussian_filter
+                sigma = params.get('sigma', 1.0)
+                data = gaussian_filter(data, sigma=sigma)
+
+            elif operation == "median_filter":
+                from scipy.ndimage import median_filter
+                size = params.get('size', 3)
+                data = median_filter(data, size=size)
+
+            elif operation == "plane_level":
+                # Subtract a fitted plane
+                rows, cols = data.shape
+                x = np.arange(cols)
+                y = np.arange(rows)
+                X, Y = np.meshgrid(x, y)
+
+                # Fit plane: z = ax + by + c
+                A = np.column_stack([X.ravel(), Y.ravel(), np.ones(X.size)])
+                coeffs, _, _, _ = np.linalg.lstsq(A, data.ravel(), rcond=None)
+                plane = (coeffs[0] * X + coeffs[1] * Y + coeffs[2])
+                data = data - plane
+
+            elif operation == "row_align":
+                # Subtract row medians
+                for i in range(data.shape[0]):
+                    data[i] -= np.nanmedian(data[i])
+
+            elif operation == "normalize":
+                vmin = np.nanmin(data)
+                vmax = np.nanmax(data)
+                if vmax > vmin:
+                    data = (data - vmin) / (vmax - vmin)
+
+            else:
+                self.processingFinished.emit(operation, False, f"Unknown operation: {operation}")
+                return
+
+            # Update channel data
+            channel.data = data
+            channel.add_history(operation, params)
+
+            # Update canvas
+            if self._canvas:
+                self._canvas.setMapData(data)
+
+            self.processingFinished.emit(operation, True, "Success")
+            self.mapDataChanged.emit()
+
+        except Exception as e:
+            logger.error(f"Processing failed: {e}")
+            self.processingFinished.emit(operation, False, str(e))
+
+    # =========================================================================
+    # Export
+    # =========================================================================
+
+    @Slot(str, str)
+    def exportChannel(self, channel_name: str, file_path: str):
+        """Export a channel to file (TIFF and CSV formats only)"""
+        if self._multi_channel_map is None:
+            return
+
+        try:
+            path = Path(file_path.replace("file://", ""))
+            channel = self._multi_channel_map.get_channel(channel_name)
+
+            if path.suffix.lower() in ['.tif', '.tiff']:
+                import tifffile
+                tifffile.imwrite(str(path), channel.data.astype(np.float32))
+            elif path.suffix.lower() == '.csv':
+                np.savetxt(str(path), channel.data, delimiter=',', fmt='%.6e')
+            elif path.suffix.lower() == '.png':
+                # PNG format is no longer supported - save as TIFF instead
+                logger.warning(f"PNG format no longer supported. Saving as TIFF instead.")
+                tiff_path = path.with_suffix('.tiff')
+                import tifffile
+                tifffile.imwrite(str(tiff_path), channel.data.astype(np.float32))
+                path = tiff_path
+            else:
+                logger.warning(f"Unsupported format {path.suffix}. Use .tiff or .csv")
+                return
+
+            logger.info(f"Exported {channel_name} to {path}")
+
+        except Exception as e:
+            logger.error(f"Export failed: {e}")
+
+    @Slot(str, result='QVariantMap')
+    def computeIntegratedMap(self, range_str: str) -> Dict:
+        """
+        Compute integrated intensity map from spectral data.
+
+        Parameters:
+            range_str: "start,end" string for integration range
+        """
+        if self._multi_channel_map is None or not self._multi_channel_map.has_spectral_link:
+            return {'error': 'No spectral data linked'}
+
+        try:
+            parts = range_str.split(',')
+            start_val = float(parts[0])
+            end_val = float(parts[1])
+
+            channel = self._multi_channel_map.compute_integrated_map(
+                start_val=start_val, end_val=end_val
+            )
+
+            # Add to map
+            self._multi_channel_map.channels[channel.name] = channel
+
+            self.channelListChanged.emit()
+
+            return {
+                'channel_name': channel.name,
+                'success': True
+            }
+
+        except Exception as e:
+            return {'error': str(e)}
+
+    # =========================================================================
+    # Profile Extraction
+    # =========================================================================
+
+    @Slot(int, int, int, int, result='QVariantMap')
+    def extractProfile(self, start_row: int, start_col: int,
+                       end_row: int, end_col: int) -> Dict:
+        """
+        Extract a line profile from the active channel.
+
+        Parameters:
+            start_row, start_col: Start position
+            end_row, end_col: End position
+
+        Returns:
+            Dict with 'distance' and 'values' arrays, plus 'stats'
+        """
+        if self._multi_channel_map is None or self._multi_channel_map.active_channel is None:
+            return {'error': 'No data loaded'}
+
+        try:
+            channel = self._multi_channel_map.active_channel
+            distance, values = channel.extract_profile(
+                start=(start_row, start_col),
+                end=(end_row, end_col)
+            )
+
+            # Compute statistics
+            stats = {
+                'min': float(np.nanmin(values)),
+                'max': float(np.nanmax(values)),
+                'mean': float(np.nanmean(values)),
+                'std': float(np.nanstd(values)),
+                'length': len(values)
+            }
+
+            return {
+                'distance': distance.tolist(),
+                'values': values.tolist(),
+                'stats': stats,
+                'start': {'row': start_row, 'col': start_col},
+                'end': {'row': end_row, 'col': end_col}
+            }
+
+        except Exception as e:
+            logger.error(f"Profile extraction failed: {e}")
+            return {'error': str(e)}
+
+    # =========================================================================
+    # State Persistence (for project save/load)
+    # =========================================================================
+
+    @Slot(result='QVariantMap')
+    def getState(self) -> Dict:
+        """
+        Get the current state of the map editor for persistence.
+        This allows restoring the map editor when loading a project.
+
+        Returns:
+            Dict with map_path, active_channel, linked_datasets (names only)
+        """
+        # Get active channel from the map object, not the cached property
+        active_channel = ''
+        if self._multi_channel_map is not None:
+            active_channel = self._multi_channel_map.active_channel_name or ''
+
+        state = {
+            'has_map': self._multi_channel_map is not None,
+            'map_path': '',
+            'active_channel': active_channel,
+            'linked_dataset_names': list(self._linked_datasets.keys()),
+            'active_dataset': self._active_dataset or ''
+        }
+
+        # Get map path if available
+        if self._multi_channel_map is not None:
+            metadata = self._multi_channel_map.metadata
+            if metadata and hasattr(metadata, 'source_path'):
+                state['map_path'] = str(metadata.source_path) if metadata.source_path else ''
+
+        return state
+
+    @Slot('QVariantMap')
+    def restoreState(self, state: Dict):
+        """
+        Restore the map editor state from a saved state dictionary.
+        The actual map data and linked datasets must be loaded separately.
+
+        Args:
+            state: Dict from getState()
+        """
+        if not state:
+            return
+
+        # Restore active channel if we have map data
+        if self._multi_channel_map is not None:
+            active_channel = state.get('active_channel', '')
+            if active_channel and active_channel in self._multi_channel_map.channel_names:
+                self.setActiveChannel(active_channel)
+
+        # Restore active dataset selection
+        active_ds = state.get('active_dataset', '')
+        if active_ds and active_ds in self._linked_datasets:
+            self._active_dataset = active_ds
+            self.linkedDatasetsChanged.emit()
+
+        logger.info(f"Map editor state restored: {state}")

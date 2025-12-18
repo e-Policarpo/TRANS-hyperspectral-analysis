@@ -1,0 +1,51 @@
+<RCC>
+    <qresource prefix="/icons">
+        <!-- Menu Icons -->
+        <file alias="menu/file-new.png">menu/file-new.png</file>
+        <file alias="menu/file-open.png">menu/file-open.png</file>
+        <file alias="menu/file-save.png">menu/file-save.png</file>
+        <file alias="menu/file-save-as.png">menu/file-save-as.png</file>
+        <file alias="menu/import.png">menu/import.png</file>
+        <file alias="menu/exit.png">menu/exit.png</file>
+        <file alias="menu/table.png">menu/table.png</file>
+        <file alias="menu/graph.png">menu/graph.png</file>
+
+        <!-- Tools Menu Icons -->
+        <file alias="menu/tools.png">menu/tools.png</file>
+        <file alias="menu/workflow.png">menu/workflow.png</file>
+
+        <!-- Window Menu Icons -->
+        <file alias="menu/window.png">menu/window.png</file>
+        <file alias="menu/browser.png">menu/browser.png</file>
+        <file alias="menu/console.png">menu/console.png</file>
+        <file alias="menu/layout-save.png">menu/layout-save.png</file>
+        <file alias="menu/layout-load.png">menu/layout-load.png</file>
+        <file alias="menu/layout-reset.png">menu/layout-reset.png</file>
+
+        <!-- Help Menu Icons -->
+        <file alias="menu/help.png">menu/help.png</file>
+        <file alias="menu/about.png">menu/about.png</file>
+
+        <!-- Toolbar Icons -->
+        <file alias="toolbar/add.png">toolbar/add.png</file>
+        <file alias="toolbar/remove.png">toolbar/remove.png</file>
+        <file alias="toolbar/refresh.png">toolbar/refresh.png</file>
+        <file alias="toolbar/settings.png">toolbar/settings.png</file>
+        <file alias="toolbar/play.png">toolbar/play.png</file>
+        <file alias="toolbar/stop.png">toolbar/stop.png</file>
+
+        <!-- Status Icons -->
+        <file alias="status/success.png">status/success.png</file>
+        <file alias="status/error.png">status/error.png</file>
+        <file alias="status/warning.png">status/warning.png</file>
+        <file alias="status/info.png">status/info.png</file>
+
+        <!-- General Icons -->
+        <file alias="general/folder.png">general/folder.png</file>
+        <file alias="general/file.png">general/file.png</file>
+        <file alias="general/dataset.png">general/dataset.png</file>
+        <file alias="general/graph.png">general/graph.png</file>
+        <file alias="general/table.png">general/table.png</file>
+        <file alias="general/map.png">general/map.png</file>
+    </qresource>
+</RCC>

@@ -1,0 +1,6 @@
+module dialogs
+ImportMeasurementDialog 1.0 ImportMeasurementDialog.qml
+SaveLayoutDialog 1.0 SaveLayoutDialog.qml
+LoadLayoutDialog 1.0 LoadLayoutDialog.qml
+LoadWorkflowDialog 1.0 LoadWorkflowDialog.qml
+ProjectStartupDialog 1.0 ProjectStartupDialog.qml

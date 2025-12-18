@@ -1,0 +1,63 @@
+# TRANS-QML Dependencies
+# Hyperspectral Data Analysis Platform
+#
+# Install with: pip install -r requirements.txt
+# Python version: 3.8+
+
+# ============================================================================
+# Core Qt/QML Framework
+# ============================================================================
+PySide6>=6.5.0                    # Qt for Python (QML, QtWidgets, QtCore, QtGui)
+PySide6-Addons>=6.5.0             # Additional Qt modules
+PySide6-Essentials>=6.5.0         # Essential Qt components
+
+# ============================================================================
+# Numerical and Scientific Computing
+# ============================================================================
+numpy>=1.24.0                     # Numerical arrays and operations
+pandas>=2.0.0                     # DataFrames for spectral data handling
+scipy>=1.10.0                     # Signal processing, optimization, interpolation
+
+# ============================================================================
+# Visualization
+# ============================================================================
+matplotlib>=3.7.0                 # Plotting backend for spectral curves
+Pillow>=10.0.0                    # Image generation and manipulation (PIL)
+
+# ============================================================================
+# File I/O
+# ============================================================================
+h5py>=3.0.0                       # HDF5 file format for .hrt project files
+NSFopen>=1.0.0                    # Nanosurf file format support
+
+# ============================================================================
+# Signal/Image Processing
+# ============================================================================
+scikit-image>=0.21.0              # Advanced image processing filters
+
+# ============================================================================
+# Optional: Performance Optimization
+# ============================================================================
+numba>=0.57.0                     # JIT compilation for numerical functions
+
+# ============================================================================
+# Utilities
+# ============================================================================
+python-dateutil>=2.8.0            # Date/time parsing
+pytz>=2023.3                      # Timezone support
+
+# ============================================================================
+# macOS-Specific (Optional)
+# ============================================================================
+# For proper menu bar display on macOS, install:
+# pip install pyobjc-framework-Cocoa
+# This is optional - the application will work without it,
+# but the menu bar may show "Python" instead of "T.R.A.N.S."
+
+# ============================================================================
+# Development & Testing (Optional)
+# ============================================================================
+# Uncomment to install test dependencies:
+# pytest>=7.0.0                   # Test framework
+# pytest-cov>=4.0.0               # Coverage reporting
+# pytest-qt>=4.0.0                # Qt testing support
