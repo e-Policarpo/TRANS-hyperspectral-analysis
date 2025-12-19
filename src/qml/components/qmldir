@@ -10,3 +10,7 @@ WorkspaceCanvas 1.0 WorkspaceCanvas.qml
 UnifiedWorkspace 1.0 UnifiedWorkspace.qml
 DatasetComboBox 1.0 DatasetComboBox.qml
 DraggableWindow 1.0 DraggableWindow.qml
+FloatingEntity 1.0 FloatingEntity.qml
+GraphEntity 1.0 GraphEntity.qml
+TableEntity 1.0 TableEntity.qml
+MapEntity 1.0 MapEntity.qml

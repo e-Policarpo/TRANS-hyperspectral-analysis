@@ -422,6 +422,77 @@ Rectangle {
         }
     }
 
+    // Entity type components for convenience
+    property Component graphEntityComponent: Component {
+        GraphEntity {
+            id: graphEntityInstance
+        }
+    }
+
+    property Component tableEntityComponent: Component {
+        TableEntity {
+            id: tableEntityInstance
+        }
+    }
+
+    property Component mapEntityComponent: Component {
+        MapEntity {
+            id: mapEntityInstance
+        }
+    }
+
+    // Convenience functions for creating specific entity types
+    function createGraphEntity(title, x, y, width, height, curves) {
+        var entityId = "graph_" + Date.now() + "_" + Math.random().toString(36).substr(2, 9)
+        var data = {
+            title: title || "Graph",
+            curves: curves || []
+        }
+        var idx = addFloatingEntity(
+            entityId, "graph", graphEntityComponent,
+            x || 50, y || 50,
+            width || 450, height || 350,
+            data
+        )
+        console.log("Created graph entity:", entityId)
+        return entityId
+    }
+
+    function createTableEntity(title, x, y, width, height, tableData, columnHeaders) {
+        var entityId = "table_" + Date.now() + "_" + Math.random().toString(36).substr(2, 9)
+        var data = {
+            title: title || "Table",
+            tableData: tableData || [],
+            columnHeaders: columnHeaders || []
+        }
+        var idx = addFloatingEntity(
+            entityId, "table", tableEntityComponent,
+            x || 80, y || 80,
+            width || 500, height || 400,
+            data
+        )
+        console.log("Created table entity:", entityId)
+        return entityId
+    }
+
+    function createMapEntity(title, x, y, width, height, mapData, mapWidth, mapHeight) {
+        var entityId = "map_" + Date.now() + "_" + Math.random().toString(36).substr(2, 9)
+        var data = {
+            title: title || "Map",
+            mapData: mapData || [],
+            mapWidth: mapWidth || 0,
+            mapHeight: mapHeight || 0
+        }
+        var idx = addFloatingEntity(
+            entityId, "map", mapEntityComponent,
+            x || 100, y || 100,
+            width || 400, height || 400,
+            data
+        )
+        console.log("Created map entity:", entityId)
+        return entityId
+    }
+
     // Layout state management
     function getLayoutState() {
         return {
