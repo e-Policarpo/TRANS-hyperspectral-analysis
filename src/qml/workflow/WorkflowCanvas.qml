@@ -230,13 +230,13 @@ Rectangle {
                 x: modelData.x
                 y: modelData.y
 
-                onNodeClicked: function(node) {
-                    selectedNode = node
+                onNodeSelected: {
+                    selectedNode = nodeData
                     selectedConnection = null
-                    nodeSelected(node)
+                    workflowCanvas.nodeSelected(nodeData)
                 }
 
-                onNodeDragged: function(nodeId, newX, newY) {
+                onNodeMoved: function(nodeId, newX, newY) {
                     if (workflowManager && workflowId) {
                         workflowManager.updateNodePosition(workflowId, nodeId, newX, newY)
                     }
