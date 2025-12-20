@@ -2,3 +2,6 @@ module workflow
 WorkflowWindow 1.0 WorkflowWindow.qml
 WorkflowNode 1.0 WorkflowNode.qml
 NodeParameterEditor 1.0 NodeParameterEditor.qml
+WorkflowCanvas 1.0 WorkflowCanvas.qml
+WorkflowToolPalette 1.0 WorkflowToolPalette.qml
+DraggableListItem 1.0 DraggableListItem.qml

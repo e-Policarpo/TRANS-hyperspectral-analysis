@@ -14,3 +14,7 @@ FloatingEntity 1.0 FloatingEntity.qml
 GraphEntity 1.0 GraphEntity.qml
 TableEntity 1.0 TableEntity.qml
 MapEntity 1.0 MapEntity.qml
+ProjectBrowserEntity 1.0 ProjectBrowserEntity.qml
+DataBrowserEntity 1.0 DataBrowserEntity.qml
+PointInspectorEntity 1.0 PointInspectorEntity.qml
+StatisticsPanelEntity 1.0 StatisticsPanelEntity.qml

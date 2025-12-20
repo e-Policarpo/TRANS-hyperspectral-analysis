@@ -493,6 +493,52 @@ Rectangle {
         return entityId
     }
 
+    // Additional entity components
+    property Component projectBrowserEntityComponent: Component {
+        ProjectBrowserEntity {}
+    }
+
+    property Component dataBrowserEntityComponent: Component {
+        DataBrowserEntity {}
+    }
+
+    property Component pointInspectorEntityComponent: Component {
+        PointInspectorEntity {}
+    }
+
+    property Component statisticsPanelEntityComponent: Component {
+        StatisticsPanelEntity {}
+    }
+
+    // Additional entity creation functions
+    function createProjectBrowserEntity(backend, x, y, width, height) {
+        var entityId = "browser_" + Date.now() + "_" + Math.random().toString(36).substr(2, 9)
+        var data = { title: "Project Browser", backend: backend }
+        addFloatingEntity(entityId, "browser", projectBrowserEntityComponent, x || 20, y || 20, width || 280, height || 400, data)
+        return entityId
+    }
+
+    function createDataBrowserEntity(channelNames, activeChannel, x, y, width, height) {
+        var entityId = "databrowser_" + Date.now() + "_" + Math.random().toString(36).substr(2, 9)
+        var data = { title: "Data Browser", channelNames: channelNames || [], activeChannel: activeChannel || "" }
+        addFloatingEntity(entityId, "browser", dataBrowserEntityComponent, x || 50, y || 50, width || 240, height || 300, data)
+        return entityId
+    }
+
+    function createPointInspectorEntity(hasSpectrum, x, y, width, height) {
+        var entityId = "inspector_" + Date.now() + "_" + Math.random().toString(36).substr(2, 9)
+        var data = { title: "Point Inspector", hasSpectrum: hasSpectrum || false }
+        addFloatingEntity(entityId, "inspector", pointInspectorEntityComponent, x || 70, y || 70, width || 220, height || 180, data)
+        return entityId
+    }
+
+    function createStatisticsPanelEntity(stats, channelName, x, y, width, height) {
+        var entityId = "stats_" + Date.now() + "_" + Math.random().toString(36).substr(2, 9)
+        var data = { title: "Statistics", stats: stats || {}, channelName: channelName || "" }
+        addFloatingEntity(entityId, "statistics", statisticsPanelEntityComponent, x || 90, y || 90, width || 240, height || 200, data)
+        return entityId
+    }
+
     // Layout state management
     function getLayoutState() {
         return {
