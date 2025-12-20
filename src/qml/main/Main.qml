@@ -106,6 +106,19 @@ ApplicationWindow {
     property color textMuted: "#cccccc"       // textMuted
     property color borderColor: "#9B4F96"     // borderColor
 
+    // ========== FONT SCALING ==========
+    // Global font sizes - components should reference these for consistent scaling
+    property int fontSizeSmall: 10
+    property int fontSizeMedium: 12
+    property int fontSizeLarge: 14
+    property int fontSizeHeader: 16
+    property int fontSizeTitle: 18
+    property string fontFamily: "system-ui"
+
+    // Computed scaled sizes for convenience
+    property int fontSizeXSmall: Math.max(8, fontSizeSmall - 2)
+    property int fontSizeXLarge: fontSizeHeader + 2
+
     // Port type colors for workflow editor - maximally distinct colors
     // Port types from PortType enum: dataset, flat_data, image, map, table, number, string, intervals, any
     // NOTE: Using hardcoded fallback - regeneratePortColors() creates the themed version
@@ -156,6 +169,17 @@ ApplicationWindow {
 
         // Apply border color
         borderColor = c.borderColor || "#9B4F96"
+
+        // Apply font settings
+        if (scheme.font) {
+            fontSizeSmall = scheme.font.sizeSmall || 10
+            fontSizeMedium = scheme.font.sizeMedium || 12
+            fontSizeLarge = scheme.font.sizeLarge || 14
+            fontSizeHeader = scheme.font.sizeHeader || 16
+            fontSizeTitle = scheme.font.sizeTitle || 18
+            fontFamily = scheme.font.family || "system-ui"
+            console.log("Applied font sizes: small=" + fontSizeSmall + ", medium=" + fontSizeMedium + ", large=" + fontSizeLarge)
+        }
 
         // Regenerate portColors object to trigger reactive updates in workflow windows
         // QML doesn't track changes inside objects, so we must reassign the entire object

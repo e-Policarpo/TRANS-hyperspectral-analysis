@@ -43,6 +43,10 @@ Rectangle {
     property color accentBlue: mainWin ? mainWin.accentBlue : "#5BCEFA"
     property color borderColor: mainWin ? mainWin.borderColor : "#9B4F96"
 
+    // Font scaling - reactive bindings to main window
+    property int fontSizeSmall: mainWin ? mainWin.fontSizeSmall : 10
+    property int fontSizeMedium: mainWin ? mainWin.fontSizeMedium : 12
+
     // Signals
     signal tabSelected(int index, string tabId)
     signal tabClosed(int index, string tabId)
@@ -116,7 +120,7 @@ Rectangle {
                                     (position === "top" ? "▲" : "▼")
                             }
                         }
-                        font.pixelSize: 10
+                        font.pixelSize: fontSizeSmall
                         color: textMuted
                     }
 
@@ -164,7 +168,7 @@ Rectangle {
                                     id: tabLabel
                                     Layout.fillWidth: true
                                     text: tabDelegate.tabTitle
-                                    font.pixelSize: 11
+                                    font.pixelSize: fontSizeSmall + 1
                                     color: index === currentTabIndex ? textLight : textMuted
                                     elide: Text.ElideRight
                                 }
@@ -180,7 +184,7 @@ Rectangle {
                                     Text {
                                         anchors.centerIn: parent
                                         text: "×"
-                                        font.pixelSize: 12
+                                        font.pixelSize: fontSizeMedium
                                         font.bold: true
                                         color: closeArea.containsMouse ? textLight : textMuted
                                     }
@@ -248,7 +252,7 @@ Rectangle {
                 anchors.centerIn: parent
                 visible: !contentLoader.item && tabRepeater.count === 0
                 text: "No content"
-                font.pixelSize: 12
+                font.pixelSize: fontSizeMedium
                 color: textMuted
             }
         }

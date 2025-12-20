@@ -128,6 +128,13 @@ Rectangle {
     property color accentBlue: mainWin ? mainWin.accentBlue : "#5BCEFA"
     property color borderColor: mainWin ? mainWin.borderColor : "#9B4F96"
 
+    // Font scaling - reactive bindings to main window
+    property int fontSizeSmall: mainWin ? mainWin.fontSizeSmall : 10
+    property int fontSizeMedium: mainWin ? mainWin.fontSizeMedium : 12
+    property int fontSizeLarge: mainWin ? mainWin.fontSizeLarge : 14
+    property int fontSizeHeader: mainWin ? mainWin.fontSizeHeader : 16
+    property string fontFamily: mainWin ? mainWin.fontFamily : "system-ui"
+
     // Signals
     signal modeChanged(string newMode)
     signal layoutChanged()
