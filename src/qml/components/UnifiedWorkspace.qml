@@ -10,12 +10,17 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
+import "../workflow"
 
 Rectangle {
     id: unifiedWorkspace
 
     // Current workspace mode: "sts", "snom", "map", "workflow"
     property string currentMode: "sts"
+
+    // External references needed for mode-specific panels
+    property var backend: null
+    property var workflowManager: null
 
     // Panel visibility per mode (can be overridden)
     property bool showLeftPanel: true
@@ -35,12 +40,73 @@ Rectangle {
     property real topPanelHeight: 200
     property real bottomPanelHeight: 200
 
-    // Components to load in panels (set by parent)
+    // Components to load in panels (set by parent or auto-configured by mode)
     property Component leftPanelContent: null
     property Component rightPanelContent: null
     property Component topPanelContent: null
     property Component bottomPanelContent: null
     property Component centerContent: null
+
+    // Mode-specific default panel components
+    property Component projectBrowserComponent: null  // Set by parent (Main.qml)
+    property Component toolPaletteComponent: Component {
+        WorkflowToolPalette {
+            workflowManager: unifiedWorkspace.workflowManager
+        }
+    }
+    property Component workflowCanvasComponent: Component {
+        WorkflowCanvas {
+            id: embeddedWorkflowCanvas
+            workflowManager: unifiedWorkspace.workflowManager
+
+            onNodeSelected: function(node) {
+                console.log("Workflow node selected:", node.id)
+            }
+
+            onStatusMessage: function(message, messageColor) {
+                console.log("Workflow:", message)
+            }
+        }
+    }
+
+    // Auto-configure panels based on mode
+    onCurrentModeChanged: {
+        configurePanelsForMode(currentMode)
+    }
+
+    function configurePanelsForMode(mode) {
+        switch(mode) {
+            case "workflow":
+                // Workflow mode: ToolPalette on left, WorkflowCanvas in center
+                showLeftPanel = true
+                showRightPanel = true  // For NodeParameterEditor
+                leftPanelContent = toolPaletteComponent
+                centerContent = workflowCanvasComponent
+                break
+
+            case "sts":
+            case "snom":
+                // STS/SNOM: ProjectBrowser on left (if provided)
+                showLeftPanel = projectBrowserComponent !== null
+                showRightPanel = false
+                leftPanelContent = projectBrowserComponent
+                centerContent = null
+                break
+
+            case "map":
+                // Map mode: handled by MapEditorWorkstation externally
+                showLeftPanel = false
+                showRightPanel = false
+                centerContent = null
+                break
+
+            default:
+                showLeftPanel = projectBrowserComponent !== null
+                showRightPanel = false
+                leftPanelContent = projectBrowserComponent
+                centerContent = null
+        }
+    }
 
     // Canvas background style based on mode
     property string canvasBackground: {

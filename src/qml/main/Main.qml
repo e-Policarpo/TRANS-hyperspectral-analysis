@@ -50,6 +50,7 @@ ApplicationWindow {
     }
 
     // Reactive tools list based on current tab
+    // Tab indices: 0=STS, 1=SNOM, 2=Map, 3=Workflow
     property var currentTools: {
         if (currentTabIndex === 0) {
             return [
@@ -76,13 +77,16 @@ ApplicationWindow {
                 "Truncate Data",
                 "Curve Analysis"
             ]
-        } else {
+        } else if (currentTabIndex === 2) {
             return [
                 "2D FFT",
                 "Image Smoothing",
                 "Gradient Filter",
                 "Map Discretizer"
             ]
+        } else {
+            // Workflow mode - no separate tools menu, tools are in the palette
+            return []
         }
     }
 
@@ -781,11 +785,12 @@ ApplicationWindow {
         anchors.fill: parent
         orientation: Qt.Horizontal
 
-        // Project Browser (left side)
+        // Project Browser (left side) - hidden in Workflow mode
         Rectangle {
-            SplitView.minimumWidth: 200
-            SplitView.preferredWidth: 280
-            SplitView.maximumWidth: 400
+            SplitView.minimumWidth: currentTabIndex === 3 ? 0 : 200
+            SplitView.preferredWidth: currentTabIndex === 3 ? 0 : 280
+            SplitView.maximumWidth: currentTabIndex === 3 ? 0 : 400
+            visible: currentTabIndex !== 3
             color: "transparent"
 
             ProjectBrowser {
@@ -934,64 +939,49 @@ ApplicationWindow {
                                     }
                                 }
                             }
-                        }  // TabBar
-
-                        // Separator
-                        Rectangle {
-                            Layout.preferredWidth: 1
-                            Layout.preferredHeight: 30
-                            color: borderColor
-                            Layout.leftMargin: 10
-                            Layout.rightMargin: 5
-                        }
-
-                        // Workflow Editor button (styled like tabs)
-                        Button {
-                            id: workflowEditorBtn
-                            text: "Workflow Editor"
-
-                            contentItem: Text {
-                                text: "Workflow Editor"
-                                font.pixelSize: 14
-                                font.bold: workflowEditorBtn.hovered
-                                color: workflowEditorBtn.hovered ? textLight : textMuted
-                                horizontalAlignment: Text.AlignHCenter
-                                verticalAlignment: Text.AlignVCenter
-                            }
-
-                            background: Rectangle {
-                                color: workflowEditorBtn.hovered ? bgLight : "transparent"
-                                Rectangle {
-                                    visible: workflowEditorBtn.hovered
-                                    anchors.bottom: parent.bottom
-                                    width: parent.width
-                                    height: 2
-                                    color: accentOrange
+                            TabButton {
+                                text: "Workflow"
+                                contentItem: Text {
+                                    text: parent.text
+                                    font.pixelSize: 14
+                                    font.bold: parent.checked
+                                    color: parent.checked ? accentOrange : textMuted
+                                    horizontalAlignment: Text.AlignHCenter
+                                    verticalAlignment: Text.AlignVCenter
+                                }
+                                background: Rectangle {
+                                    color: parent.checked ? bgLight : "transparent"
+                                    Rectangle {
+                                        visible: parent.parent.checked
+                                        anchors.bottom: parent.bottom
+                                        width: parent.width
+                                        height: 2
+                                        color: accentOrange
+                                    }
                                 }
                             }
-
-                            onClicked: openWorkflowWindow("New Workflow")
-
-                            ToolTip {
-                                visible: workflowEditorBtn.hovered
-                                text: "Open visual workflow editor for batch processing"
-                                delay: 500
-                            }
-                        }
+                        }  // TabBar
                     }  // RowLayout
                 }  // Rectangle (toolbar)
 
-        // Workspace container - switches between DockableWorkspace and MapEditor
+        // Workspace container - switches between workspaces based on tab
         StackLayout {
             id: workspaceStack
             Layout.fillWidth: true
             Layout.fillHeight: true
-            currentIndex: currentTabIndex === 2 ? 1 : 0
+            // Tab indices: 0=STS, 1=SNOM, 2=Map, 3=Workflow
+            currentIndex: {
+                if (currentTabIndex === 2) return 1      // Map Editor
+                else if (currentTabIndex === 3) return 2 // Workflow
+                else return 0                             // STS/SNOM
+            }
 
             // Unified Workspace (for STS and SNOM tabs)
             UnifiedWorkspace {
                 id: workspace
                 currentMode: currentTabIndex === 0 ? "sts" : "snom"
+                backend: mainWindow.backend
+                workflowManager: backend ? backend.workflowManager : null
 
                 // Panel visibility for STS/SNOM modes
                 showLeftPanel: false  // ProjectBrowser is in outer SplitView
@@ -1038,6 +1028,30 @@ ApplicationWindow {
                 onOpenMultiDatasetSpectraRequested: function(datasetSpectraList, forceNewWindow) {
                     console.log("Open multi-dataset spectra requested:", datasetSpectraList.length, "datasets")
                     openMultiDatasetSpectra(datasetSpectraList, forceNewWindow || false)
+                }
+            }
+
+            // Workflow Workspace (for Workflow tab)
+            UnifiedWorkspace {
+                id: workflowWorkspace
+                currentMode: "workflow"
+                backend: mainWindow.backend
+                workflowManager: backend ? backend.workflowManager : null
+
+                // Workflow mode uses internal panels
+                showLeftPanel: true   // WorkflowToolPalette
+                showRightPanel: true  // For NodeParameterEditor (future)
+                showTopPanel: false
+                showBottomPanel: false
+                leftPanelWidth: 260
+
+                // Handle workflow canvas interactions
+                onFloatingEntityAdded: function(entity) {
+                    console.log("Workflow entity added:", entity.id, entity.type)
+                }
+
+                onFloatingEntityRemoved: function(entityId) {
+                    console.log("Workflow entity removed:", entityId)
                 }
             }
         }
@@ -1302,6 +1316,7 @@ ApplicationWindow {
 
     // Functions
     function getToolsForCurrentTab() {
+        // Tab indices: 0=STS, 1=SNOM, 2=Map, 3=Workflow
         if (currentTabIndex === 0) {
             // STS Analysis tools
             return [
@@ -1329,7 +1344,7 @@ ApplicationWindow {
                 "Truncate Data",
                 "Curve Analysis"
             ]
-        } else if (currentTabIndex===2){
+        } else if (currentTabIndex === 2) {
             // Map Editor tools
             return [
                 "2D FFT",
@@ -1338,6 +1353,9 @@ ApplicationWindow {
                 "Map Discretizer",
                 "Map Processing"
             ]
+        } else {
+            // Workflow mode - tools are accessed via ToolPalette
+            return []
         }
     }
 
