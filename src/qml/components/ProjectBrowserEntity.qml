@@ -47,20 +47,7 @@ FloatingEntity {
             ProjectBrowser {
                 id: embeddedBrowser
                 anchors.fill: parent
-                backend: projectBrowserEntity.backend
-
-                // Forward signals
-                onDatasetDoubleClicked: function(name) {
-                    projectBrowserEntity.datasetDoubleClicked(name)
-                }
-
-                onDatasetActivated: function(name) {
-                    projectBrowserEntity.datasetActivated(name)
-                }
-
-                onSpectrumRequestedFromBrowser: function(name, index) {
-                    projectBrowserEntity.spectrumRequestedFromBrowser(name, index)
-                }
+                // Note: ProjectBrowser gets backend from global context, not property
             }
         }
     }
