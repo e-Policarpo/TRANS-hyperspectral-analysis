@@ -50,7 +50,7 @@ ApplicationWindow {
     }
 
     // Reactive tools list based on current tab
-    // Tab indices: 0=STS, 1=SNOM, 2=Map, 3=Workflow
+    // Tab indices: 0=STS, 1=SNOM, 2=Map
     property var currentTools: {
         if (currentTabIndex === 0) {
             return [
@@ -84,10 +84,8 @@ ApplicationWindow {
                 "Gradient Filter",
                 "Map Discretizer"
             ]
-        } else {
-            // Workflow mode - no separate tools menu, tools are in the palette
-            return []
         }
+        return []
     }
 
 
@@ -267,9 +265,10 @@ ApplicationWindow {
             }
         }
 
-        // T.R.A.N.S. application menu (first menu like on macOS)
+        // T.R.A.N.S. application menu (macOS only - on Windows/Linux, items move to Help)
         Menu {
             title: "T.R.A.N.S."
+            visible: Qt.platform.os === "osx"
             background: Rectangle {
                 color: bgMedium
                 border.color: borderColor
@@ -520,6 +519,36 @@ ApplicationWindow {
                 height: visible ? implicitHeight : 0
                 onTriggered: openToolWindow(text)
             }
+            MenuItem {
+                text: "Peak Indexing"
+                visible: currentTabIndex === 0 || currentTabIndex === 1
+                height: visible ? implicitHeight : 0
+                onTriggered: openToolWindow(text)
+            }
+            MenuItem {
+                text: "Average Curves"
+                visible: currentTabIndex === 0 || currentTabIndex === 1
+                height: visible ? implicitHeight : 0
+                onTriggered: openToolWindow(text)
+            }
+            MenuItem {
+                text: "Filter Bad Data"
+                visible: currentTabIndex === 0
+                height: visible ? implicitHeight : 0
+                onTriggered: openToolWindow(text)
+            }
+            MenuItem {
+                text: "Dirac Point Estimator"
+                visible: currentTabIndex === 0
+                height: visible ? implicitHeight : 0
+                onTriggered: openToolWindow(text)
+            }
+            MenuItem {
+                text: "Detect Bandgap & Doping"
+                visible: currentTabIndex === 0
+                height: visible ? implicitHeight : 0
+                onTriggered: openToolWindow(text)
+            }
         }
 
         Menu {
@@ -547,36 +576,6 @@ ApplicationWindow {
             MenuItem {
                 text: "New Workflow..."
                 onTriggered: openWorkflowWindow("New Workflow")
-            }
-
-            MenuSeparator {
-                contentItem: Rectangle {
-                    implicitHeight: 1
-                    color: borderColor
-                }
-            }
-
-            // Preset workflows section
-            MenuItem {
-                text: "Presets"
-                enabled: false
-                contentItem: Text {
-                    text: "— Presets —"
-                    font.pixelSize: 11
-                    font.italic: true
-                    color: textMuted
-                    leftPadding: 10
-                }
-            }
-            MenuItem {
-                text: "STS Analysis Workflow"
-                enabled: currentTabIndex === 0
-                onTriggered: openWorkflowWindow("STS Analysis")
-            }
-            MenuItem {
-                text: "SNOM Analysis Workflow"
-                enabled: currentTabIndex === 1
-                onTriggered: openWorkflowWindow("SNOM Analysis")
             }
 
             MenuSeparator {
@@ -733,18 +732,12 @@ ApplicationWindow {
             MenuItem {
                 text: "Cascade Windows"
                 enabled: openTools.length > 0
-                onTriggered: {
-                    console.log("Cascade Windows")
-                    // TODO: Implement cascade windows
-                }
+                onTriggered: toolWindowManager.cascadeWindows()
             }
             MenuItem {
                 text: "Tile Windows"
                 enabled: openTools.length > 0
-                onTriggered: {
-                    console.log("Tile Windows")
-                    // TODO: Implement tile windows
-                }
+                onTriggered: toolWindowManager.tileWindows()
             }
 
             MenuSeparator {
@@ -763,10 +756,9 @@ ApplicationWindow {
             Repeater {
                 model: openTools
                 delegate: MenuItem {
-                    text: "  " + modelData
+                    text: "  " + modelData.name
                     onTriggered: {
-                        console.log("Focus tool:", modelData)
-                        // TODO: Bring tool window to front
+                        toolWindowManager.activateWindow(modelData.windowId)
                     }
                 }
             }
@@ -794,8 +786,26 @@ ApplicationWindow {
                 }
             }
             MenuItem {
-                text: "Documentation"
-                onTriggered: Qt.openUrlExternally("file:///" + backend.getOutputDirectory() + "/../docs")
+                text: "Documentation (Coming Soon)"
+                enabled: false
+            }
+            MenuSeparator {
+                visible: Qt.platform.os !== "osx"
+                contentItem: Rectangle {
+                    implicitHeight: 1
+                    color: borderColor
+                }
+            }
+            MenuItem {
+                text: "Preferences..."
+                visible: Qt.platform.os !== "osx"
+                onTriggered: preferencesDialog.open()
+            }
+            MenuSeparator {
+                contentItem: Rectangle {
+                    implicitHeight: 1
+                    color: borderColor
+                }
             }
             MenuItem {
                 text: "About"
@@ -809,12 +819,11 @@ ApplicationWindow {
         anchors.fill: parent
         orientation: Qt.Horizontal
 
-        // Project Browser (left side) - hidden in Workflow mode
+        // Project Browser (left side)
         Rectangle {
-            SplitView.minimumWidth: currentTabIndex === 3 ? 0 : 200
-            SplitView.preferredWidth: currentTabIndex === 3 ? 0 : 280
-            SplitView.maximumWidth: currentTabIndex === 3 ? 0 : 400
-            visible: currentTabIndex !== 3
+            SplitView.minimumWidth: 200
+            SplitView.preferredWidth: 280
+            SplitView.maximumWidth: 400
             color: "transparent"
 
             ProjectBrowser {
@@ -854,28 +863,6 @@ ApplicationWindow {
                             font.pixelSize: 14
                             font.bold: true
                             color: textLight
-                        }
-
-                        // Dock position selector
-                        ComboBox {
-                            id: dockPositionCombo
-                            Layout.preferredWidth: 120
-                            model: ["Left", "Right", "Top", "Bottom"]
-                            currentIndex: 0
-
-                            background: Rectangle {
-                                color: bgLight
-                                border.color: borderColor
-                                radius: 3
-                            }
-
-                            contentItem: Text {
-                                text: dockPositionCombo.displayText
-                                color: textLight
-                                font.pixelSize: 12
-                                verticalAlignment: Text.AlignVCenter
-                                leftPadding: 8
-                            }
                         }
 
                         Item { Layout.fillWidth: true }
@@ -963,48 +950,27 @@ ApplicationWindow {
                                     }
                                 }
                             }
-                            TabButton {
-                                text: "Workflow"
-                                contentItem: Text {
-                                    text: parent.text
-                                    font.pixelSize: 14
-                                    font.bold: parent.checked
-                                    color: parent.checked ? accentOrange : textMuted
-                                    horizontalAlignment: Text.AlignHCenter
-                                    verticalAlignment: Text.AlignVCenter
-                                }
-                                background: Rectangle {
-                                    color: parent.checked ? bgLight : "transparent"
-                                    Rectangle {
-                                        visible: parent.parent.checked
-                                        anchors.bottom: parent.bottom
-                                        width: parent.width
-                                        height: 2
-                                        color: accentOrange
-                                    }
-                                }
-                            }
                         }  // TabBar
                     }  // RowLayout
                 }  // Rectangle (toolbar)
 
-        // Workspace container - switches between workspaces based on tab
-        StackLayout {
-            id: workspaceStack
+        // Workspace container wrapper - constrains WindowManager to canvas area
+        Item {
+            id: workspaceContainer
             Layout.fillWidth: true
             Layout.fillHeight: true
-            // Tab indices: 0=STS, 1=SNOM, 2=Map, 3=Workflow
-            currentIndex: {
-                if (currentTabIndex === 2) return 1      // Map Editor
-                else if (currentTabIndex === 3) return 2 // Workflow
-                else return 0                             // STS/SNOM
-            }
+
+        StackLayout {
+            id: workspaceStack
+            anchors.fill: parent
+            // Tab indices: 0=STS, 1=SNOM, 2=Map
+            currentIndex: currentTabIndex === 2 ? 1 : 0
 
             // Unified Workspace (for STS and SNOM tabs)
             UnifiedWorkspace {
                 id: workspace
                 currentMode: currentTabIndex === 0 ? "sts" : "snom"
-                backend: mainWindow.backend
+                backend: backend
                 workflowManager: backend ? backend.workflowManager : null
 
                 // Panel visibility for STS/SNOM modes
@@ -1055,30 +1021,28 @@ ApplicationWindow {
                 }
             }
 
-            // Workflow Workspace (for Workflow tab)
-            UnifiedWorkspace {
-                id: workflowWorkspace
-                currentMode: "workflow"
-                backend: mainWindow.backend
-                workflowManager: backend ? backend.workflowManager : null
+        }  // StackLayout
 
-                // Workflow mode uses internal panels
-                showLeftPanel: true   // WorkflowToolPalette
-                showRightPanel: true  // For NodeParameterEditor (future)
-                showTopPanel: false
-                showBottomPanel: false
-                leftPanelWidth: 260
+            // Embedded tool windows manager (overlays workspace only)
+            WindowManager {
+                id: toolWindowManager
+                anchors.fill: parent
+                backend: backend
+                z: 50  // Above workspace content
 
-                // Handle workflow canvas interactions
-                onFloatingEntityAdded: function(entity) {
-                    console.log("Workflow entity added:", entity.id, entity.type)
-                }
-
-                onFloatingEntityRemoved: function(entityId) {
-                    console.log("Workflow entity removed:", entityId)
+                onWindowClosed: function(windowId) {
+                    // Remove from open tools tracking
+                    var tools = openTools.slice()
+                    for (var i = tools.length - 1; i >= 0; i--) {
+                        if (tools[i].windowId === windowId) {
+                            tools.splice(i, 1)
+                            break
+                        }
+                    }
+                    openTools = tools
                 }
             }
-        }
+        }  // Item (workspaceContainer)
 
         // Debug Console (toggleable)
         DebugConsole {
@@ -1217,7 +1181,7 @@ ApplicationWindow {
         standardButtons: Dialog.Ok
 
         Label {
-            text: "TRANS-QML\nHyperspectral Data Analysis Platform\n\nVersion 2.0\n\nResearch Software"
+            text: "TRANS-QML\nHyperspectral Data Analysis Platform\n\nVersion 1.0\n\nResearch Software"
             horizontalAlignment: Text.AlignHCenter
         }
     }
@@ -1340,7 +1304,7 @@ ApplicationWindow {
 
     // Functions
     function getToolsForCurrentTab() {
-        // Tab indices: 0=STS, 1=SNOM, 2=Map, 3=Workflow
+        // Tab indices: 0=STS, 1=SNOM, 2=Map
         if (currentTabIndex === 0) {
             // STS Analysis tools
             return [
@@ -1377,26 +1341,65 @@ ApplicationWindow {
                 "Map Discretizer",
                 "Map Processing"
             ]
-        } else {
-            // Workflow mode - tools are accessed via ToolPalette
-            return []
         }
+        return []
     }
 
     function openToolWindow(toolName) {
         console.log("Opening tool:", toolName)
 
-        // Create tool window component
-        var component = Qt.createComponent("../tools/ToolWindow.qml")
+        // Map tool names to QML file paths
+        var toolMap = {
+            "1D FFT": "../tools/FFT1DTool.qml",
+            "2D FFT": "../tools/FFT2DTool.qml",
+            "Curve Smoothing": "../tools/CurveSmoothingTool.qml",
+            "Image Smoothing": "../tools/ImageSmoothingTool.qml",
+            "Derivative Calculator": "../tools/DerivativeTool.qml",
+            "Gradient Filter": "../tools/GradientTool.qml",
+            "Curve Fitting": "../tools/CurveFittingTool.qml",
+            "Integration Utility": "../tools/IntegrationTool.qml",
+            "Map Generator": "../tools/MapGeneratorTool.qml",
+            "Spatial Average": "../tools/SpatialAverageTool.qml",
+            "Map Discretizer": "../tools/MapDiscretizerTool.qml",
+            "Map Processing": "../tools/MapProcessingTool.qml",
+            "Curve Analysis": "../tools/CurveAnalysisTool.qml",
+            "Truncate Data": "../tools/TruncateTool.qml",
+            "Peak Indexing": "../tools/PeakIndexingTool.qml",
+            "Filter Bad Data": "../tools/FilterBadDataTool.qml",
+            "Average Curves": "../tools/AverageCurvesTool.qml",
+            "Dirac Point Estimator": "../tools/DiracPointEstimatorTool.qml",
+            "Detect Bandgap & Doping": "../tools/DetectBandgapDopingTool.qml"
+        }
+
+        var toolPath = toolMap[toolName] || "../tools/GenericToolUI.qml"
+        var component = Qt.createComponent(toolPath)
         if (component.status === Component.Ready) {
-            var window = component.createObject(mainWindow, {
-                toolName: toolName,
-                parentWindow: mainWindow
+            var windowId = toolWindowManager.createToolWindow(toolName, component, {
+                width: 450,
+                height: 550
             })
-            openTools.push(window)
-            window.show()
+            if (windowId) {
+                var tools = openTools.slice()
+                tools.push({ name: toolName, windowId: windowId })
+                openTools = tools
+            }
+        } else if (component.status === Component.Error) {
+            console.error("Error loading tool:", toolName, component.errorString())
         } else {
-            console.error("Error creating tool window:", component.errorString())
+            // Component is still loading, wait for it
+            component.statusChanged.connect(function() {
+                if (component.status === Component.Ready) {
+                    var wid = toolWindowManager.createToolWindow(toolName, component, {
+                        width: 450,
+                        height: 550
+                    })
+                    if (wid) {
+                        var t = openTools.slice()
+                        t.push({ name: toolName, windowId: wid })
+                        openTools = t
+                    }
+                }
+            })
         }
     }
 
@@ -1612,9 +1615,7 @@ ApplicationWindow {
 
         onAccepted: {
             var path = file.toString()
-            if (path.startsWith("file://")) {
-                path = path.substring(7)
-            }
+            path = path.replace(/^file:\/{2,3}/, "")
             console.log("Importing image:", path)
             backend.importImage(path)
         }
@@ -1703,10 +1704,7 @@ ApplicationWindow {
 
         onAccepted: {
             var path = file.toString()
-            // Remove file:// prefix
-            if (path.startsWith("file://")) {
-                path = path.substring(7)
-            }
+            path = path.replace(/^file:\/{2,3}/, "")
             console.log("Saving project to:", path)
             backend.saveProjectFile(path)
         }
