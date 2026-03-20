@@ -307,7 +307,7 @@ Dialog {
                     Layout.fillWidth: true
                 }
 
-                // Tab bar for Colors / Fonts
+                // Tab bar for General / Colors / Fonts
                 TabBar {
                     id: editTabBar
                     Layout.fillWidth: true
@@ -315,6 +315,20 @@ Dialog {
                     background: Rectangle {
                         color: bgDark
                         radius: 4
+                    }
+
+                    TabButton {
+                        text: "General"
+                        contentItem: Text {
+                            text: parent.text
+                            color: parent.checked ? accentBlue : textMuted
+                            font.pixelSize: 12
+                            horizontalAlignment: Text.AlignHCenter
+                        }
+                        background: Rectangle {
+                            color: parent.checked ? bgLight : "transparent"
+                            radius: 4
+                        }
                     }
 
                     TabButton {
@@ -351,6 +365,124 @@ Dialog {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     currentIndex: editTabBar.currentIndex
+
+                    // General tab
+                    ColumnLayout {
+                        spacing: 15
+
+                        Text { text: "General Settings"; font.bold: true; color: accentPink; font.pixelSize: 14 }
+
+                        // Autosave section
+                        Rectangle {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: autosaveContent.implicitHeight + 30
+                            color: bgDark
+                            border.color: borderColor
+                            radius: 6
+
+                            ColumnLayout {
+                                id: autosaveContent
+                                anchors.fill: parent
+                                anchors.margins: 15
+                                spacing: 12
+
+                                Text {
+                                    text: "Autosave"
+                                    font.pixelSize: 13
+                                    font.bold: true
+                                    color: textLight
+                                }
+
+                                RowLayout {
+                                    spacing: 10
+
+                                    CheckBox {
+                                        id: autosaveEnabledCheck
+                                        text: "Enable Autosave"
+                                        checked: preferencesManager ? preferencesManager.getAutosaveEnabled() : true
+
+                                        contentItem: Text {
+                                            text: autosaveEnabledCheck.text
+                                            color: textLight
+                                            font.pixelSize: 12
+                                            leftPadding: autosaveEnabledCheck.indicator.width + 6
+                                            verticalAlignment: Text.AlignVCenter
+                                        }
+
+                                        indicator: Rectangle {
+                                            implicitWidth: 18
+                                            implicitHeight: 18
+                                            y: parent.height / 2 - height / 2
+                                            radius: 3
+                                            border.color: borderColor
+                                            color: autosaveEnabledCheck.checked ? accentBlue : bgLight
+
+                                            Text {
+                                                anchors.centerIn: parent
+                                                text: "\u2713"
+                                                color: textLight
+                                                font.pixelSize: 12
+                                                visible: autosaveEnabledCheck.checked
+                                            }
+                                        }
+
+                                        onToggled: {
+                                            if (preferencesManager) {
+                                                preferencesManager.setAutosaveEnabled(checked)
+                                            }
+                                        }
+                                    }
+                                }
+
+                                RowLayout {
+                                    spacing: 10
+                                    enabled: autosaveEnabledCheck.checked
+
+                                    Text {
+                                        text: "Interval (minutes):"
+                                        color: enabled ? textLight : textMuted
+                                        font.pixelSize: 12
+                                    }
+
+                                    SpinBox {
+                                        id: autosaveIntervalSpinner
+                                        from: 1
+                                        to: 60
+                                        value: preferencesManager ? preferencesManager.getAutosaveInterval() : 5
+
+                                        background: Rectangle {
+                                            color: bgLight
+                                            border.color: borderColor
+                                            radius: 4
+                                        }
+
+                                        contentItem: Text {
+                                            text: autosaveIntervalSpinner.value
+                                            color: textLight
+                                            horizontalAlignment: Text.AlignHCenter
+                                            verticalAlignment: Text.AlignVCenter
+                                        }
+
+                                        onValueModified: {
+                                            if (preferencesManager) {
+                                                preferencesManager.setAutosaveInterval(value)
+                                            }
+                                        }
+                                    }
+                                }
+
+                                Text {
+                                    text: "Autosave creates a separate .autosave.hrt file alongside your project.\nIf the application closes unexpectedly, you will be prompted to recover."
+                                    color: textMuted
+                                    font.pixelSize: 10
+                                    wrapMode: Text.Wrap
+                                    Layout.fillWidth: true
+                                }
+                            }
+                        }
+
+                        Item { Layout.fillHeight: true }
+                    }
 
                     // Colors tab
                     ScrollView {

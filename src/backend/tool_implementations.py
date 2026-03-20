@@ -149,15 +149,15 @@ class ToolImplementations:
             smoothed_df = pd.DataFrame(smoothed, columns=spectral_data.spectra.columns)
             smoothed_df.insert(0, spectral_data.independent_var_name, independent_var)
 
-            # Create user-friendly names using helper
+            # Create user-friendly names using naming convention
             base_name = self._extract_clean_base_name(dataset_name)
-            file_safe_name = self._sanitize_filename(base_name)
+            convention_name = self._apply_naming_convention(dataset_name, operation="Smoothed")
 
-            # Save with readable filename
-            output_path = self._ensure_output_dir('smoothed') / f"{file_safe_name}_smoothed_{smoothing_type}.csv"
+            # Save with convention-based filename
+            output_path = self._ensure_output_dir('smoothed') / f"{convention_name}.csv"
             smoothed_df.to_csv(output_path, index=False)
 
-            # Create new dataset with user-friendly name
+            # Create new dataset with clean base name (convention only for file path)
             friendly_name = f"{base_name} - Smoothed"
             metadata = SpectralMetadata(
                 source_type=spectral_data.metadata.source_type,
@@ -340,18 +340,17 @@ class ToolImplementations:
             deriv_df = pd.DataFrame(derivative, columns=spectral_data.spectra.columns)
             deriv_df.insert(0, spectral_data.independent_var_name, independent_var)
 
-            # Create user-friendly names using helper
+            # Create user-friendly names using naming convention
             base_name = self._extract_clean_base_name(dataset_name)
-            file_safe_name = self._sanitize_filename(base_name)
-            order_label = "1st_derivative" if order == 1 else "2nd_derivative"
+            friendly_order = "1st_Derivative" if order == 1 else "2nd_Derivative"
+            convention_name = self._apply_naming_convention(dataset_name, operation=friendly_order)
 
-            # Save with readable filename
-            output_path = self._ensure_output_dir('derivatives') / f"{file_safe_name}_{order_label}.csv"
+            # Save with convention-based filename
+            output_path = self._ensure_output_dir('derivatives') / f"{convention_name}.csv"
             deriv_df.to_csv(output_path, index=False)
 
-            # Create new dataset with user-friendly name
-            friendly_order = "1st Derivative" if order == 1 else "2nd Derivative"
-            friendly_name = f"{base_name} - {friendly_order}"
+            # Create new dataset with clean base name (convention only for file path)
+            friendly_name = f"{base_name} - {friendly_order.replace('_', ' ')}"
 
             metadata = SpectralMetadata(
                 source_type=spectral_data.metadata.source_type,
@@ -833,11 +832,12 @@ class ToolImplementations:
             corrected_array = np.array(corrected_spectra).T
             logger.info(f"BaselineCorrection: Output data range: min={np.nanmin(corrected_array):.6e}, max={np.nanmax(corrected_array):.6e}")
 
-            # Create user-friendly names using helper
+            # Create user-friendly names using naming convention
             base_name = self._extract_clean_base_name(dataset_name)
+            convention_name = self._apply_naming_convention(dataset_name, operation="Baseline_Corrected")
             file_safe_name = self._sanitize_filename(base_name)
 
-            # Save fit parameters
+            # Save fit parameters (auxiliary files use base_name, not convention)
             params_df = pd.DataFrame(fit_params_list)
             params_path = self._ensure_output_dir('fitted') / f"{file_safe_name}_FitParams_{fit_type}.csv"
             params_df.to_csv(params_path, index=False)
@@ -852,10 +852,10 @@ class ToolImplementations:
             corrected_df = pd.DataFrame(corrected_array, columns=spectral_data.spectra.columns)
             corrected_df.insert(0, spectral_data.independent_var_name, independent_var)
 
-            corrected_path = self._ensure_output_dir('fitted') / f"{file_safe_name}_NoBaseline_{fit_type}.csv"
+            corrected_path = self._ensure_output_dir('fitted') / f"{convention_name}.csv"
             corrected_df.to_csv(corrected_path, index=False)
 
-            # Create new dataset with friendly name
+            # Create new dataset with clean base name (convention only for file path)
             friendly_name = f"{base_name} - Baseline Corrected"
             metadata = SpectralMetadata(
                 source_type=spectral_data.metadata.source_type,
@@ -1192,17 +1192,16 @@ class ToolImplementations:
             # Merge overlapping intervals and remove duplicates
             merged_intervals = self._merge_peak_intervals(raw_intervals, independent_var)
 
-            # Create user-friendly names using helper
-            base_name = self._extract_clean_base_name(dataset_name)
-            file_safe_name = self._sanitize_filename(base_name)
+            # Create user-friendly names using naming convention
+            convention_name = self._apply_naming_convention(dataset_name, operation="Peaks")
 
-            # Save peak data with readable filename
+            # Save peak data with convention-based filename
             peaks_df = pd.DataFrame(all_peaks)
-            output_path = self._ensure_output_dir('peaks') / f"{file_safe_name}_peaks.csv"
+            output_path = self._ensure_output_dir('peaks') / f"{convention_name}.csv"
             peaks_df.to_csv(output_path, index=False)
 
             # Save intervals as JSON for easy loading
-            intervals_path = self._ensure_output_dir('peaks') / f"{file_safe_name}_intervals.json"
+            intervals_path = self._ensure_output_dir('peaks') / f"{convention_name}_intervals.json"
             import json
             with open(intervals_path, 'w') as f:
                 json.dump({
@@ -1609,3 +1608,601 @@ class ToolImplementations:
         )
 
         return result
+
+    # ========================================================================
+    # Filter Bad Data
+    # Algorithms adapted from ststools by Rafael Reis
+    # (https://github.com/rafinhareis/ststools)
+    # ========================================================================
+
+    def filter_bad_data(self, task, dataset_name: str,
+                        weight_saturation: float = 1.0,
+                        weight_noise: float = 1.0,
+                        weight_linear: float = 1.0,
+                        weight_periodic: float = 1.0,
+                        weight_partial_noise: float = 1.0,
+                        threshold: float = 0.5,
+                        correct_periodic: bool = False) -> str:
+        """
+        Filter bad spectra based on saturation, noise, linear artifact, and periodic noise heuristics.
+
+        Returns path to the text report. Creates three new datasets:
+        '{base} - Good Data', '{base} - Bad Data', and '{base} - FFT Spectra'.
+        """
+        from src.backend.sts_algorithms import (
+            detect_saturation, detect_noise, detect_linear_artifact,
+            detect_periodic_noise, correct_periodic_noise,
+            detect_partial_noise
+        )
+        try:
+            if dataset_name not in self._datasets:
+                self.errorOccurred.emit("Error", "Dataset not found")
+                return ""
+
+            spectral_data = self._datasets[dataset_name]
+            independent_var = spectral_data.independent_var
+            spectra = spectral_data.spectra
+            num_spectra = spectra.shape[1]
+
+            logger.info(f"Filtering bad data for {dataset_name}: {num_spectra} spectra, "
+                        f"weights=({weight_saturation}, {weight_noise}, {weight_linear}, {weight_periodic}, {weight_partial_noise}), "
+                        f"threshold={threshold}, correct_periodic={correct_periodic}")
+
+            good_indices = []
+            bad_indices = []
+            fft_magnitudes = {}
+            fft_frequencies = None
+            corrected_spectra = {}
+
+            correction_note = " (periodic correction enabled)" if correct_periodic else ""
+            report_lines = [
+                f"Filter Bad Data Report",
+                f"Dataset: {dataset_name}",
+                f"Total spectra: {num_spectra}",
+                f"Combination: max(weighted scores) — each detector independently triggers",
+                f"Weights: saturation={weight_saturation}, noise={weight_noise}, "
+                f"linear={weight_linear}, periodic={weight_periodic}, partial_noise={weight_partial_noise}",
+                f"Threshold: {threshold}{correction_note}",
+                "",
+                f"{'Index':>6} {'Sat':>8} {'Noise':>8} {'Linear':>8} {'Periodic':>10} {'Partial':>10} {'Combined':>10} {'Trigger':>12} {'Status':>8}",
+                "-" * 90,
+            ]
+
+            for i in range(num_spectra):
+                if task.cancelled:
+                    return ""
+                task.progress = i / num_spectra
+
+                spectrum = spectra.iloc[:, i].values
+                col_name = spectra.columns[i]
+
+                sat_score = detect_saturation(spectrum)
+                noise_score = detect_noise(spectrum)
+                lin_score = detect_linear_artifact(independent_var, spectrum)
+                periodic_score, fft_mag, _bg, peak_mask = detect_periodic_noise(spectrum)
+                partial_score = detect_partial_noise(independent_var, spectrum)
+
+                # Store FFT magnitude for output dataset
+                fft_magnitudes[col_name] = fft_mag
+                if fft_frequencies is None:
+                    # Compute frequency axis once using full spectrum length
+                    # (detect_periodic_noise strips NaN internally, so use the same length)
+                    dx = np.abs(np.mean(np.diff(independent_var))) if len(independent_var) > 1 else 1.0
+                    n_clean = len(spectrum[~np.isnan(spectrum)])
+                    fft_frequencies = np.fft.rfftfreq(n_clean, d=dx)
+                    fft_expected_len = n_clean // 2 + 1
+
+                # Periodic noise correction
+                if correct_periodic and np.any(peak_mask):
+                    corrected_spectra[i] = correct_periodic_noise(spectrum, peak_mask)
+
+                # Max-based combination: each detector can independently trigger
+                weighted_scores = []
+                score_labels = []
+                if weight_saturation > 0:
+                    weighted_scores.append(weight_saturation * sat_score)
+                    score_labels.append("saturation")
+                if weight_noise > 0:
+                    weighted_scores.append(weight_noise * noise_score)
+                    score_labels.append("noise")
+                if weight_linear > 0:
+                    weighted_scores.append(weight_linear * lin_score)
+                    score_labels.append("linear")
+                if weight_periodic > 0:
+                    weighted_scores.append(weight_periodic * periodic_score)
+                    score_labels.append("periodic")
+                if weight_partial_noise > 0:
+                    weighted_scores.append(weight_partial_noise * partial_score)
+                    score_labels.append("partial_noise")
+
+                if weighted_scores:
+                    max_idx = int(np.argmax(weighted_scores))
+                    combined = weighted_scores[max_idx]
+                    trigger = score_labels[max_idx]
+                else:
+                    combined = 0.0
+                    trigger = "-"
+
+                status = "BAD" if combined >= threshold else "GOOD"
+                if combined >= threshold:
+                    bad_indices.append(i)
+                else:
+                    good_indices.append(i)
+
+                report_lines.append(
+                    f"{i:>6} {sat_score:>8.3f} {noise_score:>8.3f} {lin_score:>8.3f} "
+                    f"{periodic_score:>10.3f} {partial_score:>10.3f} {combined:>10.3f} {trigger:>12} {status:>8}"
+                )
+
+            report_lines.append("")
+            report_lines.append(f"Good spectra: {len(good_indices)}")
+            report_lines.append(f"Bad spectra: {len(bad_indices)}")
+            if correct_periodic:
+                report_lines.append(f"Spectra with periodic correction applied: {len(corrected_spectra)}")
+
+            base_name = self._extract_clean_base_name(dataset_name)
+            file_safe_name = self._sanitize_filename(base_name)
+
+            # Build good dataset (with optional periodic correction)
+            good_name = f"{base_name} - Good Data"
+            if good_indices:
+                good_cols = [spectra.columns[i] for i in good_indices]
+                if correct_periodic and corrected_spectra:
+                    # Use corrected spectra where available
+                    good_data = []
+                    for idx in good_indices:
+                        if idx in corrected_spectra:
+                            good_data.append(corrected_spectra[idx])
+                        else:
+                            good_data.append(spectra.iloc[:, idx].values)
+                    good_df = pd.DataFrame(
+                        np.column_stack(good_data),
+                        columns=[f"Spectrum_{i}" for i in range(len(good_indices))]
+                    )
+                else:
+                    good_df = pd.DataFrame(
+                        spectra[good_cols].values,
+                        columns=[f"Spectrum_{i}" for i in range(len(good_indices))]
+                    )
+                good_df.insert(0, spectral_data.independent_var_name, independent_var)
+
+                good_metadata = SpectralMetadata(
+                    source_type=spectral_data.metadata.source_type,
+                    dimensions=spectral_data.metadata.dimensions,
+                    scan_mode=spectral_data.metadata.scan_mode,
+                    units=spectral_data.metadata.units.copy(),
+                    additional_info={
+                        'original': dataset_name,
+                        'filter': 'good',
+                        'count': len(good_indices),
+                        'periodic_corrected': correct_periodic
+                    }
+                )
+                self._datasets[good_name] = SpectralData(good_df, good_metadata)
+                if not self._workflow_mode:
+                    self.dataLoaded.emit(good_name)
+            else:
+                report_lines.append("No good spectra found — 'Good Data' dataset not created.")
+
+            # Build bad dataset (always original, uncorrected spectra)
+            bad_name = f"{base_name} - Bad Data"
+            if bad_indices:
+                bad_cols = [spectra.columns[i] for i in bad_indices]
+                bad_df = pd.DataFrame(
+                    spectra[bad_cols].values,
+                    columns=[f"Spectrum_{i}" for i in range(len(bad_indices))]
+                )
+                bad_df.insert(0, spectral_data.independent_var_name, independent_var)
+
+                bad_metadata = SpectralMetadata(
+                    source_type=spectral_data.metadata.source_type,
+                    dimensions=spectral_data.metadata.dimensions,
+                    scan_mode=spectral_data.metadata.scan_mode,
+                    units=spectral_data.metadata.units.copy(),
+                    additional_info={
+                        'original': dataset_name,
+                        'filter': 'bad',
+                        'count': len(bad_indices)
+                    }
+                )
+                self._datasets[bad_name] = SpectralData(bad_df, bad_metadata)
+                if not self._workflow_mode:
+                    self.dataLoaded.emit(bad_name)
+            else:
+                report_lines.append("No bad spectra found — 'Bad Data' dataset not created.")
+
+            # Build FFT Spectra output dataset
+            if fft_frequencies is not None and fft_magnitudes:
+                fft_data = {'Frequency': fft_frequencies}
+                n_freq = len(fft_frequencies)
+                skipped = 0
+                for col_name, mag in fft_magnitudes.items():
+                    if len(mag) == n_freq:
+                        fft_data[col_name] = mag
+                    elif len(mag) > n_freq:
+                        # Truncate to match (different NaN count in this spectrum)
+                        fft_data[col_name] = mag[:n_freq]
+                    else:
+                        # Too short (e.g. edge case with <8 clean points) — skip
+                        skipped += 1
+
+                if skipped > 0:
+                    logger.warning(f"FFT: skipped {skipped} spectra with mismatched lengths")
+
+                if len(fft_data) > 1:  # At least Frequency + one spectrum
+                    fft_df = pd.DataFrame(fft_data)
+
+                    orig_units = spectral_data.metadata.units
+                    indep_unit = orig_units.get('independent', 'V')
+                    fft_metadata = SpectralMetadata(
+                        source_type='computed',
+                        dimensions='1D',
+                        scan_mode='FFT',
+                        units={'independent': f'1/{indep_unit}', 'dependent': 'a.u.'},
+                        additional_info={
+                            'original': dataset_name,
+                            'type': 'fft_spectra'
+                        }
+                    )
+                    fft_name = f"{base_name} - FFT Spectra"
+                    self._datasets[fft_name] = SpectralData(fft_df, fft_metadata)
+                    if not self._workflow_mode:
+                        self.dataLoaded.emit(fft_name)
+
+            # Save report
+            report_text = "\n".join(report_lines)
+            output_path = self._ensure_output_dir('curves') / f"{file_safe_name}_filter_report.txt"
+            output_path.write_text(report_text)
+
+            logger.info(f"Filter complete: {len(good_indices)} good, {len(bad_indices)} bad")
+            return str(output_path)
+
+        except Exception as e:
+            logger.error(f"Filter Bad Data error: {e}", exc_info=True)
+            self.errorOccurred.emit("Filter Bad Data Error", str(e))
+            return ""
+
+    # ========================================================================
+    # Detect Bandgap & Doping
+    # Algorithms adapted from ststools by Rafael Reis
+    # (https://github.com/rafinhareis/ststools)
+    # ========================================================================
+
+    def detect_bandgap_doping(self, task, dataset_name: str,
+                              smoothing: float = 1.0,
+                              delta: float = 5.0,
+                              resolution: float = 0.01,
+                              smoothing_method: str = 'Savgol') -> str:
+        """
+        Detect bandgap and doping type per spectrum.
+
+        Pipeline: validate -> smooth -> derivative -> normalize -> bandgap -> doping.
+        Produces TWO output datasets:
+        - '{base_name} - Bandgap': Spectrum Index, Bandgap (eV), Gap Left Edge (V), Gap Right Edge (V), Valid
+        - '{base_name} - Doping': Spectrum Index, Doping Type, Doping Offset (V), Valid
+        """
+        from src.backend.sts_algorithms import (
+            numerical_derivative, normalize_ldos, detect_bandgap,
+            classify_doping, validate_ldos
+        )
+        try:
+            if dataset_name not in self._datasets:
+                self.errorOccurred.emit("Error", "Dataset not found")
+                return ""
+
+            spectral_data = self._datasets[dataset_name]
+            independent_var = spectral_data.independent_var
+            spectra = spectral_data.spectra
+            num_spectra = spectra.shape[1]
+
+            logger.info(f"Detecting bandgap/doping for {dataset_name}: {num_spectra} spectra")
+
+            # Result arrays
+            bandgaps = np.full(num_spectra, np.nan)
+            doping_offsets = np.full(num_spectra, np.nan)
+            doping_numeric = np.full(num_spectra, np.nan)
+            xmins = np.full(num_spectra, np.nan)
+            xmaxs = np.full(num_spectra, np.nan)
+            valid_flags = np.zeros(num_spectra, dtype=int)
+
+            delta_frac = delta / 100.0  # Convert from % to fraction
+
+            for i in range(num_spectra):
+                if task.cancelled:
+                    return ""
+                task.progress = i / num_spectra
+
+                y = spectra.iloc[:, i].values.copy()
+                x = independent_var.copy()
+
+                # 1. Validate
+                is_valid, reason = validate_ldos(x, y)
+                if not is_valid:
+                    continue
+                valid_flags[i] = 1
+
+                # 2. Smooth if requested
+                if smoothing > 0 and smoothing_method != 'None':
+                    # Convert smoothing % to window size
+                    window = max(3, int(len(x) * smoothing / 100.0))
+                    if window % 2 == 0:
+                        window += 1
+                    window = min(window, len(x) - 1)
+                    if window >= 3:
+                        if smoothing_method == 'Savgol':
+                            poly_order = min(3, window - 1)
+                            y = signal.savgol_filter(y, window, poly_order)
+                        elif smoothing_method == 'Moving Avg':
+                            y = np.convolve(y, np.ones(window) / window, mode='same')
+
+                # 3. Numerical derivative -> dI/dV
+                dx, dy = numerical_derivative(x, y)
+
+                if len(dx) < 3:
+                    continue
+
+                # 4. Normalize LDOS
+                dx_norm, dy_norm = normalize_ldos(dx, dy)
+
+                # 5. Detect bandgap
+                gap, typ, xmin, xmax = detect_bandgap(dx_norm, dy_norm, delta_frac)
+
+                # 6. Classify doping
+                doping_str = classify_doping(typ, resolution)
+
+                bandgaps[i] = gap
+                doping_offsets[i] = typ
+                xmins[i] = xmin
+                xmaxs[i] = xmax
+
+                doping_map = {'N': -1, 'Neutral': 0, 'P': 1}
+                doping_numeric[i] = doping_map.get(doping_str, 0)
+
+            # --- Bandgap dataset ---
+            bandgap_base = self._extract_clean_base_name(dataset_name)
+            bandgap_convention = self._apply_naming_convention(dataset_name, operation="Bandgap")
+            bandgap_df = pd.DataFrame({
+                'Spectrum Index': range(num_spectra),
+                'Bandgap (eV)': bandgaps,
+                'Gap Left Edge (V)': xmins,
+                'Gap Right Edge (V)': xmaxs,
+                'Valid': valid_flags
+            })
+
+            bandgap_csv = self._ensure_output_dir('curves') / f"{bandgap_convention}.csv"
+            bandgap_df.to_csv(bandgap_csv, index=False)
+
+            bandgap_name = f"{bandgap_base} - Bandgap"
+            bandgap_metadata = SpectralMetadata(
+                source_type="bandgap_flat",
+                dimensions=spectral_data.metadata.dimensions,
+                scan_mode=spectral_data.metadata.scan_mode,
+                units={'independent': 'Index', 'dependent': 'eV'},
+                additional_info={
+                    'original': dataset_name,
+                    'original_source_type': spectral_data.metadata.source_type,
+                    'smoothing': smoothing,
+                    'delta': delta,
+                    'valid_count': int(np.sum(valid_flags)),
+                    'total_count': num_spectra
+                },
+                data_type='flat'
+            )
+            self._datasets[bandgap_name] = SpectralData(bandgap_df, bandgap_metadata)
+            if not self._workflow_mode:
+                self.dataLoaded.emit(bandgap_name)
+
+            # --- Doping dataset ---
+            doping_base = self._extract_clean_base_name(dataset_name)
+            doping_convention = self._apply_naming_convention(dataset_name, operation="Doping")
+            doping_df = pd.DataFrame({
+                'Spectrum Index': range(num_spectra),
+                'Doping Type': doping_numeric,
+                'Doping Offset (V)': doping_offsets,
+                'Valid': valid_flags
+            })
+
+            doping_csv = self._ensure_output_dir('curves') / f"{doping_convention}.csv"
+            doping_df.to_csv(doping_csv, index=False)
+
+            doping_name = f"{doping_base} - Doping"
+            doping_metadata = SpectralMetadata(
+                source_type="doping_flat",
+                dimensions=spectral_data.metadata.dimensions,
+                scan_mode=spectral_data.metadata.scan_mode,
+                units={'independent': 'Index', 'dependent': 'V'},
+                additional_info={
+                    'original': dataset_name,
+                    'original_source_type': spectral_data.metadata.source_type,
+                    'resolution': resolution,
+                    'valid_count': int(np.sum(valid_flags)),
+                    'total_count': num_spectra
+                },
+                data_type='flat'
+            )
+            self._datasets[doping_name] = SpectralData(doping_df, doping_metadata)
+            if not self._workflow_mode:
+                self.dataLoaded.emit(doping_name)
+
+            logger.info(f"Bandgap/Doping complete: {int(np.sum(valid_flags))}/{num_spectra} valid spectra")
+            return str(bandgap_csv)
+
+        except Exception as e:
+            logger.error(f"Bandgap/Doping error: {e}", exc_info=True)
+            self.errorOccurred.emit("Bandgap/Doping Error", str(e))
+            return ""
+
+    # ========================================================================
+    # Dirac Point Estimator
+    # Algorithms adapted from ststools by Rafael Reis
+    # (https://github.com/rafinhareis/ststools)
+    # ========================================================================
+
+    def estimate_dirac_point(self, task, dataset_name: str,
+                             left_min: float = -1.0,
+                             left_max: float = -0.2,
+                             right_min: float = 0.2,
+                             right_max: float = 1.0,
+                             smoothing: float = 1.0,
+                             smoothing_method: str = 'Savgol',
+                             auto_detect: bool = False) -> str:
+        """
+        Estimate Dirac point per spectrum via linear slope intersection.
+
+        Pipeline: validate -> smooth -> derivative -> normalize -> fit two lines -> intersection.
+        Output is flat_data with columns: Spectrum Index, Dirac Voltage (V), Dirac LDOS,
+        Left Slope, Left Intercept, Right Slope, Right Intercept, Left Fit R\u00b2, Right Fit R\u00b2,
+        Left Range Min (V), Left Range Max (V), Right Range Min (V), Right Range Max (V).
+
+        If auto_detect=True, fit ranges are determined per-spectrum using bandgap edge detection
+        instead of using the fixed global left/right ranges.
+        """
+        from src.backend.sts_algorithms import (
+            numerical_derivative, normalize_ldos, validate_ldos,
+            fit_dirac_point, auto_detect_dirac_ranges
+        )
+        try:
+            if dataset_name not in self._datasets:
+                self.errorOccurred.emit("Error", "Dataset not found")
+                return ""
+
+            spectral_data = self._datasets[dataset_name]
+            independent_var = spectral_data.independent_var
+            spectra = spectral_data.spectra
+            num_spectra = spectra.shape[1]
+
+            logger.info(f"Estimating Dirac point for {dataset_name}: {num_spectra} spectra "
+                        f"(auto_detect={auto_detect})")
+
+            # Result arrays
+            dirac_xs = np.full(num_spectra, np.nan)
+            dirac_ys = np.full(num_spectra, np.nan)
+            left_slopes = np.full(num_spectra, np.nan)
+            right_slopes = np.full(num_spectra, np.nan)
+            left_r2s = np.full(num_spectra, np.nan)
+            right_r2s = np.full(num_spectra, np.nan)
+            left_intercepts = np.full(num_spectra, np.nan)
+            right_intercepts = np.full(num_spectra, np.nan)
+            fit_left_mins = np.full(num_spectra, np.nan)
+            fit_left_maxs = np.full(num_spectra, np.nan)
+            fit_right_mins = np.full(num_spectra, np.nan)
+            fit_right_maxs = np.full(num_spectra, np.nan)
+
+            for i in range(num_spectra):
+                if task.cancelled:
+                    return ""
+                task.progress = i / num_spectra
+
+                y = spectra.iloc[:, i].values.copy()
+                x = independent_var.copy()
+
+                # 1. Validate
+                is_valid, reason = validate_ldos(x, y)
+                if not is_valid:
+                    continue
+
+                # 2. Smooth if requested
+                if smoothing > 0 and smoothing_method != 'None':
+                    window = max(3, int(len(x) * smoothing / 100.0))
+                    if window % 2 == 0:
+                        window += 1
+                    window = min(window, len(x) - 1)
+                    if window >= 3:
+                        if smoothing_method == 'Savgol':
+                            poly_order = min(3, window - 1)
+                            y = signal.savgol_filter(y, window, poly_order)
+                        elif smoothing_method == 'Moving Avg':
+                            y = np.convolve(y, np.ones(window) / window, mode='same')
+
+                # 3. Numerical derivative -> dI/dV
+                dx, dy = numerical_derivative(x, y)
+                if len(dx) < 3:
+                    continue
+
+                # 4. Normalize LDOS
+                dx_norm, dy_norm = normalize_ldos(dx, dy)
+
+                # 5. Determine fit ranges
+                if auto_detect:
+                    try:
+                        lmin, lmax, rmin, rmax = auto_detect_dirac_ranges(dx_norm, dy_norm)
+                        # Fallback if auto-detect returns degenerate intervals
+                        if lmin >= lmax or rmin >= rmax:
+                            lmin, lmax, rmin, rmax = left_min, left_max, right_min, right_max
+                    except Exception:
+                        lmin, lmax, rmin, rmax = left_min, left_max, right_min, right_max
+                else:
+                    lmin, lmax, rmin, rmax = left_min, left_max, right_min, right_max
+
+                # 6. Fit Dirac point
+                result = fit_dirac_point(
+                    dx_norm, dy_norm,
+                    left_range=(lmin, lmax),
+                    right_range=(rmin, rmax)
+                )
+                dirac_xs[i] = result[0]
+                dirac_ys[i] = result[1]
+                left_slopes[i] = result[2]
+                right_slopes[i] = result[3]
+                left_r2s[i] = result[4]
+                right_r2s[i] = result[5]
+                left_intercepts[i] = result[6]
+                right_intercepts[i] = result[7]
+                fit_left_mins[i] = lmin
+                fit_left_maxs[i] = lmax
+                fit_right_mins[i] = rmin
+                fit_right_maxs[i] = rmax
+
+            # Build output DataFrame with user-friendly column names
+            output_df = pd.DataFrame({
+                'Spectrum Index': range(num_spectra),
+                'Dirac Voltage (V)': dirac_xs,
+                'Dirac LDOS': dirac_ys,
+                'Left Slope': left_slopes,
+                'Left Intercept': left_intercepts,
+                'Right Slope': right_slopes,
+                'Right Intercept': right_intercepts,
+                'Left Fit R\u00b2': left_r2s,
+                'Right Fit R\u00b2': right_r2s,
+                'Left Range Min (V)': fit_left_mins,
+                'Left Range Max (V)': fit_left_maxs,
+                'Right Range Min (V)': fit_right_mins,
+                'Right Range Max (V)': fit_right_maxs
+            })
+
+            base_name = self._extract_clean_base_name(dataset_name)
+            convention_name = self._apply_naming_convention(dataset_name, operation="Dirac_Point")
+
+            # Save CSV
+            output_path = self._ensure_output_dir('curves') / f"{convention_name}.csv"
+            output_df.to_csv(output_path, index=False)
+
+            # Create SpectralData (flat_data compatible)
+            friendly_name = f"{base_name} - Dirac Point"
+            metadata = SpectralMetadata(
+                source_type="diracpoint_flat",
+                dimensions=spectral_data.metadata.dimensions,
+                scan_mode=spectral_data.metadata.scan_mode,
+                units={'independent': 'Index', 'dependent': 'V'},
+                additional_info={
+                    'original': dataset_name,
+                    'original_source_type': spectral_data.metadata.source_type,
+                    'left_range': (left_min, left_max),
+                    'right_range': (right_min, right_max),
+                    'smoothing': smoothing,
+                    'auto_detect': auto_detect
+                },
+                data_type='flat'
+            )
+            result_data = SpectralData(output_df, metadata)
+            self._datasets[friendly_name] = result_data
+            if not self._workflow_mode:
+                self.dataLoaded.emit(friendly_name)
+
+            logger.info(f"Dirac Point estimation complete for {num_spectra} spectra")
+            return str(output_path)
+
+        except Exception as e:
+            logger.error(f"Dirac Point error: {e}", exc_info=True)
+            self.errorOccurred.emit("Dirac Point Error", str(e))
+            return ""

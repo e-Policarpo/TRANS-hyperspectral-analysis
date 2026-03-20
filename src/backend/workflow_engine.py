@@ -469,13 +469,13 @@ TOOL_DEFINITIONS = {
     "FlatDataInput": {
         "display_name": "Flat Data",
         "category": "Input",
-        "description": "Load flat data (CSV) into the workflow",
+        "description": "Load flat data into the workflow",
         "inputs": [],
         "outputs": [
-            {"id": "flat_data", "name": "Flat Data", "port_type": "flat_data", "description": "Loaded flat data"}
+            {"id": "flat_data", "name": "Flat Data", "port_type": "flat_data", "description": "Selected flat data"}
         ],
         "parameters": {
-            "file_path": {"type": "file_select", "label": "Data File", "required": True, "filter": "CSV files (*.csv)", "description": "Select a CSV file with flat data"}
+            "dataset_name": {"type": "flat_data_select", "label": "Flat Dataset", "required": True}
         }
     },
 
@@ -893,6 +893,92 @@ TOOL_DEFINITIONS = {
         "parameters": {
             "order": {"type": "int", "label": "Polynomial Order", "default": 2, "min": 1, "max": 6, "description": "Order of polynomial to fit (higher = more flexible)"}
         }
+    },
+
+    # ==========================================================================
+    # STS Analysis Nodes
+    # Algorithms adapted from ststools by Rafael Reis
+    # (https://github.com/rafinhareis/ststools)
+    # ==========================================================================
+
+    "FilterBadData": {
+        "display_name": "Filter Bad Data",
+        "category": "Processing",
+        "description": "Classify and separate bad spectra (saturation, noise, linear artifacts, periodic noise)",
+        "inputs": [
+            {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
+        ],
+        "outputs": [
+            {"id": "good_data", "name": "Good Data", "port_type": "dataset"},
+            {"id": "bad_data", "name": "Bad Data", "port_type": "dataset"},
+            {"id": "fft_spectra", "name": "FFT Spectra", "port_type": "dataset"},
+            {"id": "report", "name": "Report", "port_type": "string"}
+        ],
+        "parameters": {
+            "weight_saturation": {"type": "float", "default": 1.0, "min": 0.0, "max": 1.0, "label": "Saturation Weight"},
+            "weight_noise": {"type": "float", "default": 1.0, "min": 0.0, "max": 1.0, "label": "Noise Weight"},
+            "weight_linear": {"type": "float", "default": 1.0, "min": 0.0, "max": 1.0, "label": "Linear Artifact Weight"},
+            "weight_periodic": {"type": "float", "default": 1.0, "min": 0.0, "max": 1.0, "label": "Periodic Noise Weight"},
+            "weight_partial_noise": {"type": "float", "default": 1.0, "min": 0.0, "max": 1.0, "label": "Partial Noise Weight"},
+            "threshold": {"type": "float", "default": 0.5, "min": 0.0, "max": 1.0, "label": "Quality Threshold"},
+            "correct_periodic": {"type": "bool", "default": False, "label": "Correct Periodic Noise"}
+        }
+    },
+
+    "DetectBandgapDoping": {
+        "display_name": "Detect Bandgap & Doping",
+        "category": "Analysis",
+        "description": "Bandgap size and doping type (N/P/Neutral) per spectrum",
+        "inputs": [
+            {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
+        ],
+        "outputs": [
+            {"id": "bandgap_data", "name": "Bandgap Data", "port_type": "flat_data"},
+            {"id": "doping_data", "name": "Doping Data", "port_type": "flat_data"}
+        ],
+        "parameters": {
+            "smoothing": {"type": "float", "default": 1.0, "min": 0, "max": 50, "label": "Smoothing (%)"},
+            "delta": {"type": "float", "default": 5.0, "min": 0.1, "max": 100, "label": "Delta Threshold (%)"},
+            "resolution": {"type": "float", "default": 0.01, "min": 0.001, "max": 1.0, "label": "Doping Offset Tolerance (V)"},
+            "smoothing_method": {"type": "select", "default": "Savgol", "options": ["Savgol", "Moving Avg", "None"], "label": "Smoothing Method"}
+        }
+    },
+
+    "DiracPointEstimator": {
+        "display_name": "Dirac Point Estimator",
+        "category": "Analysis",
+        "description": "Estimate Dirac point from linear slope intersections",
+        "inputs": [
+            {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
+        ],
+        "outputs": [
+            {"id": "flat_data", "name": "Dirac Point Data", "port_type": "flat_data"}
+        ],
+        "parameters": {
+            "auto_detect": {"type": "bool", "default": True, "label": "Auto-detect Fit Ranges"},
+            "left_min": {"type": "float", "default": -1.0, "label": "Left Fit Min (V)"},
+            "left_max": {"type": "float", "default": -0.2, "label": "Left Fit Max (V)"},
+            "right_min": {"type": "float", "default": 0.2, "label": "Right Fit Min (V)"},
+            "right_max": {"type": "float", "default": 1.0, "label": "Right Fit Max (V)"},
+            "smoothing": {"type": "float", "default": 1.0, "min": 0, "max": 50, "label": "Smoothing (%)"},
+            "smoothing_method": {"type": "select", "default": "Savgol", "options": ["Savgol", "Moving Avg", "None"], "label": "Smoothing Method"}
+        }
+    },
+
+    # ===========================================================================
+    # TEXT OUTPUT NODE
+    # ===========================================================================
+    "TextOutput": {
+        "display_name": "Text Report",
+        "category": "Output",
+        "description": "Save text report to project outputs",
+        "inputs": [
+            {"id": "text", "name": "Text", "port_type": "string", "required": True}
+        ],
+        "outputs": [],
+        "parameters": {
+            "output_name": {"type": "string", "label": "Report Name", "required": True, "default": "Report"}
+        }
     }
 }
 
@@ -950,8 +1036,11 @@ def create_node_from_tool(tool_name: str, x: float = 100, y: float = 100) -> Opt
     )
 
 
-def get_tool_categories() -> Dict[str, List[str]]:
+def get_tool_categories() -> List[Dict]:
     """Get tools organized by category with optimal ordering.
+
+    Returns a list of {"category": str, "tools": List[str]} dicts to preserve
+    category order (PySide6 QVariantMap sorts keys alphabetically).
 
     Category order: Input -> Output -> Annotations -> Processing -> Analysis -> Visualization -> Image Processing
     Within each category, tools are sorted for optimal UX flow.
@@ -979,6 +1068,7 @@ def get_tool_categories() -> Dict[str, List[str]]:
         "MapOutput": 1,
         "ImageOutput": 2,
         "FlatDataOutput": 3,
+        "TextOutput": 4,
         # Annotations
         "CommentNode": 0,
         # Processing tools - ordered by typical workflow
@@ -991,8 +1081,11 @@ def get_tool_categories() -> Dict[str, List[str]]:
         "SpatialAverage": 5,
         "DataManipulation": 6,
         "FFT1D": 7,
+        "FilterBadData": 8,
         # Analysis tools
         "PeakFinder": 0,
+        "DetectBandgapDoping": 1,
+        "DiracPointEstimator": 2,
         # Visualization
         "MapGenerator": 0,
         # Image Processing - image tools first, then map processing
@@ -1010,18 +1103,19 @@ def get_tool_categories() -> Dict[str, List[str]]:
     for category in categories:
         categories[category].sort(key=lambda x: tool_order.get(x, 999))
 
-    # Return ordered dict with categories in specified order
-    ordered_categories = {}
+    # Build ordered list to preserve category order (QVariantList, not QVariantMap)
+    result = []
     for cat in category_order:
         if cat in categories:
-            ordered_categories[cat] = categories[cat]
+            result.append({"category": cat, "tools": categories[cat]})
 
     # Add any remaining categories not in the order list
+    seen = {r["category"] for r in result}
     for cat in categories:
-        if cat not in ordered_categories:
-            ordered_categories[cat] = categories[cat]
+        if cat not in seen:
+            result.append({"category": cat, "tools": categories[cat]})
 
-    return ordered_categories
+    return result
 
 
 def get_tool_info(tool_name: str) -> Optional[Dict]:

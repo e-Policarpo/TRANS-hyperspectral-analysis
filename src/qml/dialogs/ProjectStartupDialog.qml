@@ -433,10 +433,10 @@ Dialog {
 
         onAccepted: {
             var path = selectedFolder.toString()
-            // Remove file:// prefix
             if (path.startsWith("file://")) {
                 path = path.substring(7)
             }
+            path = decodeURIComponent(path)
             projectLocationField.text = path
         }
     }
@@ -451,6 +451,7 @@ Dialog {
             if (path.startsWith("file://")) {
                 path = path.substring(7)
             }
+            path = decodeURIComponent(path)
             // Extract project name from path
             var parts = path.split("/")
             var name = parts[parts.length - 1]
@@ -468,19 +469,17 @@ Dialog {
 
         onAccepted: {
             var path = file.toString()
-            // Remove file:// prefix
             if (path.startsWith("file://")) {
                 path = path.substring(7)
             }
+            // Decode URL-encoded characters (e.g., %20 for spaces)
+            path = decodeURIComponent(path)
             console.log("Opening .hrt project file:", path)
 
-            // Use backend to open the .hrt file
-            if (backend && backend.openProjectFile(path)) {
-                dialog.close()
-            } else {
-                // Error handled by backend's errorOccurred signal
-                console.log("Failed to open project file")
+            if (backend) {
+                backend.openProjectFile(path)
             }
+            dialog.close()
         }
     }
 

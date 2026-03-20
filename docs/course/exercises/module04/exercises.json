@@ -1,0 +1,90 @@
+{
+  "module": 4,
+  "title": "Multithreading for Responsive UIs",
+  "exercises": [
+    {
+      "id": "04_01",
+      "title": "Basic Worker Pattern",
+      "description": "Create a Worker class that runs in a QThread and emits progress signals",
+      "difficulty": "intermediate",
+      "points": 150,
+      "required_patterns": [
+        "QThread",
+        "QObject",
+        "moveToThread",
+        "Signal",
+        "progress"
+      ],
+      "test_cases": [
+        {
+          "name": "worker_class_exists",
+          "type": "class_exists",
+          "target": "Worker"
+        },
+        {
+          "name": "has_run_method",
+          "type": "has_method",
+          "target": "Worker",
+          "method": "run"
+        }
+      ]
+    },
+    {
+      "id": "04_02",
+      "title": "Task Cancellation",
+      "description": "Implement a cancellable worker with proper cleanup",
+      "difficulty": "advanced",
+      "points": 150,
+      "required_patterns": [
+        "_cancelled",
+        "cancel",
+        "is_cancelled",
+        "while.*not.*cancelled"
+      ]
+    },
+    {
+      "id": "04_03",
+      "title": "Progress Reporting",
+      "description": "Create a worker that reports progress and updates a QML ProgressBar",
+      "difficulty": "intermediate",
+      "points": 100,
+      "required_patterns": [
+        "progressChanged",
+        "emit"
+      ],
+      "required_qml_patterns": [
+        "ProgressBar",
+        "value:"
+      ]
+    },
+    {
+      "id": "04_04",
+      "title": "Worker Manager",
+      "description": "Implement a manager that queues and limits concurrent workers",
+      "difficulty": "advanced",
+      "points": 200,
+      "required_patterns": [
+        "queue",
+        "max_concurrent",
+        "submit",
+        "worker_completed"
+      ]
+    }
+  ],
+  "extra_exercises": [
+    {
+      "id": "04_E1",
+      "title": "Thread-Safe Data Container",
+      "description": "Create a thread-safe data container using QMutex or threading.Lock",
+      "difficulty": "advanced",
+      "points": 125
+    },
+    {
+      "id": "04_E2",
+      "title": "Async File Loader",
+      "description": "Load a large file in a background thread without blocking the UI",
+      "difficulty": "intermediate",
+      "points": 100
+    }
+  ]
+}

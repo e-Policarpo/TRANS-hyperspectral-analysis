@@ -1,0 +1,105 @@
+{
+  "module": 2,
+  "title": "QML-Python Integration Basics",
+  "exercises": [
+    {
+      "id": "02_01",
+      "title": "Type Registration",
+      "description": "Register a custom Python type for use in QML using qmlRegisterType",
+      "difficulty": "intermediate",
+      "points": 100,
+      "files_required": ["counter.py", "Main.qml"],
+      "required_patterns": [
+        "qmlRegisterType",
+        "QObject",
+        "Signal",
+        "Slot"
+      ],
+      "test_cases": [
+        {
+          "name": "counter_class_exists",
+          "type": "class_exists",
+          "target": "Counter"
+        },
+        {
+          "name": "has_increment_slot",
+          "type": "has_method",
+          "target": "Counter",
+          "method": "increment"
+        }
+      ]
+    },
+    {
+      "id": "02_02",
+      "title": "Context Property Exposure",
+      "description": "Expose a Python object to QML via setContextProperty and use it in QML",
+      "difficulty": "intermediate",
+      "points": 100,
+      "required_patterns": [
+        "setContextProperty",
+        "rootContext"
+      ],
+      "required_qml_patterns": [
+        "backend\\.",
+        "Connections"
+      ]
+    },
+    {
+      "id": "02_03",
+      "title": "Bidirectional Data Binding",
+      "description": "Create a property that can be read and written from both Python and QML",
+      "difficulty": "advanced",
+      "points": 150,
+      "required_patterns": [
+        "@Property",
+        "notify=",
+        "@.*\\.setter"
+      ],
+      "test_cases": [
+        {
+          "name": "property_readable",
+          "type": "attribute_exists",
+          "target": "DataModel",
+          "attribute": "value"
+        }
+      ]
+    },
+    {
+      "id": "02_04",
+      "title": "Type Conversion",
+      "description": "Implement a slot that accepts a QML list and returns a QVariantMap",
+      "difficulty": "advanced",
+      "points": 150,
+      "required_patterns": [
+        "@Slot",
+        "result=",
+        "QVariantList",
+        "QVariantMap"
+      ]
+    }
+  ],
+  "extra_exercises": [
+    {
+      "id": "02_E1",
+      "title": "QML Component Lifecycle",
+      "description": "Create a component that tracks its lifecycle (Component.onCompleted, Component.onDestruction)",
+      "difficulty": "intermediate",
+      "points": 75,
+      "required_qml_patterns": [
+        "Component.onCompleted",
+        "Component.onDestruction"
+      ]
+    },
+    {
+      "id": "02_E2",
+      "title": "Dynamic Type Creation",
+      "description": "Use Qt.createComponent and createObject to dynamically create QML objects from Python data",
+      "difficulty": "advanced",
+      "points": 100,
+      "required_qml_patterns": [
+        "Qt.createComponent",
+        "createObject"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,129 @@
+{
+  "module": 1,
+  "title": "Introduction and Project Setup",
+  "exercises": [
+    {
+      "id": "01_01",
+      "title": "Basic QML Application",
+      "description": "Create a minimal QML application with a Python entry point that displays a window with title 'Hello TRANS'",
+      "difficulty": "beginner",
+      "points": 100,
+      "files_required": ["main.py", "Main.qml"],
+      "test_cases": [
+        {
+          "name": "main_function_exists",
+          "type": "function_call",
+          "target": "main",
+          "description": "main() function should exist and be callable"
+        }
+      ],
+      "required_patterns": [
+        "QApplication",
+        "QQmlApplicationEngine",
+        "engine.load"
+      ],
+      "required_qml_patterns": [
+        "import QtQuick",
+        "ApplicationWindow",
+        "visible: true"
+      ],
+      "grading_weights": {
+        "correctness": 0.40,
+        "patterns": 0.30,
+        "best_practices": 0.20,
+        "style": 0.10
+      }
+    },
+    {
+      "id": "01_02",
+      "title": "Project Structure Setup",
+      "description": "Create a proper project directory structure with src/, tests/, and docs/ directories and appropriate __init__.py files",
+      "difficulty": "beginner",
+      "points": 50,
+      "type": "directory_structure",
+      "required_structure": [
+        "src/__init__.py",
+        "src/main.py",
+        "src/qml/main/Main.qml",
+        "tests/__init__.py",
+        "docs/"
+      ]
+    },
+    {
+      "id": "01_03",
+      "title": "Backend QObject Creation",
+      "description": "Create a basic AppBackend class inheriting from QObject with a status property and statusChanged signal",
+      "difficulty": "intermediate",
+      "points": 100,
+      "files_required": ["backend.py"],
+      "test_cases": [
+        {
+          "name": "class_exists",
+          "type": "class_exists",
+          "target": "AppBackend"
+        },
+        {
+          "name": "inherits_qobject",
+          "type": "inheritance",
+          "target": "AppBackend",
+          "base_class_name": "QObject"
+        },
+        {
+          "name": "has_status_property",
+          "type": "attribute_exists",
+          "target": "AppBackend",
+          "attribute": "status"
+        }
+      ],
+      "required_patterns": [
+        "QObject",
+        "Signal",
+        "Property",
+        "statusChanged"
+      ]
+    },
+    {
+      "id": "01_04_extra",
+      "title": "Context Property Integration",
+      "description": "Expose a Python backend object to QML using setContextProperty and access it from QML",
+      "difficulty": "intermediate",
+      "points": 150,
+      "files_required": ["main.py", "backend.py", "Main.qml"],
+      "required_patterns": [
+        "setContextProperty",
+        "backend"
+      ],
+      "required_qml_patterns": [
+        "backend.status",
+        "Connections"
+      ]
+    }
+  ],
+  "extra_exercises": [
+    {
+      "id": "01_E1",
+      "title": "Command Line Arguments",
+      "description": "Extend main.py to accept --debug and --config flags using argparse",
+      "difficulty": "intermediate",
+      "points": 75,
+      "required_patterns": [
+        "argparse",
+        "ArgumentParser",
+        "--debug",
+        "--config"
+      ]
+    },
+    {
+      "id": "01_E2",
+      "title": "Application Icon and Metadata",
+      "description": "Set application name, organization, and icon using QGuiApplication properties",
+      "difficulty": "beginner",
+      "points": 50,
+      "required_patterns": [
+        "setApplicationName",
+        "setOrganizationName",
+        "setWindowIcon"
+      ]
+    }
+  ]
+}

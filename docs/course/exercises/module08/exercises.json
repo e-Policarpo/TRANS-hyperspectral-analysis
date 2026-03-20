@@ -1,0 +1,133 @@
+{
+  "module": 8,
+  "title": "Application Architecture",
+  "exercises": [
+    {
+      "id": "08_01",
+      "title": "Backend/Frontend Bridge",
+      "description": "Create an AppBackend QObject that exposes signals and slots to QML",
+      "difficulty": "intermediate",
+      "points": 150,
+      "required_patterns": [
+        "class.*AppBackend.*QObject",
+        "Signal",
+        "@Slot",
+        "setContextProperty"
+      ],
+      "test_cases": [
+        {
+          "name": "backend_class_exists",
+          "type": "class_exists",
+          "target": "AppBackend"
+        }
+      ]
+    },
+    {
+      "id": "08_02",
+      "title": "State Management",
+      "description": "Implement centralized state with properties and notify signals",
+      "difficulty": "intermediate",
+      "points": 150,
+      "required_patterns": [
+        "@Property.*notify=",
+        "Changed.emit|Changed\\.emit",
+        "@.*\\.setter",
+        "_datasets|_state"
+      ]
+    },
+    {
+      "id": "08_03",
+      "title": "Project Manager",
+      "description": "Create a project save/load system with JSON metadata",
+      "difficulty": "advanced",
+      "points": 200,
+      "required_patterns": [
+        "ProjectManager|project_manager",
+        "create_project|createProject",
+        "load_project|loadProject",
+        "save_project|saveProject",
+        "json.dump|json.load"
+      ]
+    },
+    {
+      "id": "08_04",
+      "title": "Preferences System",
+      "description": "Build a preferences manager with auto-save functionality",
+      "difficulty": "intermediate",
+      "points": 125,
+      "required_patterns": [
+        "PreferencesManager",
+        "@Slot.*get|def get",
+        "@Slot.*set|def set",
+        "json|JSON"
+      ]
+    },
+    {
+      "id": "08_05",
+      "title": "Tool Implementation Pattern",
+      "description": "Create a runTool dispatcher that routes tool requests to implementations",
+      "difficulty": "advanced",
+      "points": 175,
+      "required_patterns": [
+        "runTool",
+        "getattr",
+        "_run_|_execute_",
+        "result.*success"
+      ]
+    }
+  ],
+  "extra_exercises": [
+    {
+      "id": "08_E1",
+      "title": "Workflow System",
+      "description": "Implement a basic workflow manager with node creation and execution",
+      "difficulty": "advanced",
+      "points": 200,
+      "required_patterns": [
+        "WorkflowManager",
+        "createWorkflow",
+        "addNode",
+        "executeWorkflow"
+      ]
+    },
+    {
+      "id": "08_E2",
+      "title": "Error Handler",
+      "description": "Create centralized error handling with signal propagation to QML",
+      "difficulty": "intermediate",
+      "points": 125,
+      "required_patterns": [
+        "errorOccurred.*Signal",
+        "_handle_error|handleError",
+        "emit",
+        "logger.error|logging"
+      ]
+    },
+    {
+      "id": "08_E3",
+      "title": "Recent Projects",
+      "description": "Track and display recent projects with timestamps",
+      "difficulty": "intermediate",
+      "points": 100,
+      "required_patterns": [
+        "recent_projects|recentProjects",
+        "getRecentProjects",
+        "datetime|timestamp",
+        "@Slot.*result="
+      ]
+    },
+    {
+      "id": "08_E4",
+      "title": "Unit Tests for Backend",
+      "description": "Write pytest tests for backend methods using QSignalSpy",
+      "difficulty": "advanced",
+      "points": 150,
+      "required_patterns": [
+        "pytest|unittest",
+        "@pytest.fixture|def.*fixture",
+        "assert",
+        "QSignalSpy|Signal"
+      ]
+    }
+  ]
+}

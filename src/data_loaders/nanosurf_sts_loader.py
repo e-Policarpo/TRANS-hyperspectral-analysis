@@ -18,12 +18,10 @@ from .base_loader import BaseDataLoader
 from ..models.spectral_data import SpectralData, SpectralMetadata
 from ..models.topography_data import TopographyData
 
-try:
-    from NSFopen.read import read as nid_read
-    NSFOPEN_AVAILABLE = True
-except ImportError:
-    NSFOPEN_AVAILABLE = False
-    logging.warning("NSFopen library not available. Install it to use Nanosurf loader.")
+# NID file reading powered by NSFopen (vendored, MIT licensed)
+# Original library by Nanosurf AG (nelson@nanosurf.com)
+# See src/data_loaders/nsfopen/LICENSE for full license text
+from .nsfopen import read as nid_read
 
 logger = logging.getLogger(__name__)
 
@@ -36,46 +34,11 @@ class NanosurfSTSLoader(BaseDataLoader):
     standardized SpectralData objects with proper meander correction.
     """
     
-    def __init__(self, patch_nsfopen: bool = True):
-        """
-        Initialize Nanosurf STS loader.
-        
-        Parameters:
-        -----------
-        patch_nsfopen : bool
-            Whether to apply patches for STM compatibility (no cantilever data)
-        """
+    def __init__(self):
+        """Initialize Nanosurf STS loader."""
         super().__init__()
         self.supported_extensions = ['.nid']
         self.loader_type = 'nanosurf_sts'
-        self.patch_nsfopen = patch_nsfopen
-        
-        if not NSFOPEN_AVAILABLE:
-            raise ImportError("NSFopen library is required for Nanosurf loader")
-        
-        if self.patch_nsfopen:
-            self._apply_nsfopen_patches()
-    
-    def _apply_nsfopen_patches(self):
-        """Apply runtime patches to NSFopen for STM compatibility"""
-        try:
-            import NSFopen.read
-            # Monkey-patch to ignore cantilever errors
-            original_read = NSFopen.read.read.__init__
-            
-            def patched_init(self, *args, **kwargs):
-                try:
-                    original_read(self, *args, **kwargs)
-                except KeyError as e:
-                    if 'cantilever' in str(e).lower():
-                        logger.debug("Ignoring cantilever-related error (STM mode)")
-                    else:
-                        raise
-            
-            NSFopen.read.read.__init__ = patched_init
-            logger.debug("Applied NSFopen patches for STM compatibility")
-        except Exception as e:
-            logger.warning(f"Could not apply NSFopen patches: {e}")
     
     def load_from_directory(self, directory: Path, progress_callback=None) -> Tuple[SpectralData, Optional[TopographyData]]:
         """

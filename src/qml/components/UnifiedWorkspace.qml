@@ -15,8 +15,8 @@ import "../workflow"
 Rectangle {
     id: unifiedWorkspace
 
-    // Current workspace mode: "sts", "snom", "map", "workflow"
-    property string currentMode: "sts"
+    // Current workspace mode: "spectral", "map", "workflow"
+    property string currentMode: "spectral"
 
     // External references needed for mode-specific panels
     property var backend: null
@@ -27,6 +27,9 @@ Rectangle {
     property bool showRightPanel: false
     property bool showTopPanel: false
     property bool showBottomPanel: false
+
+    // Canvas zoom control
+    property bool canvasZoomEnabled: true
 
     // Panel collapsed states
     property bool leftCollapsed: false
@@ -49,6 +52,7 @@ Rectangle {
 
     // Mode-specific default panel components
     property Component projectBrowserComponent: null  // Set by parent (Main.qml)
+    property Component standalonePaletteComponent: null  // Tool palette for spectral mode
     property Component toolPaletteComponent: Component {
         WorkflowToolPalette {
             workflowManager: unifiedWorkspace.workflowManager
@@ -79,17 +83,16 @@ Rectangle {
             case "workflow":
                 // Workflow mode: ToolPalette on left, WorkflowCanvas in center
                 showLeftPanel = true
-                showRightPanel = true  // For NodeParameterEditor
+                showRightPanel = false  // NodeParameterEditor not yet implemented
                 leftPanelContent = toolPaletteComponent
                 centerContent = workflowCanvasComponent
                 break
 
-            case "sts":
-            case "snom":
-                // STS/SNOM: ProjectBrowser on left (if provided)
-                showLeftPanel = projectBrowserComponent !== null
+            case "spectral":
+                // Spectral Analysis: Tool palette on left (if provided)
+                showLeftPanel = standalonePaletteComponent !== null
                 showRightPanel = false
-                leftPanelContent = projectBrowserComponent
+                leftPanelContent = standalonePaletteComponent
                 centerContent = null
                 break
 
@@ -231,6 +234,7 @@ Rectangle {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 backgroundStyle: canvasBackground
+                zoomEnabled: canvasZoomEnabled
 
                 // Content loader for mode-specific content
                 Loader {
@@ -393,8 +397,7 @@ Rectangle {
         currentMode = mode
 
         switch(mode) {
-            case "sts":
-            case "snom":
+            case "spectral":
                 showLeftPanel = true
                 showRightPanel = false
                 showTopPanel = false
@@ -410,7 +413,7 @@ Rectangle {
 
             case "workflow":
                 showLeftPanel = true
-                showRightPanel = true
+                showRightPanel = false  // NodeParameterEditor not yet implemented
                 showTopPanel = false
                 showBottomPanel = false
                 break
@@ -682,8 +685,22 @@ Rectangle {
         layoutChanged()
     }
 
+    // React to leftPanelContent changes (e.g. after configurePanelsForMode)
+    onLeftPanelContentChanged: {
+        if (leftPanelContent && leftDockPanel) {
+            leftDockPanel.setContent(leftPanelContent)
+        }
+    }
+
+    onRightPanelContentChanged: {
+        if (rightPanelContent && rightDockPanel) {
+            rightDockPanel.setContent(rightPanelContent)
+        }
+    }
+
     Component.onCompleted: {
         console.log("UnifiedWorkspace created, mode:", currentMode)
         applyModePreset(currentMode)
+        configurePanelsForMode(currentMode)
     }
 }

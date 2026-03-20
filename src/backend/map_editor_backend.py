@@ -54,6 +54,7 @@ class MapEditorBackend(QObject):
     processingFinished = Signal(str, bool, str, arguments=['operation', 'success', 'message'])
     selectionChanged = Signal(int, arguments=['blockCount'])
     statisticsUpdated = Signal('QVariantMap', arguments=['stats'])
+    discretizationReady = Signal(int, int, arguments=['gridRows', 'gridCols'])
 
     # New signals for dataset linking and spectrum plotting
     linkedDatasetsChanged = Signal()
@@ -585,6 +586,201 @@ class MapEditorBackend(QObject):
         """Handle spectrum request from canvas click"""
         # This signal can be connected in QML to update a spectrum viewer
         pass
+
+    # =========================================================================
+    # Discretization Grid (Hyperspectral tab integration)
+    # =========================================================================
+
+    @Slot(int, int)
+    def setDiscretizationGrid(self, block_h: int, block_v: int):
+        """
+        Set up discretization grid on the map canvas.
+        Enables block selection mode with grid overlay.
+
+        Parameters:
+            block_h: Horizontal block size (in original pixels)
+            block_v: Vertical block size (in original pixels)
+        """
+        if self._canvas is None or self._multi_channel_map is None:
+            return
+
+        rows = self._multi_channel_map.shape[0] if self._multi_channel_map.shape else 0
+        cols = self._multi_channel_map.shape[1] if self._multi_channel_map.shape else 0
+
+        if rows == 0 or cols == 0:
+            return
+
+        # Configure canvas grid overlay and block selection
+        self._canvas.setGridBlockSize(block_h, block_v)
+        self._canvas.setTool("block_select")
+
+        import math
+        grid_rows = math.ceil(rows / block_v)
+        grid_cols = math.ceil(cols / block_h)
+
+        self.discretizationReady.emit(grid_rows, grid_cols)
+        logger.info(f"Discretization grid set: {block_h}x{block_v} blocks, "
+                     f"grid {grid_cols}x{grid_rows}")
+
+    @Slot()
+    def invertSelection(self):
+        """Invert the set of selected blocks"""
+        if self._canvas is None or self._canvas._map_data is None:
+            return
+
+        rows = self._canvas._map_data.shape[0]
+        cols = self._canvas._map_data.shape[1]
+
+        # If grid overlay is active, use grid block coordinates
+        if self._canvas._show_grid_overlay and self._canvas._grid_block_h > 1:
+            import math
+            grid_rows = math.ceil(rows / self._canvas._grid_block_v)
+            grid_cols = math.ceil(cols / self._canvas._grid_block_h)
+            all_blocks = {(r, c) for r in range(grid_rows) for c in range(grid_cols)}
+        else:
+            all_blocks = {(r, c) for r in range(rows) for c in range(cols)}
+
+        self._canvas._selected_blocks = all_blocks - self._canvas._selected_blocks
+        self._canvas.blockSelectionChanged.emit()
+        self._canvas.update()
+
+    @Slot(result='QVariantMap')
+    def getAverageSpectrumForSelectedBlocks(self) -> Dict:
+        """
+        Average spectra from all selected blocks in the active linked dataset.
+        Returns {x, y, x_name, y_name, title, block_count}.
+        """
+        if not self._active_dataset or self._active_dataset not in self._linked_datasets:
+            return {'error': 'No active dataset'}
+
+        if self._canvas is None:
+            return {'error': 'No canvas'}
+
+        selected = self._canvas._selected_blocks
+        if not selected:
+            return {'error': 'No blocks selected'}
+
+        spectral_data = self._linked_datasets[self._active_dataset]
+        dims = spectral_data.metadata.dimensions
+        num_cols = dims[0]  # horizontal dimension
+
+        accumulated = None
+        count = 0
+
+        for row, col in selected:
+            # If grid overlay active, translate grid block to original pixel
+            # For grid blocks, we average all spectra within the block
+            if self._canvas._show_grid_overlay and self._canvas._grid_block_h > 1:
+                block_h = self._canvas._grid_block_h
+                block_v = self._canvas._grid_block_v
+                orig_rows = self._canvas._map_data.shape[0] if self._canvas._map_data is not None else 0
+                orig_cols = self._canvas._map_data.shape[1] if self._canvas._map_data is not None else 0
+
+                for pr in range(row * block_v, min((row + 1) * block_v, orig_rows)):
+                    for pc in range(col * block_h, min((col + 1) * block_h, orig_cols)):
+                        idx = pr * num_cols + pc
+                        if idx < spectral_data.num_spectra:
+                            y_vals = spectral_data.spectra.iloc[:, idx].values
+                            if not np.all(np.isnan(y_vals)):
+                                if accumulated is None:
+                                    accumulated = np.zeros_like(y_vals, dtype=float)
+                                accumulated += y_vals
+                                count += 1
+            else:
+                idx = row * num_cols + col
+                if idx < spectral_data.num_spectra:
+                    y_vals = spectral_data.spectra.iloc[:, idx].values
+                    if not np.all(np.isnan(y_vals)):
+                        if accumulated is None:
+                            accumulated = np.zeros_like(y_vals, dtype=float)
+                        accumulated += y_vals
+                        count += 1
+
+        if count == 0 or accumulated is None:
+            return {'error': 'No valid spectra in selection'}
+
+        averaged = accumulated / count
+        x = spectral_data.independent_var.tolist()
+
+        return {
+            'x': x,
+            'y': averaged.tolist(),
+            'x_name': spectral_data.independent_var_name,
+            'y_name': 'Intensity',
+            'title': f'Average spectrum ({count} spectra from {len(selected)} blocks)',
+            'block_count': count
+        }
+
+    @Slot(str, result='QVariantMap')
+    def exportSelectionSpectra(self, dataset_name: str) -> Dict:
+        """
+        Get all individual spectra for selected blocks, ready for CSV export.
+        Returns {x, x_name, columns: [[y1], [y2], ...], labels: ["Block(r,c)", ...]}.
+        """
+        if dataset_name not in self._linked_datasets:
+            return {'error': f'Dataset not found: {dataset_name}'}
+
+        if self._canvas is None:
+            return {'error': 'No canvas'}
+
+        selected = sorted(self._canvas._selected_blocks)
+        if not selected:
+            return {'error': 'No blocks selected'}
+
+        spectral_data = self._linked_datasets[dataset_name]
+        dims = spectral_data.metadata.dimensions
+        num_cols = dims[0]
+
+        x = spectral_data.independent_var.tolist()
+        columns = []
+        labels = []
+
+        for row, col in selected:
+            idx = row * num_cols + col
+            if idx < spectral_data.num_spectra:
+                y_vals = spectral_data.spectra.iloc[:, idx].values.tolist()
+                columns.append(y_vals)
+                labels.append(f"Block({row},{col})")
+
+        return {
+            'x': x,
+            'x_name': spectral_data.independent_var_name,
+            'columns': columns,
+            'labels': labels
+        }
+
+    @Slot('QVariant')
+    def autoLinkMatchingDatasets(self, app_backend):
+        """
+        Auto-link datasets whose spatial dimensions match the current map.
+        Compare map dimensions to each dataset's metadata.dimensions.
+        """
+        if self._multi_channel_map is None or self._multi_channel_map.shape is None:
+            return
+
+        map_rows, map_cols = self._multi_channel_map.shape
+        map_total = map_rows * map_cols
+
+        if not hasattr(app_backend, '_datasets'):
+            return
+
+        linked_count = 0
+        for name, dataset in app_backend._datasets.items():
+            if name in self._linked_datasets:
+                continue  # Already linked
+
+            if hasattr(dataset, 'metadata') and hasattr(dataset.metadata, 'dimensions'):
+                dims = dataset.metadata.dimensions
+                if dims and len(dims) >= 2:
+                    ds_total = dims[0] * dims[1]
+                    if ds_total == map_total:
+                        self.linkDataset(name, dataset)
+                        linked_count += 1
+                        logger.info(f"Auto-linked dataset '{name}' "
+                                    f"(dims {dims[0]}x{dims[1]} matches map {map_cols}x{map_rows})")
+
+        if linked_count > 0:
+            self.linkedDatasetsChanged.emit()
 
     # =========================================================================
     # Processing Operations

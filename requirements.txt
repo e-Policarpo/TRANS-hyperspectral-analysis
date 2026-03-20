@@ -28,7 +28,7 @@ Pillow>=10.0.0                    # Image generation and manipulation (PIL)
 # File I/O
 # ============================================================================
 h5py>=3.0.0                       # HDF5 file format for .hrt project files
-NSFopen>=1.0.0                    # Nanosurf file format support
+# NSFopen - now vendored in src/data_loaders/nsfopen/ (MIT licensed, by Nanosurf AG)
 
 # ============================================================================
 # Signal/Image Processing

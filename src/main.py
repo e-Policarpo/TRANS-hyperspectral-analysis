@@ -25,6 +25,7 @@ sys.path.insert(0, str(app_dir))
 from src.backend.app_backend import AppBackend
 from src.widgets.qml_map_canvas import QMLMapCanvas
 from src.widgets.qml_profile_canvas import QMLProfileCanvas
+from src.widgets.qml_graph_canvas import QMLGraphCanvas
 from src.backend.map_editor_backend import MapEditorBackend
 
 # Configure logging
@@ -86,6 +87,7 @@ def main():
     # This allows using MapCanvas, ProfileCanvas, and MapEditorBackend directly in QML
     qmlRegisterType(QMLMapCanvas, "TransQML", 1, 0, "MapCanvas")
     qmlRegisterType(QMLProfileCanvas, "TransQML", 1, 0, "ProfileCanvas")
+    qmlRegisterType(QMLGraphCanvas, "TransQML", 1, 0, "GraphCanvas")
     qmlRegisterType(MapEditorBackend, "TransQML", 1, 0, "MapEditorBackend")
 
     # Create QML engine

@@ -18,3 +18,6 @@ ProjectBrowserEntity 1.0 ProjectBrowserEntity.qml
 DataBrowserEntity 1.0 DataBrowserEntity.qml
 PointInspectorEntity 1.0 PointInspectorEntity.qml
 StatisticsPanelEntity 1.0 StatisticsPanelEntity.qml
+EmbeddedWindow 1.0 EmbeddedWindow.qml
+WindowManager 1.0 WindowManager.qml
+ToolPalettePanel 1.0 ToolPalettePanel.qml

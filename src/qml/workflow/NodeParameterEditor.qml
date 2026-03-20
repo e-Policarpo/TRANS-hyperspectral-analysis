@@ -9,6 +9,7 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
+import Qt.labs.platform 1.1 as Platform
 
 Rectangle {
     id: editorRoot
@@ -86,6 +87,12 @@ Rectangle {
             case "dataset_select":
                 component = datasetSelectComponent
                 break
+            case "flat_data_select":
+                component = flatDataSelectComponent
+                break
+            case "file_select":
+                component = fileSelectComponent
+                break
             case "interval_list":
                 component = intervalListComponent
                 break
@@ -157,14 +164,16 @@ Rectangle {
         // Node info
         Rectangle {
             Layout.fillWidth: true
-            Layout.preferredHeight: descriptionText.height + 20
+            Layout.preferredHeight: descriptionText.implicitHeight + 20
             color: bgDark
             radius: 5
             visible: currentNode !== null
 
             Text {
                 id: descriptionText
-                anchors.fill: parent
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.top: parent.top
                 anchors.margins: 10
                 text: toolInfo.description || ""
                 color: textMuted
@@ -596,6 +605,154 @@ Rectangle {
 
                 onClicked: {
                     datasetCombo.model = workflowWindow.workflowManager.getAvailableDatasets()
+                }
+            }
+        }
+    }
+
+    Component {
+        id: flatDataSelectComponent
+
+        ColumnLayout {
+            property string paramName: ""
+            property var paramDef: ({})
+            property var currentValue: ""
+
+            Layout.fillWidth: true
+            spacing: 3
+
+            Text {
+                text: paramDef.label || paramName
+                color: textLight
+                font.pixelSize: 11
+            }
+
+            ComboBox {
+                id: flatDataCombo
+                Layout.fillWidth: true
+                model: workflowWindow && workflowWindow.workflowManager ?
+                       workflowWindow.workflowManager.getAvailableFlatDatasets() : []
+                currentIndex: {
+                    var datasets = workflowWindow && workflowWindow.workflowManager ?
+                                   workflowWindow.workflowManager.getAvailableFlatDatasets() : []
+                    return datasets.indexOf(currentValue)
+                }
+
+                background: Rectangle {
+                    color: bgDark
+                    border.color: flatDataCombo.activeFocus ? accentPink : borderColor
+                    radius: 3
+                }
+
+                contentItem: Text {
+                    text: flatDataCombo.displayText || "Select flat dataset..."
+                    color: flatDataCombo.displayText ? textLight : textMuted
+                    font.pixelSize: 11
+                    verticalAlignment: Text.AlignVCenter
+                    leftPadding: 8
+                }
+
+                delegate: ItemDelegate {
+                    width: flatDataCombo.width
+                    contentItem: Text {
+                        text: modelData
+                        color: textLight
+                        font.pixelSize: 11
+                    }
+                    background: Rectangle {
+                        color: highlighted ? bgLight : bgMedium
+                    }
+                }
+
+                onCurrentTextChanged: updateParameter(paramName, currentText)
+            }
+
+            Button {
+                text: "Refresh"
+                Layout.alignment: Qt.AlignRight
+
+                contentItem: Text {
+                    text: parent.text
+                    color: textMuted
+                    font.pixelSize: 10
+                }
+
+                background: Rectangle {
+                    color: parent.hovered ? bgLight : "transparent"
+                    radius: 3
+                }
+
+                onClicked: {
+                    flatDataCombo.model = workflowWindow.workflowManager.getAvailableFlatDatasets()
+                }
+            }
+        }
+    }
+
+    Component {
+        id: fileSelectComponent
+
+        ColumnLayout {
+            property string paramName: ""
+            property var paramDef: ({})
+            property var currentValue: ""
+
+            Layout.fillWidth: true
+            spacing: 3
+
+            Text {
+                text: paramDef.label || paramName
+                color: textLight
+                font.pixelSize: 11
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 4
+
+                TextField {
+                    id: filePathField
+                    Layout.fillWidth: true
+                    readOnly: true
+                    text: currentValue || ""
+                    placeholderText: paramDef.description || "Select file..."
+                    color: textLight
+                    font.pixelSize: 11
+
+                    background: Rectangle {
+                        color: bgDark
+                        border.color: borderColor
+                        radius: 3
+                    }
+                }
+
+                Button {
+                    text: "Browse..."
+                    onClicked: fileDialog.open()
+
+                    contentItem: Text {
+                        text: parent.text
+                        color: textMuted
+                        font.pixelSize: 10
+                    }
+
+                    background: Rectangle {
+                        color: parent.hovered ? bgLight : bgDark
+                        border.color: borderColor
+                        radius: 3
+                    }
+                }
+            }
+
+            Platform.FileDialog {
+                id: fileDialog
+                title: paramDef.label || "Select File"
+                nameFilters: [paramDef.filter || "All files (*)"]
+                fileMode: Platform.FileDialog.OpenFile
+                onAccepted: {
+                    var path = file.toString().replace("file://", "")
+                    filePathField.text = path
+                    updateParameter(paramName, path)
                 }
             }
         }

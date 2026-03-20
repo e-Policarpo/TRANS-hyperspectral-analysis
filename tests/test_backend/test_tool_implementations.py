@@ -35,6 +35,10 @@ class TestToolImplementationsSetup:
                 self.errorOccurred = Mock()
                 self.dataLoaded = Mock()
                 self._workflow_mode = False
+                self._naming_convention = "[dataset_name]"
+                self._naming_index_start = 1
+                self._naming_date_format = "dd-mm-yyyy"
+                self._current_file_index = 1
 
             def _ensure_output_dir(self, subdir):
                 path = self._output_base_dir / subdir
@@ -59,6 +63,14 @@ class TestToolImplementationsSetup:
                 name = name.replace('_', ' ')
                 name = ' '.join(name.split())
                 return name
+
+            def _apply_naming_convention(self, dataset_name, operation="", preview=False):
+                """Apply naming convention to create a filename."""
+                clean_name = self._extract_clean_base_name(dataset_name)
+                result = self._naming_convention.replace("[dataset_name]", clean_name)
+                if operation:
+                    result = f"{result}_{operation}"
+                return self._sanitize_filename(result)
 
         return MockBackend()
 

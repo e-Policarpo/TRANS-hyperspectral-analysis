@@ -17,6 +17,7 @@ import "../components"
 // Operations: Gaussian Filter, Median Filter, Plane Level, Row Align, Normalize
 Item {
     id: root
+    property var closeWindow: null
 
     // Theme colors - reactive bindings to parent DraggableWindow
     property var parentWindow: Window.window
@@ -295,8 +296,7 @@ Item {
             Button {
                 text: "Close"
                 onClicked: {
-                    var win = root.Window.window
-                    if (win) win.close()
+                    if (root.closeWindow) { root.closeWindow() } else { var win = root.Window.window; if (win) win.close() }
                 }
             }
         }

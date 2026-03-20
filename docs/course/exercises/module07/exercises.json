@@ -1,0 +1,124 @@
+{
+  "module": 7,
+  "title": "Advanced UI Patterns",
+  "exercises": [
+    {
+      "id": "07_01",
+      "title": "Custom Dock Panel",
+      "description": "Create a dock panel with a search box and filterable list in QML",
+      "difficulty": "intermediate",
+      "points": 150,
+      "required_qml_patterns": [
+        "Rectangle",
+        "TextField.*search|searchField",
+        "ListView",
+        "model:",
+        "filter|Filter"
+      ],
+      "test_cases": [
+        {
+          "name": "qml_file_valid",
+          "type": "qml_syntax",
+          "target": "DockPanel.qml"
+        }
+      ]
+    },
+    {
+      "id": "07_02",
+      "title": "Theme Switcher",
+      "description": "Implement light/dark theme switching with smooth transitions in QML",
+      "difficulty": "intermediate",
+      "points": 150,
+      "required_qml_patterns": [
+        "property color",
+        "Behavior on",
+        "ColorAnimation|NumberAnimation",
+        "dark|light|theme"
+      ]
+    },
+    {
+      "id": "07_03",
+      "title": "Window Snapping",
+      "description": "Add edge snapping when windows are dragged near each other",
+      "difficulty": "advanced",
+      "points": 175,
+      "required_qml_patterns": [
+        "MouseArea",
+        "onPositionChanged",
+        "snap|Snap",
+        "Math.abs"
+      ]
+    },
+    {
+      "id": "07_04",
+      "title": "Layout Presets",
+      "description": "Create named layout presets that users can save and restore",
+      "difficulty": "advanced",
+      "points": 175,
+      "required_patterns": [
+        "saveLayoutState|savePreset",
+        "restoreLayoutState|loadPreset",
+        "JSON|json",
+        "@Slot"
+      ],
+      "required_qml_patterns": [
+        "ListModel|preset",
+        "function save|function load"
+      ]
+    },
+    {
+      "id": "07_05",
+      "title": "Floating Toolbar",
+      "description": "Create a floating toolbar that stays visible across mode changes",
+      "difficulty": "intermediate",
+      "points": 125,
+      "required_qml_patterns": [
+        "Rectangle",
+        "Row|RowLayout",
+        "ToolButton|Button",
+        "z:|Z:",
+        "drag|Drag"
+      ]
+    }
+  ],
+  "extra_exercises": [
+    {
+      "id": "07_E1",
+      "title": "Embedded Window Manager",
+      "description": "Create a window manager that handles z-ordering and window activation",
+      "difficulty": "advanced",
+      "points": 175,
+      "required_qml_patterns": [
+        "property var windows",
+        "createWindow|createObject",
+        "activateWindow",
+        "z:"
+      ]
+    },
+    {
+      "id": "07_E2",
+      "title": "Resizable Window",
+      "description": "Create an embedded window with 8-direction resize handles",
+      "difficulty": "advanced",
+      "points": 150,
+      "required_qml_patterns": [
+        "MouseArea",
+        "cursorShape:",
+        "Qt.SizeHorCursor|Qt.SizeVerCursor",
+        "resize|Resize"
+      ]
+    },
+    {
+      "id": "07_E3",
+      "title": "Mode-Specific Panels",
+      "description": "Implement different panel configurations for different application modes",
+      "difficulty": "intermediate",
+      "points": 125,
+      "required_qml_patterns": [
+        "property string.*mode|currentMode",
+        "switch|if.*mode",
+        "showLeftPanel|showRightPanel"
+      ]
+    }
+  ]
+}

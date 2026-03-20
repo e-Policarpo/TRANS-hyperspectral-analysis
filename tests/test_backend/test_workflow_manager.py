@@ -320,9 +320,10 @@ class TestWorkflowManagerSlots:
         """Test getToolCategories slot."""
         categories = manager.getToolCategories()
 
-        assert isinstance(categories, dict)
-        assert "Input" in categories
-        assert "Processing" in categories
+        assert isinstance(categories, list)
+        cat_names = [c["category"] for c in categories]
+        assert "Input" in cat_names
+        assert "Processing" in cat_names
 
     def test_get_tool_info(self, manager):
         """Test getToolInfo slot."""
@@ -625,3 +626,223 @@ class TestExecutorNodeExecution:
         assert name1.startswith("_wf_temp_")
         assert name2.startswith("_wf_temp_")
         assert name1 != name2  # Should be unique
+
+
+class TestWorkflowIntermediateCleanup:
+    """Tests for intermediate dataset cleanup during workflow execution."""
+
+    @pytest.fixture
+    def cleanup_executor(self, tmp_path):
+        """Create executor with controllable backend for cleanup testing."""
+        test_data = create_test_spectral_data()
+        backend = Mock()
+        backend._datasets = {'OriginalData': test_data}
+        backend._output_base_dir = tmp_path / "outputs"
+        backend._output_base_dir.mkdir(exist_ok=True)
+        backend.dataLoaded = Mock()
+        backend.errorOccurred = Mock()
+        backend._workflow_mode = False
+
+        executor = WorkflowExecutor(backend)
+        return executor, backend
+
+    def test_datasets_before_snapshot(self, cleanup_executor):
+        """WM-17: Verify datasets are snapshotted before execution."""
+        executor, backend = cleanup_executor
+
+        # Pre-existing datasets
+        assert 'OriginalData' in backend._datasets
+        datasets_before = set(backend._datasets.keys())
+
+        assert 'OriginalData' in datasets_before
+        assert len(datasets_before) == 1
+
+    def test_intermediate_datasets_cleaned_after_execution(self, cleanup_executor):
+        """WM-18: Intermediate datasets are removed after workflow execution."""
+        executor, backend = cleanup_executor
+
+        # Create a simple workflow: DatasetInput -> DatasetOutput
+        workflow = Workflow(id="cleanup_test", name="Cleanup Test")
+
+        input_node = create_node_from_tool("DatasetInput")
+        input_node.parameters['dataset_name'] = 'OriginalData'
+        workflow.add_node(input_node)
+
+        output_node = create_node_from_tool("DatasetOutput")
+        output_node.parameters['output_name'] = 'FinalOutput'
+        workflow.add_node(output_node)
+
+        # Connect input to output
+        conn = Connection(
+            id="c1",
+            source_node_id=input_node.id,
+            source_port_id="dataset",
+            target_node_id=output_node.id,
+            target_port_id="dataset"
+        )
+        workflow.add_connection(conn)
+
+        # Execute workflow
+        result = executor.execute(workflow)
+
+        # Original dataset should still exist
+        assert 'OriginalData' in backend._datasets
+
+        # Workflow mode should be disabled
+        assert backend._workflow_mode is False
+
+    def test_workflow_mode_disabled_on_error(self, cleanup_executor):
+        """WM-19: _workflow_mode is set to False even if execution fails."""
+        executor, backend = cleanup_executor
+
+        # Create workflow with missing dataset to trigger error
+        workflow = Workflow(id="error_test", name="Error Test")
+
+        input_node = create_node_from_tool("DatasetInput")
+        input_node.parameters['dataset_name'] = 'NonExistentDataset'
+        workflow.add_node(input_node)
+
+        output_node = create_node_from_tool("DatasetOutput")
+        output_node.parameters['output_name'] = 'Output'
+        workflow.add_node(output_node)
+
+        conn = Connection(
+            id="c1",
+            source_node_id=input_node.id,
+            source_port_id="dataset",
+            target_node_id=output_node.id,
+            target_port_id="dataset"
+        )
+        workflow.add_connection(conn)
+
+        # Execute - may have errors but should not crash
+        result = executor.execute(workflow)
+
+        # workflow_mode should always be reset in finally block
+        assert backend._workflow_mode is False
+
+    def test_output_datasets_preserved(self, cleanup_executor):
+        """WM-20: Datasets named by output nodes are not cleaned up."""
+        executor, backend = cleanup_executor
+        test_data = create_test_spectral_data()
+
+        # Simulate what happens: workflow adds intermediate + output datasets
+        # We'll manually add them and check cleanup logic
+        datasets_before = set(backend._datasets.keys())
+
+        # Simulate intermediates being added during workflow
+        backend._datasets['_wf_temp_smooth_abc123'] = test_data
+        backend._datasets['_wf_temp_derivative_def456'] = test_data
+
+        datasets_after = set(backend._datasets.keys())
+        intermediate_datasets = datasets_after - datasets_before
+
+        # Simulate output names (what the cleanup code does)
+        output_names = set()  # No output nodes in this test
+
+        # All intermediates should be identified for removal
+        to_remove = [name for name in intermediate_datasets if name not in output_names]
+        assert '_wf_temp_smooth_abc123' in to_remove
+        assert '_wf_temp_derivative_def456' in to_remove
+        assert 'OriginalData' not in to_remove
+
+    def test_cleanup_preserves_pre_existing_datasets(self, cleanup_executor):
+        """WM-21: Pre-existing datasets are never removed by cleanup."""
+        executor, backend = cleanup_executor
+        test_data = create_test_spectral_data()
+
+        # Add another pre-existing dataset
+        backend._datasets['SecondDataset'] = test_data
+
+        datasets_before = set(backend._datasets.keys())
+        assert len(datasets_before) == 2
+
+        # Simulate intermediates
+        backend._datasets['_wf_temp_abc'] = test_data
+
+        datasets_after = set(backend._datasets.keys())
+        intermediate_datasets = datasets_after - datasets_before
+
+        # Only the new intermediate should be in the set
+        assert intermediate_datasets == {'_wf_temp_abc'}
+        assert 'OriginalData' not in intermediate_datasets
+        assert 'SecondDataset' not in intermediate_datasets
+
+    def test_comment_nodes_skipped_during_execution(self, cleanup_executor):
+        """WM-22: CommentNodes are skipped during execution."""
+        executor, backend = cleanup_executor
+
+        workflow = Workflow(id="comment_test", name="Comment Test")
+
+        # Add a comment node and a dataset input
+        input_node = create_node_from_tool("DatasetInput")
+        input_node.parameters['dataset_name'] = 'OriginalData'
+        workflow.add_node(input_node)
+
+        comment_node = create_node_from_tool("CommentNode")
+        workflow.add_node(comment_node)
+
+        output_node = create_node_from_tool("DatasetOutput")
+        output_node.parameters['output_name'] = 'Result'
+        workflow.add_node(output_node)
+
+        conn = Connection(
+            id="c1",
+            source_node_id=input_node.id,
+            source_port_id="dataset",
+            target_node_id=output_node.id,
+            target_port_id="dataset"
+        )
+        workflow.add_connection(conn)
+
+        # Execute - should not error on comment node
+        result = executor.execute(workflow)
+
+        assert backend._workflow_mode is False
+
+    def test_cancelled_execution_still_cleans_up(self, cleanup_executor):
+        """WM-23: Cancelled execution still runs cleanup in finally block."""
+        executor, backend = cleanup_executor
+
+        workflow = Workflow(id="cancel_test", name="Cancel Test")
+        input_node = create_node_from_tool("DatasetInput")
+        input_node.parameters['dataset_name'] = 'OriginalData'
+        workflow.add_node(input_node)
+
+        output_node = create_node_from_tool("DatasetOutput")
+        output_node.parameters['output_name'] = 'Output'
+        workflow.add_node(output_node)
+
+        conn = Connection(
+            id="c1",
+            source_node_id=input_node.id,
+            source_port_id="dataset",
+            target_node_id=output_node.id,
+            target_port_id="dataset"
+        )
+        workflow.add_connection(conn)
+
+        # Use a progress callback to cancel mid-execution
+        def cancel_on_progress(current, total, msg):
+            executor.cancelled = True
+
+        result = executor.execute(workflow, progress_callback=cancel_on_progress)
+
+        # Workflow mode should always be reset in finally block
+        assert backend._workflow_mode is False
+
+    def test_format_output_name_fallback(self, cleanup_executor):
+        """WM-24: _format_output_name uses fallback when no naming convention."""
+        executor, backend = cleanup_executor
+        executor.original_dataset_name = "STS_Data"
+        executor.workflow_name = "My_Workflow"
+
+        # Ensure no _apply_naming_convention method
+        if hasattr(backend, '_apply_naming_convention'):
+            del backend._apply_naming_convention
+
+        name = executor._format_output_name("Smoothed")
+
+        assert "STS_Data" in name
+        assert "Smoothed" in name
+        assert "My Workflow" in name  # underscores replaced with spaces

@@ -1,0 +1,147 @@
+{
+  "module": 6,
+  "title": "Scientific Computing Integration",
+  "exercises": [
+    {
+      "id": "06_01",
+      "title": "Basic QAbstractTableModel",
+      "description": "Create a QAbstractTableModel that displays a numpy array with row/column headers",
+      "difficulty": "intermediate",
+      "points": 150,
+      "required_patterns": [
+        "QAbstractTableModel",
+        "rowCount",
+        "columnCount",
+        "data",
+        "headerData"
+      ],
+      "test_cases": [
+        {
+          "name": "model_class_exists",
+          "type": "class_exists",
+          "target": "SimpleTableModel"
+        },
+        {
+          "name": "has_rowCount",
+          "type": "has_method",
+          "target": "SimpleTableModel",
+          "method": "rowCount"
+        },
+        {
+          "name": "has_columnCount",
+          "type": "has_method",
+          "target": "SimpleTableModel",
+          "method": "columnCount"
+        },
+        {
+          "name": "has_data_method",
+          "type": "has_method",
+          "target": "SimpleTableModel",
+          "method": "data"
+        }
+      ]
+    },
+    {
+      "id": "06_02",
+      "title": "Editable Table",
+      "description": "Add editing support with validation (numbers only in numeric columns)",
+      "difficulty": "advanced",
+      "points": 175,
+      "required_patterns": [
+        "setData",
+        "flags",
+        "Qt.ItemIsEditable",
+        "dataChanged.emit",
+        "beginInsertRows|beginRemoveRows"
+      ]
+    },
+    {
+      "id": "06_03",
+      "title": "Statistics Panel",
+      "description": "Create a method that calculates column statistics (mean, std, min, max, median)",
+      "difficulty": "intermediate",
+      "points": 125,
+      "required_patterns": [
+        "calculateColumnStatistics|calculateStatistics",
+        "mean",
+        "std",
+        "min",
+        "max"
+      ],
+      "test_cases": [
+        {
+          "name": "statistics_method_exists",
+          "type": "has_method",
+          "target": "TableDataModel",
+          "method": "calculateColumnStatistics"
+        }
+      ]
+    },
+    {
+      "id": "06_04",
+      "title": "CSV Import/Export",
+      "description": "Add methods to load from and save to CSV files with proper encoding",
+      "difficulty": "intermediate",
+      "points": 125,
+      "required_patterns": [
+        "loadFromCsv|load_csv",
+        "saveToCsv|save_csv|exportToCsv",
+        "pd.read_csv|csv.reader",
+        "encoding"
+      ]
+    },
+    {
+      "id": "06_05",
+      "title": "Formula Engine Extension",
+      "description": "Extend the formula engine with AVERAGE, STDEV, and PERCENTILE functions",
+      "difficulty": "advanced",
+      "points": 200,
+      "required_patterns": [
+        "FormulaEngine",
+        "evaluate_column|evaluateColumn",
+        "AVERAGE|average",
+        "STDEV|stdev",
+        "PERCENTILE|percentile"
+      ]
+    }
+  ],
+  "extra_exercises": [
+    {
+      "id": "06_E1",
+      "title": "Locale-Aware Number Parser",
+      "description": "Implement a function that parses numbers with both comma and dot decimal separators",
+      "difficulty": "intermediate",
+      "points": 100,
+      "required_patterns": [
+        "parse_number",
+        "replace.*,.*\\.",
+        "float"
+      ]
+    },
+    {
+      "id": "06_E2",
+      "title": "Column Metadata System",
+      "description": "Create a ColumnMetadata dataclass with name, unit, comment, and formula fields",
+      "difficulty": "intermediate",
+      "points": 100,
+      "required_patterns": [
+        "@dataclass|dataclass",
+        "ColumnMetadata",
+        "name.*str",
+        "unit.*str"
+      ]
+    },
+    {
+      "id": "06_E3",
+      "title": "Numerical Integration",
+      "description": "Implement trapezoidal integration of table columns",
+      "difficulty": "advanced",
+      "points": 125,
+      "required_patterns": [
+        "integrateColumn|integrate",
+        "np.trapz|trapezoid",
+        "@Slot"
+      ]
+    }
+  ]
+}

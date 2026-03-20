@@ -106,7 +106,10 @@ class ProjectManager:
                     'graphs': project_data.get('graphs', []),
                     'map_editor': project_data.get('map_editor', None)
                 },
-                'workspace': project_data.get('workspace', {})
+                'workspace': project_data.get('workspace', {}),
+                'output_files': project_data.get('output_files', []),
+                'maps': project_data.get('maps', []),
+                'naming_convention': project_data.get('naming_convention'),
             }
 
             # Save to file (compressed)
@@ -181,7 +184,10 @@ class ProjectManager:
                 'tables': windows.get('tables', project_json.get('tables', [])),
                 'graphs': windows.get('graphs', project_json.get('plots', [])),
                 'map_editor': windows.get('map_editor', None),
-                'workspace': project_json.get('workspace', {})
+                'workspace': project_json.get('workspace', {}),
+                'output_files': project_json.get('output_files', []),
+                'maps': project_json.get('maps', []),
+                'naming_convention': project_json.get('naming_convention'),
             }
 
             self.current_project_path = project_path
@@ -239,7 +245,8 @@ class ProjectManager:
                             'scan_mode': dataset.metadata.scan_mode,
                             'units': units,
                             'acquisition_date': dataset.metadata.acquisition_date,
-                            'additional_info': additional_info
+                            'additional_info': additional_info,
+                            'data_type': getattr(dataset.metadata, 'data_type', 'spectral')
                         }
                     }
                     logger.debug(f"Serialized dataset {name}: shape={spectra_array.shape}")
@@ -332,7 +339,8 @@ class ProjectManager:
                         scan_mode=data['metadata'].get('scan_mode', 'unknown'),
                         units=data['metadata'].get('units', {}),
                         acquisition_date=data['metadata'].get('acquisition_date'),
-                        additional_info=data['metadata'].get('additional_info', {})
+                        additional_info=data['metadata'].get('additional_info', {}),
+                        data_type=data['metadata'].get('data_type', 'spectral')
                     )
 
                     spectral_data = SpectralData(data=df, metadata=metadata)

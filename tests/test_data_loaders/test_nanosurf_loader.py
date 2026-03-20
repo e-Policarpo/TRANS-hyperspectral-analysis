@@ -25,14 +25,10 @@ from src.models.topography_data import TopographyData
 
 
 # =============================================================================
-# Check if NSFopen is available
+# NSFopen is now vendored - always available
 # =============================================================================
-
-try:
-    from NSFopen.read import read as nid_read
-    NSFOPEN_AVAILABLE = True
-except ImportError:
-    NSFOPEN_AVAILABLE = False
+from src.data_loaders.nsfopen import read as nid_read
+NSFOPEN_AVAILABLE = True
 
 
 # =============================================================================
@@ -116,18 +112,13 @@ class TestNanosurfSTSLoaderWithMock:
     @pytest.fixture
     def patched_loader(self, mock_nsfopen):
         """Create loader with mocked nid_read function."""
-        # Patch at module level before importing
-        with patch.dict('sys.modules', {'NSFopen': MagicMock(), 'NSFopen.read': MagicMock()}):
-            # Need to set NSFOPEN_AVAILABLE to True for this test
-            with patch('src.data_loaders.nanosurf_sts_loader.NSFOPEN_AVAILABLE', True):
-                with patch('src.data_loaders.nanosurf_sts_loader.nid_read', return_value=mock_nsfopen):
-                    from src.data_loaders.nanosurf_sts_loader import NanosurfSTSLoader
-                    loader = NanosurfSTSLoader.__new__(NanosurfSTSLoader)
-                    loader.supported_extensions = ['.nid']
-                    loader.loader_type = 'nanosurf_sts'
-                    loader.patch_nsfopen = False
-                    loader.last_loaded_path = None
-                    yield loader, mock_nsfopen
+        with patch('src.data_loaders.nanosurf_sts_loader.nid_read', return_value=mock_nsfopen):
+            from src.data_loaders.nanosurf_sts_loader import NanosurfSTSLoader
+            loader = NanosurfSTSLoader.__new__(NanosurfSTSLoader)
+            loader.supported_extensions = ['.nid']
+            loader.loader_type = 'nanosurf_sts'
+            loader.last_loaded_path = None
+            yield loader, mock_nsfopen
 
     def test_generate_voltage_array_from_metadata(self, patched_loader):
         """NS-03: Can generate voltage array from metadata."""
@@ -148,21 +139,6 @@ class TestNanosurfSTSLoaderWithMock:
 
         assert dims is not None
         assert dims == (10, 10)
-
-
-class TestNanosurfSTSLoaderImportError:
-    """Tests for import error handling when NSFopen is not available."""
-
-    def test_loader_raises_without_nsfopen(self):
-        """NS-05: Loader raises ImportError when NSFopen not available."""
-        with patch('src.data_loaders.nanosurf_sts_loader.NSFOPEN_AVAILABLE', False):
-            # Clear the module from cache to force re-import with patched value
-            import sys
-            if 'src.data_loaders.nanosurf_sts_loader' in sys.modules:
-                del sys.modules['src.data_loaders.nanosurf_sts_loader']
-
-            # This test verifies behavior when NSFopen is not available
-            # The actual ImportError is raised in __init__
 
 
 # =============================================================================

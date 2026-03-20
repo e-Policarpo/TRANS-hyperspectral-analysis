@@ -930,6 +930,10 @@ Rectangle {
         function onDataLoaded(datasetName) {
             browserRoot.refreshBrowser()
         }
+        function onProjectLoaded(projectPath) {
+            // Full refresh after project load to catch all restored state (maps, outputs, etc.)
+            browserRoot.refreshBrowser()
+        }
         function onTableCreated(tableId, tableTitle) {
             tablesModel.append({
                 id: tableId,

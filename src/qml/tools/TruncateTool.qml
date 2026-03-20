@@ -15,6 +15,7 @@ import "../components"
 // Voltage/Range Truncation Tool
 Item {
     id: truncateTool
+    property var closeWindow: null
 
     // Theme colors - reactive bindings to parent DraggableWindow
     property var parentWindow: Window.window
@@ -178,11 +179,7 @@ Item {
             Button {
                 text: "Close"
                 onClicked: {
-                    // Find the Window ancestor and close it
-                    var window = truncateTool.Window.window
-                    if (window) {
-                        window.close()
-                    }
+                    if (truncateTool.closeWindow) { truncateTool.closeWindow() } else { var window = truncateTool.Window.window; if (window) window.close() }
                 }
             }
         }

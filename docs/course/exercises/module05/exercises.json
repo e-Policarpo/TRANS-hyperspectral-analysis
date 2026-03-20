@@ -1,0 +1,100 @@
+{
+  "module": 5,
+  "title": "Custom QML Components with Python",
+  "exercises": [
+    {
+      "id": "05_01",
+      "title": "Basic QQuickPaintedItem",
+      "description": "Create a custom painted item that draws a simple shape",
+      "difficulty": "intermediate",
+      "points": 150,
+      "required_patterns": [
+        "QQuickPaintedItem",
+        "paint",
+        "QPainter",
+        "update"
+      ],
+      "test_cases": [
+        {
+          "name": "class_exists",
+          "type": "class_exists",
+          "target": "CustomCanvas"
+        },
+        {
+          "name": "has_paint_method",
+          "type": "has_method",
+          "target": "CustomCanvas",
+          "method": "paint"
+        }
+      ]
+    },
+    {
+      "id": "05_02",
+      "title": "Matplotlib Integration",
+      "description": "Create a QQuickPaintedItem that renders a matplotlib figure",
+      "difficulty": "advanced",
+      "points": 200,
+      "required_patterns": [
+        "QQuickPaintedItem",
+        "Figure",
+        "FigureCanvasAgg",
+        "buffer_rgba",
+        "QImage"
+      ]
+    },
+    {
+      "id": "05_03",
+      "title": "Mouse Event Handling",
+      "description": "Handle mouse events in a custom item and emit data coordinates",
+      "difficulty": "intermediate",
+      "points": 150,
+      "required_patterns": [
+        "mousePressEvent",
+        "mouseMoveEvent",
+        "setAcceptedMouseButtons",
+        "Signal.*float.*float"
+      ]
+    },
+    {
+      "id": "05_04",
+      "title": "Coordinate Transformation",
+      "description": "Implement pixel-to-data and data-to-pixel coordinate transforms",
+      "difficulty": "advanced",
+      "points": 150,
+      "required_patterns": [
+        "_pixelToData",
+        "_dataToPixel",
+        "ax_left",
+        "ax_right"
+      ]
+    },
+    {
+      "id": "05_05",
+      "title": "Render Caching",
+      "description": "Implement efficient render caching with a _needs_redraw flag",
+      "difficulty": "intermediate",
+      "points": 100,
+      "required_patterns": [
+        "_needs_redraw",
+        "_cached_image",
+        "componentComplete"
+      ]
+    }
+  ],
+  "extra_exercises": [
+    {
+      "id": "05_E1",
+      "title": "Interactive Zoom Tool",
+      "description": "Implement rectangle zoom selection with visual feedback",
+      "difficulty": "advanced",
+      "points": 150
+    },
+    {
+      "id": "05_E2",
+      "title": "Overlay Drawing",
+      "description": "Draw interactive overlays (cursors, selections) on top of the main render",
+      "difficulty": "intermediate",
+      "points": 125
+    }
+  ]
+}

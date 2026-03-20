@@ -44,46 +44,28 @@ ApplicationWindow {
         // Apply saved color scheme from preferences
         applyColorScheme()
 
+        // Register map editor backend for state persistence
+        backend.setMapEditorBackend(mapEditorWorkstation.mapEditorBackend)
+
         if (!backend.projectReady) {
             projectStartupDialog.open()
         }
     }
 
     // Reactive tools list based on current tab
-    // Tab indices: 0=STS, 1=SNOM, 2=Map
+    // Tab indices: 0=Spectral, 1=Hyperspectral
     property var currentTools: {
         if (currentTabIndex === 0) {
             return [
-                "1D FFT",
-                "Curve Smoothing",
-                "Derivative Calculator",
-                "Curve Fitting",
-                "Integration Utility",
-                "Map Generator",
-                "Spatial Average",
-                "Truncate Data",
-                "Curve Analysis"
+                "1D FFT", "2D FFT", "Curve Smoothing", "Image Smoothing",
+                "Derivative Calculator", "Curve Fitting", "Gradient Filter",
+                "Integration Utility", "Map Generator", "Spatial Average",
+                "Truncate Data", "Curve Analysis", "Peak Indexing",
+                "Average Curves", "Filter Bad Data",
+                "Dirac Point Estimator", "Detect Bandgap & Doping"
             ]
         } else if (currentTabIndex === 1) {
-            return [
-                "1D FFT",
-                "2D FFT",
-                "Curve Smoothing",
-                "Image Smoothing",
-                "Derivative Calculator",
-                "Gradient Filter",
-                "Integration Utility",
-                "Map Generator",
-                "Truncate Data",
-                "Curve Analysis"
-            ]
-        } else if (currentTabIndex === 2) {
-            return [
-                "2D FFT",
-                "Image Smoothing",
-                "Gradient Filter",
-                "Map Discretizer"
-            ]
+            return ["2D FFT", "Image Smoothing", "Gradient Filter", "Map Discretizer", "Map Processing"]
         }
         return []
     }
@@ -412,6 +394,41 @@ ApplicationWindow {
         }
 
         Menu {
+            title: "Edit"
+            background: Rectangle {
+                color: bgMedium
+                border.color: borderColor
+                border.width: 1
+            }
+            delegate: MenuItem {
+                id: editMenuItem
+                contentItem: Text {
+                    text: editMenuItem.text
+                    font.pixelSize: 13
+                    color: editMenuItem.enabled ? textLight : textMuted
+                    leftPadding: 10
+                    rightPadding: 10
+                }
+                background: Rectangle {
+                    color: editMenuItem.highlighted ? accentBlue : "transparent"
+                    opacity: editMenuItem.highlighted ? 0.3 : 1
+                }
+            }
+
+            MenuItem {
+                text: backend.undoManager ? backend.undoManager.undoText : "Undo"
+                enabled: backend.undoManager ? backend.undoManager.canUndo : false
+                onTriggered: backend.undoManager.undo()
+            }
+
+            MenuItem {
+                text: backend.undoManager ? backend.undoManager.redoText : "Redo"
+                enabled: backend.undoManager ? backend.undoManager.canRedo : false
+                onTriggered: backend.undoManager.redo()
+            }
+        }
+
+        Menu {
             id: toolsMenu
             title: "Tools"
             background: Rectangle {
@@ -434,34 +451,34 @@ ApplicationWindow {
                 }
             }
 
-            // STS Analysis tools (tab 0)
+            // Spectral Analysis tools (tab 0)
             MenuItem {
                 text: "1D FFT"
-                visible: currentTabIndex === 0 || currentTabIndex === 1
+                visible: currentTabIndex === 0
                 height: visible ? implicitHeight : 0
                 onTriggered: openToolWindow(text)
             }
             MenuItem {
                 text: "2D FFT"
-                visible: currentTabIndex === 1 || currentTabIndex === 2
+                visible: currentTabIndex === 0 || currentTabIndex === 1
                 height: visible ? implicitHeight : 0
                 onTriggered: openToolWindow(text)
             }
             MenuItem {
                 text: "Curve Smoothing"
-                visible: currentTabIndex === 0 || currentTabIndex === 1
+                visible: currentTabIndex === 0
                 height: visible ? implicitHeight : 0
                 onTriggered: openToolWindow(text)
             }
             MenuItem {
                 text: "Image Smoothing"
-                visible: currentTabIndex === 1 || currentTabIndex === 2
+                visible: currentTabIndex === 0 || currentTabIndex === 1
                 height: visible ? implicitHeight : 0
                 onTriggered: openToolWindow(text)
             }
             MenuItem {
                 text: "Derivative Calculator"
-                visible: currentTabIndex === 0 || currentTabIndex === 1
+                visible: currentTabIndex === 0
                 height: visible ? implicitHeight : 0
                 onTriggered: openToolWindow(text)
             }
@@ -473,31 +490,31 @@ ApplicationWindow {
             }
             MenuItem {
                 text: "Gradient Filter"
-                visible: currentTabIndex === 1 || currentTabIndex === 2
+                visible: currentTabIndex === 0 || currentTabIndex === 1
                 height: visible ? implicitHeight : 0
                 onTriggered: openToolWindow(text)
             }
             MenuItem {
                 text: "Integration Utility"
-                visible: currentTabIndex === 0 || currentTabIndex === 1
+                visible: currentTabIndex === 0
                 height: visible ? implicitHeight : 0
                 onTriggered: openToolWindow(text)
             }
             MenuItem {
                 text: "Map Generator"
-                visible: currentTabIndex === 0 || currentTabIndex === 1
+                visible: currentTabIndex === 0
                 height: visible ? implicitHeight : 0
                 onTriggered: openToolWindow(text)
             }
             MenuItem {
                 text: "Map Discretizer"
-                visible: currentTabIndex === 2
+                visible: currentTabIndex === 1
                 height: visible ? implicitHeight : 0
                 onTriggered: openToolWindow(text)
             }
             MenuItem {
                 text: "Map Processing"
-                visible: currentTabIndex === 2
+                visible: currentTabIndex === 1
                 height: visible ? implicitHeight : 0
                 onTriggered: openToolWindow(text)
             }
@@ -509,25 +526,25 @@ ApplicationWindow {
             }
             MenuItem {
                 text: "Truncate Data"
-                visible: currentTabIndex === 0 || currentTabIndex === 1
+                visible: currentTabIndex === 0
                 height: visible ? implicitHeight : 0
                 onTriggered: openToolWindow(text)
             }
             MenuItem {
                 text: "Curve Analysis"
-                visible: currentTabIndex === 0 || currentTabIndex === 1
+                visible: currentTabIndex === 0
                 height: visible ? implicitHeight : 0
                 onTriggered: openToolWindow(text)
             }
             MenuItem {
                 text: "Peak Indexing"
-                visible: currentTabIndex === 0 || currentTabIndex === 1
+                visible: currentTabIndex === 0
                 height: visible ? implicitHeight : 0
                 onTriggered: openToolWindow(text)
             }
             MenuItem {
                 text: "Average Curves"
-                visible: currentTabIndex === 0 || currentTabIndex === 1
+                visible: currentTabIndex === 0
                 height: visible ? implicitHeight : 0
                 onTriggered: openToolWindow(text)
             }
@@ -888,7 +905,7 @@ ApplicationWindow {
                             }
 
                             TabButton {
-                                text: "STS Analysis"
+                                text: "Spectral Analysis"
                                 contentItem: Text {
                                     text: parent.text
                                     font.pixelSize: 14
@@ -909,28 +926,7 @@ ApplicationWindow {
                                 }
                             }
                             TabButton {
-                                text: "SNOM Analysis"
-                                contentItem: Text {
-                                    text: parent.text
-                                    font.pixelSize: 14
-                                    font.bold: parent.checked
-                                    color: parent.checked ? accentBlue : textMuted
-                                    horizontalAlignment: Text.AlignHCenter
-                                    verticalAlignment: Text.AlignVCenter
-                                }
-                                background: Rectangle {
-                                    color: parent.checked ? bgLight : "transparent"
-                                    Rectangle {
-                                        visible: parent.parent.checked
-                                        anchors.bottom: parent.bottom
-                                        width: parent.width
-                                        height: 2
-                                        color: accentBlue
-                                    }
-                                }
-                            }
-                            TabButton {
-                                text: "Map Editor"
+                                text: "Hyperspectral Analysis"
                                 contentItem: Text {
                                     text: parent.text
                                     font.pixelSize: 14
@@ -951,6 +947,32 @@ ApplicationWindow {
                                 }
                             }
                         }  // TabBar
+
+                        // Workflow Editor button
+                        Button {
+                            text: "Workflow Editor"
+                            onClicked: openWorkflowWindow("New Workflow")
+                            contentItem: Text {
+                                text: parent.text
+                                font.pixelSize: fontSizeLarge
+                                font.bold: true
+                                font.family: fontFamily
+                                color: parent.hovered ? textLight : textMuted
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                            }
+                            background: Rectangle {
+                                color: parent.hovered ? bgLight : "transparent"
+                                radius: 4
+                                Rectangle {
+                                    visible: parent.parent.hovered
+                                    anchors.bottom: parent.bottom
+                                    width: parent.width
+                                    height: 2
+                                    color: accentOrange
+                                }
+                            }
+                        }
                     }  // RowLayout
                 }  // Rectangle (toolbar)
 
@@ -963,21 +985,33 @@ ApplicationWindow {
         StackLayout {
             id: workspaceStack
             anchors.fill: parent
-            // Tab indices: 0=STS, 1=SNOM, 2=Map
-            currentIndex: currentTabIndex === 2 ? 1 : 0
+            // Tab indices: 0=Spectral, 1=Hyperspectral
+            currentIndex: currentTabIndex
 
-            // Unified Workspace (for STS and SNOM tabs)
+            // Unified Workspace (for Spectral Analysis tab)
             UnifiedWorkspace {
                 id: workspace
-                currentMode: currentTabIndex === 0 ? "sts" : "snom"
+                currentMode: "spectral"
                 backend: backend
                 workflowManager: backend ? backend.workflowManager : null
 
-                // Panel visibility for STS/SNOM modes
-                showLeftPanel: false  // ProjectBrowser is in outer SplitView
+                // Panel visibility for Spectral Analysis mode
+                showLeftPanel: true
+                leftPanelWidth: 220
                 showRightPanel: false
                 showTopPanel: false
                 showBottomPanel: false
+                canvasZoomEnabled: false
+
+                // Provide tool palette as left panel content
+                standalonePaletteComponent: Component {
+                    ToolPalettePanel {
+                        tools: currentTools
+                        onToolActivated: function(toolName) {
+                            openToolWindow(toolName)
+                        }
+                    }
+                }
 
                 // Listen to backend tool open signals
                 Connections {
@@ -998,7 +1032,7 @@ ApplicationWindow {
                 }
             }
 
-            // Map Editor Workstation (for Map Editor tab)
+            // Map Editor Workstation (for Hyperspectral Analysis tab)
             MapEditorWorkstation {
                 id: mapEditorWorkstation
 
@@ -1012,7 +1046,30 @@ ApplicationWindow {
 
                 onOpenSpectrumPlotRequested: function(datasetName, spectra, forceNewWindow) {
                     console.log("Open spectrum plot requested:", datasetName, "with", spectra.length, "spectra")
-                    openSpectrumPlotWindow(datasetName, spectra, forceNewWindow || false)
+                    if (!spectra || spectra.length === 0) return
+
+                    var curves = []
+                    for (var i = 0; i < spectra.length; i++) {
+                        curves.push({
+                            x: spectra[i].x,
+                            y: spectra[i].y,
+                            label: spectra[i].title || ("Spectrum " + (i+1)),
+                            color: ""
+                        })
+                    }
+                    var title = datasetName + " Spectra"
+                    var xl = spectra[0].x_name || "X"
+                    var yl = spectra[0].y_name || "Intensity"
+
+                    // Reuse existing spectrum window if possible (prevents memory bloat)
+                    if (!forceNewWindow && mainSpectrumWindowId
+                            && toolWindowManager.hasWindow(mainSpectrumWindowId)) {
+                        toolWindowManager.updateGraphWindow(
+                            mainSpectrumWindowId, title, curves, xl, yl)
+                    } else {
+                        mainSpectrumWindowId = toolWindowManager.openGraphWindow(
+                            title, curves, xl, yl)
+                    }
                 }
 
                 onOpenMultiDatasetSpectraRequested: function(datasetSpectraList, forceNewWindow) {
@@ -1023,10 +1080,19 @@ ApplicationWindow {
 
         }  // StackLayout
 
-            // Embedded tool windows manager (overlays workspace only)
+            // Embedded tool windows manager (overlays workspace canvas, not the tool palette)
             WindowManager {
                 id: toolWindowManager
-                anchors.fill: parent
+                visible: currentTabIndex === 0
+                anchors.top: parent.top
+                anchors.bottom: parent.bottom
+                anchors.right: parent.right
+                anchors.left: parent.left
+                anchors.leftMargin: {
+                    if (currentTabIndex !== 0) return 0
+                    if (!workspace.showLeftPanel) return 0
+                    return workspace.leftCollapsed ? 32 : workspace.leftPanelWidth
+                }
                 backend: backend
                 z: 50  // Above workspace content
 
@@ -1202,6 +1268,12 @@ ApplicationWindow {
             mapEditorWorkstation.linkDatasetsFromBackend(backend)
         }
 
+        function onToolCompleted(toolName, outputPath) {
+            console.log("Tool completed:", toolName, "output:", outputPath)
+            // Refresh Map Editor dataset links after tool completion
+            mapEditorWorkstation.linkDatasetsFromBackend(backend)
+        }
+
         function onErrorOccurred(title, message) {
             errorDialog.title = title
             errorDialog.text = message
@@ -1222,9 +1294,9 @@ ApplicationWindow {
 
         function onImageImported(mapName, filePath, mapId) {
             console.log("Image imported:", mapName, "from", filePath)
-            // Switch to Map Editor tab
-            tabBar.currentIndex = 2
-            currentTabIndex = 2
+            // Switch to Hyperspectral Analysis tab
+            tabBar.currentIndex = 1
+            currentTabIndex = 1
 
             // Load the map data into the Map Editor
             mapEditorWorkstation.loadMap(filePath)
@@ -1232,9 +1304,9 @@ ApplicationWindow {
 
         function onLoadMapInEditor(mapPath) {
             console.log("Loading map in editor:", mapPath)
-            // Switch to Map Editor tab
-            tabBar.currentIndex = 2
-            currentTabIndex = 2
+            // Switch to Hyperspectral Analysis tab
+            tabBar.currentIndex = 1
+            currentTabIndex = 1
 
             // Close the current active map if any (force close without save dialog)
             if (mapEditorWorkstation.openMaps && mapEditorWorkstation.openMaps.length > 0) {
@@ -1304,49 +1376,17 @@ ApplicationWindow {
 
     // Functions
     function getToolsForCurrentTab() {
-        // Tab indices: 0=STS, 1=SNOM, 2=Map
-        if (currentTabIndex === 0) {
-            // STS Analysis tools
-            return [
-                "1D FFT",
-                "Curve Smoothing",
-                "Derivative Calculator",
-                "Curve Fitting",
-                "Integration Utility",
-                "Map Generator",
-                "Spatial Average",
-                "Truncate Data",
-                "Curve Analysis"
-            ]
-        } else if (currentTabIndex === 1) {
-            // SNOM Analysis tools
-            return [
-                "1D FFT",
-                "2D FFT",
-                "Curve Smoothing",
-                "Image Smoothing",
-                "Derivative Calculator",
-                "Gradient Filter",
-                "Integration Utility",
-                "Map Generator",
-                "Truncate Data",
-                "Curve Analysis"
-            ]
-        } else if (currentTabIndex === 2) {
-            // Map Editor tools
-            return [
-                "2D FFT",
-                "Image Smoothing",
-                "Gradient Filter",
-                "Map Discretizer",
-                "Map Processing"
-            ]
-        }
-        return []
+        // Reuse the reactive currentTools property
+        return currentTools
     }
 
     function openToolWindow(toolName) {
         console.log("Opening tool:", toolName)
+
+        // Switch to spectral analysis tab if not already there
+        if (currentTabIndex !== 0) {
+            tabBar.currentIndex = 0
+        }
 
         // Map tool names to QML file paths
         var toolMap = {
@@ -1403,100 +1443,40 @@ ApplicationWindow {
         }
     }
 
-    // Track the main spectrum plot window (reused for click-to-plot)
-    property var mainSpectrumWindow: null
-
-    // Track additional spectrum windows (for "New Window" action)
-    property var additionalSpectrumWindows: []
-
-    function openSpectrumPlotWindow(datasetName, spectra, forceNewWindow) {
-        console.log("Spectrum plot requested for:", datasetName, "with", spectra.length, "spectra, forceNew:", forceNewWindow)
-
-        // If we have an existing main window and not forcing new, add to it
-        if (!forceNewWindow && mainSpectrumWindow && mainSpectrumWindow.visible) {
-            console.log("Adding spectra to existing window")
-            for (var i = 0; i < spectra.length; i++) {
-                mainSpectrumWindow.addSpectrum(spectra[i])
-            }
-            mainSpectrumWindow.raise()
-            mainSpectrumWindow.requestActivate()
-            return
-        }
-
-        // Create new window
-        var component = Qt.createComponent("../map_editor/SpectrumPlotWindow.qml")
-        if (component.status === Component.Ready) {
-            var window = component.createObject(mainWindow, {
-                datasetName: datasetName,
-                spectra: spectra
-            })
-            if (window) {
-                if (forceNewWindow) {
-                    // Track as additional window
-                    additionalSpectrumWindows.push(window)
-                    window.closing.connect(function() {
-                        var idx = additionalSpectrumWindows.indexOf(window)
-                        if (idx >= 0) additionalSpectrumWindows.splice(idx, 1)
-                    })
-                } else {
-                    // Set as main window
-                    mainSpectrumWindow = window
-                    window.closing.connect(function() {
-                        mainSpectrumWindow = null
-                    })
-                }
-                window.show()
-                console.log("Spectrum plot window created successfully")
-            } else {
-                console.error("Failed to create spectrum plot window object")
-            }
-        } else if (component.status === Component.Error) {
-            console.error("Error creating spectrum plot window:", component.errorString())
-        } else {
-            // Component loading asynchronously
-            component.statusChanged.connect(function() {
-                if (component.status === Component.Ready) {
-                    var window = component.createObject(mainWindow, {
-                        datasetName: datasetName,
-                        spectra: spectra
-                    })
-                    if (window) {
-                        if (forceNewWindow) {
-                            additionalSpectrumWindows.push(window)
-                            window.closing.connect(function() {
-                                var idx = additionalSpectrumWindows.indexOf(window)
-                                if (idx >= 0) additionalSpectrumWindows.splice(idx, 1)
-                            })
-                        } else {
-                            mainSpectrumWindow = window
-                            window.closing.connect(function() {
-                                mainSpectrumWindow = null
-                            })
-                        }
-                        window.show()
-                    }
-                }
-            })
-        }
-    }
+    // Track the main spectrum plot window ID (reused for click-to-plot)
+    property string mainSpectrumWindowId: ""
 
     // Open spectra from multiple datasets at once
     function openMultiDatasetSpectra(datasetSpectraList, forceNewWindow) {
         // datasetSpectraList is array of {datasetName, spectra}
         if (datasetSpectraList.length === 0) return
 
-        // Combine all spectra
-        var allSpectra = []
+        // Combine all spectra into curves
+        var curves = []
         var combinedName = []
         for (var i = 0; i < datasetSpectraList.length; i++) {
             var ds = datasetSpectraList[i]
             combinedName.push(ds.datasetName)
             for (var j = 0; j < ds.spectra.length; j++) {
-                allSpectra.push(ds.spectra[j])
+                var s = ds.spectra[j]
+                curves.push({
+                    x: s.x, y: s.y,
+                    label: s.title || (ds.datasetName + " " + (j+1)),
+                    color: ""
+                })
             }
         }
 
-        openSpectrumPlotWindow(combinedName.join(" + "), allSpectra, forceNewWindow)
+        var title = combinedName.join(" + ") + " Spectra"
+        var xl = datasetSpectraList[0].spectra[0].x_name || "X"
+        var yl = datasetSpectraList[0].spectra[0].y_name || "Intensity"
+
+        if (!forceNewWindow && mainSpectrumWindowId
+                && toolWindowManager.hasWindow(mainSpectrumWindowId)) {
+            toolWindowManager.updateGraphWindow(mainSpectrumWindowId, title, curves, xl, yl)
+        } else {
+            mainSpectrumWindowId = toolWindowManager.openGraphWindow(title, curves, xl, yl)
+        }
     }
 
     // Track open workflow windows
@@ -1615,7 +1595,12 @@ ApplicationWindow {
 
         onAccepted: {
             var path = file.toString()
-            path = path.replace(/^file:\/{2,3}/, "")
+            // file:///path -> /path (preserve leading slash for absolute paths)
+            if (path.startsWith("file:///")) {
+                path = path.substring(7)  // "file:///" is 7 chars, leaves "/path"
+            } else if (path.startsWith("file://")) {
+                path = path.substring(7)
+            }
             console.log("Importing image:", path)
             backend.importImage(path)
         }
@@ -1653,6 +1638,16 @@ ApplicationWindow {
 
         onDialogCancelled: {
             console.log("Project dialog cancelled, quitting...")
+        }
+    }
+
+    // Close startup dialog whenever a project becomes ready
+    Connections {
+        target: backend
+        function onProjectReadyChanged() {
+            if (backend.projectReady && projectStartupDialog.visible) {
+                projectStartupDialog.close()
+            }
         }
     }
 
@@ -1704,7 +1699,12 @@ ApplicationWindow {
 
         onAccepted: {
             var path = file.toString()
-            path = path.replace(/^file:\/{2,3}/, "")
+            // file:///path -> /path (preserve leading slash for absolute paths)
+            if (path.startsWith("file:///")) {
+                path = path.substring(7)  // "file:///" is 7 chars, leaves "/path"
+            } else if (path.startsWith("file://")) {
+                path = path.substring(7)
+            }
             console.log("Saving project to:", path)
             backend.saveProjectFile(path)
         }
@@ -1818,6 +1818,211 @@ ApplicationWindow {
             largeDatasetDialog.numSpectra = numSpectra
             largeDatasetDialog.numPoints = numPoints
             largeDatasetDialog.open()
+        }
+    }
+
+    // ========== UNDO/REDO KEYBOARD SHORTCUTS ==========
+    Shortcut {
+        sequence: StandardKey.Undo
+        onActivated: if (backend.undoManager && backend.undoManager.canUndo) backend.undoManager.undo()
+    }
+
+    Shortcut {
+        sequence: StandardKey.Redo
+        onActivated: if (backend.undoManager && backend.undoManager.canRedo) backend.undoManager.redo()
+    }
+
+    // ========== PROJECT STATE RESTORATION ==========
+    Connections {
+        target: backend
+
+        function onProjectStateRestored(stateJson) {
+            var state = JSON.parse(stateJson)
+            // Restore graph windows
+            if (state.graphs) {
+                for (var i = 0; i < state.graphs.length; i++) {
+                    var g = state.graphs[i]
+                    toolWindowManager.createEnhancedGraphWindow(g.title || g.id || "Graph", {
+                        curves: g.curves || [],
+                        xLabel: g.xLabel,
+                        yLabel: g.yLabel,
+                        width: g.geometry ? g.geometry.width : undefined,
+                        height: g.geometry ? g.geometry.height : undefined
+                    })
+                }
+            }
+            // Restore table windows
+            if (state.tables) {
+                for (var j = 0; j < state.tables.length; j++) {
+                    var t = state.tables[j]
+                    toolWindowManager.createEnhancedTableWindow(t.title || t.id || "Table", {
+                        dataRows: t.data || [],
+                        headers: t.columns || []
+                    })
+                }
+            }
+        }
+    }
+
+    // ========== EMBEDDED DATASET WINDOWS ==========
+    Connections {
+        target: backend
+
+        function onOpenDatasetEmbedded(name, curves, xLabel, yLabel) {
+            if (currentTabIndex !== 0) tabBar.currentIndex = 0
+            toolWindowManager.openGraphWindow(name, curves, xLabel, yLabel)
+        }
+
+        function onOpenTableEmbedded(title, headers, dataRows) {
+            if (currentTabIndex !== 0) tabBar.currentIndex = 0
+            toolWindowManager.createEnhancedTableWindow(title, {headers: headers, dataRows: dataRows})
+        }
+
+        function onCollectWindowStatesRequested() {
+            var states = toolWindowManager.getWindowStates()
+            backend.setEmbeddedWindowStates(states)
+        }
+    }
+
+    // ========== AUTOSAVE RECOVERY DIALOG ==========
+    Dialog {
+        id: recoveryDialog
+        title: "Autosave Recovery"
+        modal: true
+        width: 450
+        height: 220
+        anchors.centerIn: Overlay.overlay
+
+        property string autosavePath: ""
+        property string mainPath: ""
+
+        background: Rectangle {
+            color: bgDark
+            border.color: borderColor
+            border.width: 1
+            radius: 8
+        }
+
+        header: Rectangle {
+            color: bgMedium
+            height: 45
+            radius: 8
+
+            Rectangle {
+                anchors.bottom: parent.bottom
+                anchors.left: parent.left
+                anchors.right: parent.right
+                height: parent.radius
+                color: parent.color
+            }
+
+            Text {
+                anchors.centerIn: parent
+                text: "Autosave Recovery"
+                font.pixelSize: 16
+                font.bold: true
+                color: textLight
+            }
+        }
+
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: 15
+            spacing: 12
+
+            Text {
+                text: "A more recent autosave was found for this project."
+                color: textLight
+                font.pixelSize: 13
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+            }
+
+            Text {
+                text: "Would you like to recover from the autosave, or discard it and use the last manually saved version?"
+                color: textMuted
+                font.pixelSize: 12
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+            }
+        }
+
+        footer: Rectangle {
+            color: bgMedium
+            height: 55
+            radius: 8
+
+            Rectangle {
+                anchors.top: parent.top
+                width: parent.width
+                height: 1
+                color: borderColor
+            }
+
+            RowLayout {
+                anchors.fill: parent
+                anchors.margins: 10
+                spacing: 10
+
+                Item { Layout.fillWidth: true }
+
+                Button {
+                    text: "Discard"
+                    Layout.preferredWidth: 100
+
+                    background: Rectangle {
+                        color: parent.hovered ? bgLight : "transparent"
+                        border.color: borderColor
+                        radius: 4
+                    }
+
+                    contentItem: Text {
+                        text: parent.text
+                        color: textLight
+                        font.pixelSize: 12
+                        horizontalAlignment: Text.AlignHCenter
+                    }
+
+                    onClicked: {
+                        backend.autosaveManager.discardAutosave(recoveryDialog.autosavePath)
+                        recoveryDialog.close()
+                    }
+                }
+
+                Button {
+                    text: "Recover"
+                    Layout.preferredWidth: 100
+
+                    background: Rectangle {
+                        color: parent.hovered ? accentPink : accentBlue
+                        radius: 4
+                    }
+
+                    contentItem: Text {
+                        text: parent.text
+                        color: textLight
+                        font.pixelSize: 12
+                        font.bold: true
+                        horizontalAlignment: Text.AlignHCenter
+                    }
+
+                    onClicked: {
+                        backend.autosaveManager.recoverFromAutosave(recoveryDialog.autosavePath)
+                        recoveryDialog.close()
+                    }
+                }
+            }
+        }
+    }
+
+    // Connection for autosave recovery
+    Connections {
+        target: backend.autosaveManager
+
+        function onRecoveryAvailable(autosavePath, mainPath) {
+            recoveryDialog.autosavePath = autosavePath
+            recoveryDialog.mainPath = mainPath
+            recoveryDialog.open()
         }
     }
 }

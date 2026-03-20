@@ -198,7 +198,7 @@ class QMLProfileCanvas(QQuickPaintedItem):
 
     @Slot(list, list, str)
     def addCurveSimple(self, x_data: List[float], y_data: List[float], color: str = ""):
-        """Add curve with auto-generated name (for SpectrumPlotWindow)"""
+        """Add curve with auto-generated name"""
         name = f"Curve_{len(self._curves) + 1}"
         self.addCurve(name, x_data, y_data, color)
 

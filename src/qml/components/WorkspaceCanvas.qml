@@ -22,6 +22,7 @@ Rectangle {
     property color gridColor: Qt.rgba(textMuted.r, textMuted.g, textMuted.b, 0.15)
 
     // Zoom and pan
+    property bool zoomEnabled: true
     property real zoomLevel: 1.0
     property real minZoom: 0.25
     property real maxZoom: 4.0
@@ -194,6 +195,7 @@ Rectangle {
         property real lastY: 0
 
         onPressed: function(mouse) {
+            if (!zoomEnabled) return
             if (mouse.button === Qt.MiddleButton || (mouse.button === Qt.LeftButton && mouse.modifiers & Qt.AltModifier)) {
                 isPanning = true
                 lastX = mouse.x
@@ -232,6 +234,10 @@ Rectangle {
         }
 
         onWheel: function(wheel) {
+            if (!zoomEnabled) {
+                wheel.accepted = false
+                return
+            }
             var zoomFactor = wheel.angleDelta.y > 0 ? 1.1 : 0.9
             var newZoom = zoomLevel * zoomFactor
             newZoom = Math.max(minZoom, Math.min(maxZoom, newZoom))

@@ -1,0 +1,625 @@
+# -*- coding: utf-8 -*-
+"""
+Nanosurf NID and NHF file reader.
+
+Original work Copyright (c) 2018 Nanosurf AG (nelson@nanosurf.com)
+Licensed under the MIT License - see LICENSE file in this directory.
+Source: https://pypi.org/project/NSFopen/  (version 2.2.4)
+
+Modifications for T.R.A.N.S. (marked with [TRANS PATCH]):
+  - Cantilever calibration section restored with guard for STM compatibility
+  - DataSet-Info thermal tuning section guarded against missing keys
+  - Parameters dict key/value alignment fixed
+"""
+
+
+import re
+import numpy as np
+import h5py
+import pandas as pd
+import sys, os
+import time
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class read:
+    def __init__(self, filename=None, **kwargs):
+        self.filename = filename
+        self.data = None
+        self.param = None
+
+        if not filename:
+            print("\nFile required!\n")
+            return
+
+        _, ext = os.path.splitext(filename)
+        if ext == ".nid":
+            nid = nid_read(filename=filename, **kwargs)
+            self.data = nid.data
+            self.param = nid.param
+
+        elif ext == ".nhf":
+            nhf = nhf_read(filename)
+
+            self.data = nhf.data
+            self.param = nhf.param
+
+        else:
+            print("Not a valid filetype")
+            return
+
+
+class nid_read:
+    def __init__(self, filename=None, dataframe=True, verbose=False):
+        self.filename = filename
+        self.data = None
+        self.param = None
+
+        if not filename:
+            print("\nFile required!\n")
+            return
+
+        self.__dataframe = dataframe
+        self.verbose = verbose
+        # names of the channels that can be opened.  Can be added to.
+        self.data_names = [
+            "Spec forward",
+            "Spec backward",
+            "Spec fwd pause",
+            "Spec bwd pause",
+            "Scan forward",
+            "Scan backward",
+            "2nd scan forward",
+            "2nd scan backward",
+            "Frequency sweep",
+            "Frequency sweep SHO",
+            "Spectrum FFT",
+            "Spectrum Fit",
+        ]
+        self.data_types = [1, 1, 1, 1, 0, 0, 0, 0, 2, 2, 2, 2]
+
+        self.read()
+
+    def read(self):
+        t = time.time()
+
+        encode = "ANSI"
+        # encode = 'UTF-8'
+        encode = "ISO-8859-1"
+
+        # isolates header from data file
+        if self.verbose:
+            print("Reading Header")
+
+        fid = open(self.filename, "rb")
+        data_in = fid.read().split(b"\n\r\n\r")
+        fid.close()
+
+        head = np.array(data_in[0].split(b"\r\n"))
+        boo = head == b""
+        indices = np.nonzero(boo[1:] != boo[:-1])[0] + 1
+        head = np.split(head, indices)
+
+        head = [h for h in head if len(h) > 1]
+
+        header = {}
+        for h in head:
+            title = h[0].decode(encode)[1:-1]
+            data = h[1:]
+            values = {}
+            for d in data:
+                val = d.decode(encode).split("=")
+                values[val[0]] = val[1].rstrip()
+            header[title] = values
+
+        param = {}
+
+        def from_array(key, param):
+            return float(header[key][param].split(",")[4])
+
+        def get_values(key, param, df=False):
+            string = header[key][param]
+
+            ty, val, unit = re.search(
+                r"(\S)\[(.*)\]\*\[(.*)\]", string
+            ).groups()
+            if ty == "D":
+                val = float(val)
+            if ty == "B":
+                val = bool(val)
+            if ty == "L":
+                val = int(val)
+            if ty == "V":
+                val = [float(v) for v in val.split(",")]
+                unit = [str(u) for u in unit.split(",")]
+            out = {"Value": val, "Unit": unit}
+            if df:
+                if len(out) == 1:
+                    return pd.DataFrame(out)
+                else:
+                    return pd.DataFrame(out)
+            else:
+                return out
+
+        groupNames = []
+        dataSet = []
+
+        ds = "DataSet"
+        grCnt = int(header[ds]["GroupCount"])
+        for gr in range(grCnt):
+            groupNames.append(header[ds]["Gr" + str(gr) + "-Name"])
+            gc = int(header[ds]["Gr" + str(gr) + "-Count"])
+
+            for g in range(gc):
+                key = "Gr" + str(gr) + "-Ch" + str(g)
+                if key in header[ds]:
+                    dataSet.append(header[ds][key])
+
+        terms = [
+            "Frame",
+            "Points",
+            "Lines",
+            "SaveBits",
+            "Dim0Min",
+            "Dim0Range",
+            "Dim0Unit",
+            "Dim1Min",
+            "Dim1Range",
+            "Dim1Unit",
+            "Dim2Min",
+            "Dim2Range",
+            "Dim2Unit",
+            "Dim2Name",
+        ]
+
+        types = [0, 1, 1, 1, 2, 2, 0, 2, 2, 0, 2, 2, 0, 0]
+
+        # 0 = string, 1 = integer, 2 = float
+        typ = [lambda x: str(x), lambda x: int(x), lambda x: float(x)]
+
+        for term, ty in zip(terms, types):
+            val = []
+            for d in dataSet:
+                h = header[d]
+                if term in h:
+                    val.append(typ[ty](h[term]))
+
+            param[term] = val
+
+        # for spectroscopy with maps
+        dataPoints = []
+        for d in dataSet:
+            h = header[d]
+            linePoints = []
+            if "LineDim0Min" in h:
+                for key, value in h.items():
+                    if re.match(r"LineDim\d*Points", key):
+                        linePoints.append(int(value))
+            dataPoints.append(np.array(linePoints))
+        param["LinePoints"] = dataPoints
+
+        # [TRANS PATCH] Cantilever calibration - guarded for STM compatibility.
+        # STM measurements have no cantilever data; this section is skipped
+        # gracefully when the relevant header keys are absent.
+        cantilever = {}
+        key = "DataSet\\Calibration\\Cantilever"
+        if key in header:
+            try:
+                cantilever = {
+                    "Manufacturer": header[key].get("Manufacturer", ""),
+                    "Name": header[key].get("Name", ""),
+                }
+                propcount = int(header[key].get("PropCount", 0))
+                for i in range(propcount):
+                    prop_key = "Prop" + str(i)
+                    if prop_key in header[key]:
+                        cantilever[prop_key] = get_values(key, prop_key)
+            except Exception as e:
+                logger.debug(
+                    "Skipping cantilever calibration (STM mode): %s", e
+                )
+                cantilever = {}
+
+        key = "DataSet\\Calibration\\Scanhead"
+        if key in header:
+            try:
+                sens = from_array(key, "In5")
+                cantilever["Sensitivity"] = {"Value": sens / 10, "Unit": "m"}
+            except Exception as e:
+                logger.debug("Skipping scanhead calibration: %s", e)
+
+        mapTable = {}
+        key = "DataSet\\SpecInfos"
+        if key in header:
+            n = int(header[key]["SubSectionCount"])
+            secNames = [header[key]["SubSection" + str(i)] for i in range(n)]
+
+            specMode = header[key + "\\" + secNames[0]]["SpecMode"]
+
+            count = int(header[key + "\\" + secNames[1]]["Count"])
+
+            mapTable = [
+                header[key + "\\" + secNames[1]][specMode[:3] + str(i)].split(
+                    ";"
+                )
+                for i in range(count)
+            ]
+            mapTable = np.array(mapTable).astype(float)[0]
+
+        specParam = {}
+        modFw, modBw, pauseFw, pauseBw, rangeFw, rangeBw, stopFw = (
+            [] for i in range(7)
+        )
+        key = "DataSet\\Parameters\\Spectroscopy"
+        if key in header:
+            modFw = get_values(key, "FwModTime")
+            modBw = get_values(key, "BwModTime")
+            pauseFw = get_values(key, "FwPauseTime")
+            pauseBw = get_values(key, "BwPauseTime")
+            rangeFw = get_values(key, "FwModRange")
+            rangeBw = get_values(key, "BwModRange")
+            stopFw = get_values(key, "FwModStopValue")
+
+        scanParam = {}
+        scanRange, scanTime, scanOffset, scanRotation = ([] for i in range(4))
+        key = "DataSet\\Parameters\\Imaging"
+        if key in header:
+            scanRange = get_values(key, "ScanRange")
+            scanTime = get_values(key, "ScanTime")
+            scanOffset = get_values(key, "ScanOffset")
+            scanRotation = get_values(key, "ScanRotation")
+
+        # [TRANS PATCH] Thermal tuning - guarded against missing DataSet-Info.
+        # STM files may not contain this section at all.
+        thermal = {}
+        key = "DataSet-Info"
+        if key in header and "-- Thermal Tuning --" in header[key]:
+            try:
+                if "k" in header[key]["Q Factor:"]:
+                    Q = float(header[key]["Q Factor:"][:-1]) * 1e3
+                else:
+                    Q = float(header[key]["Q Factor:"])
+                Freq = header[key]["Frequency:"]
+                SpringK = header[key]["Spring Constant:"]
+                Peak = header[key]["Peak Value:"]
+
+                gr = re.search(r"(\d+\.\d+)(\S*)", Freq).groups()
+                Freq = {"Value": gr[0], "Unit": gr[1]}
+                try:
+                    gr = re.search(r"(\d+\.\d+)\s(\S*)", SpringK).groups()
+                except:
+                    gr = re.search(r"(\d)\s(\S*)", SpringK).groups()
+                SpringK = {"Value": gr[0], "Unit": gr[1]}
+
+                try:
+                    gr = re.search(r"(\d+\.\d+)(\S*)", Peak).groups()
+                except:
+                    gr = re.search(r"(\d)(\S*)", Peak).groups()
+                Peak = {"Value": gr[0], "Unit": gr[1]}
+
+                thermal = {
+                    "Frequency": Freq,
+                    "Q Factor": Q,
+                    "Spring Constant": SpringK,
+                    "Peak": Peak,
+                }
+            except Exception as e:
+                logger.debug("Skipping thermal tuning data: %s", e)
+                thermal = {}
+
+        required_size = int(
+            sum(
+                [
+                    a * b * c / 8
+                    for a, b, c in zip(
+                        param["Points"], param["Lines"], param["SaveBits"]
+                    )
+                ]
+            )
+        )
+
+        q = float(2 ** param["SaveBits"][0])
+        z0 = float(q / 2)
+
+        if param["SaveBits"][0] == 16:
+            dt = np.int16
+        elif param["SaveBits"][0] == 32:
+            dt = np.int32
+
+        if self.verbose:
+            print("Reading Data")
+
+        fid = open(self.filename, "rb")
+        fid.seek(-required_size, 2)
+        data_in = np.fromfile(fid, count=required_size, dtype=dt).astype(float)
+        data_in = (data_in + z0) / q
+        fid.close()
+
+        data_in = np.split(
+            data_in,
+            np.cumsum(
+                [a * b for a, b in zip(param["Points"], param["Lines"])]
+            ),
+        )
+        data_in.pop()
+
+        data = []
+        # reshape and rescale data
+        for datain, pts, lns, zran, zmin in zip(
+            data_in,
+            param["Points"],
+            param["Lines"],
+            param["Dim2Range"],
+            param["Dim2Min"],
+        ):
+
+            data.append(datain.reshape((lns, pts)).__mul__(zran).__add__(zmin))
+
+        data_crop = []
+        for numP, dSet in zip(param["LinePoints"], data):
+            if numP.any():
+                temp = []
+                for n, d in zip(numP, dSet):
+                    temp.append(d[:n])
+                data_crop.append(temp)
+            else:
+                data_crop.append(dSet)
+        data = np.asarray(data_crop, dtype=object)
+
+        # this is the index of the channels that will be output.
+        idx = [
+            idx
+            for idx, frame in enumerate(param["Frame"])
+            if frame in self.data_names
+        ]
+
+        # only take data from approved list in name
+        data = data[idx]
+        frames = np.array(param["Frame"])[idx]
+        channel = np.array(param["Dim2Name"])[idx]
+
+        frame_chan = [i + ";" + j for i, j in zip(frames, channel)]
+
+        seen = set()
+        new_channel = []
+        for x in frame_chan:
+            if x not in seen:
+                new_channel.append(x)
+                seen.add(x)
+            else:
+                new_channel.append(x + "2")
+        channel = [x.split(";")[1] for x in new_channel]
+
+        out = {}
+        for frame, chan, dat in zip(frames, channel, data):
+            if frame not in out:
+                out[frame] = {}
+            if chan not in out[frame]:
+                out[frame][chan] = {}
+            if isinstance(dat, list):
+                out[frame][chan] = dat
+            else:
+                out[frame][chan] = dat.astype(float)
+
+        image = {}
+        spec = {}
+        spectrum = {}
+
+        for name, value in out.items():
+            dt = self.data_types[self.data_names.index(name)]
+            if dt == 0:
+                if name == "Scan forward":
+                    image["Forward"] = value
+                elif name == "Scan backward":
+                    image["Backward"] = value
+                elif name == "2nd scan forward":
+                    image["2nd Forward"] = value
+                elif name == "2nd scan backward":
+                    image["2nd Backward"] = value
+                else:
+                    pass
+            if dt == 1:
+                if name == "Spec forward":
+                    spec["Forward"] = value
+                elif name == "Spec backward":
+                    spec["Backward"] = value
+                elif name == "Spec fwd pause":
+                    spec["Pause Forward"] = value
+                elif name == "Spec bwd pause":
+                    spec["Pause Backward"] = value
+                else:
+                    pass
+            if dt == 2:
+                if name == "Spectrum FFT":
+                    spectrum["FFT"] = value
+                elif name == "Spectrum Fit":
+                    spectrum["Fit"] = value
+                elif name == "Frequency sweep":
+                    spectrum["Sweep"] = value
+                elif name == "Frequency sweep SHO":
+                    spectrum["SHO"] = value
+                else:
+                    pass
+
+        x = dict(
+            zip(
+                ["min", "range", "units"],
+                [param["Dim0Min"], param["Dim0Range"], param["Dim0Unit"]],
+            )
+        )
+        y = dict(
+            zip(
+                ["min", "range", "units"],
+                [param["Dim1Min"], param["Dim1Range"], param["Dim1Unit"]],
+            )
+        )
+        z = dict(
+            zip(
+                ["min", "range", "units"],
+                [param["Dim2Min"], param["Dim2Range"], param["Dim2Unit"]],
+            )
+        )
+        scanParam = dict(
+            zip(
+                ["range", "time/line", "offset", "rotation"],
+                [scanRange, scanTime, scanOffset, scanRotation],
+            )
+        )
+        specParam = dict(
+            zip(
+                [
+                    "modFw",
+                    "modBw",
+                    "pauseFw",
+                    "pauseBw",
+                    "rangeFw",
+                    "rangeBw",
+                    "stop-by-value",
+                    "maps",
+                ],
+                [
+                    modFw,
+                    modBw,
+                    pauseFw,
+                    pauseBw,
+                    rangeFw,
+                    rangeBw,
+                    stopFw,
+                    mapTable,
+                ],
+            )
+        )
+
+        # [TRANS PATCH] Fixed key/value alignment - cantilever restored as
+        # 'Tip' entry so all 8 keys map to 8 values correctly.
+        parameters = dict(
+            zip(
+                ["Tip", "X", "Y", "Z", "Scan", "Spec", "Tune", "HeaderDump"],
+                [cantilever, x, y, z, scanParam, specParam, thermal, header],
+            )
+        )
+
+        dataout = [image, spec, spectrum]
+        datanames = ["Image", "Spec", "Sweep"]
+
+        valid_data = [val for num, val in enumerate(dataout) if val]
+        valid_names = [
+            datanames[num] for num, val in enumerate(dataout) if val
+        ]
+
+        dataout = dict(zip(valid_names, valid_data))
+        t_end = time.time() - t
+
+        if self.verbose:
+            print("Elapsed Time: %3.2f sec\n" % t_end)
+
+        if self.__dataframe:
+            # import pandas as pd
+            self.data = toPandaDF(dataout).unstack(level=0)
+            self.data.dropna(inplace=True)
+            # self.specunits = pd.DataFrame(specUnits)
+            self.param = toPandaSeries(parameters)
+        else:
+            self.data = dataout
+            self.param = parameters
+
+
+class nhf_read:
+    def __init__(self, filename=None):
+        self.filename = filename
+        self.data = None
+        self.param = None
+        self.read()
+
+    def read(self):
+        # measurement
+        fopen = h5py.File(self.filename, "r")
+
+        group_name = list(fopen.keys())
+        # forward/backward
+        segment = fopen[group_name[0]]
+        seg_names = list(segment.keys())
+
+        s_prop = segment.attrs
+        prop_s = {name: s_prop[name] for name in list(s_prop)}
+
+        DAC_max = 2**31 - 1
+
+        data_out = {}
+        prop = []
+
+        for s in seg_names:
+            meas = segment[s]
+
+            if fopen.attrs["nsf_file_version_major"] == 1:
+                direction = meas.attrs["name"]
+                Nx = prop_s["image_points_per_line"]
+                Ny = prop_s["image_number_of_lines"]
+            else:
+                direction = meas.attrs["segment_name"]
+                Nx, Ny = meas.attrs["rect_axis_size"]
+
+            data_out[direction] = {}
+
+            for m in list(meas.keys()):
+                data = meas[m]
+                d_prop = data.attrs
+
+                if fopen.attrs["nsf_file_version_major"] == 1:
+                    prop.append({name: d_prop[name] for name in list(d_prop)})
+                    cal_max = d_prop["base_calibration_max"]
+                    cal_min = d_prop["base_calibration_min"]
+                    channel = d_prop["name"]
+
+                    scale = (cal_max - cal_min) / DAC_max / 2
+
+                    data_out[direction][channel] = (
+                        np.reshape(data[:], [Nx, Ny]) * scale
+                    )
+
+                elif fopen.attrs["nsf_file_version_major"] == 2:
+                    if "signal_name" in list(d_prop):
+                        prop.append(
+                            {name: d_prop[name] for name in list(d_prop)}
+                        )
+                        cal_max = d_prop["signal_calibration_max"]
+                        cal_min = d_prop["signal_calibration_min"]
+                        channel = d_prop["signal_name"]
+
+                        scale = (cal_max - cal_min) / DAC_max / 2
+
+                        data_out[direction][channel] = (
+                            np.reshape(data[:], [Nx, Ny]) * scale
+                        )
+
+        _data_out = {}
+        _data_out["Image"] = data_out
+
+        self.data = toPandaDF(_data_out).unstack(level=0)
+        self.param = pd.Series(prop_s)
+        fopen.close()
+
+
+def toPandaDF(user_dict):
+    df = pd.DataFrame.from_dict(
+        {
+            (i, j): user_dict[i][j]
+            for i in user_dict.keys()
+            for j in user_dict[i].keys()
+        },
+        orient="index",
+    ).transpose()
+    return df
+
+
+def toPandaSeries(user_dict):
+    df = pd.Series(
+        {
+            (i, j): user_dict[i][j]
+            for i in user_dict.keys()
+            for j in user_dict[i].keys()
+        }
+    )
+    return df

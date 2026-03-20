@@ -15,7 +15,7 @@ from enum import Enum
 import logging
 
 from PySide6.QtCore import (
-    Qt, Signal, Slot, Property, QPointF, QRectF, QObject
+    Qt, Signal, Slot, Property, QPointF, QRectF, QObject, QTimer
 )
 from PySide6.QtGui import QImage, QPainter, QColor, QPen, QBrush, QCursor
 from PySide6.QtQuick import QQuickPaintedItem
@@ -115,6 +115,12 @@ class QMLMapCanvas(QQuickPaintedItem):
         self._cached_image: Optional[QImage] = None
         self._needs_redraw: bool = True
 
+        # Resize debounce timer — avoids re-rendering matplotlib on every pixel
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.setInterval(150)  # ms
+        self._resize_timer.timeout.connect(self._onResizeFinished)
+
         # Block selection state (TRANS_v3 style)
         # For discretized data where each cell represents a spatial block
         self._selected_blocks: set = set()  # Set of (row, col) tuples
@@ -122,10 +128,33 @@ class QMLMapCanvas(QQuickPaintedItem):
         self._discretized_data: Optional[np.ndarray] = None  # Discretized (averaged) data
         self._block_size: Optional[Tuple[int, int]] = None  # (block_v, block_h) in original pixels
 
+        # Grid overlay state for discretization
+        self._show_grid_overlay: bool = False
+        self._grid_block_h: int = 1  # Horizontal block size in pixels
+        self._grid_block_v: int = 1  # Vertical block size in pixels
+        self._hover_block: Optional[Tuple[int, int]] = None  # Grid block under cursor
+
         # Spectral cube link for reconstruction
         self._spectral_cube: Optional[np.ndarray] = None  # Shape: (n_spectral_pts, rows, cols)
         self._independent_var: Optional[np.ndarray] = None  # Wavenumber/voltage axis
         self._independent_var_name: str = "x"
+
+    @Slot()
+    def cleanup(self):
+        """Release matplotlib resources to prevent memory leaks."""
+        try:
+            if hasattr(self, '_resize_timer'):
+                self._resize_timer.stop()
+            if hasattr(self, 'figure') and self.figure is not None:
+                self.figure.clear()
+                plt.close(self.figure)
+                self.figure = None
+                self.axes = None
+                self.canvas = None
+            self._cached_image = None
+            logger.debug("MapCanvas cleaned up matplotlib resources")
+        except Exception as e:
+            logger.warning(f"Error during MapCanvas cleanup: {e}")
 
     # =========================================================================
     # Properties exposed to QML
@@ -309,6 +338,49 @@ class QMLMapCanvas(QQuickPaintedItem):
             return expanded_mask
 
         return mask
+
+    # =========================================================================
+    # Grid Overlay for Discretization
+    # =========================================================================
+
+    @Slot(int, int)
+    def setGridBlockSize(self, block_h: int, block_v: int):
+        """Set grid block size and enable grid overlay."""
+        self._grid_block_h = max(1, block_h)
+        self._grid_block_v = max(1, block_v)
+        self._show_grid_overlay = True
+        self._selected_blocks.clear()
+        self._hover_block = None
+        self._needs_redraw = True
+        self.blockSelectionChanged.emit()
+        self.update()
+        logger.info(f"Grid overlay enabled: block_h={block_h}, block_v={block_v}")
+
+    @Slot(bool)
+    def setGridOverlayVisible(self, visible: bool):
+        """Show or hide the grid overlay."""
+        self._show_grid_overlay = visible
+        self.update()
+
+    @Slot()
+    def clearGridOverlay(self):
+        """Remove grid overlay and reset grid state."""
+        self._show_grid_overlay = False
+        self._grid_block_h = 1
+        self._grid_block_v = 1
+        self._hover_block = None
+        self._selected_blocks.clear()
+        self.blockSelectionChanged.emit()
+        self.update()
+
+    def _pixelToGridBlock(self, x: float, y: float) -> Tuple[int, int]:
+        """Convert pixel coordinates to grid block (grid_row, grid_col)."""
+        row, col = self._pixelToData(x, y)
+        if self._grid_block_h > 1 or self._grid_block_v > 1:
+            grid_col = col // self._grid_block_h
+            grid_row = row // self._grid_block_v
+            return grid_row, grid_col
+        return row, col
 
     # =========================================================================
     # Spectral-Spatial Reconstruction (TRANS_v3 core feature)
@@ -592,6 +664,44 @@ class QMLMapCanvas(QQuickPaintedItem):
         """Draw interactive overlay elements"""
         painter.setRenderHint(QPainter.Antialiasing, True)
 
+        # Draw grid overlay for discretization
+        if self._show_grid_overlay and self._data_to_pixel is not None and self._map_data is not None:
+            d = self._data_to_pixel
+            ax_width = d['ax_right'] - d['ax_left']
+            ax_height = d['ax_bottom'] - d['ax_top']
+            data_rows, data_cols = d['data_rows'], d['data_cols']
+
+            # Draw semi-transparent white grid lines
+            pen = QPen(QColor(255, 255, 255, 100))
+            pen.setWidth(1)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+
+            # Vertical grid lines
+            for gc in range(1, (data_cols // self._grid_block_h) + 1):
+                px = gc * self._grid_block_h
+                if px < data_cols:
+                    x = d['ax_left'] + (px / data_cols) * ax_width
+                    painter.drawLine(int(x), int(d['ax_top']), int(x), int(d['ax_bottom']))
+
+            # Horizontal grid lines
+            for gr in range(1, (data_rows // self._grid_block_v) + 1):
+                py = gr * self._grid_block_v
+                if py < data_rows:
+                    y = d['ax_top'] + (py / data_rows) * ax_height
+                    painter.drawLine(int(d['ax_left']), int(y), int(d['ax_right']), int(y))
+
+            # Draw hover highlight on grid block
+            if self._hover_block is not None and self._current_tool == MapTool.BLOCK_SELECT:
+                hr, hc = self._hover_block
+                cell_w = (self._grid_block_h / data_cols) * ax_width
+                cell_h = (self._grid_block_v / data_rows) * ax_height
+                rect_x = d['ax_left'] + hc * self._grid_block_h / data_cols * ax_width
+                rect_y = d['ax_top'] + hr * self._grid_block_v / data_rows * ax_height
+                painter.setPen(QPen(QColor(245, 169, 184, 180)))  # Pink hover
+                painter.setBrush(QBrush(QColor(245, 169, 184, 50)))
+                painter.drawRect(QRectF(rect_x, rect_y, cell_w, cell_h))
+
         # Draw selected blocks (TRANS_v3 style blue highlight)
         if self._selected_blocks and self._data_to_pixel is not None:
             pen = QPen(QColor(31, 119, 180, 200))  # Blue from TRANS_v3 (#1f77b4)
@@ -599,23 +709,26 @@ class QMLMapCanvas(QQuickPaintedItem):
             painter.setPen(pen)
             painter.setBrush(QBrush(QColor(31, 119, 180, 80)))
 
-            for row, col in self._selected_blocks:
-                # Get pixel bounds for this block
-                x1, y1 = self._dataToPixel(row, col)
-                x2, y2 = self._dataToPixel(row + 1, col + 1)
+            d = self._data_to_pixel
+            ax_width = d['ax_right'] - d['ax_left']
+            ax_height = d['ax_bottom'] - d['ax_top']
 
-                # Adjust for cell centering
-                d = self._data_to_pixel
-                ax_width = d['ax_right'] - d['ax_left']
-                ax_height = d['ax_bottom'] - d['ax_top']
+            if self._show_grid_overlay and (self._grid_block_h > 1 or self._grid_block_v > 1):
+                # Grid-snapped block selection
+                cell_w = (self._grid_block_h / d['data_cols']) * ax_width
+                cell_h = (self._grid_block_v / d['data_rows']) * ax_height
+                for row, col in self._selected_blocks:
+                    rect_x = d['ax_left'] + col * self._grid_block_h / d['data_cols'] * ax_width
+                    rect_y = d['ax_top'] + row * self._grid_block_v / d['data_rows'] * ax_height
+                    painter.drawRect(QRectF(rect_x, rect_y, cell_w, cell_h))
+            else:
+                # Per-pixel block selection
                 cell_w = ax_width / d['data_cols']
                 cell_h = ax_height / d['data_rows']
-
-                rect_x = d['ax_left'] + col * cell_w
-                rect_y = d['ax_top'] + row * cell_h
-
-                rect = QRectF(rect_x, rect_y, cell_w, cell_h)
-                painter.drawRect(rect)
+                for row, col in self._selected_blocks:
+                    rect_x = d['ax_left'] + col * cell_w
+                    rect_y = d['ax_top'] + row * cell_h
+                    painter.drawRect(QRectF(rect_x, rect_y, cell_w, cell_h))
 
         # Draw crosshair
         if self._show_crosshair and self._crosshair_pos is not None:
@@ -713,7 +826,12 @@ class QMLMapCanvas(QQuickPaintedItem):
 
         elif self._current_tool == MapTool.BLOCK_SELECT:
             # TRANS_v3 style block selection - toggle on click
-            self.toggleBlockSelection(row, col)
+            # Snap to grid if grid overlay is active
+            if self._show_grid_overlay and (self._grid_block_h > 1 or self._grid_block_v > 1):
+                grid_row, grid_col = self._pixelToGridBlock(pos.x(), pos.y())
+                self.toggleBlockSelection(grid_row, grid_col)
+            else:
+                self.toggleBlockSelection(row, col)
             # Also emit point clicked for spectrum display
             self.pointClicked.emit(pos.x(), pos.y(), row, col, value)
             self.spectralDataRequested.emit(row, col)
@@ -787,6 +905,13 @@ class QMLMapCanvas(QQuickPaintedItem):
             self._crosshair_pos = (row, col)
             self.update()
 
+        # Track hover block for grid overlay highlight
+        if self._show_grid_overlay and self._current_tool == MapTool.BLOCK_SELECT:
+            new_hover = self._pixelToGridBlock(pos.x(), pos.y())
+            if new_hover != self._hover_block:
+                self._hover_block = new_hover
+                self.update()
+
     def wheelEvent(self, event):
         """Handle mouse wheel for zooming"""
         # TODO: Implement zoom
@@ -797,11 +922,18 @@ class QMLMapCanvas(QQuickPaintedItem):
     # =========================================================================
 
     def geometryChange(self, newGeometry, oldGeometry):
-        """Handle size changes"""
+        """Handle resize with debouncing — scale cached image during drag, re-render when done."""
         super().geometryChange(newGeometry, oldGeometry)
         if newGeometry.size() != oldGeometry.size():
-            self._needs_redraw = True
+            # During resize: just repaint with the existing cached image (scaled by Qt)
             self.update()
+            # Restart debounce timer — full re-render happens when resizing stops
+            self._resize_timer.start()
+
+    def _onResizeFinished(self):
+        """Called after resize stops (debounce). Triggers full matplotlib re-render."""
+        self._needs_redraw = True
+        self.update()
 
     # =========================================================================
     # Statistics and Export (for docked viewer)

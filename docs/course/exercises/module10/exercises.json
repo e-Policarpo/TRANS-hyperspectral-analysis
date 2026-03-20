@@ -1,0 +1,152 @@
+{
+  "module": 10,
+  "title": "Code Complexity Analysis",
+  "exercises": [
+    {
+      "id": "10_01",
+      "title": "Cyclomatic Complexity Calculator",
+      "description": "Implement a function that calculates cyclomatic complexity using AST",
+      "difficulty": "intermediate",
+      "points": 150,
+      "required_patterns": [
+        "ast.NodeVisitor|ast.walk",
+        "visit_If|ast.If",
+        "visit_For|ast.For",
+        "visit_While|ast.While",
+        "complexity"
+      ],
+      "test_cases": [
+        {
+          "name": "function_exists",
+          "type": "attribute_exists",
+          "target": "module",
+          "attribute": "calculate_cyclomatic_complexity"
+        }
+      ]
+    },
+    {
+      "id": "10_02",
+      "title": "Nesting Depth Analyzer",
+      "description": "Build a visitor that tracks maximum nesting depth",
+      "difficulty": "intermediate",
+      "points": 125,
+      "required_patterns": [
+        "ast.NodeVisitor",
+        "max_depth|nesting_depth",
+        "current_depth",
+        "generic_visit"
+      ],
+      "test_cases": [
+        {
+          "name": "class_exists",
+          "type": "class_exists",
+          "target": "NestingDepthVisitor"
+        }
+      ]
+    },
+    {
+      "id": "10_03",
+      "title": "Complete Code Analyzer",
+      "description": "Create a CodeAnalyzer class that reports all metrics",
+      "difficulty": "advanced",
+      "points": 200,
+      "required_patterns": [
+        "class.*CodeAnalyzer",
+        "analyze_file|analyze",
+        "@dataclass|dataclass",
+        "cyclomatic|complexity",
+        "nesting|depth"
+      ],
+      "test_cases": [
+        {
+          "name": "analyzer_class_exists",
+          "type": "class_exists",
+          "target": "CodeAnalyzer"
+        },
+        {
+          "name": "has_analyze_method",
+          "type": "has_method",
+          "target": "CodeAnalyzer",
+          "method": "analyze_file"
+        }
+      ]
+    },
+    {
+      "id": "10_04",
+      "title": "JSON Report Generator",
+      "description": "Add a method that outputs analysis as JSON",
+      "difficulty": "intermediate",
+      "points": 125,
+      "required_patterns": [
+        "json.dumps|to_json|as_json",
+        "generate_report|export",
+        "dict|asdict"
+      ]
+    },
+    {
+      "id": "10_05",
+      "title": "Analyze TRANS-QML",
+      "description": "Run your analyzer on the TRANS backend and identify refactoring targets",
+      "difficulty": "advanced",
+      "points": 175,
+      "required_patterns": [
+        "analyze_directory|rglob",
+        "get_issues|find_issues",
+        "severity|warning|error",
+        "refactor|suggestion"
+      ]
+    }
+  ],
+  "extra_exercises": [
+    {
+      "id": "10_E1",
+      "title": "Cognitive Complexity Calculator",
+      "description": "Implement cognitive complexity that weights nesting depth",
+      "difficulty": "advanced",
+      "points": 175,
+      "required_patterns": [
+        "cognitive|CognitiveComplexity",
+        "nesting_level|nesting_penalty",
+        "ast.NodeVisitor"
+      ]
+    },
+    {
+      "id": "10_E2",
+      "title": "Pre-commit Hook",
+      "description": "Create a git pre-commit hook that blocks high-complexity commits",
+      "difficulty": "advanced",
+      "points": 150,
+      "required_patterns": [
+        "subprocess|git",
+        "staged|diff.*cached",
+        "sys.exit|return.*[1-9]"
+      ]
+    },
+    {
+      "id": "10_E3",
+      "title": "Function Metrics Dataclass",
+      "description": "Create a FunctionMetrics dataclass with all relevant metrics",
+      "difficulty": "intermediate",
+      "points": 100,
+      "required_patterns": [
+        "@dataclass",
+        "FunctionMetrics",
+        "cyclomatic_complexity|cc",
+        "nesting_depth",
+        "lines_of_code|loc"
+      ]
+    },
+    {
+      "id": "10_E4",
+      "title": "Halstead Metrics",
+      "description": "Implement Halstead complexity metrics (operators, operands, volume)",
+      "difficulty": "advanced",
+      "points": 175,
+      "required_patterns": [
+        "Halstead|halstead",
+        "operators|operands",
+        "volume|difficulty|effort"
+      ]
+    }
+  ]
+}

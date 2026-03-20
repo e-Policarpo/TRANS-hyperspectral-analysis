@@ -89,6 +89,8 @@ Item {
             dataBrowser.mapCols = mapBackend.mapCols
             dataBrowser.hasSpectralData = mapBackend.hasSpectralData
             dataBrowser.spectralPoints = mapBackend.spectralPoints
+            // Auto-link datasets with matching spatial dimensions
+            mapBackend.autoLinkMatchingDatasets(backend)
         }
 
         onOpenPlotWindowRequested: function(datasetName, spectra) {
@@ -790,6 +792,14 @@ Item {
                         var count = getSelectedBlockCount()
                         selectionLabel.text = count + " selected"
                         root.blockSelectionChanged(count)
+                        // Debounce spectrum updates to avoid memory leak from rapid clicks
+                        spectrumUpdateTimer.restart()
+                    }
+
+                    Timer {
+                        id: spectrumUpdateTimer
+                        interval: 200; repeat: false
+                        onTriggered: inlineSpectrumViewer.updateSpectrum()
                     }
 
                     onProfileDrawn: function(x1, y1, x2, y2) {
@@ -888,6 +898,13 @@ Item {
                 }
             }
 
+            // Inline Spectrum Viewer (collapsible, below status bar)
+            InlineSpectrumViewer {
+                id: inlineSpectrumViewer
+                Layout.fillWidth: true
+                mapBackend: mapBackend
+            }
+
             // Bottom panel area (Profile Viewer)
             ProfileViewer {
                 id: profileViewer
@@ -982,67 +999,25 @@ Item {
                     color: borderColor
                 }
 
-                // Export Section
-                Rectangle {
+                // Hyperspectral Control Panel (replaces Export section)
+                HyperspectralControlPanel {
+                    id: hyperspectralPanel
                     Layout.fillWidth: true
                     Layout.fillHeight: true
-                    color: bgDark
+                    mapBackend: mapBackend
+                    appBackend: backend
+                    mapCanvas: mapCanvas
 
-                    ColumnLayout {
-                        anchors.fill: parent
-                        anchors.margins: 8
-                        spacing: 6
+                    onOpenGraphRequested: {
+                        // Forward to parent for embedded window creation
+                        root.openSpectrumPlotRequested(
+                            mapBackend.activeDataset,
+                            mapBackend.getSelectedSpectraFromDataset(mapBackend.activeDataset),
+                            false)
+                    }
 
-                        Label {
-                            text: "Export"
-                            font.pixelSize: 12
-                            font.bold: true
-                            color: textLight
-                        }
-
-                        Button {
-                            text: "Export TIFF"
-                            Layout.fillWidth: true
-                            font.pixelSize: 11
-
-                            background: Rectangle {
-                                color: parent.hovered ? bgLight : bgMedium
-                                border.color: borderColor
-                                radius: 4
-                            }
-
-                            contentItem: Text {
-                                text: parent.text
-                                font: parent.font
-                                color: textLight
-                                horizontalAlignment: Text.AlignHCenter
-                            }
-
-                            onClicked: exportTiffDialog.open()
-                        }
-
-                        Button {
-                            text: "Export CSV"
-                            Layout.fillWidth: true
-                            font.pixelSize: 11
-
-                            background: Rectangle {
-                                color: parent.hovered ? bgLight : bgMedium
-                                border.color: borderColor
-                                radius: 4
-                            }
-
-                            contentItem: Text {
-                                text: parent.text
-                                font: parent.font
-                                color: textLight
-                                horizontalAlignment: Text.AlignHCenter
-                            }
-
-                            onClicked: exportCsvDialog.open()
-                        }
-
-                        Item { Layout.fillHeight: true }
+                    onOpenTableRequested: {
+                        console.log("Table view requested for", mapBackend.activeDataset)
                     }
                 }
             }

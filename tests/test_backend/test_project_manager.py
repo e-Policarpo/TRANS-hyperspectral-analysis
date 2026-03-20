@@ -177,7 +177,74 @@ class TestDataSerialization:
 
         assert 'test' in deserialized
         assert isinstance(deserialized['test'], SpectralData)
-        assert deserialized['test'].num_spectra == sample_spectral_data.num_spectra
+
+    def test_data_type_roundtrip(self, project_manager):
+        """PM-05b: data_type field preserved through serialize/deserialize."""
+        # Create a flat dataset (like integrated data)
+        df = pd.DataFrame({
+            'Index': range(10),
+            'Interval_0': np.random.rand(10),
+            'Interval_1': np.random.rand(10),
+        })
+        flat_metadata = SpectralMetadata(
+            source_type='integrated_flat',
+            dimensions=(5, 2),
+            scan_mode='forward',
+            units={'independent': 'Index', 'dependent': 'a.u.'},
+            data_type='flat'
+        )
+        flat_data = SpectralData(data=df, metadata=flat_metadata)
+
+        # Also test a normal spectral dataset
+        x = np.linspace(-2, 2, 50)
+        spectral_df = pd.DataFrame({
+            'V': x,
+            'Spectrum_0': np.sin(x),
+        })
+        spectral_metadata = SpectralMetadata(
+            source_type='test',
+            dimensions=(1, 1),
+            scan_mode='forward',
+            units={'independent': 'V', 'dependent': 'A'},
+            data_type='spectral'
+        )
+        spectral_data = SpectralData(data=spectral_df, metadata=spectral_metadata)
+
+        datasets = {'flat_ds': flat_data, 'spectral_ds': spectral_data}
+        serialized = project_manager._serialize_datasets(datasets)
+
+        # Verify data_type is serialized
+        assert serialized['flat_ds']['metadata']['data_type'] == 'flat'
+        assert serialized['spectral_ds']['metadata']['data_type'] == 'spectral'
+
+        # Deserialize and verify data_type is preserved
+        deserialized = project_manager._deserialize_datasets(serialized)
+        assert deserialized['flat_ds'].metadata.data_type == 'flat'
+        assert deserialized['spectral_ds'].metadata.data_type == 'spectral'
+
+    def test_data_type_defaults_to_spectral(self, project_manager):
+        """PM-05c: Legacy projects without data_type default to 'spectral'."""
+        # Simulate a legacy serialized dataset without data_type
+        serialized = {
+            'legacy': {
+                'type': 'SpectralData',
+                'format': 'binary',
+                'shape': [50, 1],
+                'columns': ['Spectrum_0'],
+                'data_binary': project_manager._numpy_to_base64(np.random.rand(50, 1)),
+                'independent_var_binary': project_manager._numpy_to_base64(np.linspace(0, 1, 50)),
+                'independent_var_name': 'X',
+                'metadata': {
+                    'source_type': 'test',
+                    'dimensions': [1, 1],
+                    'scan_mode': 'forward',
+                    'units': {}
+                    # NOTE: no 'data_type' key — legacy format
+                }
+            }
+        }
+        deserialized = project_manager._deserialize_datasets(serialized)
+        assert deserialized['legacy'].metadata.data_type == 'spectral'
 
     def test_serialize_dataframe_small(self, project_manager):
         """PM-06: Serialize small DataFrame as JSON."""

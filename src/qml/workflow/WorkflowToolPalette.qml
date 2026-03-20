@@ -60,8 +60,8 @@ Rectangle {
             return
         }
 
-        var categories = workflowManager.getToolCategories()
-        if (!categories || Object.keys(categories).length === 0) {
+        var categoriesList = workflowManager.getToolCategories()
+        if (!categoriesList || categoriesList.length === 0) {
             console.log("WorkflowToolPalette: No categories returned")
             return
         }
@@ -69,15 +69,17 @@ Rectangle {
         toolboxModel.clear()
         var totalTools = 0
 
-        for (var category in categories) {
-            var tools = categories[category]
-            for (var i = 0; i < tools.length; i++) {
-                var toolInfo = workflowManager.getToolInfo(tools[i])
+        for (var i = 0; i < categoriesList.length; i++) {
+            var catObj = categoriesList[i]
+            var category = catObj.category
+            var tools = catObj.tools
+            for (var j = 0; j < tools.length; j++) {
+                var toolInfo = workflowManager.getToolInfo(tools[j])
                 var portTypesStr = JSON.stringify(toolInfo.port_types || [])
                 toolboxModel.append({
                     "category": category,
-                    "toolName": tools[i],
-                    "displayName": toolInfo.display_name || tools[i],
+                    "toolName": tools[j],
+                    "displayName": toolInfo.display_name || tools[j],
                     "description": toolInfo.description || "",
                     "portTypes": portTypesStr
                 })

@@ -26,6 +26,7 @@ class SpectralMetadata:
     units: Dict[str, str]  # {'x': 'nm', 'y': 'nm', 'independent': 'V', 'dependent': 'A'}
     acquisition_date: Optional[str] = None
     additional_info: Dict[str, Any] = None
+    data_type: str = 'spectral'  # 'spectral' or 'flat'
     
     def __post_init__(self):
         if self.additional_info is None:

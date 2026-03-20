@@ -55,6 +55,27 @@ class TestSpectralMetadata:
         )
         assert metadata.additional_info == {}
 
+    def test_metadata_data_type_defaults_to_spectral(self):
+        """Test that data_type defaults to 'spectral'."""
+        metadata = SpectralMetadata(
+            source_type='test',
+            dimensions=(5, 5),
+            scan_mode='forward',
+            units={}
+        )
+        assert metadata.data_type == 'spectral'
+
+    def test_metadata_data_type_flat(self):
+        """Test that data_type can be set to 'flat'."""
+        metadata = SpectralMetadata(
+            source_type='test',
+            dimensions=(5, 5),
+            scan_mode='forward',
+            units={},
+            data_type='flat'
+        )
+        assert metadata.data_type == 'flat'
+
 
 class TestSpectralDataCreation:
     """Tests for SpectralData creation and initialization."""

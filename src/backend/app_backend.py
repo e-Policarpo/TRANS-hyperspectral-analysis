@@ -8,6 +8,7 @@ Date: December 2025
 License: GPL
 """
 
+import json
 import logging
 import sys
 import numpy as np
@@ -31,6 +32,8 @@ from src.backend.project_manager import ProjectManager
 from src.backend.dock_manager import DockManager
 from src.backend.workflow_manager import WorkflowManager
 from src.backend.preferences_manager import PreferencesManager
+from src.backend.undo_manager import UndoManager, UndoCommand
+from src.backend.autosave_manager import AutosaveManager
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +71,10 @@ class AppBackend(ToolImplementations, QObject):
     projectPathChanged = Signal(str)  # project path changed
     namingConventionChanged = Signal(str)  # naming convention pattern changed
     loadMapInEditor = Signal(str)  # map_path - request to load map in the map editor
+    projectStateRestored = Signal(str)  # stateJson - emitted after loading project to restore tables/graphs/workspace
+    openDatasetEmbedded = Signal(str, 'QVariantList', str, str)  # name, curves, xLabel, yLabel
+    openTableEmbedded = Signal(str, 'QVariantList', 'QVariantList')  # title, headers, rows
+    collectWindowStatesRequested = Signal()  # ask QML for embedded window states before saving
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -153,6 +160,21 @@ class AppBackend(ToolImplementations, QObject):
 
         # Initialize preferences manager
         self._preferences_manager = PreferencesManager(self)
+
+        # Initialize undo manager
+        self._undo_manager = UndoManager(parent=self)
+
+        # Initialize autosave manager
+        self._autosave_manager = AutosaveManager(self, parent=self)
+
+        # Flag to suppress undo registration during undo/redo operations
+        self._suppress_undo = False
+
+        # Map editor backend reference (set from QML)
+        self._map_editor_backend = None
+
+        # Embedded window states for persistence (collected from QML before save)
+        self._embedded_window_states = []
 
         # Keep references to open windows with metadata
         self.open_windows = []
@@ -324,6 +346,28 @@ class AppBackend(ToolImplementations, QObject):
     def preferencesManager(self):
         """Expose preferences manager to QML."""
         return self._preferences_manager
+
+    @Property(QObject, constant=True)
+    def undoManager(self):
+        """Expose undo manager to QML."""
+        return self._undo_manager
+
+    @Property(QObject, constant=True)
+    def autosaveManager(self):
+        """Expose autosave manager to QML."""
+        return self._autosave_manager
+
+    @Slot(QObject)
+    def setMapEditorBackend(self, backend):
+        """Store reference to map editor backend (called from QML)."""
+        self._map_editor_backend = backend
+        logger.info("Map editor backend registered with app backend")
+
+    @Slot('QVariantList')
+    def setEmbeddedWindowStates(self, states):
+        """Receive embedded window states from QML (called before project save)."""
+        self._embedded_window_states = list(states) if states else []
+        logger.debug(f"Received {len(self._embedded_window_states)} embedded window states")
 
     @Property(bool, notify=projectReadyChanged)
     def projectReady(self):
@@ -710,7 +754,29 @@ class AppBackend(ToolImplementations, QObject):
             # Set first dataset as active if any
             if self._datasets:
                 self._active_dataset = list(self._datasets.keys())[0]
-                self.dataLoaded.emit(self._active_dataset)
+
+            # Restore workspace state
+            workspace = project_data.get('workspace', {})
+            if workspace.get('active_dataset') and workspace['active_dataset'] in self._datasets:
+                self._active_dataset = workspace['active_dataset']
+            if 'current_tab' in workspace:
+                self._current_tab = workspace['current_tab']
+            if 'window_counter' in workspace:
+                self._window_id_counter = workspace['window_counter']
+
+            # Restore naming convention
+            naming = project_data.get('naming_convention')
+            if naming:
+                self._naming_convention = naming
+
+            # Restore maps and output files
+            loaded_maps = project_data.get('maps', [])
+            for m in loaded_maps:
+                self.maps.append(m)
+
+            loaded_outputs = project_data.get('output_files', [])
+            for o in loaded_outputs:
+                self.output_files.append(o)
 
             # Scan for additional outputs in the outputs directory
             if self._outputs_created:
@@ -725,6 +791,36 @@ class AppBackend(ToolImplementations, QObject):
             self.projectPathChanged.emit(str(actual_project_path))
             self.projectLoaded.emit(str(actual_project_path))
 
+            # Emit dataLoaded AFTER all state is restored (maps, outputs, etc.)
+            # so that refreshBrowser() sees the complete project state
+            if self._datasets:
+                self.dataLoaded.emit(self._active_dataset)
+
+            # Restore map editor state
+            map_editor_state = project_data.get('map_editor', {})
+            if map_editor_state and self._map_editor_backend is not None:
+                map_path = map_editor_state.get('map_path', '')
+                if map_path:
+                    try:
+                        self._map_editor_backend.loadMapFromFile(map_path)
+                        self._map_editor_backend.restoreState(map_editor_state)
+                    except Exception as e:
+                        logger.warning(f"Could not restore map editor state: {e}")
+
+            # Emit signal for tables and graphs to be restored by QML
+            tables = project_data.get('tables', [])
+            graphs = project_data.get('graphs', [])
+            if tables or graphs:
+                self.projectStateRestored.emit(json.dumps({
+                    'tables': tables,
+                    'graphs': graphs,
+                    'workspace': workspace
+                }))
+
+            # Check for autosave recovery and start autosave timer
+            self._autosave_manager.check_recovery(file_path)
+            self._autosave_manager.start()
+
             self.status = f"Project '{project_name}' opened with {len(self._datasets)} dataset(s)"
             logger.info(f"Project opened from file: {project_name}")
             return True
@@ -737,41 +833,26 @@ class AppBackend(ToolImplementations, QObject):
     @Slot(str, result=bool)
     def saveProjectFile(self, file_path: str = "") -> bool:
         """
-        Save project to a .hrt file using the ProjectManager.
+        Save project to a .hrt file using the full save path (worker-based).
         If file_path is not provided, saves to the project directory.
         """
         if not self._project_ready or not self._project_path:
             logger.warning("Cannot save project: no project is open")
             return False
 
-        # Determine save path
-        if file_path:
-            save_path = Path(file_path)
-        else:
-            save_path = self._project_path / f"{self._project_name}.hrt"
+        save_path = Path(file_path) if file_path else self._project_path / f"{self._project_name}.hrt"
+        self.status = "Saving project..."
 
-        # Build project data for ProjectManager
-        project_data = {
-            'metadata': {
-                'name': self._project_name,
-                'description': ''
-            },
-            'datasets': self._datasets,
-            'tables': [],  # TODO: serialize open tables
-            'graphs': [],  # TODO: serialize open graphs
-            'workspace': {}
-        }
+        # Ask QML to collect embedded window states before we save
+        self.collectWindowStatesRequested.emit()
 
-        # Use ProjectManager to save
-        success = self.project_manager.save_project(save_path, project_data)
-
-        if success:
-            self.projectSaved.emit(str(save_path))
-            self.status = f"Project saved: {save_path.name}"
-        else:
-            self.errorOccurred.emit("Save Error", "Failed to save project file")
-
-        return success
+        self.worker_manager.submit(
+            name="Save Project",
+            operation=self._do_save_project,
+            project_path=save_path,
+            on_finished=lambda _: self._on_project_saved(save_path)
+        )
+        return True
 
     @Slot(result=str)
     def getProjectFilePath(self) -> str:
@@ -1160,6 +1241,15 @@ class AppBackend(ToolImplementations, QObject):
         return dataset_list
 
     @Slot(result='QVariantList')
+    def getFlatDatasetList(self):
+        """Get list of datasets with flat data structure (metadata-driven, not name-driven)."""
+        flat_datasets = []
+        for name, data in self._datasets.items():
+            if hasattr(data, 'metadata') and getattr(data.metadata, 'data_type', 'spectral') == 'flat':
+                flat_datasets.append(name)
+        return flat_datasets
+
+    @Slot(result='QVariantList')
     def getTableList(self):
         """Get list of open tables with metadata."""
         return [{'id': t['id'], 'title': t['title']} for t in self.open_tables]
@@ -1348,6 +1438,10 @@ class AppBackend(ToolImplementations, QObject):
             logger.warning(f"Cannot delete: dataset '{dataset_name}' not found")
             return False
 
+        # Capture state for undo before deleting
+        deleted_data = self._datasets[dataset_name]
+        was_active = self._active_dataset == dataset_name
+
         # Remove from datasets
         del self._datasets[dataset_name]
         logger.info(f"Deleted dataset: {dataset_name}")
@@ -1359,6 +1453,28 @@ class AppBackend(ToolImplementations, QObject):
         # Emit signal for UI update
         self.datasetDeleted.emit(dataset_name)
         self.projectModifiedChanged.emit(True)
+
+        # Register undo command
+        if not self._suppress_undo:
+            def undo_delete():
+                self._datasets[dataset_name] = deleted_data
+                if was_active:
+                    self._active_dataset = dataset_name
+                self.dataLoaded.emit(dataset_name)
+                self.projectModifiedChanged.emit(True)
+
+            def redo_delete():
+                self._suppress_undo = True
+                try:
+                    self.deleteDataset(dataset_name)
+                finally:
+                    self._suppress_undo = False
+
+            self._undo_manager.push(UndoCommand(
+                description=f"Delete '{dataset_name}'",
+                undo_fn=undo_delete,
+                redo_fn=redo_delete
+            ))
 
         return True
 
@@ -1397,6 +1513,30 @@ class AppBackend(ToolImplementations, QObject):
         # Emit signal for UI update
         self.datasetRenamed.emit(old_name, new_name)
         self.projectModifiedChanged.emit(True)
+
+        # Register undo command
+        if not self._suppress_undo:
+            def undo_rename():
+                if new_name in self._datasets:
+                    self._datasets[old_name] = self._datasets.pop(new_name)
+                    if self._active_dataset == new_name:
+                        self._active_dataset = old_name
+                    self.datasetRenamed.emit(new_name, old_name)
+                    self.projectModifiedChanged.emit(True)
+
+            def redo_rename():
+                if old_name in self._datasets:
+                    self._suppress_undo = True
+                    try:
+                        self.renameDataset(old_name, new_name)
+                    finally:
+                        self._suppress_undo = False
+
+            self._undo_manager.push(UndoCommand(
+                description=f"Rename '{old_name}' \u2192 '{new_name}'",
+                undo_fn=undo_rename,
+                redo_fn=redo_rename
+            ))
 
         return True
 
@@ -1661,55 +1801,6 @@ class AppBackend(ToolImplementations, QObject):
         projects_dir.mkdir(exist_ok=True)
         return str(projects_dir)
 
-    @Slot()
-    def openProject(self):
-        """Open existing project from .HRT file."""
-        file_path, _ = QFileDialog.getOpenFileName(
-            None,
-            "Open Project",
-            self._get_projects_directory(),
-            "TRANS Project Files (*.hrt);;All Files (*)"
-        )
-
-        if not file_path:
-            return
-
-        project_path = Path(file_path)
-        project_data = self.project_manager.load_project(project_path)
-
-        if project_data:
-            # Close existing windows first
-            self.closeAllWindows()
-
-            # Restore datasets
-            self._datasets = project_data.get('datasets', {})
-
-            # Emit dataLoaded for each dataset to update UI
-            for dataset_name in self._datasets.keys():
-                self.dataLoaded.emit(dataset_name)
-
-            # Restore workspace state
-            workspace = project_data.get('workspace', {})
-            if workspace:
-                self._active_dataset = workspace.get('active_dataset')
-                self._current_tab = workspace.get('current_tab', 0)
-                self._window_id_counter = workspace.get('window_counter', 0)
-
-            # Restore table windows
-            for table_state in project_data.get('tables', []):
-                self._restore_table_window(table_state)
-
-            # Restore graph windows
-            for graph_state in project_data.get('graphs', []):
-                self._restore_graph_window(graph_state)
-
-            self.status = f"Project loaded: {project_path.name}"
-            self.projectPathChanged.emit(str(project_path))
-            self.projectLoaded.emit(str(project_path))
-            self.projectModifiedChanged.emit(False)
-            logger.info(f"Project loaded: {project_path} with {len(self._datasets)} datasets")
-        else:
-            self.errorOccurred.emit("Load Error", f"Failed to load project: {project_path}")
 
     @Slot()
     def saveProject(self):
@@ -1759,31 +1850,24 @@ class AppBackend(ToolImplementations, QObject):
     def _do_save_project(self, task, project_path: Path):
         """Internal method to save project (runs in worker thread)."""
         from datetime import datetime
-        from src.backend.project_manager import serialize_plot_state, serialize_table_state
 
         # Check if cancelled
         if task.cancelled:
             logger.info("Project save cancelled")
             return None
 
-        # Serialize window states
-        table_states = []
-        for table_info in self.open_tables:
-            try:
-                state = serialize_table_state(table_info['window'])
-                state['id'] = table_info['id']
-                table_states.append(state)
-            except Exception as e:
-                logger.warning(f"Could not serialize table {table_info['id']}: {e}")
+        # Use embedded window states collected from QML
+        embedded_states = self._embedded_window_states or []
+        graph_states = [s for s in embedded_states if s.get('type') == 'graph']
+        table_states = [s for s in embedded_states if s.get('type') == 'table']
 
-        graph_states = []
-        for graph_info in self.open_graphs:
+        # Get map editor state
+        map_editor_state = {}
+        if self._map_editor_backend is not None:
             try:
-                state = serialize_plot_state(graph_info['window'])
-                state['id'] = graph_info['id']
-                graph_states.append(state)
+                map_editor_state = self._map_editor_backend.getState()
             except Exception as e:
-                logger.warning(f"Could not serialize graph {graph_info['id']}: {e}")
+                logger.warning(f"Could not get map editor state: {e}")
 
         # Gather project data
         project_data = {
@@ -1799,7 +1883,11 @@ class AppBackend(ToolImplementations, QObject):
                 'active_dataset': self._active_dataset,
                 'current_tab': self._current_tab,
                 'window_counter': self._window_id_counter
-            }
+            },
+            'output_files': self.output_files,
+            'maps': self.maps,
+            'naming_convention': self._naming_convention,
+            'map_editor': map_editor_state,
         }
 
         success = self.project_manager.save_project(project_path, project_data)
@@ -1836,63 +1924,27 @@ class AppBackend(ToolImplementations, QObject):
 
     @Slot()
     def newPlot(self):
-        """Create a new enhanced plot window."""
-        from src.widgets.enhanced_plot_window import EnhancedPlotWindow
-
-        logger.info("Creating new plot window")
+        """Create a new embedded graph window."""
+        logger.info("Creating new embedded plot window")
         self._window_id_counter += 1
-        graph_id = f"graph_{self._window_id_counter}"
         graph_title = f"Graph {self._window_id_counter}"
 
-        plot_window = EnhancedPlotWindow(datasets=self._datasets)
-        plot_window.setWindowTitle(graph_title)
-
-        # Track in both general windows list and graphs-specific list
-        self.open_windows.append(plot_window)
-        graph_info = {
-            'window': plot_window,
-            'id': graph_id,
-            'title': graph_title
-        }
-        self.open_graphs.append(graph_info)
-
-        # Connect close signal to remove from both lists
-        plot_window.closed.connect(lambda: self._remove_graph(graph_id))
-
-        plot_window.show()
+        # Emit signal for QML to create an embedded graph window (empty)
+        self.openDatasetEmbedded.emit(graph_title, [], "", "")
         self.status = f"{graph_title} created"
-        self.graphCreated.emit(graph_id, graph_title)
-        logger.info(f"Plot window created: {graph_title} (ID: {graph_id})")
+        logger.info(f"Embedded plot window requested: {graph_title}")
 
     @Slot()
     def newTable(self):
-        """Create a new enhanced table window."""
-        from src.widgets.enhanced_table_window import EnhancedTableWindow
-
-        logger.info("Creating new table window")
+        """Create a new embedded table window."""
+        logger.info("Creating new embedded table window")
         self._window_id_counter += 1
-        table_id = f"table_{self._window_id_counter}"
         table_title = f"Table {self._window_id_counter}"
 
-        table_window = EnhancedTableWindow()
-        table_window.setWindowTitle(table_title)
-
-        # Track in both general windows list and tables-specific list
-        self.open_windows.append(table_window)
-        table_info = {
-            'window': table_window,
-            'id': table_id,
-            'title': table_title
-        }
-        self.open_tables.append(table_info)
-
-        # Connect close signal to remove from both lists
-        table_window.closed.connect(lambda: self._remove_table(table_id))
-
-        table_window.show()
+        # Emit signal for QML to create an embedded table window (empty)
+        self.openTableEmbedded.emit(table_title, [], [])
         self.status = f"{table_title} created"
-        self.tableCreated.emit(table_id, table_title)
-        logger.info(f"Table window created: {table_title} (ID: {table_id})")
+        logger.info(f"Embedded table window requested: {table_title}")
 
     @Slot(str)
     def openWorkflow(self, workflow_name: str):
@@ -2261,29 +2313,31 @@ class AppBackend(ToolImplementations, QObject):
                 col_name = f"Interval_{result['interval']}"
                 output_df[col_name] = result['integrated_values']
 
-            # Create user-friendly names using helper
+            # Create user-friendly names using naming convention
             base_name = self._extract_clean_base_name(dataset_name)
-            file_safe_name = self._sanitize_filename(base_name)
+            convention_name = self._apply_naming_convention(dataset_name, operation="Integrated")
 
-            # Save to file with readable filename
-            output_path = self._ensure_output_dir('integrated') / f"{file_safe_name}_integrated.csv"
+            # Save to file with convention-based filename
+            output_path = self._ensure_output_dir('integrated') / f"{convention_name}.csv"
             output_df.to_csv(output_path, index=False)
 
-            # Create new SpectralData object with user-friendly name
+            # Create new SpectralData object with clean base name (convention only for file path)
             friendly_name = f"{base_name} - Integrated"
             legacy_result_name = f"Integrated_{dataset_name}"
 
             # Create metadata for the integrated data (preserve dimensions from original)
             integrated_metadata = SpectralMetadata(
-                source_type=f"Integrated_{spectral_data.metadata.source_type}",
+                source_type="integrated_flat",
                 dimensions=spectral_data.metadata.dimensions,
                 scan_mode=spectral_data.metadata.scan_mode,
                 units={'independent': 'Index', 'dependent': 'Integrated Value'},
                 additional_info={
                     'original_dataset': dataset_name,
+                    'original_source_type': spectral_data.metadata.source_type,
                     'num_intervals': len(integration_results),
                     'intervals': [r['interval_tuple'] for r in integration_results]  # Store numeric tuples
-                }
+                },
+                data_type='flat'
             )
 
             # Create SpectralData object
@@ -2384,16 +2438,16 @@ class AppBackend(ToolImplementations, QObject):
                 data_type='spectral'
             )
 
-            # Create user-friendly names using helper
+            # Create user-friendly names using naming convention
             base_name = self._extract_clean_base_name(dataset_name)
-            file_safe_name = self._sanitize_filename(base_name)
+            convention_name = self._apply_naming_convention(dataset_name, operation="Averaged")
 
-            # Save final results with readable filename
+            # Save final results with convention-based filename
             final_data = results['final']
-            output_path = self._ensure_output_dir('discretized') / f"{file_safe_name}_averaged_{discrete_x}x{discrete_y}.csv"
+            output_path = self._ensure_output_dir('discretized') / f"{convention_name}.csv"
             final_data.save(str(output_path))
 
-            # Add to datasets with only friendly name (no duplicates)
+            # Add to datasets with clean base name (convention only for file path)
             friendly_name = f"{base_name} - Spatially Averaged ({discrete_x}x{discrete_y})"
             self._datasets[friendly_name] = final_data
 
@@ -2412,6 +2466,94 @@ class AppBackend(ToolImplementations, QObject):
             logger.error(f"Spatial average error: {e}", exc_info=True)
             self.errorOccurred.emit("Spatial Average Error", str(e))
             return ""
+
+    @Slot(str, int, int, bool, 'QVariantList')
+    def spatialAverageWithSelection(self, dataset_name: str, discrete_x: int, discrete_y: int,
+                                     ignore_empty: bool, selected_blocks_list: list):
+        """
+        Spatial averaging restricted to selected blocks.
+        Uses Discretizer with selection mask support.
+
+        Parameters:
+            dataset_name: Name of dataset to discretize
+            discrete_x: Number of horizontal blocks
+            discrete_y: Number of vertical blocks
+            ignore_empty: Skip empty blocks
+            selected_blocks_list: List of {row, col} dicts for selected blocks.
+                                  Empty list means process all blocks.
+        """
+        if dataset_name not in self._datasets:
+            self.errorOccurred.emit("Error", f"Dataset not found: {dataset_name}")
+            return
+
+        try:
+            spectral_data = self._datasets[dataset_name]
+            dim_h, dim_v = spectral_data.metadata.dimensions
+
+            block_h = int(np.ceil(dim_h / discrete_x))
+            block_v = int(np.ceil(dim_v / discrete_y))
+
+            # Convert selected blocks list to tuples
+            selected_blocks = None
+            suffix = "full"
+            if selected_blocks_list and len(selected_blocks_list) > 0:
+                selected_blocks = [(b['row'], b['col']) for b in selected_blocks_list
+                                    if isinstance(b, dict) and 'row' in b and 'col' in b]
+                if not selected_blocks:
+                    selected_blocks = None
+                else:
+                    suffix = "selection"
+
+            logger.info(f"Discretizing {dataset_name}: {dim_h}x{dim_v} -> {discrete_x}x{discrete_y}"
+                         f" ({suffix}, {len(selected_blocks) if selected_blocks else 'all'} blocks)")
+
+            # If selected_blocks provided, mask out unselected spectra before discretization
+            data_to_process = spectral_data
+            if selected_blocks:
+                import math
+                selected_set = set(selected_blocks)
+                # Create a copy with NaN for unselected block positions
+                masked_df = spectral_data.spectra.copy()
+                for spec_idx in range(spectral_data.num_spectra):
+                    r = spec_idx // dim_h
+                    c = spec_idx % dim_h
+                    grid_r = r // block_v
+                    grid_c = c // block_h
+                    if (grid_r, grid_c) not in selected_set:
+                        masked_df.iloc[:, spec_idx] = np.nan
+
+                data_to_process = SpectralData(
+                    data=pd.concat([spectral_data.data.iloc[:, :1], masked_df], axis=1),
+                    metadata=spectral_data.metadata
+                )
+
+            results = self.discretizer.discretize_spectral_data(
+                spectral_data=data_to_process,
+                block_h=block_h,
+                block_v=block_v,
+                ignore_empty_blocks=ignore_empty,
+                data_type='spectral'
+            )
+
+            final_data = results['final']
+            base_name = self._extract_clean_base_name(dataset_name)
+            friendly_name = f"{base_name} - Averaged [{suffix}] ({discrete_x}x{discrete_y})"
+
+            self._datasets[friendly_name] = final_data
+            self.dataLoaded.emit(friendly_name)
+
+            # Save to disk
+            file_safe_name = self._sanitize_filename(base_name)
+            output_path = self._ensure_output_dir('discretized') / f"{file_safe_name}_averaged_{suffix}_{discrete_x}x{discrete_y}.csv"
+            final_data.save(str(output_path))
+
+            self.status = f"Spatial averaging complete: {final_data.num_spectra} blocks"
+            self.toolCompleted.emit("Spatial Average", str(output_path))
+            logger.info(f"Spatial average with selection saved: {output_path}")
+
+        except Exception as e:
+            logger.error(f"Spatial average with selection error: {e}", exc_info=True)
+            self.errorOccurred.emit("Spatial Average Error", str(e))
 
     # ========================================================================
     # TOOL IMPLEMENTATIONS - 1D FFT
@@ -2479,18 +2621,19 @@ class AppBackend(ToolImplementations, QObject):
             phase_df = pd.DataFrame(fft_phase, columns=spectral_data.spectra.columns)
             phase_df.insert(0, 'Frequency', frequencies)
 
-            # Create user-friendly names using helper
+            # Create user-friendly names using naming convention
             base_name = self._extract_clean_base_name(dataset_name)
+            convention_name = self._apply_naming_convention(dataset_name, operation="FFT")
             file_safe_name = self._sanitize_filename(base_name)
 
             # Save results using _ensure_output_dir for proper project structure
-            mag_path = self._ensure_output_dir('fft') / f"{file_safe_name}_FFT_Magnitude.csv"
+            mag_path = self._ensure_output_dir('fft') / f"{convention_name}_Magnitude.csv"
             phase_path = self._ensure_output_dir('fft') / f"{file_safe_name}_FFT_Phase.csv"
 
             mag_df.to_csv(mag_path, index=False)
             phase_df.to_csv(phase_path, index=False)
 
-            # Create new datasets with friendly names
+            # Create new datasets with clean base name (convention only for file path)
             friendly_name = f"{base_name} - FFT Magnitude"
             mag_metadata = SpectralMetadata(
                 source_type=spectral_data.metadata.source_type,
@@ -2931,6 +3074,41 @@ class AppBackend(ToolImplementations, QObject):
             self.outputCreated.emit(output_id, tool_name, output_path)
             logger.info(f"Registered output file: {output_id} from {tool_name}")
 
+        # Register undo for tool results that created new datasets
+        if output_path and not self._suppress_undo:
+            # Find any newly created dataset that matches this tool output
+            # Tool results typically create datasets with names derived from the tool
+            self._register_tool_result_undo(tool_name, output_path)
+
+    def _register_tool_result_undo(self, tool_name: str, output_path: str):
+        """Register an undo command for a tool that created a new dataset."""
+        # Find the most recently added dataset (the one this tool just created)
+        if not self._datasets:
+            return
+        created_dataset_name = list(self._datasets.keys())[-1]
+        created_data = self._datasets.get(created_dataset_name)
+        if not created_data:
+            return
+
+        def undo_tool():
+            if created_dataset_name in self._datasets:
+                del self._datasets[created_dataset_name]
+                self.datasetDeleted.emit(created_dataset_name)
+                self.projectModifiedChanged.emit(True)
+
+        def redo_tool():
+            # Cannot re-execute tool, just restore the dataset
+            if created_data and created_dataset_name not in self._datasets:
+                self._datasets[created_dataset_name] = created_data
+                self.dataLoaded.emit(created_dataset_name)
+                self.projectModifiedChanged.emit(True)
+
+        self._undo_manager.push(UndoCommand(
+            description=f"{tool_name}",
+            undo_fn=undo_tool,
+            redo_fn=redo_tool
+        ))
+
     def _generate_multiple_maps(self, task, flat_dataset_name: str, value_indices: list):
         """Generate maps for multiple values from flat data (runs in worker thread)."""
         output_paths = []
@@ -3212,15 +3390,15 @@ class AppBackend(ToolImplementations, QObject):
                 self.errorOccurred.emit("Truncation Error", error_msg)
                 return ""
 
-            # Create user-friendly names using helper
+            # Create user-friendly names using naming convention
             base_name = self._extract_clean_base_name(dataset_name)
-            file_safe_name = self._sanitize_filename(base_name)
+            convention_name = self._apply_naming_convention(dataset_name, operation="Truncated")
 
-            # Save truncated data with readable filename
-            output_path = self._ensure_output_dir('curves') / f"{file_safe_name}_truncated_{min_val:.2f}_{max_val:.2f}.csv"
+            # Save truncated data with convention-based filename
+            output_path = self._ensure_output_dir('curves') / f"{convention_name}.csv"
             truncated_data.save(str(output_path))
 
-            # Add to datasets with only friendly name (no duplicates)
+            # Add to datasets with clean base name (convention only for file path)
             friendly_name = f"{base_name} - Truncated ({min_val:.1f} to {max_val:.1f})"
             self._datasets[friendly_name] = truncated_data
             # Only emit to browser when not in workflow mode (intermediate results shouldn't appear)
@@ -3319,49 +3497,60 @@ class AppBackend(ToolImplementations, QObject):
         self.status = "Ready"
 
     def _do_open_dataset_in_plot(self, dataset_name: str):
-        """Actually open a dataset in both enhanced plot and table windows"""
-        from src.widgets.enhanced_plot_window import EnhancedPlotWindow
-        from src.widgets.enhanced_table_window import EnhancedTableWindow
-
+        """Open a dataset in embedded graph and table windows via QML signals"""
         dataset = self._datasets[dataset_name]
 
-        # Create plot window
-        self._window_id_counter += 1
-        graph_id = f"graph_{self._window_id_counter}"
-
-        plot_window = EnhancedPlotWindow(datasets={dataset_name: dataset})
-        plot_window.setWindowTitle(f"Plot: {dataset_name}")
-
-        # Auto-add first curve
+        # Build curves list for embedded graph
+        curves = []
         if hasattr(dataset, 'independent_var'):
             try:
-                x = dataset.independent_var
-                y = dataset.spectra.iloc[:, 0].values if dataset.num_spectra > 0 else []
+                x = dataset.independent_var.tolist()
+                y = dataset.spectra.iloc[:, 0].values.tolist() if dataset.num_spectra > 0 else []
                 if len(y) > 0:
-                    plot_window.canvas.add_curve(x, y, label=dataset_name)
-                    plot_window.canvas.set_labels(
-                        xlabel=dataset.independent_var_name,
-                        ylabel='Intensity',
-                        title=dataset_name
-                    )
+                    curves.append({
+                        'x': x,
+                        'y': y,
+                        'label': dataset_name
+                    })
             except Exception as e:
-                logger.error(f"Error auto-plotting: {e}")
+                logger.error(f"Error building curves: {e}")
 
-        self.open_windows.append(plot_window)
-        graph_info = {
-            'window': plot_window,
-            'id': graph_id,
-            'title': dataset_name
-        }
-        self.open_graphs.append(graph_info)
+        x_label = getattr(dataset, 'independent_var_name', 'x')
+        y_label = 'Intensity'
+        self.openDatasetEmbedded.emit(dataset_name, curves, x_label, y_label)
 
-        plot_window.closed.connect(lambda: self._remove_graph(graph_id))
-        plot_window.show()
+        # Build table data for embedded table
+        self._emit_table_data(dataset_name, dataset)
 
-        # Create table window asynchronously to avoid UI freeze for large datasets
-        self._create_table_async(dataset_name, dataset)
+        logger.info(f"Opened dataset {dataset_name} in embedded windows")
 
-        logger.info(f"Opened dataset {dataset_name} in plot window, table loading...")
+    def _emit_table_data(self, dataset_name: str, dataset):
+        """Build and emit table data for embedded table window"""
+        try:
+            headers = []
+            rows = []
+
+            if hasattr(dataset, 'independent_var') and hasattr(dataset, 'spectra'):
+                x_name = getattr(dataset, 'independent_var_name', 'x')
+                headers.append(x_name)
+
+                # Add spectrum column headers
+                num_cols = min(dataset.num_spectra, 50)  # Limit columns for performance
+                for i in range(num_cols):
+                    headers.append(f"Spectrum {i+1}")
+
+                # Build rows
+                x = dataset.independent_var
+                num_rows = min(len(x), 500)  # Limit rows for performance
+                for r in range(num_rows):
+                    row = [float(x[r])]
+                    for c in range(num_cols):
+                        row.append(float(dataset.spectra.iloc[r, c]))
+                    rows.append(row)
+
+            self.openTableEmbedded.emit(f"Table: {dataset_name}", headers, rows)
+        except Exception as e:
+            logger.error(f"Error building table data: {e}")
 
     def _create_table_async(self, dataset_name: str, dataset):
         """Create table window asynchronously in worker thread"""
@@ -3470,10 +3659,7 @@ class AppBackend(ToolImplementations, QObject):
 
     @Slot(str, 'QVariantList')
     def openDatasetWithCurves(self, dataset_name: str, curve_indices: List):
-        """Open a dataset in plot and table windows with specific curves selected"""
-        from src.widgets.enhanced_plot_window import EnhancedPlotWindow
-        from src.widgets.enhanced_table_window import EnhancedTableWindow
-
+        """Open a dataset in embedded windows with specific curves selected"""
         logger.info(f"Opening dataset with selected curves: {dataset_name}, curves: {curve_indices}")
 
         if dataset_name not in self._datasets:
@@ -3482,50 +3668,31 @@ class AppBackend(ToolImplementations, QObject):
 
         dataset = self._datasets[dataset_name]
 
-        # Create plot window
-        self._window_id_counter += 1
-        graph_id = f"graph_{self._window_id_counter}"
-
-        plot_window = EnhancedPlotWindow(datasets={dataset_name: dataset})
-        plot_window.setWindowTitle(f"Plot: {dataset_name}")
-
-        # Add selected curves
+        # Build curves list for embedded graph
+        curves = []
         if hasattr(dataset, 'independent_var'):
             try:
-                x = dataset.independent_var
+                x = dataset.independent_var.tolist()
                 for idx in curve_indices:
                     if 0 <= idx < dataset.num_spectra:
-                        y = dataset.spectra.iloc[:, idx].values
+                        y = dataset.spectra.iloc[:, idx].values.tolist()
                         if len(y) > 0:
-                            plot_window.canvas.add_curve(
-                                x, y,
-                                label=f"{dataset_name} - Curve {idx + 1}"
-                            )
-
-                # Set labels
-                plot_window.canvas.set_labels(
-                    xlabel=dataset.independent_var_name,
-                    ylabel='Intensity',
-                    title=dataset_name
-                )
+                            curves.append({
+                                'x': x,
+                                'y': y,
+                                'label': f"{dataset_name} - Curve {idx + 1}"
+                            })
             except Exception as e:
-                logger.error(f"Error plotting curves: {e}")
+                logger.error(f"Error building curves: {e}")
 
-        self.open_windows.append(plot_window)
-        graph_info = {
-            'window': plot_window,
-            'id': graph_id,
-            'title': dataset_name
-        }
-        self.open_graphs.append(graph_info)
+        x_label = getattr(dataset, 'independent_var_name', 'x')
+        y_label = 'Intensity'
+        self.openDatasetEmbedded.emit(dataset_name, curves, x_label, y_label)
 
-        plot_window.closed.connect(lambda: self._remove_graph(graph_id))
-        plot_window.show()
+        # Build table data
+        self._emit_table_data(dataset_name, dataset)
 
-        # Create table window asynchronously to avoid UI freeze for large datasets
-        self._create_table_async(dataset_name, dataset)
-
-        logger.info(f"Opened dataset {dataset_name} with {len(curve_indices)} curves, table loading...")
+        logger.info(f"Opened dataset {dataset_name} with {len(curve_indices)} curves in embedded windows")
 
     def _open_file_by_type(self, file_path: Path):
         """Open file in appropriate viewer based on extension"""
@@ -3778,3 +3945,83 @@ class AppBackend(ToolImplementations, QObject):
             data = data[:xres * yres].reshape((yres, xres))
 
             return data
+
+    # ========================================================================
+    # TOOL IMPLEMENTATIONS - Filter Bad Data
+    # Algorithms adapted from ststools by Rafael Reis
+    # (https://github.com/rafinhareis/ststools)
+    # ========================================================================
+
+    @Slot(str, float, float, float, float, float, float, bool)
+    def filterBadData(self, dataset_name: str, weight_saturation: float,
+                      weight_noise: float, weight_linear: float,
+                      weight_periodic: float, weight_partial_noise: float,
+                      threshold: float, correct_periodic: bool):
+        """QML wrapper for filter bad data - runs in background thread."""
+        logger.info(f"Submitting filter bad data for {dataset_name} to worker")
+        self.status = f"Filtering bad data for {dataset_name}..."
+        self.worker_manager.submit(
+            name=f"Filter Bad Data {dataset_name}",
+            operation=self.filter_bad_data,
+            dataset_name=dataset_name,
+            weight_saturation=weight_saturation,
+            weight_noise=weight_noise,
+            weight_linear=weight_linear,
+            weight_periodic=weight_periodic,
+            weight_partial_noise=weight_partial_noise,
+            threshold=threshold,
+            correct_periodic=correct_periodic,
+            on_finished=lambda path: self._on_tool_completed("Filter Bad Data", path)
+        )
+
+    # ========================================================================
+    # TOOL IMPLEMENTATIONS - Detect Bandgap & Doping
+    # Algorithms adapted from ststools by Rafael Reis
+    # (https://github.com/rafinhareis/ststools)
+    # ========================================================================
+
+    @Slot(str, float, float, float, str)
+    def detectBandgapDoping(self, dataset_name: str, smoothing: float,
+                            delta: float, resolution: float,
+                            smoothing_method: str):
+        """QML wrapper for bandgap/doping detection - runs in background thread."""
+        logger.info(f"Submitting bandgap/doping detection for {dataset_name} to worker")
+        self.status = f"Detecting bandgap/doping for {dataset_name}..."
+        self.worker_manager.submit(
+            name=f"Bandgap/Doping {dataset_name}",
+            operation=self.detect_bandgap_doping,
+            dataset_name=dataset_name,
+            smoothing=smoothing,
+            delta=delta,
+            resolution=resolution,
+            smoothing_method=smoothing_method,
+            on_finished=lambda path: self._on_tool_completed("Detect Bandgap & Doping", path)
+        )
+
+    # ========================================================================
+    # TOOL IMPLEMENTATIONS - Dirac Point Estimator
+    # Algorithms adapted from ststools by Rafael Reis
+    # (https://github.com/rafinhareis/ststools)
+    # ========================================================================
+
+    @Slot(str, float, float, float, float, float, str, bool)
+    def estimateDiracPoint(self, dataset_name: str, left_min: float,
+                           left_max: float, right_min: float, right_max: float,
+                           smoothing: float, smoothing_method: str,
+                           auto_detect: bool = False):
+        """QML wrapper for Dirac point estimation - runs in background thread."""
+        logger.info(f"Submitting Dirac point estimation for {dataset_name} to worker (auto_detect={auto_detect})")
+        self.status = f"Estimating Dirac point for {dataset_name}..."
+        self.worker_manager.submit(
+            name=f"Dirac Point {dataset_name}",
+            operation=self.estimate_dirac_point,
+            dataset_name=dataset_name,
+            left_min=left_min,
+            left_max=left_max,
+            right_min=right_min,
+            right_max=right_max,
+            smoothing=smoothing,
+            smoothing_method=smoothing_method,
+            auto_detect=auto_detect,
+            on_finished=lambda path: self._on_tool_completed("Dirac Point Estimator", path)
+        )

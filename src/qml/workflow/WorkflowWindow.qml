@@ -258,29 +258,31 @@ Window {
             return
         }
 
-        var categories = workflowManager.getToolCategories()
-        console.log("Got categories:", JSON.stringify(Object.keys(categories)))
+        var categoriesList = workflowManager.getToolCategories()
 
-        if (!categories || Object.keys(categories).length === 0) {
+        if (!categoriesList || categoriesList.length === 0) {
             console.log("No categories returned from getToolCategories")
             return
         }
 
+        console.log("Got", categoriesList.length, "categories")
         toolboxModel.clear()
         var totalTools = 0
 
-        for (var category in categories) {
-            var tools = categories[category]
+        for (var i = 0; i < categoriesList.length; i++) {
+            var catObj = categoriesList[i]
+            var category = catObj.category
+            var tools = catObj.tools
             console.log("Processing category:", category, "with", tools.length, "tools")
 
-            for (var i = 0; i < tools.length; i++) {
-                var toolInfo = workflowManager.getToolInfo(tools[i])
+            for (var j = 0; j < tools.length; j++) {
+                var toolInfo = workflowManager.getToolInfo(tools[j])
                 // Get port types as JSON string for ListModel
                 var portTypesStr = JSON.stringify(toolInfo.port_types || [])
                 toolboxModel.append({
                     "category": category,
-                    "toolName": tools[i],
-                    "displayName": toolInfo.display_name || tools[i],
+                    "toolName": tools[j],
+                    "displayName": toolInfo.display_name || tools[j],
                     "description": toolInfo.description || "",
                     "portTypes": portTypesStr
                 })

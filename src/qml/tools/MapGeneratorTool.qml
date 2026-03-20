@@ -15,6 +15,7 @@ import "../components"
 // Map Generator Tool
 Item {
     id: root
+    property var closeWindow: null
 
     // Theme colors - reactive bindings to parent DraggableWindow
     property var parentWindow: Window.window
@@ -180,28 +181,15 @@ Item {
             Button {
                 text: "Close"
                 onClicked: {
-                    var win = root.Window.window
-                    if (win) win.close()
+                    if (root.closeWindow) { root.closeWindow() } else { var win = root.Window.window; if (win) win.close() }
                 }
             }
         }
     }
 
     function getFlatDatasets() {
-        // Get all datasets that have flat data structure
-        // This includes integrated datasets and any other single-value-per-point data
-        var all = backend.getDatasetList()
-        var flatData = []
-
-        for (var i = 0; i < all.length; i++) {
-            // Include datasets that start with common flat data prefixes
-            if (all[i].indexOf("Integrated_") === 0 ||
-                all[i].indexOf("Peaks_") === 0 ||
-                all[i].indexOf("Flat_") === 0) {
-                flatData.push(all[i])
-            }
-        }
-
+        // Get flat datasets from backend using metadata-driven detection
+        var flatData = backend.getFlatDatasetList()
         return flatData.length > 0 ? flatData : ["No flat datasets"]
     }
 

@@ -686,6 +686,8 @@ class PreferencesManager(QObject):
     fontChanged = Signal()
     preferencesLoaded = Signal()
     preferencesSaved = Signal()
+    autosaveEnabledChanged = Signal(bool)
+    autosaveIntervalChanged = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -695,6 +697,10 @@ class PreferencesManager(QObject):
         self._preferences_dir = Path.home() / ".trans_qml"
         self._preferences_file = self._preferences_dir / "preferences.json"
         self._schemes_dir = self._preferences_dir / "color_schemes"
+
+        # Autosave settings
+        self._autosave_enabled = True
+        self._autosave_interval_minutes = 5
 
         self._ensure_dirs()
         self._load_preferences()
@@ -712,6 +718,10 @@ class PreferencesManager(QObject):
                     data = json.load(f)
                     scheme_name = data.get('current_scheme', 'blahaj_aesthetic')
                     self._current_scheme_name = scheme_name
+
+                    # Load autosave settings
+                    self._autosave_enabled = data.get('autosave_enabled', True)
+                    self._autosave_interval_minutes = data.get('autosave_interval_minutes', 5)
 
                     # Load custom schemes
                     for scheme_file in self._schemes_dir.glob("*.json"):
@@ -738,7 +748,9 @@ class PreferencesManager(QObject):
         try:
             data = {
                 'current_scheme': self._current_scheme_name,
-                'version': '1.0'
+                'version': '1.0',
+                'autosave_enabled': self._autosave_enabled,
+                'autosave_interval_minutes': self._autosave_interval_minutes,
             }
             with open(self._preferences_file, 'w') as f:
                 json.dump(data, f, indent=2)
@@ -876,3 +888,29 @@ class PreferencesManager(QObject):
                 'isPreset': False
             })
         return customs
+
+    # Autosave settings
+    @Slot(result=bool)
+    def getAutosaveEnabled(self) -> bool:
+        return self._autosave_enabled
+
+    @Slot(bool)
+    def setAutosaveEnabled(self, enabled: bool):
+        if self._autosave_enabled != enabled:
+            self._autosave_enabled = enabled
+            self._save_preferences()
+            self.autosaveEnabledChanged.emit(enabled)
+            logger.info(f"Autosave {'enabled' if enabled else 'disabled'}")
+
+    @Slot(result=int)
+    def getAutosaveInterval(self) -> int:
+        return self._autosave_interval_minutes
+
+    @Slot(int)
+    def setAutosaveInterval(self, minutes: int):
+        minutes = max(1, min(60, minutes))
+        if self._autosave_interval_minutes != minutes:
+            self._autosave_interval_minutes = minutes
+            self._save_preferences()
+            self.autosaveIntervalChanged.emit(minutes)
+            logger.info(f"Autosave interval set to {minutes} minutes")

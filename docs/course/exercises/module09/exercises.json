@@ -1,0 +1,149 @@
+{
+  "module": 9,
+  "title": "Build Systems, Executables, and JSON Logging",
+  "exercises": [
+    {
+      "id": "09_01",
+      "title": "Basic Makefile",
+      "description": "Create a Makefile with install, run, test, and clean targets",
+      "difficulty": "intermediate",
+      "points": 125,
+      "required_patterns": [
+        "\\.PHONY",
+        "install:",
+        "run:",
+        "test:",
+        "clean:"
+      ],
+      "file_type": "makefile"
+    },
+    {
+      "id": "09_02",
+      "title": "PyInstaller Spec",
+      "description": "Write a PyInstaller spec file for a PySide6/QML application",
+      "difficulty": "advanced",
+      "points": 175,
+      "required_patterns": [
+        "Analysis",
+        "PYZ",
+        "EXE",
+        "COLLECT",
+        "hiddenimports",
+        "datas"
+      ],
+      "file_type": "spec"
+    },
+    {
+      "id": "09_03",
+      "title": "JSON Logger",
+      "description": "Implement a JSON formatter for Python's logging module",
+      "difficulty": "intermediate",
+      "points": 150,
+      "required_patterns": [
+        "logging.Formatter",
+        "json.dumps",
+        "format.*LogRecord",
+        "timestamp|datetime"
+      ],
+      "test_cases": [
+        {
+          "name": "formatter_class_exists",
+          "type": "class_exists",
+          "target": "JsonFormatter"
+        },
+        {
+          "name": "has_format_method",
+          "type": "has_method",
+          "target": "JsonFormatter",
+          "method": "format"
+        }
+      ]
+    },
+    {
+      "id": "09_04",
+      "title": "Performance Decorator",
+      "description": "Create a decorator that logs function execution time as JSON",
+      "difficulty": "intermediate",
+      "points": 125,
+      "required_patterns": [
+        "def.*decorator|@functools.wraps",
+        "time.perf_counter|time.time",
+        "elapsed|duration",
+        "logger|logging"
+      ]
+    },
+    {
+      "id": "09_05",
+      "title": "Config Manager",
+      "description": "Build a configuration system with file persistence and environment overrides",
+      "difficulty": "advanced",
+      "points": 175,
+      "required_patterns": [
+        "@dataclass|dataclass",
+        "load|from_file",
+        "save|to_file",
+        "os.environ",
+        "json"
+      ],
+      "test_cases": [
+        {
+          "name": "config_class_exists",
+          "type": "class_exists",
+          "target": "AppConfig"
+        }
+      ]
+    }
+  ],
+  "extra_exercises": [
+    {
+      "id": "09_E1",
+      "title": "Log Rotation Setup",
+      "description": "Implement log rotation with size and time-based policies",
+      "difficulty": "intermediate",
+      "points": 100,
+      "required_patterns": [
+        "RotatingFileHandler|TimedRotatingFileHandler",
+        "maxBytes|when",
+        "backupCount"
+      ]
+    },
+    {
+      "id": "09_E2",
+      "title": "Cross-Platform Makefile",
+      "description": "Create a Makefile that detects OS and uses platform-specific commands",
+      "difficulty": "advanced",
+      "points": 125,
+      "required_patterns": [
+        "uname|OS",
+        "ifeq|ifdef",
+        "PLATFORM|platform"
+      ],
+      "file_type": "makefile"
+    },
+    {
+      "id": "09_E3",
+      "title": "QML Resource Handler",
+      "description": "Create a function that finds QML paths in both development and bundled mode",
+      "difficulty": "intermediate",
+      "points": 100,
+      "required_patterns": [
+        "sys.frozen|_MEIPASS",
+        "Path|pathlib",
+        "qml"
+      ]
+    },
+    {
+      "id": "09_E4",
+      "title": "Timing Context Manager",
+      "description": "Create a context manager for timing code blocks with JSON logging",
+      "difficulty": "intermediate",
+      "points": 100,
+      "required_patterns": [
+        "@contextmanager|__enter__|__exit__",
+        "time.perf_counter",
+        "yield",
+        "logger|logging"
+      ]
+    }
+  ]
+}

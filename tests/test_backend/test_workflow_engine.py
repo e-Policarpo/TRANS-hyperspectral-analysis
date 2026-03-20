@@ -660,13 +660,19 @@ class TestToolDefinitions:
         """WE-23: Get tools organized by category."""
         categories = get_tool_categories()
 
-        assert isinstance(categories, dict)
-        assert "Input" in categories
-        assert "Processing" in categories
-        assert "Output" in categories
+        assert isinstance(categories, list)
+        # Convert to dict for easy lookup
+        cat_dict = {c["category"]: c["tools"] for c in categories}
+        assert "Input" in cat_dict
+        assert "Processing" in cat_dict
+        assert "Output" in cat_dict
 
-        assert "DatasetInput" in categories["Input"]
-        assert "CurveSmoothing" in categories["Processing"]
+        assert "DatasetInput" in cat_dict["Input"]
+        assert "CurveSmoothing" in cat_dict["Processing"]
+
+        # Verify ordering: Input and Output should come first
+        assert categories[0]["category"] == "Input"
+        assert categories[1]["category"] == "Output"
 
     def test_get_tool_info(self):
         """Test getting tool info."""
@@ -702,9 +708,7 @@ class TestToolDefinitions:
         Image Processing should be LAST.
         """
         categories = get_tool_categories()
-
-        # Convert dict keys to list to check order
-        category_list = list(categories.keys())
+        category_list = [c["category"] for c in categories]
 
         # Input should come before Output
         if "Input" in category_list and "Output" in category_list:
@@ -738,9 +742,10 @@ class TestToolDefinitions:
     def test_tools_within_category_ordering(self):
         """Test that tools within Processing category are in workflow order."""
         categories = get_tool_categories()
+        cat_dict = {c["category"]: c["tools"] for c in categories}
 
-        if "Processing" in categories:
-            processing_tools = categories["Processing"]
+        if "Processing" in cat_dict:
+            processing_tools = cat_dict["Processing"]
             # TruncateData should come before Derivative
             if "TruncateData" in processing_tools and "Derivative" in processing_tools:
                 assert processing_tools.index("TruncateData") < processing_tools.index("Derivative")
@@ -886,9 +891,10 @@ class TestNewTools:
     def test_image_processing_category_exists(self):
         """Test Image Processing category contains merged tools."""
         categories = get_tool_categories()
-        assert "Image Processing" in categories
+        cat_dict = {c["category"]: c["tools"] for c in categories}
+        assert "Image Processing" in cat_dict
 
-        image_tools = categories["Image Processing"]
+        image_tools = cat_dict["Image Processing"]
         # Should contain both image tools and map processing tools
         assert "ImageSmoothing" in image_tools
         assert "GradientFilter" in image_tools
@@ -902,3 +908,44 @@ class TestNewTools:
         params = TOOL_DEFINITIONS["SpatialAverage"]["parameters"]
         assert "input_queue" in params
         assert params["input_queue"]["default"] == []
+
+    def test_flat_data_input_uses_flat_data_select(self):
+        """Test FlatDataInput uses flat_data_select parameter type."""
+        assert "FlatDataInput" in TOOL_DEFINITIONS
+        tool_def = TOOL_DEFINITIONS["FlatDataInput"]
+        assert tool_def["category"] == "Input"
+        params = tool_def["parameters"]
+        assert "dataset_name" in params
+        assert params["dataset_name"]["type"] == "flat_data_select"
+
+    def test_filter_bad_data_has_weight_partial_noise(self):
+        """Test FilterBadData has weight_partial_noise parameter."""
+        assert "FilterBadData" in TOOL_DEFINITIONS
+        params = TOOL_DEFINITIONS["FilterBadData"]["parameters"]
+        assert "weight_partial_noise" in params
+        assert params["weight_partial_noise"]["type"] == "float"
+        assert params["weight_partial_noise"]["default"] == 1.0
+
+    def test_filter_bad_data_in_processing_category(self):
+        """Test FilterBadData is in Processing category."""
+        tool_def = TOOL_DEFINITIONS["FilterBadData"]
+        assert tool_def["category"] == "Processing"
+
+        # Verify it appears in Processing tools list
+        categories = get_tool_categories()
+        cat_dict = {c["category"]: c["tools"] for c in categories}
+        assert "FilterBadData" in cat_dict["Processing"]
+
+    def test_map_input_uses_file_select(self):
+        """Test MapInput uses file_select parameter type."""
+        assert "MapInput" in TOOL_DEFINITIONS
+        params = TOOL_DEFINITIONS["MapInput"]["parameters"]
+        assert "file_path" in params
+        assert params["file_path"]["type"] == "file_select"
+
+    def test_image_input_uses_file_select(self):
+        """Test ImageInput uses file_select parameter type."""
+        assert "ImageInput" in TOOL_DEFINITIONS
+        params = TOOL_DEFINITIONS["ImageInput"]["parameters"]
+        assert "file_path" in params
+        assert params["file_path"]["type"] == "file_select"

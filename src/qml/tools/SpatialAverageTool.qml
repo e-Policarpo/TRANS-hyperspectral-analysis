@@ -15,6 +15,7 @@ import "../components"
 // Spatial Average Utility Tool
 Item {
     id: root
+    property var closeWindow: null
 
     // Theme colors - reactive bindings to parent DraggableWindow
     property var parentWindow: Window.window
@@ -282,8 +283,7 @@ Item {
             Button {
                 text: "Close"
                 onClicked: {
-                    var win = Window.window
-                    if (win) win.close()
+                    if (root.closeWindow) { root.closeWindow() } else { var win = Window.window; if (win) win.close() }
                 }
             }
         }

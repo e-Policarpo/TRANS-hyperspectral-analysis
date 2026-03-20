@@ -67,6 +67,9 @@ class WorkflowExecutor:
         # Enable workflow mode to suppress intermediate dataset additions to project browser
         self.app_backend._workflow_mode = True
 
+        # Snapshot datasets before execution for cleanup
+        datasets_before = set(self.app_backend._datasets.keys())
+
         try:
             for i, node_id in enumerate(execution_order):
                 if self.cancelled:
@@ -96,7 +99,7 @@ class WorkflowExecutor:
                     self.node_outputs[node_id] = node_result
 
                     # If this is an output node, add to results
-                    if node.tool_name in ['DatasetOutput', 'MapOutput', 'ImageOutput', 'TableOutput', 'FlatDataOutput']:
+                    if node.tool_name in ['DatasetOutput', 'MapOutput', 'ImageOutput', 'TableOutput', 'FlatDataOutput', 'TextOutput']:
                         output_name = node.parameters.get('output_name', f'output_{node_id}')
                         results[output_name] = node_result
 
@@ -109,6 +112,31 @@ class WorkflowExecutor:
         finally:
             # Always disable workflow mode when done
             self.app_backend._workflow_mode = False
+
+            # Clean up intermediate datasets added during workflow
+            datasets_after = set(self.app_backend._datasets.keys())
+            intermediate_datasets = datasets_after - datasets_before
+
+            # Collect output node dataset names to preserve
+            output_names = set()
+            for node_id in execution_order:
+                node = workflow.get_node(node_id)
+                if node and node.tool_name in ['DatasetOutput', 'FlatDataOutput', 'TextOutput']:
+                    user_output_name = node.parameters.get('output_name', f'output_{node_id}')
+                    output_names.add(self._format_output_name(user_output_name))
+
+            # Remove intermediate datasets that aren't final outputs
+            for name in intermediate_datasets:
+                if name not in output_names:
+                    del self.app_backend._datasets[name]
+                    logger.debug(f"Cleaned up intermediate dataset: {name}")
+
+            # Emit dataLoaded for each preserved output AFTER cleanup
+            # This ensures the Project Browser only sees final outputs, not intermediates
+            for name in output_names:
+                if name in self.app_backend._datasets:
+                    self.app_backend.dataLoaded.emit(name)
+                    logger.debug(f"Emitted dataLoaded for output: {name}")
 
         success = len(errors) == 0
         return {
@@ -182,6 +210,27 @@ class WorkflowExecutor:
                 # Track original dataset name for output naming
                 if not self.original_dataset_name:
                     self.original_dataset_name = dataset_name
+
+        elif tool_name == "FlatDataInput":
+            dataset_name = params.get('dataset_name')
+            if dataset_name and dataset_name in self.app_backend._datasets:
+                outputs['flat_data'] = self.app_backend._datasets[dataset_name]
+
+        elif tool_name == "MapInput":
+            file_path = params.get('file_path')
+            if file_path:
+                if Path(file_path).exists():
+                    outputs['map'] = file_path
+                else:
+                    logger.error(f"Map file not found: {file_path}")
+
+        elif tool_name == "ImageInput":
+            file_path = params.get('file_path')
+            if file_path:
+                if Path(file_path).exists():
+                    outputs['image'] = file_path
+                else:
+                    logger.error(f"Image file not found: {file_path}")
 
         elif tool_name == "Integration":
             dataset = inputs.get('dataset')
@@ -614,7 +663,7 @@ class WorkflowExecutor:
                 output_name = self._format_output_name(user_output_name)
 
                 self.app_backend._datasets[output_name] = dataset
-                self.app_backend.dataLoaded.emit(output_name)
+                # NOTE: dataLoaded emission deferred to after cleanup in execute()
                 outputs['result'] = dataset
                 logger.info(f"Dataset saved as: {output_name}")
 
@@ -637,11 +686,27 @@ class WorkflowExecutor:
                                 continue
                             map_name = f"{output_name}_{i+1}" if len(map_path) > 1 else output_name
                             self.app_backend._open_map_window(str(path), f"wf_map_{node.id}_{i}", map_name)
+                            # Register map in project browser
+                            self.app_backend._map_id_counter += 1
+                            map_id = f"map_{self.app_backend._map_id_counter}"
+                            self.app_backend.maps.append({
+                                'id': map_id, 'title': map_name, 'path': str(path),
+                                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            })
+                            self.app_backend.mapCreated.emit(map_id, map_name)
                             logger.info(f"Map displayed as: {map_name}")
                     else:
                         from pathlib import Path
                         if Path(map_path).exists():
                             self.app_backend._open_map_window(str(map_path), f"wf_map_{node.id}", output_name)
+                            # Register map in project browser
+                            self.app_backend._map_id_counter += 1
+                            map_id = f"map_{self.app_backend._map_id_counter}"
+                            self.app_backend.maps.append({
+                                'id': map_id, 'title': output_name, 'path': str(map_path),
+                                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            })
+                            self.app_backend.mapCreated.emit(map_id, output_name)
                             logger.info(f"Map displayed as: {output_name}")
                         else:
                             logger.error(f"Map file not found: {map_path}")
@@ -676,7 +741,7 @@ class WorkflowExecutor:
 
                 # Store as dataset
                 self.app_backend._datasets[output_name] = flat_data
-                self.app_backend.dataLoaded.emit(output_name)
+                # NOTE: dataLoaded emission deferred to after cleanup in execute()
 
                 # Optionally save as CSV
                 if params.get('save_csv', True):
@@ -791,6 +856,141 @@ class WorkflowExecutor:
                 if result_path:
                     outputs['corrected_map'] = result_path
                     logger.info(f"MapPolynomialBGRemoval: order={order}, output={result_path}")
+
+        # STS Analysis Nodes
+        elif tool_name == "FilterBadData":
+            dataset = inputs.get('dataset')
+            if dataset:
+                if isinstance(dataset, str):
+                    logger.error(f"FilterBadData received string instead of dataset: {dataset}")
+                    return outputs
+
+                dataset_name = self._get_temp_dataset_name(dataset, "filter")
+                self.app_backend._datasets[dataset_name] = dataset
+
+                class MockTask:
+                    cancelled = False
+                    progress = 0
+
+                result_path = self.app_backend.filter_bad_data(
+                    MockTask(), dataset_name,
+                    weight_saturation=params.get('weight_saturation', 1.0),
+                    weight_noise=params.get('weight_noise', 1.0),
+                    weight_linear=params.get('weight_linear', 1.0),
+                    weight_periodic=params.get('weight_periodic', 1.0),
+                    weight_partial_noise=params.get('weight_partial_noise', 1.0),
+                    threshold=params.get('threshold', 0.5),
+                    correct_periodic=params.get('correct_periodic', False)
+                )
+
+                # Get output datasets by their actual names
+                base_name = self.app_backend._extract_clean_base_name(dataset_name)
+
+                good_name = f"{base_name} - Good Data"
+                if good_name in self.app_backend._datasets:
+                    outputs['good_data'] = self.app_backend._datasets[good_name]
+
+                bad_name = f"{base_name} - Bad Data"
+                if bad_name in self.app_backend._datasets:
+                    outputs['bad_data'] = self.app_backend._datasets[bad_name]
+
+                fft_name = f"{base_name} - FFT Spectra"
+                if fft_name in self.app_backend._datasets:
+                    outputs['fft_spectra'] = self.app_backend._datasets[fft_name]
+
+                # Capture report text for TextOutput connection
+                if result_path:
+                    try:
+                        report_text = Path(result_path).read_text()
+                        outputs['report'] = report_text
+                    except Exception as e:
+                        logger.warning(f"Could not read filter report: {e}")
+
+        elif tool_name == "DetectBandgapDoping":
+            dataset = inputs.get('dataset')
+            if dataset:
+                if isinstance(dataset, str):
+                    logger.error(f"DetectBandgapDoping received string instead of dataset: {dataset}")
+                    return outputs
+
+                dataset_name = self._get_temp_dataset_name(dataset, "bandgap")
+                self.app_backend._datasets[dataset_name] = dataset
+
+                class MockTask:
+                    cancelled = False
+                    progress = 0
+
+                self.app_backend.detect_bandgap_doping(
+                    MockTask(), dataset_name,
+                    smoothing=params.get('smoothing', 1.0),
+                    delta=params.get('delta', 5.0),
+                    resolution=params.get('resolution', 0.01),
+                    smoothing_method=params.get('smoothing_method', 'Savgol')
+                )
+
+                # Retrieve both output datasets
+                base_name = self.app_backend._extract_clean_base_name(dataset_name)
+                bandgap_name = f"{base_name} - Bandgap"
+                doping_name = f"{base_name} - Doping"
+                if bandgap_name in self.app_backend._datasets:
+                    outputs['bandgap_data'] = self.app_backend._datasets[bandgap_name]
+                if doping_name in self.app_backend._datasets:
+                    outputs['doping_data'] = self.app_backend._datasets[doping_name]
+
+        elif tool_name == "DiracPointEstimator":
+            dataset = inputs.get('dataset')
+            if dataset:
+                if isinstance(dataset, str):
+                    logger.error(f"DiracPointEstimator received string instead of dataset: {dataset}")
+                    return outputs
+
+                dataset_name = self._get_temp_dataset_name(dataset, "dirac")
+                self.app_backend._datasets[dataset_name] = dataset
+
+                class MockTask:
+                    cancelled = False
+                    progress = 0
+
+                self.app_backend.estimate_dirac_point(
+                    MockTask(), dataset_name,
+                    left_min=params.get('left_min', -1.0),
+                    left_max=params.get('left_max', -0.1),
+                    right_min=params.get('right_min', 0.1),
+                    right_max=params.get('right_max', 1.0),
+                    smoothing=params.get('smoothing', 1.0),
+                    smoothing_method=params.get('smoothing_method', 'Savgol'),
+                    auto_detect=params.get('auto_detect', True)
+                )
+
+                # Get the result dataset
+                base_name = self.app_backend._extract_clean_base_name(dataset_name)
+                result_name = f"{base_name} - Dirac Point"
+                if result_name in self.app_backend._datasets:
+                    outputs['flat_data'] = self.app_backend._datasets[result_name]
+
+        elif tool_name == "TextOutput":
+            text = inputs.get('text')
+            if text and isinstance(text, str):
+                user_output_name = params.get('output_name', 'Report')
+                output_name = self._format_output_name(user_output_name)
+                safe_filename = output_name.replace(" ", "_").replace("(", "").replace(")", "").replace("-", "_")
+                output_path = self.app_backend._ensure_output_dir('curves') / f"{safe_filename}.txt"
+                output_path.write_text(text)
+
+                # Register so it shows in ProjectBrowser
+                self.app_backend._output_id_counter += 1
+                output_id = f"output_{self.app_backend._output_id_counter}"
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self.app_backend.output_files.append({
+                    'id': output_id,
+                    'type': 'Text Report',
+                    'path': str(output_path),
+                    'timestamp': timestamp,
+                    'name': output_name
+                })
+                self.app_backend.outputCreated.emit(output_id, "Text Report", str(output_path))
+                outputs['result'] = str(output_path)
+                logger.info(f"Text report saved as: {output_name} -> {output_path}")
 
         return outputs
 
@@ -1117,9 +1317,9 @@ class WorkflowManager(QObject):
         if self.executor:
             self.executor.cancel()
 
-    @Slot(result='QVariantMap')
-    def getToolCategories(self) -> Dict:
-        """Get available tools organized by category"""
+    @Slot(result='QVariantList')
+    def getToolCategories(self) -> list:
+        """Get available tools organized by category (ordered list)"""
         return get_tool_categories()
 
     @Slot(str, result='QVariantMap')
@@ -1140,6 +1340,14 @@ class WorkflowManager(QObject):
     def getAvailableDatasets(self) -> List[str]:
         """Get list of available datasets for DatasetInput node"""
         return list(self.app_backend._datasets.keys())
+
+    @Slot(result='QVariantList')
+    def getAvailableFlatDatasets(self) -> List[str]:
+        """Get list of flat data datasets for FlatDataInput node."""
+        return [
+            name for name, ds in self.app_backend._datasets.items()
+            if hasattr(ds, 'metadata') and getattr(ds.metadata, 'data_type', 'spectral') == 'flat'
+        ]
 
     @Slot(str, str, result='QVariantList')
     def getConnectedInputs(self, workflow_id: str, node_id: str) -> List[Dict]:

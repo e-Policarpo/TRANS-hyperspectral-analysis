@@ -1,0 +1,211 @@
+{
+  "pack": "extra",
+  "title": "Bonus Exercise Pack - Advanced TRANS-QML Development",
+  "description": "A comprehensive collection of advanced exercises covering real-world TRANS-QML development patterns",
+  "total_points": 2500,
+  "exercises": [
+    {
+      "id": "EX_01",
+      "title": "Complete Scientific Application",
+      "description": "Build a mini spectroscopy viewer that loads data, displays graphs, and applies basic processing",
+      "difficulty": "expert",
+      "points": 300,
+      "required_patterns": [
+        "QApplication",
+        "QQmlApplicationEngine",
+        "QQuickPaintedItem",
+        "Signal",
+        "@Slot",
+        "@Property.*notify="
+      ],
+      "required_qml_patterns": [
+        "ApplicationWindow",
+        "Connections",
+        "target:"
+      ],
+      "modules_covered": [1, 2, 3, 5]
+    },
+    {
+      "id": "EX_02",
+      "title": "Threaded Data Processor",
+      "description": "Create a multi-threaded data processing pipeline with progress reporting and cancellation",
+      "difficulty": "expert",
+      "points": 250,
+      "required_patterns": [
+        "QThread",
+        "moveToThread",
+        "_cancelled|is_cancelled",
+        "progressChanged|progress",
+        "queue|Queue"
+      ],
+      "modules_covered": [4]
+    },
+    {
+      "id": "EX_03",
+      "title": "Custom Graph Canvas",
+      "description": "Implement a QQuickPaintedItem that renders matplotlib figures with zoom and pan",
+      "difficulty": "advanced",
+      "points": 200,
+      "required_patterns": [
+        "QQuickPaintedItem",
+        "paint",
+        "Figure|FigureCanvas",
+        "mousePressEvent|mouseReleaseEvent",
+        "_pixelToData|pixelToData"
+      ],
+      "modules_covered": [5]
+    },
+    {
+      "id": "EX_04",
+      "title": "Advanced Table Model",
+      "description": "Build a pandas-backed table model with formulas, statistics, and CSV import/export",
+      "difficulty": "expert",
+      "points": 275,
+      "required_patterns": [
+        "QAbstractTableModel",
+        "pandas|pd",
+        "setData",
+        "flags",
+        "formula|Formula",
+        "statistics|calculateStats"
+      ],
+      "modules_covered": [6]
+    },
+    {
+      "id": "EX_05",
+      "title": "Dockable Workspace System",
+      "description": "Create a complete workspace with collapsible panels, floating windows, and theme switching",
+      "difficulty": "expert",
+      "points": 300,
+      "required_qml_patterns": [
+        "Rectangle",
+        "DockPanel|dockPanel",
+        "collapsed",
+        "property color.*bg|theme",
+        "WindowManager|createWindow"
+      ],
+      "modules_covered": [7]
+    },
+    {
+      "id": "EX_06",
+      "title": "Full Application Backend",
+      "description": "Implement a complete AppBackend with project management, preferences, and tool dispatch",
+      "difficulty": "expert",
+      "points": 325,
+      "required_patterns": [
+        "class.*AppBackend.*QObject",
+        "ProjectManager|project_manager",
+        "PreferencesManager|preferences",
+        "runTool",
+        "saveProject|loadProject"
+      ],
+      "modules_covered": [8]
+    },
+    {
+      "id": "EX_07",
+      "title": "Build and Distribution Pipeline",
+      "description": "Create a complete build system with Makefile, PyInstaller spec, and JSON logging",
+      "difficulty": "advanced",
+      "points": 225,
+      "required_patterns": [
+        "Analysis|PYZ|EXE|COLLECT",
+        "JsonFormatter|json.dumps",
+        "RotatingFileHandler|logging"
+      ],
+      "file_types": ["spec", "makefile", "py"],
+      "modules_covered": [9]
+    },
+    {
+      "id": "EX_08",
+      "title": "Code Quality Analyzer",
+      "description": "Build a complete code complexity analyzer with cyclomatic, nesting, and cognitive metrics",
+      "difficulty": "advanced",
+      "points": 250,
+      "required_patterns": [
+        "CodeAnalyzer",
+        "cyclomatic|CyclomaticComplexity",
+        "nesting_depth|NestingDepth",
+        "cognitive|CognitiveComplexity",
+        "generate_report|get_issues"
+      ],
+      "modules_covered": [10]
+    },
+    {
+      "id": "EX_09",
+      "title": "Workflow Node System",
+      "description": "Implement a visual node-based workflow system with connections and execution",
+      "difficulty": "expert",
+      "points": 300,
+      "required_patterns": [
+        "WorkflowManager",
+        "addNode|createNode",
+        "connect|addConnection",
+        "execute|run",
+        "topological|sort"
+      ],
+      "required_qml_patterns": [
+        "WorkflowCanvas|Canvas",
+        "WorkflowNode|Node",
+        "drag|Drag"
+      ],
+      "modules_covered": [7, 8]
+    },
+    {
+      "id": "EX_10",
+      "title": "Real-Time Data Visualization",
+      "description": "Create a streaming data visualizer that updates in real-time with efficient rendering",
+      "difficulty": "expert",
+      "points": 275,
+      "required_patterns": [
+        "QQuickPaintedItem",
+        "QTimer|timer",
+        "_cached|_needs_redraw",
+        "componentComplete",
+        "update"
+      ],
+      "modules_covered": [4, 5]
+    }
+  ],
+  "mini_challenges": [
+    {
+      "id": "MC_01",
+      "title": "Signal Relay",
+      "description": "Create a signal that chains through 3 Python objects before reaching QML",
+      "difficulty": "intermediate",
+      "points": 75,
+      "required_patterns": ["Signal", "connect", "emit"]
+    },
+    {
+      "id": "MC_02",
+      "title": "Property Computed",
+      "description": "Create a read-only property that computes from other properties",
+      "difficulty": "intermediate",
+      "points": 75,
+      "required_patterns": ["@Property", "notify=", "def.*property"]
+    },
+    {
+      "id": "MC_03",
+      "title": "Context Menu",
+      "description": "Add a context menu to a QML component with Python backend actions",
+      "difficulty": "intermediate",
+      "points": 75,
+      "required_qml_patterns": ["Menu", "MenuItem", "onTriggered", "backend\\."]
+    },
+    {
+      "id": "MC_04",
+      "title": "Async File Load",
+      "description": "Load a large file without blocking the UI using QThread",
+      "difficulty": "intermediate",
+      "points": 100,
+      "required_patterns": ["QThread", "moveToThread", "finished"]
+    },
+    {
+      "id": "MC_05",
+      "title": "Number Formatter",
+      "description": "Create a locale-aware number parser supporting European and US formats",
+      "difficulty": "beginner",
+      "points": 50,
+      "required_patterns": ["float", "replace", "\\.", ","]
+    }
+  ]
+}

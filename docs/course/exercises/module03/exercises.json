@@ -1,0 +1,89 @@
+{
+  "module": 3,
+  "title": "Signals, Slots, and Properties",
+  "exercises": [
+    {
+      "id": "03_01",
+      "title": "Custom Signal with Arguments",
+      "description": "Create a signal that passes multiple typed arguments to QML",
+      "difficulty": "intermediate",
+      "points": 100,
+      "required_patterns": [
+        "Signal\\(.*,.*arguments=",
+        "emit"
+      ],
+      "test_cases": [
+        {
+          "name": "signal_exists",
+          "type": "attribute_exists",
+          "target": "DataEmitter",
+          "attribute": "dataReady"
+        }
+      ]
+    },
+    {
+      "id": "03_02",
+      "title": "Slot with Return Value",
+      "description": "Create a slot that returns a calculated value to QML",
+      "difficulty": "intermediate",
+      "points": 100,
+      "required_patterns": [
+        "@Slot\\(result=",
+        "return"
+      ]
+    },
+    {
+      "id": "03_03",
+      "title": "Property with Notify Signal",
+      "description": "Implement a read-write property with change notification",
+      "difficulty": "intermediate",
+      "points": 100,
+      "required_patterns": [
+        "@Property",
+        "notify=",
+        "@.*\\.setter",
+        "Changed\\.emit"
+      ]
+    },
+    {
+      "id": "03_04",
+      "title": "QML Connections Component",
+      "description": "Use QML Connections to handle multiple signals from a Python backend",
+      "difficulty": "intermediate",
+      "points": 100,
+      "required_qml_patterns": [
+        "Connections",
+        "target:",
+        "function on"
+      ]
+    },
+    {
+      "id": "03_05",
+      "title": "Signal Chaining",
+      "description": "Connect a Python signal to another Python slot and propagate to QML",
+      "difficulty": "advanced",
+      "points": 150,
+      "required_patterns": [
+        "\\.connect\\(",
+        "Signal",
+        "@Slot"
+      ]
+    }
+  ],
+  "extra_exercises": [
+    {
+      "id": "03_E1",
+      "title": "Computed Property",
+      "description": "Create a read-only property that computes its value from other properties",
+      "difficulty": "advanced",
+      "points": 100
+    },
+    {
+      "id": "03_E2",
+      "title": "Signal with Custom Type",
+      "description": "Pass a custom Python dataclass through a signal to QML as QVariantMap",
+      "difficulty": "advanced",
+      "points": 125
+    }
+  ]
+}
