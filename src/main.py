@@ -147,7 +147,11 @@ def main():
 
     # Load main QML file (now relative to src/ directory)
     qml_file = Path(__file__).parent / "qml" / "main" / "Main.qml"
+    import time
+    t0 = time.time()
     engine.load(QUrl.fromLocalFile(str(qml_file)))
+    t1 = time.time()
+    logger.info(f"QML engine.load() took {t1 - t0:.2f}s")
 
     if not engine.rootObjects():
         logger.error("Failed to load QML")

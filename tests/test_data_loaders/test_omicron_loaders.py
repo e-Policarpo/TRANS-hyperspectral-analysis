@@ -362,49 +362,70 @@ class TestOmicronFlatLoaderLoading:
 
 
 class TestOmicronFlatLoaderMetadata:
-    """Tests for metadata parsing from flat files."""
+    """Tests for header parsing from flat files."""
 
-    def test_parse_metadata_basic(self, flat_loader, sample_flat_file):
-        """OM-FLAT-08: Basic metadata is parsed."""
+    @pytest.mark.xfail(reason="Mock flat file does not have valid FLAT0100 structure")
+    def test_parse_header_basic(self, flat_loader, sample_flat_file):
+        """OM-FLAT-08: Basic header is parsed from valid file."""
         with open(sample_flat_file, 'rb') as f:
             content = f.read()
 
-        flat_loader._parse_flat_metadata(content)
+        result = flat_loader._parse_flat_header(content)
 
-        # Should at least initialize the dict
-        assert isinstance(flat_loader.metadata_dict, dict)
+        assert result is not None
+        assert 'axes' in result
+        assert 'data_offset' in result
+        assert 'data_count' in result
 
-    def test_get_image_dimensions(self, flat_loader, sample_flat_file):
-        """OM-FLAT-09: Image dimensions can be determined."""
-        with open(sample_flat_file, 'rb') as f:
-            content = f.read()
+    def test_load_flat_file_invalid_magic(self, flat_loader, tmp_path):
+        """OM-FLAT-09: Invalid magic number returns None from _load_flat_file."""
+        bad_file = tmp_path / "bad.Z_flat"
+        bad_file.write_bytes(b'BADMAGIC' + b'\x00' * 200)
 
-        width, height = flat_loader._get_image_dimensions(content)
+        result = flat_loader._load_flat_file(bad_file)
 
-        # May be None for mock file, but shouldn't crash
-        # Real files would have dimensions embedded
+        assert result is None
 
 
 class TestOmicronFlatLoaderScaling:
-    """Tests for image data scaling."""
+    """Tests for transfer function scaling."""
 
-    def test_scale_image_data_default(self, flat_loader):
-        """OM-FLAT-10: Default scaling is applied."""
-        raw_data = np.array([[1000, 2000], [3000, 4000]], dtype=np.float64)
+    def test_apply_transfer_linear1d(self, flat_loader):
+        """OM-FLAT-10: TFF_Linear1D scaling is applied correctly."""
+        raw_data = np.array([1000, 2000, 3000, 4000], dtype=np.float64)
+        xfer = {
+            'name': 'TFF_Linear1D',
+            'unit': 'm',
+            'params': {'Offset': 0.0, 'Factor': 1e12},
+        }
 
-        scaled = flat_loader._scale_image_data(raw_data)
+        scaled = flat_loader._apply_transfer_function(raw_data, xfer)
 
-        # Should be scaled (default is pm to m, so very small values)
         assert scaled is not None
         assert scaled.shape == raw_data.shape
+        np.testing.assert_allclose(scaled, raw_data / 1e12)
 
-    def test_scale_image_data_preserves_shape(self, flat_loader):
-        """OM-FLAT-11: Scaling preserves data shape."""
-        raw_data = np.random.rand(128, 128) * 10000
+    def test_apply_transfer_multilinear1d(self, flat_loader):
+        """OM-FLAT-11: TFF_MultiLinear1D scaling is applied correctly."""
+        raw_data = np.array([100, 200, 300], dtype=np.float64)
+        xfer = {
+            'name': 'TFF_MultiLinear1D',
+            'unit': 'm',
+            'params': {
+                'Raw_1': 1.0,
+                'PreOffset': 0.0,
+                'Offset': 0.0,
+                'NeutralFactor': 1.0,
+                'PreFactor': 2.0,
+            },
+        }
 
-        scaled = flat_loader._scale_image_data(raw_data)
+        scaled = flat_loader._apply_transfer_function(raw_data, xfer)
 
-        assert scaled.shape == (128, 128)
+        assert scaled is not None
+        assert scaled.shape == raw_data.shape
+        # (1.0 - 0.0) * (raw - 0.0) / (1.0 * 2.0) = raw / 2
+        np.testing.assert_allclose(scaled, raw_data / 2.0)
 
 
 # =============================================================================

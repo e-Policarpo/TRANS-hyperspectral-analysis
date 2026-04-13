@@ -20,6 +20,7 @@ from PySide6.QtWidgets import QFileDialog, QApplication
 from PySide6.QtGui import QDesktopServices
 
 from src.models.spectral_data import SpectralData, SpectralMetadata
+from src.models.table_data_model import TableDataModel
 from src.models.topography_data import TopographyData
 from src.models.discretizer import Discretizer
 from src.data_loaders.nanosurf_sts_enhanced import NanosurfSTSEnhancedLoader
@@ -55,8 +56,6 @@ class AppBackend(ToolImplementations, QObject):
     projectSaved = Signal(str)  # project_path
     projectModifiedChanged = Signal(bool)  # is_modified
     projectReadyChanged = Signal(bool)  # project is set up and ready
-    tableCreated = Signal(str, str)  # table_id, table_title
-    graphCreated = Signal(str, str)  # graph_id, graph_title
     mapCreated = Signal(str, str)  # map_id, map_title
     mapDeleted = Signal(str)  # map_path - emitted when a map is deleted
     imageImported = Signal(str, str, str)  # map_name, file_path, map_id - opens in Map Editor tab
@@ -73,7 +72,7 @@ class AppBackend(ToolImplementations, QObject):
     loadMapInEditor = Signal(str)  # map_path - request to load map in the map editor
     projectStateRestored = Signal(str)  # stateJson - emitted after loading project to restore tables/graphs/workspace
     openDatasetEmbedded = Signal(str, 'QVariantList', str, str)  # name, curves, xLabel, yLabel
-    openTableEmbedded = Signal(str, 'QVariantList', 'QVariantList')  # title, headers, rows
+    openTableEmbedded = Signal(str, QObject)  # title, TableDataModel
     collectWindowStatesRequested = Signal()  # ask QML for embedded window states before saving
 
     def __init__(self, parent=None):
@@ -176,11 +175,10 @@ class AppBackend(ToolImplementations, QObject):
         # Embedded window states for persistence (collected from QML before save)
         self._embedded_window_states = []
 
-        # Keep references to open windows with metadata
+        # Keep references to open OS windows (map visualization only)
         self.open_windows = []
-        self.open_tables = []  # List of {'window': TableWindow, 'title': str, 'id': str}
-        self.open_graphs = []  # List of {'window': PlotWindow, 'title': str, 'id': str}
         self.open_map_windows = []  # List of {'window': MapWindow, 'title': str, 'id': str, 'path': str}
+        self._table_models = []  # Keep references to prevent GC
         self._window_id_counter = 0
 
         # Track maps and output files from tools
@@ -890,6 +888,102 @@ class AppBackend(ToolImplementations, QObject):
         self.status = f"Importing folder: {Path(folder_path).name}..."
         self._import_folder_path(Path(folder_path))
 
+    @Slot(str)
+    def importSmartMap(self, file_path):
+        """
+        Smart map import: pick one file and auto-discover siblings
+        from the same measurement session.
+
+        Supports:
+        - .nid files (Nanosurf) — discovers sibling .nid files
+        - .mtrx / .I(V)_mtrx / etc (Omicron Matrix) — reads _0001.mtrx header
+          to enumerate all session files via FERB blocks
+        """
+        filepath = Path(str(file_path))
+        logger.info(f"Smart map import from: {filepath}")
+        self.status = f"Smart import: scanning for siblings of {filepath.name}..."
+
+        self.worker_manager.submit(
+            name=f"Smart Load {filepath.name}",
+            operation=self._do_smart_load,
+            filepath=filepath,
+            on_finished=self._on_file_loaded,
+            on_error=None,
+            on_progress=self._progress_callback
+        )
+
+    def _do_smart_load(self, task, filepath: Path, progress_callback=None):
+        """Smart map loading in background thread — dispatches by file type."""
+        if task.cancelled:
+            return None
+
+        # Determine file type and dispatch
+        name = filepath.name.lower()
+
+        if name.endswith('.nid'):
+            return self._do_smart_load_nanosurf(filepath, progress_callback)
+        elif name.endswith('_mtrx') or name.endswith('.mtrx'):
+            return self._do_smart_load_matrix(filepath, progress_callback)
+        else:
+            raise ValueError(f"Smart import not supported for: {filepath.name}")
+
+    def _do_smart_load_nanosurf(self, filepath: Path, progress_callback=None):
+        """Smart load for Nanosurf .nid files."""
+        if not self.nanosurf_loader:
+            raise RuntimeError("Nanosurf loader not available")
+
+        spectral_data, topography = self.nanosurf_loader.smart_load_from_file(
+            filepath, progress_callback=progress_callback
+        )
+
+        result = {'datasets': {}, 'active_dataset': None}
+        folder_name = filepath.parent.name
+        channels = spectral_data.metadata.additional_info.get('channels', {})
+        for channel_name, channel_data in channels.items():
+            dataset_name = f"{folder_name}_{channel_name}"
+            result['datasets'][dataset_name] = channel_data
+            logger.info(f"Loaded dataset: {dataset_name}")
+
+        result['active_dataset'] = f"{folder_name}_Mixed"
+        return result
+
+    def _do_smart_load_matrix(self, filepath: Path, progress_callback=None):
+        """Smart load for Omicron Matrix files — uses header FERB enumeration."""
+        if not self.omicron_sts_loader:
+            raise RuntimeError("Omicron STS loader not available")
+
+        spectral_data, topography = self.omicron_sts_loader.smart_load_from_file(
+            filepath, progress_callback=progress_callback
+        )
+
+        result = {'datasets': {}, 'active_dataset': None}
+        folder_name = filepath.parent.name
+
+        sweep_channels = spectral_data.metadata.additional_info.get('sweep_channels', {})
+        if sweep_channels:
+            base_name = self._apply_naming_convention(folder_name, 'IV')
+            for sweep_name, sweep_df in sweep_channels.items():
+                dataset_name = f"{base_name}_{sweep_name}"
+                channel_metadata = self.omicron_sts_loader.create_metadata(
+                    dimensions=spectral_data.metadata.dimensions,
+                    scan_mode=spectral_data.metadata.scan_mode,
+                    units=spectral_data.metadata.units,
+                    source_directory=str(filepath.parent),
+                    instrument="Omicron Matrix",
+                    sweep_direction=sweep_name
+                )
+                channel_data = SpectralData(sweep_df, channel_metadata)
+                result['datasets'][dataset_name] = channel_data
+                logger.info(f"Smart-loaded Omicron {sweep_name}: {dataset_name}")
+
+            result['active_dataset'] = f"{base_name}_Mixed"
+        else:
+            dataset_name = self._apply_naming_convention(folder_name, 'IV')
+            result['datasets'][dataset_name] = spectral_data
+            result['active_dataset'] = dataset_name
+
+        return result
+
     def _import_single_file_path(self, filepath: Path):
         """Import a single data file from given path (submits to worker)."""
         logger.info(f"Importing file: {filepath}")
@@ -955,8 +1049,10 @@ class AppBackend(ToolImplementations, QObject):
             first_key = list(spectral_data_dict.keys())[0]
             result['active_dataset'] = f"{filepath.stem}_{first_key}"
 
-        elif filepath.name.endswith('.I(V)_mtrx'):
-            # Omicron Matrix I(V) spectroscopy file
+        elif any(filepath.name.endswith(ext) for ext in
+                 ['.I(V)_mtrx', '.Aux2(V)_mtrx', '.Aux1(V)_mtrx',
+                  '.I(Z)_mtrx', '.Z(V)_mtrx', '.Aux2(Z)_mtrx', '.Aux1(Z)_mtrx']):
+            # Omicron Matrix spectroscopy file
             if not self.omicron_sts_loader:
                 raise RuntimeError("Omicron STS loader not available")
 
@@ -1024,6 +1120,9 @@ class AppBackend(ToolImplementations, QObject):
             self._active_dataset = result['active_dataset']
             self.dataLoaded.emit(self._active_dataset)
 
+        # Auto-load topography overlay if Nanosurf data has map geometry
+        self._try_load_topo_overlay(result)
+
         self.status = f"Loaded {len(result['datasets'])} datasets"
         logger.info(f"File loading complete: {len(result['datasets'])} datasets")
 
@@ -1031,6 +1130,32 @@ class AppBackend(ToolImplementations, QObject):
         app = QApplication.instance()
         if app:
             app.processEvents()
+
+    def _try_load_topo_overlay(self, result: dict):
+        """If loaded data has topography + map geometry, send to map editor."""
+        if self._map_editor_backend is None:
+            return
+
+        for name, spectral_data in result.get('datasets', {}).items():
+            if not hasattr(spectral_data, 'metadata'):
+                continue
+            info = spectral_data.metadata.additional_info
+            map_geom = info.get('map_geometry')
+            topo_geom = info.get('topo_geometry')
+            topo_data = getattr(spectral_data, 'topography', None)
+
+            if map_geom and topo_geom and topo_data is not None:
+                try:
+                    self._map_editor_backend.loadTopographyWithOverlay(
+                        topo_data, map_geom, topo_geom,
+                        channel_name=f"{name}_Topography"
+                    )
+                    # Also link the spectral data for spectrum viewing
+                    self._map_editor_backend.linkDataset(name, spectral_data)
+                    logger.info(f"Auto-loaded topography overlay for {name}")
+                except Exception as e:
+                    logger.warning(f"Could not load topography overlay: {e}")
+                return  # Only load once (from first dataset with topo)
 
     def _import_folder_path(self, dirpath: Path):
         """Import all files from a folder path (submits to worker)."""
@@ -1250,16 +1375,6 @@ class AppBackend(ToolImplementations, QObject):
         return flat_datasets
 
     @Slot(result='QVariantList')
-    def getTableList(self):
-        """Get list of open tables with metadata."""
-        return [{'id': t['id'], 'title': t['title']} for t in self.open_tables]
-
-    @Slot(result='QVariantList')
-    def getGraphList(self):
-        """Get list of open graphs with metadata."""
-        return [{'id': g['id'], 'title': g['title']} for g in self.open_graphs]
-
-    @Slot(result='QVariantList')
     def getMapList(self):
         """Get list of generated maps with metadata."""
         return [{'id': m['id'], 'title': m['title'], 'path': m['path']} for m in self.maps]
@@ -1368,30 +1483,6 @@ class AppBackend(ToolImplementations, QObject):
         """Request to load a map file in the Map Editor (callable from QML)."""
         self.loadMapInEditor.emit(map_path)
         logger.info(f"Requested map load in editor: {map_path}")
-
-    @Slot(str)
-    def openTable(self, table_id: str):
-        """Bring a table window to the front."""
-        for table_info in self.open_tables:
-            if table_info['id'] == table_id:
-                window = table_info['window']
-                window.raise_()
-                window.activateWindow()
-                logger.info(f"Brought table to front: {table_info['title']}")
-                return
-        logger.warning(f"Table ID not found: {table_id}")
-
-    @Slot(str)
-    def openGraph(self, graph_id: str):
-        """Bring a graph window to the front."""
-        for graph_info in self.open_graphs:
-            if graph_info['id'] == graph_id:
-                window = graph_info['window']
-                window.raise_()
-                window.activateWindow()
-                logger.info(f"Brought graph to front: {graph_info['title']}")
-                return
-        logger.warning(f"Graph ID not found: {graph_id}")
 
     @Slot(str)
     def setActiveDataset(self, dataset_name: str):
@@ -1936,15 +2027,30 @@ class AppBackend(ToolImplementations, QObject):
 
     @Slot()
     def newTable(self):
-        """Create a new embedded table window."""
+        """Create a new embedded table window with initial blank grid."""
         logger.info("Creating new embedded table window")
         self._window_id_counter += 1
         table_title = f"Table {self._window_id_counter}"
 
-        # Emit signal for QML to create an embedded table window (empty)
-        self.openTableEmbedded.emit(table_title, [], [])
+        # Create model with initial blank rows and columns
+        model = TableDataModel(self)
+        initial_rows = [[0.0] * 5 for _ in range(20)]
+        initial_headers = ['A', 'B', 'C', 'D', 'E']
+        model.setTableData(initial_rows, initial_headers)
+        self._table_models.append(model)
+        logger.info(f"Table model created: {model.rows} rows x {model.columns} cols")
+        self.openTableEmbedded.emit(table_title, model)
         self.status = f"{table_title} created"
         logger.info(f"Embedded table window requested: {table_title}")
+
+    @Slot(str, list, list)
+    def restoreTableFromState(self, title: str, data: list, headers: list):
+        """Restore a table from saved project state by creating a TableDataModel."""
+        model = TableDataModel(self)
+        if data:
+            model.setTableData(data, headers)
+        self._table_models.append(model)
+        self.openTableEmbedded.emit(title, model)
 
     @Slot(str)
     def openWorkflow(self, workflow_name: str):
@@ -1964,36 +2070,6 @@ class AppBackend(ToolImplementations, QObject):
 
         # Return the workflow_id so QML can use it
         return workflow_id
-
-    def _remove_window(self, window):
-        """Remove window from tracking list."""
-        if window in self.open_windows:
-            self.open_windows.remove(window)
-            logger.info(f"Window closed. Remaining open windows: {len(self.open_windows)}")
-
-    def _remove_table(self, table_id: str):
-        """Remove table from tracking lists."""
-        for table_info in self.open_tables:
-            if table_info['id'] == table_id:
-                window = table_info['window']
-                if window in self.open_windows:
-                    self.open_windows.remove(window)
-                self.open_tables.remove(table_info)
-                self.windowClosed.emit('table', table_id)
-                logger.info(f"Table closed: {table_id}")
-                break
-
-    def _remove_graph(self, graph_id: str):
-        """Remove graph from tracking lists."""
-        for graph_info in self.open_graphs:
-            if graph_info['id'] == graph_id:
-                window = graph_info['window']
-                if window in self.open_windows:
-                    self.open_windows.remove(window)
-                self.open_graphs.remove(graph_info)
-                self.windowClosed.emit('graph', graph_id)
-                logger.info(f"Graph closed: {graph_id}")
-                break
 
     def _open_map_window(self, map_path: str, map_id: str, map_title: str):
         """Open a map visualization window."""
@@ -2064,153 +2140,8 @@ class AppBackend(ToolImplementations, QObject):
 
         # Clear tracking lists
         self.open_windows.clear()
-        self.open_tables.clear()
-        self.open_graphs.clear()
         self.open_map_windows.clear()
         logger.info("All windows closed")
-
-    def _restore_table_window(self, table_state: dict):
-        """Restore a table window from saved state."""
-        from src.widgets.enhanced_table_window import EnhancedTableWindow
-        from src.backend.project_manager import restore_window_geometry
-        import pandas as pd
-
-        try:
-            table_id = table_state.get('id', f"table_{self._window_id_counter + 1}")
-            table_title = table_state.get('title', 'Restored Table')
-
-            # Create table window with data
-            data = table_state.get('data', [])
-            columns = table_state.get('columns', [])
-
-            if data and columns:
-                df = pd.DataFrame(data, columns=columns)
-                table_window = EnhancedTableWindow(data=df)
-            else:
-                table_window = EnhancedTableWindow()
-
-            table_window.setWindowTitle(table_title)
-
-            # Restore geometry
-            geometry = table_state.get('geometry', {})
-            restore_window_geometry(table_window, geometry)
-
-            # Restore column widths
-            column_widths = table_state.get('column_widths', [])
-            if hasattr(table_window, 'table') and column_widths:
-                for col, width in enumerate(column_widths):
-                    if col < table_window.table.columnCount():
-                        table_window.table.setColumnWidth(col, width)
-
-            # Restore formulas
-            formulas = table_state.get('formulas', {})
-            if hasattr(table_window, 'formulas'):
-                for key, formula in formulas.items():
-                    parts = key.split(',')
-                    if len(parts) == 2:
-                        r, c = int(parts[0]), int(parts[1])
-                        table_window.formulas[(r, c)] = formula
-
-            # Track window
-            self._window_id_counter += 1
-            self.open_windows.append(table_window)
-            table_info = {
-                'window': table_window,
-                'id': table_id,
-                'title': table_title
-            }
-            self.open_tables.append(table_info)
-
-            # Connect close signal
-            table_window.closed.connect(lambda tid=table_id: self._remove_table(tid))
-
-            table_window.show()
-            self.tableCreated.emit(table_id, table_title)
-            logger.info(f"Restored table window: {table_title}")
-
-        except Exception as e:
-            logger.error(f"Error restoring table window: {e}", exc_info=True)
-
-    def _restore_graph_window(self, graph_state: dict):
-        """Restore a graph window from saved state."""
-        from src.widgets.enhanced_plot_window import EnhancedPlotWindow
-        from src.backend.project_manager import restore_window_geometry
-        import numpy as np
-
-        try:
-            graph_id = graph_state.get('id', f"graph_{self._window_id_counter + 1}")
-            graph_title = graph_state.get('title', 'Restored Graph')
-
-            # Create plot window
-            plot_window = EnhancedPlotWindow(datasets=self._datasets)
-            plot_window.setWindowTitle(graph_title)
-
-            # Restore geometry
-            geometry = graph_state.get('geometry', {})
-            restore_window_geometry(plot_window, geometry)
-
-            # Restore curves
-            curves = graph_state.get('curves', [])
-            for curve in curves:
-                x_data = curve.get('x_data')
-                y_data = curve.get('y_data')
-                if x_data is not None and y_data is not None:
-                    plot_window.canvas.add_curve(
-                        x=np.array(x_data),
-                        y=np.array(y_data),
-                        label=curve.get('label', 'Curve'),
-                        color=curve.get('color', '#ff66b2'),
-                        marker=curve.get('marker'),
-                        linestyle=curve.get('linestyle', '-'),
-                        linewidth=curve.get('linewidth', 2),
-                        alpha=curve.get('alpha', 1.0)
-                    )
-
-            # Restore axes configuration
-            axes_config = graph_state.get('axes', {})
-            if axes_config and hasattr(plot_window, 'canvas'):
-                ax = plot_window.canvas.axes
-                if axes_config.get('xlabel'):
-                    ax.set_xlabel(axes_config['xlabel'])
-                if axes_config.get('ylabel'):
-                    ax.set_ylabel(axes_config['ylabel'])
-                if axes_config.get('title'):
-                    ax.set_title(axes_config['title'])
-                if axes_config.get('xlim'):
-                    ax.set_xlim(axes_config['xlim'])
-                if axes_config.get('ylim'):
-                    ax.set_ylim(axes_config['ylim'])
-                if axes_config.get('xscale'):
-                    ax.set_xscale(axes_config['xscale'])
-                if axes_config.get('yscale'):
-                    ax.set_yscale(axes_config['yscale'])
-
-                plot_window.canvas.draw()
-
-            # Restore grid
-            if graph_state.get('grid', False) and hasattr(plot_window, 'canvas'):
-                plot_window.canvas.axes.grid(True)
-                plot_window.canvas.draw()
-
-            # Track window
-            self._window_id_counter += 1
-            self.open_windows.append(plot_window)
-            graph_info = {
-                'window': plot_window,
-                'id': graph_id,
-                'title': graph_title
-            }
-            self.open_graphs.append(graph_info)
-
-            # Connect close signal
-            plot_window.closed.connect(lambda gid=graph_id: self._remove_graph(gid))
-
-            plot_window.show()
-            self.graphCreated.emit(graph_id, graph_title)
-            logger.info(f"Restored graph window: {graph_title}")
-
-        except Exception as e:
-            logger.error(f"Error restoring graph window: {e}", exc_info=True)
 
     # ========================================================================
     # TOOL IMPLEMENTATIONS - Integration Utility
@@ -3535,127 +3466,25 @@ class AppBackend(ToolImplementations, QObject):
                 headers.append(x_name)
 
                 # Add spectrum column headers
-                num_cols = min(dataset.num_spectra, 50)  # Limit columns for performance
+                num_cols = dataset.num_spectra
                 for i in range(num_cols):
                     headers.append(f"Spectrum {i+1}")
 
                 # Build rows
                 x = dataset.independent_var
-                num_rows = min(len(x), 500)  # Limit rows for performance
+                num_rows = len(x)
                 for r in range(num_rows):
                     row = [float(x[r])]
                     for c in range(num_cols):
                         row.append(float(dataset.spectra.iloc[r, c]))
                     rows.append(row)
 
-            self.openTableEmbedded.emit(f"Table: {dataset_name}", headers, rows)
+            model = TableDataModel(self)
+            model.setTableData(rows, headers)
+            self._table_models.append(model)
+            self.openTableEmbedded.emit(f"Table: {dataset_name}", model)
         except Exception as e:
             logger.error(f"Error building table data: {e}")
-
-    def _create_table_async(self, dataset_name: str, dataset):
-        """Create table window asynchronously in worker thread"""
-        from PySide6.QtWidgets import QApplication
-
-        # Update status
-        self.status = f"Loading table for {dataset_name}..."
-        QApplication.processEvents()  # Keep UI responsive
-
-        # Check dataset size - if small, create immediately
-        if hasattr(dataset, 'num_spectra') and dataset.num_spectra <= 100:
-            # Small dataset - create table immediately
-            self._create_table_window(dataset_name, dataset)
-        else:
-            # Large dataset - use worker thread
-            logger.info(f"Large dataset detected ({dataset.num_spectra} spectra), loading table in background")
-            self.worker_manager.submit(
-                name=f"Load Table {dataset_name}",
-                operation=self._do_prepare_table_data,
-                dataset_name=dataset_name,
-                dataset=dataset,
-                on_finished=lambda table_data: self._on_table_data_ready(dataset_name, table_data)
-            )
-
-    def _do_prepare_table_data(self, task, dataset_name: str, dataset):
-        """Prepare table data in worker thread"""
-        # Check if cancelled
-        if task.cancelled:
-            logger.info("Table data preparation cancelled")
-            return None
-
-        logger.info(f"Preparing table data for {dataset_name} in worker thread")
-
-        # Convert dataset to DataFrame for table
-        if hasattr(dataset, 'data'):
-            table_data = dataset.data
-        else:
-            # Fallback: create DataFrame from independent var and spectra
-            import pandas as pd
-            table_data = dataset.spectra.copy()
-            table_data.insert(0, dataset.independent_var_name, dataset.independent_var)
-
-        logger.info(f"Table data prepared: {table_data.shape}")
-        return table_data
-
-    def _create_table_window(self, dataset_name: str, dataset):
-        """Create table window immediately (for small datasets)"""
-        from src.widgets.enhanced_table_window import EnhancedTableWindow
-
-        self._window_id_counter += 1
-        table_id = f"table_{self._window_id_counter}"
-
-        # Convert dataset to DataFrame for table
-        if hasattr(dataset, 'data'):
-            table_data = dataset.data
-        else:
-            # Fallback: create DataFrame from independent var and spectra
-            table_data = dataset.spectra.copy()
-            table_data.insert(0, dataset.independent_var_name, dataset.independent_var)
-
-        table_window = EnhancedTableWindow(data=table_data)
-        table_window.setWindowTitle(f"Table: {dataset_name}")
-
-        self.open_windows.append(table_window)
-        table_info = {
-            'window': table_window,
-            'id': table_id,
-            'title': dataset_name
-        }
-        self.open_tables.append(table_info)
-
-        table_window.closed.connect(lambda: self._remove_table(table_id))
-        table_window.show()
-
-        self.status = "Ready"
-        logger.info(f"Table window created for {dataset_name}")
-
-    def _on_table_data_ready(self, dataset_name: str, table_data):
-        """Called when table data is ready from worker thread"""
-        from src.widgets.enhanced_table_window import EnhancedTableWindow
-
-        if table_data is None:
-            logger.warning(f"Table data preparation was cancelled or failed for {dataset_name}")
-            self.status = "Ready"
-            return
-
-        self._window_id_counter += 1
-        table_id = f"table_{self._window_id_counter}"
-
-        table_window = EnhancedTableWindow(data=table_data)
-        table_window.setWindowTitle(f"Table: {dataset_name}")
-
-        self.open_windows.append(table_window)
-        table_info = {
-            'window': table_window,
-            'id': table_id,
-            'title': dataset_name
-        }
-        self.open_tables.append(table_info)
-
-        table_window.closed.connect(lambda: self._remove_table(table_id))
-        table_window.show()
-
-        self.status = "Ready"
-        logger.info(f"Table window created for {dataset_name} (loaded in background)")
 
     @Slot(str, 'QVariantList')
     def openDatasetWithCurves(self, dataset_name: str, curve_indices: List):
@@ -3696,10 +3525,6 @@ class AppBackend(ToolImplementations, QObject):
 
     def _open_file_by_type(self, file_path: Path):
         """Open file in appropriate viewer based on extension"""
-        from src.widgets.enhanced_table_window import EnhancedTableWindow
-        import subprocess
-        import platform
-
         extension = file_path.suffix.lower()
 
         # CSV/Excel -> Table
@@ -3719,12 +3544,10 @@ class AppBackend(ToolImplementations, QObject):
             self._open_with_system_viewer(file_path)
 
     def _open_file_in_table(self, file_path: Path):
-        """Open CSV/Excel file in table window"""
-        from src.widgets.enhanced_table_window import EnhancedTableWindow
+        """Open CSV/Excel file in embedded table"""
         import pandas as pd
 
         try:
-            # Load data
             if file_path.suffix.lower() == '.csv':
                 data = pd.read_csv(file_path)
             elif file_path.suffix.lower() in ['.xlsx', '.xls']:
@@ -3732,25 +3555,24 @@ class AppBackend(ToolImplementations, QObject):
             else:
                 raise ValueError(f"Unsupported file type: {file_path.suffix}")
 
-            # Create table window
-            self._window_id_counter += 1
-            table_id = f"table_{self._window_id_counter}"
+            headers = list(data.columns)
+            max_cols = min(len(headers), 50)
+            max_rows = min(len(data), 500)
+            headers = headers[:max_cols]
 
-            table_window = EnhancedTableWindow(data=data)
-            table_window.setWindowTitle(f"Table: {file_path.name}")
+            rows = []
+            for r in range(max_rows):
+                row = []
+                for c in range(max_cols):
+                    val = data.iloc[r, c]
+                    row.append(float(val) if isinstance(val, (int, float)) else str(val))
+                rows.append(row)
 
-            self.open_windows.append(table_window)
-            table_info = {
-                'window': table_window,
-                'id': table_id,
-                'title': file_path.name
-            }
-            self.open_tables.append(table_info)
-
-            table_window.closed.connect(lambda: self._remove_table(table_id))
-            table_window.show()
-
-            logger.info(f"Opened file in table: {file_path}")
+            model = TableDataModel(self)
+            model.setTableData(rows, headers)
+            self._table_models.append(model)
+            self.openTableEmbedded.emit(f"Table: {file_path.name}", model)
+            logger.info(f"Opened file in embedded table: {file_path}")
 
         except Exception as e:
             logger.error(f"Error opening file in table: {e}", exc_info=True)

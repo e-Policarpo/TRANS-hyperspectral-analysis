@@ -46,6 +46,7 @@ Item {
     property color textLight: mainWin ? mainWin.textLight : "#ffffff"
     property color textMuted: mainWin ? mainWin.textMuted : "#cccccc"
     property color borderColor: mainWin ? mainWin.borderColor : "#9B4F96"
+    property string monoFont: mainWin ? mainWin.fontFamilyMono : (Qt.platform.os === "osx" ? "Menlo" : "Consolas")
 
     // Define size for scrolling
     implicitWidth: mainLayout.implicitWidth
@@ -331,7 +332,7 @@ Item {
                             text: "X: ---, Y: ---"
                             color: textMuted
                             font.pixelSize: 10
-                            font.family: "monospace"
+                            font.family: monoFont
                         }
                     }
 
@@ -586,7 +587,6 @@ Item {
                                     text: "X"
                                     onClicked: {
                                         graphCanvas.removeCurve(model.curveId)
-                                        updateCurvesList()
                                     }
                                     background: Rectangle {
                                         color: parent.hovered ? "#FF6B6B" : "transparent"
@@ -623,7 +623,6 @@ Item {
                             text: "Clear All"
                             onClicked: {
                                 graphCanvas.clearCurves()
-                                updateCurvesList()
                             }
                             background: Rectangle {
                                 color: parent.hovered ? "#FF6B6B" : bgLight
@@ -876,14 +875,13 @@ Item {
 
     // Public API
     function addCurve(label, xData, yData, color) {
-        var id = graphCanvas.addCurve(label, xData, yData, color || "", 2.0)
-        updateCurvesList()
-        return id
+        // curvesChanged signal from graphCanvas.addCurve() triggers updateCurvesList() via Connections
+        return graphCanvas.addCurve(label, xData, yData, color || "", 2.0)
     }
 
     function clearCurves() {
+        // curvesChanged signal from graphCanvas.clearCurves() triggers updateCurvesList() via Connections
         graphCanvas.clearCurves()
-        updateCurvesList()
     }
 
     function setLabels(xLabel, yLabel) {
@@ -941,7 +939,7 @@ Item {
                     )
                 }
             }
-            updateCurvesList()
+            // curvesChanged signal handles updateCurvesList() via Connections
         }
     }
 
@@ -980,11 +978,13 @@ Item {
                     )
                 }
             }
-            updateCurvesList()
+            // curvesChanged signal handles updateCurvesList() via Connections
         }
     }
 
-    // Update curves list when canvas changes
+    // Update curves list when curves are added/removed
+    // Note: curvesChanged only fires on add/remove, NOT on property changes (like visibility),
+    // to avoid rebuilding the entire ListView on every checkbox toggle.
     Connections {
         target: graphCanvas
         function onCurvesChanged() {

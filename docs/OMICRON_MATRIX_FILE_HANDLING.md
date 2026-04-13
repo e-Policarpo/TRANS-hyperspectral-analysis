@@ -1,594 +1,557 @@
-# Omicron Matrix File Handling Documentation
+# Omicron Matrix File Format Specification
 
-This document provides comprehensive technical documentation for the Omicron Matrix STM/STS file format handling in TRANS-QML, based on previous work by Marek (matrixFileHandling.py, June 2022).
+Comprehensive technical documentation for the Omicron (Scienta Omicron) Matrix
+STM/STS binary file formats, reverse-engineered from real measurement data.
+
+Based on previous work by Marek (matrixFileHandling.py, June 2022).
+Updated with full header decoding: April 2026.
 
 ---
 
 ## Table of Contents
 
 1. [Overview](#1-overview)
-2. [File Formats](#2-file-formats)
-3. [Binary Format Specification](#3-binary-format-specification)
-4. [Data Loaders API](#4-data-loaders-api)
-5. [Forward/Backward Sweep Handling](#5-forwardbackward-sweep-handling)
+2. [File Naming Conventions](#2-file-naming-conventions)
+3. [ONTMATRX0101 Format (Data Files)](#3-ontmatrx0101-format)
+4. [Session Header Format (_0001.mtrx)](#4-session-header-format)
+5. [FLAT0100 Format (Flat Files)](#5-flat0100-format)
 6. [Transfer Function Scaling](#6-transfer-function-scaling)
-7. [Usage Examples](#7-usage-examples)
-8. [Troubleshooting](#8-troubleshooting)
+7. [Forward/Backward Sweep Handling](#7-forwardbackward-sweep-handling)
+8. [Smart Import](#8-smart-import)
+9. [Data Loaders API](#9-data-loaders-api)
+10. [Troubleshooting](#10-troubleshooting)
 
 ---
 
 ## 1. Overview
 
-### Background
+### Instruments
 
-The Omicron Matrix file format is a proprietary binary format used by Omicron (now Scienta Omicron) Matrix STM/STS systems. TRANS-QML includes loaders for:
+The Matrix file format is produced by Scienta Omicron (formerly Omicron
+NanoTechnology) MATRIX SPM control software, versions V3.x. The software controls
+STM and AFM systems and writes binary data files during measurement sessions.
 
-- **I(V)_mtrx**: Scanning Tunneling Spectroscopy (STS) current-voltage curves
-- **I(Z)_mtrx**: Current-distance spectroscopy
-- **Z(V)_mtrx**: Height-voltage spectroscopy
-- **Z_flat**: Processed (flattened) topography images
-- **I_flat**: Current channel images
+### File Types
 
-### Credits
+| Extension | Type | Description |
+|-----------|------|-------------|
+| `.I(V)_mtrx` | Spectroscopy | Current vs. voltage (STS), forward + backward |
+| `.Aux2(V)_mtrx` | Spectroscopy | Aux channel 2 vs. voltage, same structure |
+| `.Aux1(V)_mtrx` | Spectroscopy | Aux channel 1 vs. voltage |
+| `.I(Z)_mtrx` | Spectroscopy | Current vs. distance |
+| `.Z(V)_mtrx` | Spectroscopy | Height vs. voltage |
+| `.I_mtrx` | Scanning | Current image (line-by-line, variable length) |
+| `.Z_mtrx` | Scanning | Z height (line-by-line, variable length) |
+| `_0001.mtrx` | Header | Session header: parameters, transfer functions, file index |
+| `.Z_flat` | Flat image | Processed (flattened) topography, self-contained |
+| `.I_flat` | Flat image | Processed current image, self-contained |
 
-Based on previous work by Marek (June 2022):
-- Original implementation: `matrixFileHandling.py`
-- Reverse-engineered file format specification
-- Transfer function scaling algorithms
+### Session Structure
 
-### File Locations
+A measurement session produces one `_0001.mtrx` header and many data files:
 
-| File | Location | Purpose |
-|------|----------|---------|
-| `omicron_mtrx_loader.py` | `src/data_loaders/` | STS spectroscopy files |
-| `omicron_flat_loader.py` | `src/data_loaders/` | Flat/image files |
-
----
-
-## 2. File Formats
-
-### 2.1 I(V)_mtrx Files (STS Spectroscopy)
-
-**Purpose**: Contains current-voltage (I-V) spectroscopy data from single point or grid measurements.
-
-**File naming convention**:
 ```
-<experiment>--<index>_<point>.I(V)_mtrx
-Example: MnBi2Te4_2024-01-15--1_1.I(V)_mtrx
-```
-
-**Data structure**:
-- Each file contains **both forward AND backward** voltage sweeps concatenated
-- First half: Forward sweep (V increases from V_start to V_end)
-- Second half: Backward sweep (V decreases from V_end to V_start)
-- Data stored as 32-bit signed integers
-
-### 2.2 Z_flat Files (Topography)
-
-**Purpose**: Contains processed (plane-leveled, flattened) STM topography images.
-
-**File naming convention**:
-```
-<experiment>--<index>_<channel>.Z_flat
-Example: MnBi2Te4_2024-01-15--1_1.Z_flat
-```
-
-**Data structure**:
-- Self-contained metadata in UTF-16 format
-- Transfer function parameters embedded
-- Image data as 32-bit signed integers
-
-### 2.3 Associated Header Files
-
-**mtrx files**: Parameter files containing voltage ranges, scaling factors, and metadata.
-
-**File naming convention**:
-```
-<experiment>_0001.mtrx
+default_2025Feb14-191224_STM-STM_Spectroscopy_0001.mtrx    ← session header
+default_2025Feb14-191224_STM-STM_Spectroscopy--1_1.I(V)_mtrx
+default_2025Feb14-191224_STM-STM_Spectroscopy--1_1.Aux2(V)_mtrx
+default_2025Feb14-191224_STM-STM_Spectroscopy--1_1.I_mtrx
+default_2025Feb14-191224_STM-STM_Spectroscopy--1_1.Z_mtrx
+default_2025Feb14-191224_STM-STM_Spectroscopy--1_2.I(V)_mtrx
+...
 ```
 
 ---
 
-## 3. Binary Format Specification
-
-### 3.1 I(V)_mtrx Format
+## 2. File Naming Conventions
 
 ```
-Offset    Size    Description
-────────────────────────────────────────────────────────
-0x00      12      Magic number: "ONTMATRX0101"
-0x0C      4       Tag: "TLKB" (timestamp block)
-0x10      4       File size
-0x14      4       Unix timestamp
-0x18      8       Padding
-0x20      4       Tag: "CSED" (description block)
-0x24      4       Block size
-0x28      N       Description data
-...       4       Tag: "ATAD" (data block)
-...       4       Data size in bytes
-...       N       Raw data (32-bit signed integers)
+<session>_<YYYY><Mon><DD>-<HHMMSS>_<instrument>-<experiment>--<grid>_<point>.<channel>_mtrx
+└──────────────────────────────────────────────────────┘  └───┘ └───┘ └──────┘
+                  Session base name                      Grid#  Pt#   Channel
 ```
 
-### 3.2 Tag Types
+- **Grid number** (`--N`): The spectroscopy grid index within the session
+- **Point number** (`_M`): The spectrum index within the grid
+- **Channel**: `I(V)`, `Aux2(V)`, `I`, `Z`, etc.
 
-| Tag | Name | Description |
-|-----|------|-------------|
-| `TLKB` | Timestamp | Unix timestamp of measurement |
-| `CSED` | Description | Text description block |
-| `ATAD` | Data | Raw measurement data |
-| `APEE` | Parameters | Measurement parameters |
-| `YSCC` | Channel Config | Channel/transfer function configuration |
-| `FERB` | File Reference | Reference to data file |
-
-### 3.3 Z_flat Format
-
-```
-Offset    Size    Description
-────────────────────────────────────────────────────────
-0x00      8       Magic number: "FLAT0100"
-0x08      N       Metadata (UTF-16 strings, variable length)
-...       ...     Transfer function parameters
-...       ...     Axis information
-END-N*4   N*4     Image data (N = width × height, 32-bit integers)
-```
-
-### 3.4 Header File (mtrx) Format
-
-```
-Offset    Size    Description
-────────────────────────────────────────────────────────
-0x00      12      Magic number: "ONTMATRX0101"
-...       ...     APEE blocks (parameters)
-...       ...     YSCC blocks (channel config)
-...       ...     FERB blocks (file references)
-```
+The header file uses `_0001.mtrx` instead of `--N_M.<channel>_mtrx`.
 
 ---
 
-## 4. Data Loaders API
+## 3. ONTMATRX0101 Format
 
-### 4.1 OmicronMatrixSTSLoader
+All `.mtrx` and `_mtrx` data files share this format.
 
-**Class**: `src/data_loaders/omicron_mtrx_loader.py`
+### Structure
 
-```python
-class OmicronMatrixSTSLoader(BaseDataLoader):
-    """Loader for Omicron Matrix STS data."""
-
-    MAGIC_NUMBER = b'ONTMATRX0101'
-
-    def __init__(self):
-        self.supported_extensions = ['.I(V)_mtrx']
-        self.loader_type = 'omicron_matrix_sts'
+```
+Offset   Size     Description
+─────────────────────────────────────
+0x00     12       Magic: "ONTMATRX0101" (ASCII)
+0x0C     ...      Sequential tagged blocks (TLKB, CSED, ATAD)
 ```
 
-#### Key Methods
+### Tag: TLKB (Timestamp)
 
-```python
-def load_from_directory(self, directory: Path,
-                        progress_callback=None) -> Tuple[SpectralData, Optional[TopographyData]]:
-    """
-    Load STS data from directory of .I(V)_mtrx files.
-
-    Returns:
-        SpectralData with Mixed channel as main data
-        Forward/Backward/Mixed channels in metadata.sweep_channels
-    """
-
-def load_single_file(self, filepath: Path) -> SpectralData:
-    """
-    Load single .I(V)_mtrx file.
-
-    Returns SpectralData with columns:
-        - V: Voltage array
-        - Forward: Forward sweep current
-        - Backward: Backward sweep current
-        - Mixed: Average of Forward and Backward
-    """
-
-def _parse_iv_file(self, filepath: Path) -> Dict[str, Any]:
-    """
-    Parse I(V)_mtrx file.
-
-    Returns:
-        {
-            'V': voltage array (half-sweep length),
-            'forward': forward current data,
-            'backward': backward current data (reordered),
-            'mixed': average of forward and backward,
-            'n_points': points per sweep
-        }
-    """
-
-def _parse_header(self, header_path: Path, target_file: Path):
-    """Parse .mtrx header file for voltage range and scaling."""
-
-def _scale_data(self, raw_data: np.ndarray) -> np.ndarray:
-    """Apply transfer function scaling to raw data."""
-
-def _get_voltage_array(self, current_data: np.ndarray) -> np.ndarray:
-    """Get voltage array from parameters or use default."""
+```
+Offset   Size   Type     Description
+────────────────────────────────────
++0x00    4      ASCII    "TLKB"
++0x04    4      uint32   File size (unused)
++0x08    4      uint32   Unix timestamp
++0x0C    8      bytes    Padding (zeroes)
 ```
 
-### 4.2 OmicronFlatLoader
+### Tag: CSED (Description)
 
-**Class**: `src/data_loaders/omicron_flat_loader.py`
-
-```python
-class OmicronFlatLoader(BaseDataLoader):
-    """Loader for Omicron Matrix Flat STM images."""
-
-    MAGIC_NUMBER = b'FLAT0100'
-
-    def __init__(self):
-        self.supported_extensions = ['.Z_flat', '.I_flat']
-        self.loader_type = 'omicron_flat'
+```
+Offset   Size   Type     Description
+────────────────────────────────────
++0x00    4      ASCII    "CSED"
++0x04    4      int32    Block size N
++0x08    N      bytes    Description data (binary, opaque)
 ```
 
-#### Key Methods
+### Tag: ATAD (Data)
 
-```python
-def load_topography(self, filepath: Path) -> TopographyData:
-    """
-    Load topography directly from .Z_flat file.
-
-    Returns:
-        TopographyData with scaled height values
-    """
-
-def _load_flat_file(self, filepath: Path) -> Optional[TopographyData]:
-    """
-    Load and parse a .Z_flat or .I_flat file.
-
-    Steps:
-        1. Verify magic number
-        2. Parse metadata and transfer function
-        3. Extract image dimensions
-        4. Extract raw image data
-        5. Apply transfer function scaling
-    """
-
-def _parse_flat_metadata(self, content: bytes):
-    """Parse UTF-16 encoded metadata from file."""
-
-def _parse_transfer_function(self, content: bytes, start_pos: int):
-    """Extract transfer function parameters (NeutralFactor, Offset, etc.)."""
-
-def _get_image_dimensions(self, content: bytes) -> Tuple[Optional[int], Optional[int]]:
-    """Extract image width and height from metadata."""
-
-def _extract_image_data(self, content: bytes, width: int, height: int) -> Optional[np.ndarray]:
-    """Extract raw 32-bit integer image data."""
-
-def _scale_image_data(self, raw_data: np.ndarray) -> np.ndarray:
-    """Apply transfer function to convert raw integers to physical units."""
 ```
+Offset   Size   Type     Description
+────────────────────────────────────
++0x00    4      ASCII    "ATAD"
++0x04    4      int32    Data size in bytes (= n_points × 4)
++0x08    N      int32[]  Raw measurement data (signed 32-bit LE integers)
+```
+
+### Spectroscopy Data Layout
+
+For spectroscopy files (`.I(V)_mtrx`, `.Aux2(V)_mtrx`, etc.), the ATAD block
+contains `2 × N` points: the first N are the **forward sweep**, the second N
+are the **backward sweep** (recorded in reverse voltage order).
+
+```
+[fwd[0], fwd[1], ..., fwd[N-1], bwd[0], bwd[1], ..., bwd[N-1]]
+                                         └── reverse voltage order
+```
+
+### Scanning Data Layout
+
+For scanning files (`.I_mtrx`, `.Z_mtrx`), the ATAD block contains one
+continuous data stream of varying length (one scan line or partial line).
 
 ---
 
-## 5. Forward/Backward Sweep Handling
+## 4. Session Header Format
 
-### 5.1 Data Layout
+### Block Layout
 
-Each `.I(V)_mtrx` file contains both sweep directions concatenated:
-
-```
-┌─────────────────────────────────────────────────────────┐
-│              Raw Data in File (2N points)               │
-├─────────────────────────┬───────────────────────────────┤
-│     Forward Sweep       │      Backward Sweep           │
-│     (N points)          │      (N points)               │
-│                         │                               │
-│  V: start → end         │  V: end → start               │
-│  I[0], I[1], ..., I[N-1]│  I[N], I[N+1], ..., I[2N-1]  │
-└─────────────────────────┴───────────────────────────────┘
-```
-
-### 5.2 Processing Steps
-
-```python
-# 1. Read raw data (2N points)
-n_points_total = datasize // 4
-raw_data = np.array(unpack(f'<{n_points_total}i', data), dtype=np.float64)
-
-# 2. Apply scaling
-scaled_data = self._scale_data(raw_data)
-
-# 3. Split into forward and backward
-n_points = n_points_total // 2
-forward_data = scaled_data[:n_points]
-backward_data_raw = scaled_data[n_points:n_points * 2]
-
-# 4. Reverse backward to align with forward direction
-backward_data = backward_data_raw[::-1]
-
-# 5. Calculate mixed (average)
-mixed_data = (forward_data + backward_data) / 2
-```
-
-### 5.3 Why Reverse Backward Data?
-
-The backward sweep is recorded as voltage decreases (V_end → V_start), so the data indices are reversed compared to the forward sweep. By reversing the backward data, both arrays align to the same voltage points:
+The `_0001.mtrx` header uses the same `ONTMATRX0101` magic but contains
+different block types. **Every block** (including ATEM and DPXE) follows
+the same layout:
 
 ```
-Forward:   V[0]=V_start,  V[1],  ...,  V[N-1]=V_end
-Backward:  V[0]=V_start,  V[1],  ...,  V[N-1]=V_end  (after reversal)
+Offset   Size   Type     Description
+────────────────────────────────────
++0x00    4      ASCII    Tag (e.g. "APEE")
++0x04    4      uint32   Data size N
++0x08    4      uint32   Unix timestamp
++0x0C    4      uint32   Padding / flags
++0x10    N      bytes    Block data
 ```
 
-### 5.4 Channel Access
+Total block size: 16 + N bytes.
 
-```python
-# Load single file
-loader = OmicronMatrixSTSLoader()
-data = loader.load_single_file(filepath)
+### Block Types
 
-# Main DataFrame has all channels
-print(data.data.columns)
-# Output: ['V', 'Forward', 'Backward', 'Mixed']
+| Tag | Reversed | Count* | Description |
+|-----|----------|--------|-------------|
+| `ATEM` | META | 1 | Software version, session name, instrument |
+| `DPXE` | EXPD | 1 | Experiment type, description, file paths |
+| `APEE` | EEPA | 1 | Experiment parameters (29 groups, 300+ params) |
+| `YSCC` | CCSY | 16 | Transfer functions (updated per spectrum) |
+| `FERB` | BREF | 360 | File references (index of all data files) |
+| `KRAM` | MARK | 39 | Annotations (sample name, dataset, recording flags) |
+| `CORP` | PROC | 165 | Data processing pipeline definitions |
+| `DOMP` | PMOD | 223 | Runtime parameter modifications |
+| `WEIV` | VIEW | 35 | UI view configurations |
+| `ICNI` | INCI | 58 | Increment counters |
+| `QESF` | FSEQ | 1 | File sequence info |
+| `SPXE` | EXPS | 1 | Experiment state |
 
-# Access individual channels
-V = data.data['V'].values
-forward = data.data['Forward'].values
-backward = data.data['Backward'].values
-mixed = data.data['Mixed'].values
+*Counts from a real session (Feb 2025, ~150 spectra).
 
-# Or from metadata (for directory loading)
-sweep_channels = data.metadata.additional_info.get('sweep_channels', {})
-forward_df = sweep_channels.get('Forward')
-backward_df = sweep_channels.get('Backward')
-mixed_df = sweep_channels.get('Mixed')
+### APEE Block (Parameters)
+
+Contains all measurement parameters organized in groups:
+
+```
+Data layout:
+  uint32   padding (skip 4 bytes)
+  uint32   num_groups
+  For each group:
+    string   group_name       (length-prefixed UTF-16LE)
+    uint32   num_params
+    For each parameter:
+      string   param_name     (length-prefixed UTF-16LE)
+      string   unit           (length-prefixed UTF-16LE)
+      uint32   padding
+      typed_value              (see below)
+```
+
+#### Key Parameter Groups
+
+| Group | Key Parameters | Description |
+|-------|---------------|-------------|
+| `Spectroscopy` | `Device_1_Start`, `Device_1_End`, `Device_1_Points`, `Raster_Time_1`, `Device_1_Repetitions`, `Disable_Feedback_Loop` | Voltage sweep configuration |
+| `Regulator` | `Setpoint_1`, `Loop_Gain_1_I`, `Loop_Gain_1_P`, `Feedback_Loop_Enabled` | Feedback loop settings |
+| `GapVoltageControl` | `Voltage`, `Preamp_Range` | Gap voltage and preamp |
+| `XYScanner` | `Width`, `Height`, `Points`, `Lines`, `X_Offset`, `Y_Offset`, `Raster_Time` | Scan area configuration |
+| `I_V` | `Enable`, `Enable_Storing` | I(V) channel recording |
+| `Aux2_V` | `Enable`, `Enable_Storing` | Aux2(V) channel recording |
+
+#### Typed Values
+
+| Tag | Type | Size | Python unpack |
+|-----|------|------|--------------|
+| `LOOB` | Boolean | 4 bytes | `unpack('<I', ...)` → bool |
+| `GNOL` | Integer | 4 bytes | `unpack('<i', ...)` → int |
+| `BUOD` | Double | 8 bytes | `unpack('<d', ...)` → float |
+| `GRTS` | String | Variable | Length-prefixed UTF-16LE |
+
+### YSCC Block (Transfer Functions)
+
+Contains channel scaling configuration. Multiple YSCC blocks appear as the
+transfer function is updated during the session (e.g., when preamp range changes).
+
+```
+Data layout:
+  uint32   padding
+  Repeated sub-blocks:
+    ASCII(4)   sub_tag      ("REFX" for transfer functions)
+    uint32     sub_size
+    If REFX:
+      uint32   padding
+      uint32   group_number
+      string   function_name  (e.g. "TFF_MultiLinear1D")
+      string   unit           (e.g. "A")
+      uint32   num_params
+      For each param:
+        string   param_name
+        typed_value
+```
+
+### FERB Block (File References)
+
+Each FERB block references one data file in the session:
+
+```
+Data layout:
+  uint32   padding
+  string   filename    (length-prefixed UTF-16LE)
+```
+
+Example: `"default_2025Feb14-191224_STM-STM_Spectroscopy--1_1.I(V)_mtrx"`
+
+### KRAM Block (Annotations)
+
+User-defined annotations in the format `MTRX$KEY-VALUE`:
+
+```
+Data layout:
+  string   annotation    (length-prefixed UTF-16LE)
+```
+
+Key annotations:
+
+| Key | Example | Description |
+|-----|---------|-------------|
+| `SAMPLE_NAME` | `MBT Duda` | Sample name entered by user |
+| `DATA_SET_NAME` | `15/02/25` | Dataset/experiment name |
+| `CREATION_COMMENT` | (empty) | User comment |
+| `ENABLE_RECORDING` | `Aux2(V)` | Channel recording enabled |
+| `DISABLE_RECORDING` | `Aux1` | Channel recording disabled |
+
+---
+
+## 5. FLAT0100 Format
+
+Self-contained processed image files (`.Z_flat`, `.I_flat`).
+
+### Structure
+
+```
+Offset   Size     Description
+─────────────────────────────────────
+0x00     8        Magic: "FLAT0100" (ASCII)
+0x08     4        uint32: axis_count (typically 2)
+
+─── For each axis ───
+         4        uint32: string length N
+         N×2      UTF-16LE: trigger name (e.g. "Default::XYScanner::X")
+         4+N×2    UTF-16LE: mirror name (empty for non-mirrored axis)
+         4+N×2    UTF-16LE: unit (e.g. "m")
+         4        uint32: n_points (800 for X=fwd+bwd, 400 for Y)
+         8        double: physical start coordinate
+         8        double: physical increment (step size)
+         8        double: physical end coordinate
+         4        uint32: mirrored flag (1 = forward+backward, 0 = single)
+         4        uint32: reserved (0)
+
+─── Channel info ───
+         4+N×2    UTF-16LE: channel name (e.g. "Z")
+         4+N×2    UTF-16LE: transfer function name (e.g. "TFF_MultiLinear1D")
+         4+N×2    UTF-16LE: channel unit (e.g. "m")
+         4        uint32: num_xfer_params
+         For each param:
+           4+N×2  UTF-16LE: param name
+           8      double: param value
+
+─── Creation metadata ───
+         4        uint32: field1 (typically 1)
+         4        uint32: field2 (typically 3)
+         4        uint32: Unix timestamp
+         4        uint32: field4 (typically 0)
+         4+N×2    UTF-16LE: comment string
+                  Format: "Sample=<name>;DataSet=<date>;CreationComment=<text>"
+
+─── Data ───
+         4        uint32: data_count (e.g. 320000 = 800 × 400)
+         4        uint32: data_count (repeated)
+  data_count×4    int32[]: raw image data (signed 32-bit LE integers)
+
+─── Footer ───
+         ...      Experiment definition (strings: experiment name, version,
+                  description, paths, software info, original result path)
+```
+
+### Image Data Layout
+
+For a 400-line scan with forward+backward (X axis mirrored):
+
+```
+X axis: 800 points = 400 forward + 400 backward
+Y axis: 400 lines
+
+Data: 800 × 400 = 320,000 int32 values
+
+Row layout (each of 400 rows):
+  [fwd_px0, fwd_px1, ..., fwd_px399, bwd_px0, bwd_px1, ..., bwd_px399]
+
+To extract forward-only image:
+  image = data.reshape(400, 800)[:, :400]
+```
+
+### String Encoding
+
+All strings in FLAT0100 use **length-prefixed UTF-16LE**:
+
+```
+uint32   N          (character count, NOT byte count)
+N × 2    bytes      UTF-16LE encoded string
 ```
 
 ---
 
 ## 6. Transfer Function Scaling
 
-### 6.1 Transfer Function Types
-
-#### TFF_Linear1D
-
-Simple linear scaling:
+### TFF_Linear1D
 
 ```
-scaled = (raw_data - Offset) / Factor
+scaled = (raw - Offset) / Factor
 ```
 
-Parameters:
-- `Offset`: Zero-point offset
-- `Factor`: Scaling factor (ADC counts per unit)
+| Parameter | Typical Value | Description |
+|-----------|--------------|-------------|
+| `Offset` | 0.0 | ADC zero offset |
+| `Factor` | 2.148e8 | ADC counts per unit |
 
-#### TFF_MultiLinear1D
+Used for: voltage channels.
 
-Multi-parameter linear scaling:
+### TFF_MultiLinear1D
 
 ```
-scaled = (Raw_1 - PreOffset) × (raw_data - Offset) / (NeutralFactor × PreFactor)
+scaled = (Raw_1 - PreOffset) × (raw - Offset) / (NeutralFactor × PreFactor)
 ```
 
-Parameters:
-- `Raw_1`: Reference raw value
-- `PreOffset`: Pre-amplifier offset
-- `Offset`: ADC offset
-- `NeutralFactor`: Neutral scaling factor
-- `PreFactor`: Pre-amplifier gain factor
+| Parameter | Typical Value | Description |
+|-----------|--------------|-------------|
+| `NeutralFactor` | 6.449e15 or 2.4e15 | Neutral scaling (ADC + preamp) |
+| `Offset` | 0.0 | ADC zero offset |
+| `PreFactor` | 1.01 or 105.0 | Preamp gain factor |
+| `PreOffset` | -0.01 or -105.0 | Preamp offset |
+| `Raw_1` | 0.0 or 1.0 | Reference (toggles 0↔1 with preamp range) |
 
-### 6.2 Parameter Extraction
+Used for: current channels (I, Aux), height (Z).
 
-Parameters are extracted from the `.mtrx` header file:
+### YSCC Group Numbers
 
-```python
-def _parse_apee_block(self, apee: bytes):
-    """
-    Parse APEE (parameter) block.
+From a real session:
 
-    Structure:
-        - num_groups: int32
-        - For each group:
-            - groupname: length-prefixed UTF-16
-            - num_params: int32
-            - For each parameter:
-                - param_name: length-prefixed UTF-16
-                - unit: length-prefixed UTF-16
-                - value: typed value (LOOB, GNOL, BUOD, GRTS)
-    """
-```
-
-### 6.3 Value Types
-
-| Tag | Type | Size | Description |
-|-----|------|------|-------------|
-| `LOOB` | Boolean | 4 bytes | True/False |
-| `GNOL` | Long | 4 bytes | 32-bit signed integer |
-| `BUOD` | Double | 8 bytes | 64-bit float |
-| `GRTS` | String | Variable | Length-prefixed UTF-16 |
-
-### 6.4 Scaling Implementation
-
-```python
-def _scale_data(self, raw_data: np.ndarray) -> np.ndarray:
-    """Scale raw data using transfer function parameters."""
-
-    for key in self.parameter.get('XFER', {}):
-        xfer = self.parameter['XFER'][key]
-        xfer_params = xfer[2]  # Parameter dictionary
-
-        if xfer[0] == 'TFF_Linear1D':
-            # Linear scaling
-            offset = xfer_params.get('Offset', [0])[0]
-            factor = xfer_params.get('Factor', [1])[0]
-            return (raw_data - offset) / factor
-
-        else:
-            # MultiLinear scaling
-            raw_1 = xfer_params.get('Raw_1', [1])[0]
-            pre_offset = xfer_params.get('PreOffset', [0])[0]
-            offset = xfer_params.get('Offset', [0])[0]
-            neutral_factor = xfer_params.get('NeutralFactor', [1])[0]
-            pre_factor = xfer_params.get('PreFactor', [1])[0]
-
-            return (raw_1 - pre_offset) * (raw_data - offset) / (neutral_factor * pre_factor)
-
-    # Default: assume nA scale
-    return raw_data * 1e-9
-```
+| XFER # | Function | Unit | Channel |
+|--------|----------|------|---------|
+| 7 | TFF_MultiLinear1D | A | Current (scanning) |
+| 11 | TFF_Linear1D | V | Voltage |
+| 20 | TFF_MultiLinear1D | A | Current (spectroscopy) |
 
 ---
 
-## 7. Usage Examples
+## 7. Forward/Backward Sweep Handling
 
-### 7.1 Load Single STS File
+### Data Split
 
 ```python
-from src.data_loaders.omicron_mtrx_loader import OmicronMatrixSTSLoader
+# Raw data: 2N points (N forward + N backward)
+n_total = datasize // 4
+n_half = n_total // 2
 
-loader = OmicronMatrixSTSLoader()
-data = loader.load_single_file("path/to/spectrum.I(V)_mtrx")
+forward = scaled[:n_half]
+backward_raw = scaled[n_half:n_half * 2]
 
-# Access data
-V = data.data['V'].values
-I_forward = data.data['Forward'].values
-I_backward = data.data['Backward'].values
-I_mixed = data.data['Mixed'].values
+# Backward sweep goes V_end → V_start, so reverse to align
+backward = backward_raw[::-1]
 
-# Plot
-import matplotlib.pyplot as plt
-plt.figure(figsize=(10, 6))
-plt.plot(V, I_forward * 1e9, label='Forward', alpha=0.7)
-plt.plot(V, I_backward * 1e9, label='Backward', alpha=0.7)
-plt.plot(V, I_mixed * 1e9, label='Mixed', linewidth=2)
-plt.xlabel('Voltage (V)')
-plt.ylabel('Current (nA)')
-plt.legend()
-plt.title('STS I-V Curve')
-plt.show()
+# Average
+mixed = (forward + backward) / 2
 ```
 
-### 7.2 Load STS Grid from Directory
+### Voltage Array
+
+Generated from header parameters:
 
 ```python
-from src.data_loaders.omicron_mtrx_loader import OmicronMatrixSTSLoader
-from pathlib import Path
-
-loader = OmicronMatrixSTSLoader()
-
-def progress(current, total, message):
-    print(f"[{current}/{total}] {message}")
-
-spectral_data, topography = loader.load_from_directory(
-    Path("path/to/sts_grid/"),
-    progress_callback=progress
+V = np.linspace(
+    params['Spectroscopy.Device_1_Start'],  # e.g. -0.4 V
+    params['Spectroscopy.Device_1_End'],    # e.g. +0.4 V
+    n_half                                   # e.g. 150 points
 )
-
-print(f"Loaded {spectral_data.num_spectra} spectra with {spectral_data.num_points} points each")
-print(f"Grid dimensions: {spectral_data.metadata.dimensions}")
-
-# Access sweep channels
-sweep_channels = spectral_data.metadata.additional_info.get('sweep_channels', {})
-forward_df = sweep_channels['Forward']
-backward_df = sweep_channels['Backward']
-mixed_df = sweep_channels['Mixed']
-```
-
-### 7.3 Load Topography Image
-
-```python
-from src.data_loaders.omicron_flat_loader import OmicronFlatLoader
-
-loader = OmicronFlatLoader()
-topography = loader.load_topography("path/to/image.Z_flat")
-
-# Access data
-z_data = topography.data  # 2D numpy array in meters
-print(f"Image size: {z_data.shape}")
-print(f"Height range: {z_data.min()*1e12:.2f} pm to {z_data.max()*1e12:.2f} pm")
-
-# Plot
-import matplotlib.pyplot as plt
-plt.figure(figsize=(8, 8))
-plt.imshow(z_data * 1e12, cmap='afmhot', origin='lower')
-plt.colorbar(label='Height (pm)')
-plt.title('STM Topography')
-plt.show()
-```
-
-### 7.4 Integration with TRANS-QML Backend
-
-```python
-# In app_backend.py
-
-@Slot(str, str)
-def loadMeasurement(self, file_path: str, data_format: str):
-    """Load measurement file."""
-
-    filepath = Path(file_path)
-
-    if filepath.suffix == '.I(V)_mtrx' or data_format == 'omicron_sts':
-        if self.omicron_sts_loader is None:
-            raise RuntimeError("Omicron STS loader not available")
-
-        # Single file
-        spectral_data = self.omicron_sts_loader.load_single_file(filepath)
-
-    elif filepath.suffix in ['.Z_flat', '.I_flat'] or data_format == 'omicron_flat':
-        if self.omicron_flat_loader is None:
-            raise RuntimeError("Omicron Flat loader not available")
-
-        topography = self.omicron_flat_loader.load_topography(filepath)
-        # Handle topography...
 ```
 
 ---
 
-## 8. Troubleshooting
+## 8. Smart Import
 
-### 8.1 Common Issues
+### How It Works
 
-#### Invalid Magic Number
+1. User picks **one file** from a session (any data file or the `_0001.mtrx` header)
+2. The loader finds the `_0001.mtrx` header in the same directory
+3. Parses all **FERB blocks** to enumerate every data file in the session
+4. Parses **APEE** for voltage range, scan parameters
+5. Parses **YSCC** for transfer functions
+6. Parses **KRAM** for sample name and dataset name
+7. Loads all matching spectroscopy files from disk
+
+### Supported Smart Import Sources
+
+| File Type | How Header is Found |
+|-----------|-------------------|
+| `_0001.mtrx` | Direct — this IS the header |
+| `.I(V)_mtrx` | Strip `--N_M.I(V)_mtrx`, append `_0001.mtrx` |
+| `.Aux2(V)_mtrx` | Same pattern |
+| Any `_mtrx` | Try `*_0001.mtrx` glob in same directory |
+
+### Session File Discovery
+
+From FERB blocks in a real session:
 
 ```
-Error: Invalid magic number in <file>
+  .I(V)_mtrx       146 files    ← voltage spectroscopy
+  .Aux2(V)_mtrx    146 files    ← aux channel 2 vs voltage
+  .I_mtrx           34 files    ← scanning current (image lines)
+  .Z_mtrx           34 files    ← scanning height (image lines)
 ```
 
-**Cause**: File is corrupted or not an Omicron Matrix file.
+---
 
-**Solution**: Verify file integrity, check if it's the correct file type.
+## 9. Data Loaders API
 
-#### No Transfer Function Found
+### OmicronMatrixSTSLoader
+
+**File**: `src/data_loaders/omicron_mtrx_loader.py`
+
+```python
+class OmicronMatrixSTSLoader(BaseDataLoader):
+    """Comprehensive loader for Omicron Matrix STM data."""
+
+    # Load all spectra from a directory
+    def load_from_directory(self, directory, progress_callback=None)
+        -> Tuple[SpectralData, Optional[TopographyData]]
+
+    # Load a single spectroscopy file
+    def load_single_file(self, filepath) -> SpectralData
+
+    # Smart import from one file or header
+    def smart_load_from_file(self, filepath, progress_callback=None)
+        -> Tuple[SpectralData, Optional[TopographyData]]
+```
+
+### MatrixHeaderParser
+
+**File**: `src/data_loaders/omicron_mtrx_loader.py`
+
+```python
+class MatrixHeaderParser:
+    """Parser for _0001.mtrx session header files."""
+
+    def parse(self)                          # Parse the full header
+    def get_session_files() -> Dict[str, List[str]]  # FERB file groups by extension
+    def get_voltage_range() -> Tuple[float, float]   # From Spectroscopy params
+    def get_scan_dimensions() -> Tuple[int, int]     # XYScanner Points × Lines
+    def get_sample_name() -> str                     # From KRAM annotations
+    def get_dataset_name() -> str                    # From KRAM annotations
+
+    # Accessible after parse():
+    .parameters: Dict[str, Any]    # All APEE parameters
+    .xfer: Dict[str, Any]          # All YSCC transfer functions
+    .file_refs: List[str]          # All FERB file names
+    .annotations: Dict[str, str]   # All KRAM key-value pairs
+```
+
+### OmicronFlatLoader
+
+**File**: `src/data_loaders/omicron_flat_loader.py`
+
+```python
+class OmicronFlatLoader(BaseDataLoader):
+    """Structural parser for FLAT0100 format."""
+
+    def load_topography(self, filepath) -> TopographyData
+    def load_single_file(self, filepath) -> SpectralData
+    def load_from_directory(self, directory, progress_callback=None)
+        -> Tuple[SpectralData, Optional[TopographyData]]
+```
+
+---
+
+## 10. Troubleshooting
+
+### No Transfer Function Found
 
 ```
-Warning: No transfer function found, using default scaling
+Warning: No transfer function found, using default scaling (nA)
 ```
 
-**Cause**: Header file not found or couldn't parse transfer function.
+Ensure the `_0001.mtrx` header file is in the same directory as the data files.
+The loader needs it to read YSCC blocks with scaling parameters.
 
-**Solution**:
-1. Ensure the `_0001.mtrx` header file is in the same directory
-2. Check file permissions
-3. Data will still load with default scaling (nA for current, pm for height)
-
-#### Odd Number of Points
+### Odd Number of Points
 
 ```
 Warning: Odd number of points (N), truncating last point
 ```
 
-**Cause**: File has an odd number of data points (should be even for forward+backward).
+The spectroscopy file has a non-even data count, which means the measurement
+may have been interrupted. The loader truncates the extra point.
 
-**Solution**: This is handled automatically by truncating. May indicate incomplete measurement.
+### Smart Import Finds No Files
 
-#### Could Not Load Topography
+If FERB blocks reference files that don't exist on disk, the session data may
+have been partially exported or moved. The loader only imports files it finds.
 
-```
-Warning: Could not load flat topography: <error>
-```
+### FLAT Image Dimensions Wrong
 
-**Cause**: Z_flat file is corrupted or has unexpected format.
+The FLAT loader reads axis `n_points` directly from the header. If the X axis
+is mirrored (forward+backward), the forward image is `n_points / 2` wide.
 
-**Solution**: Check file integrity, try loading standalone with `load_topography()`.
-
-### 8.2 Debugging
-
-Enable debug logging to see detailed parsing information:
+### Debug Logging
 
 ```python
 import logging
@@ -596,58 +559,9 @@ logging.getLogger('src.data_loaders.omicron_mtrx_loader').setLevel(logging.DEBUG
 logging.getLogger('src.data_loaders.omicron_flat_loader').setLevel(logging.DEBUG)
 ```
 
-### 8.3 File Format Variations
-
-Different Omicron Matrix software versions may produce slightly different file formats:
-
-| Version | Magic Number | Notes |
-|---------|--------------|-------|
-| Standard | `ONTMATRX0101` | Main format supported |
-| Flat | `FLAT0100` | For processed images |
-
-If you encounter files that don't load, check the magic number first:
-
-```python
-with open(filepath, 'rb') as f:
-    magic = f.read(12)
-    print(f"Magic number: {magic}")
-```
-
 ---
 
-## Appendix A: Block Tag Reference
-
-### I(V)_mtrx Tags
-
-| Tag | Full Name | Description |
-|-----|-----------|-------------|
-| `ONTMATRX0101` | Magic | File format identifier |
-| `TLKB` | Timestamp Block | Measurement timestamp |
-| `CSED` | Description | Text metadata |
-| `ATAD` | Data | Raw measurement data |
-
-### Header (.mtrx) Tags
-
-| Tag | Full Name | Description |
-|-----|-----------|-------------|
-| `APEE` | Parameters | Measurement parameters |
-| `YSCC` | Channel Config | Transfer function and channel settings |
-| `FERB` | File Reference | Links to data files |
-| `REFX` | Transfer Function | Transfer function definition |
-
----
-
-## Appendix B: Unit Conversions
-
-| Measurement | Raw Unit | Physical Unit | Typical Range |
-|-------------|----------|---------------|---------------|
-| Current (I) | ADC counts | Amperes (A) | 1e-12 to 1e-9 |
-| Voltage (V) | Volts | Volts (V) | -3 to +3 |
-| Height (Z) | ADC counts | Meters (m) | 1e-12 to 1e-9 |
-| Distance | pm | nm | 0.1 to 100 |
-
----
-
-*Omicron Matrix File Handling Documentation*
-*Based on work by Marek (June 2022)*
-*Updated for TRANS-QML: December 2025*
+*Omicron Matrix File Format Specification*
+*Reverse-engineered from MATRIX V3.3.2 output (Scienta Omicron)*
+*Based on original work by Marek (June 2022)*
+*Updated: April 2026*

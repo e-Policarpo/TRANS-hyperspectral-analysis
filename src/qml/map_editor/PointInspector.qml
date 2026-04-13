@@ -42,6 +42,7 @@ Rectangle {
     property color textLight: mainWin ? mainWin.textLight : "#ffffff"
     property color textMuted: mainWin ? mainWin.textMuted : "#B0A0B8"
     property color borderColor: mainWin ? mainWin.borderColor : "#7B3F76"
+    property string monoFont: mainWin ? mainWin.fontFamilyMono : (Qt.platform.os === "osx" ? "Menlo" : "Consolas")
 
     color: bgMedium
     height: 120
@@ -105,7 +106,7 @@ Rectangle {
                 Label {
                     text: hasPoint ? "(" + currentRow + ", " + currentCol + ")" : "--"
                     font.pixelSize: 11
-                    font.family: "monospace"
+                    font.family: monoFont
                     color: hasPoint ? textLight : textMuted
                 }
 
@@ -118,7 +119,7 @@ Rectangle {
                 Label {
                     text: hasPoint ? currentValue.toFixed(6) : "--"
                     font.pixelSize: 11
-                    font.family: "monospace"
+                    font.family: monoFont
                     color: hasPoint ? accentBlue : textMuted
                 }
 

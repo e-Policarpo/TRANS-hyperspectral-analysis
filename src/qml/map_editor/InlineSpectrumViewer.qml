@@ -148,4 +148,9 @@ Item {
         blockCount = 0
         spectrumGraph.clearCurves()
     }
+
+    // Cleanup matplotlib resources when destroyed
+    Component.onDestruction: {
+        if (spectrumGraph) spectrumGraph.cleanup()
+    }
 }

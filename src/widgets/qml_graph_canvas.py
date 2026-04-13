@@ -125,10 +125,14 @@ class QMLGraphCanvas(QQuickPaintedItem):
         self._cursor_y: Optional[float] = None
         self._show_cursor: bool = False
 
-        # Selection state
+        # Selection / drag-zoom state
         self._is_selecting: bool = False
         self._selection_start: Optional[Tuple[float, float]] = None
         self._selection_end: Optional[Tuple[float, float]] = None
+
+        # Pan state (right-drag, tracked in pixel space for log-scale correctness)
+        self._is_panning: bool = False
+        self._pan_last_px: Optional[Tuple[float, float]] = None
 
         # Zoom state
         self._zoom_level: float = 1.0
@@ -409,7 +413,8 @@ class QMLGraphCanvas(QQuickPaintedItem):
             curve.alpha = float(value)
 
         self._needs_redraw = True
-        self.curvesChanged.emit()
+        # Don't emit curvesChanged for property updates — only for add/remove.
+        # This prevents the ListView from being fully rebuilt on every checkbox toggle.
         self.update()
 
     @Slot(int)
@@ -570,23 +575,28 @@ class QMLGraphCanvas(QQuickPaintedItem):
 
     @Slot(float)
     def zoomIn(self, factor: float = 1.2):
-        """Zoom in by factor"""
-        self._zoom_level *= factor
-        self._auto_scale = False
+        """Zoom in by factor, centered on viewport (works with log scale)"""
+        d = self._data_bounds
+        if not d:
+            return
 
-        # Calculate new ranges
-        x_center = (self._x_min + self._x_max) / 2
-        y_center = (self._y_min + self._y_max) / 2
-        x_range = (self._x_max - self._x_min) / factor
-        y_range = (self._y_max - self._y_min) / factor
+        ax_w = d['ax_right'] - d['ax_left']
+        ax_h = d['ax_bottom'] - d['ax_top']
+        if ax_w <= 0 or ax_h <= 0:
+            return
 
-        self._x_min = x_center - x_range / 2
-        self._x_max = x_center + x_range / 2
-        self._y_min = y_center - y_range / 2
-        self._y_max = y_center + y_range / 2
+        shrink = 1.0 / factor
+        cx = d['ax_left'] + ax_w / 2
+        cy = d['ax_top'] + ax_h / 2
 
-        self._needs_redraw = True
-        self.update()
+        new_left = cx - ax_w * shrink / 2
+        new_right = cx + ax_w * shrink / 2
+        new_top = cy - ax_h * shrink / 2
+        new_bottom = cy + ax_h * shrink / 2
+
+        xmin, ymax = self._pixelToData(new_left, new_top)
+        xmax, ymin = self._pixelToData(new_right, new_bottom)
+        self.setViewRange(xmin, xmax, ymin, ymax)
 
     @Slot(float)
     def zoomOut(self, factor: float = 1.2):
@@ -641,6 +651,9 @@ class QMLGraphCanvas(QQuickPaintedItem):
         self.axes.set_yscale(self._y_scale)
 
         # Plot all visible curves
+        # Determine max display points based on widget width (no need for more than 2× pixel count)
+        max_points = max(2000, w * 2)
+
         for cid, curve in self._curves.items():
             if not curve.visible:
                 continue
@@ -651,7 +664,6 @@ class QMLGraphCanvas(QQuickPaintedItem):
                 'linestyle': curve.linestyle,
                 'alpha': curve.alpha,
                 'label': curve.label,
-                'picker': 5  # Enable picking
             }
 
             if curve.marker:
@@ -662,7 +674,14 @@ class QMLGraphCanvas(QQuickPaintedItem):
                 line_kwargs['linewidth'] = curve.linewidth + 1
                 line_kwargs['alpha'] = 1.0
 
-            self.axes.plot(curve.x, curve.y, **line_kwargs)
+            # Downsample large curves for rendering performance
+            x_plot, y_plot = curve.x, curve.y
+            if len(x_plot) > max_points:
+                step = len(x_plot) // max_points
+                x_plot = x_plot[::step]
+                y_plot = y_plot[::step]
+
+            self.axes.plot(x_plot, y_plot, **line_kwargs)
 
         # Grid
         if self._show_grid:
@@ -764,70 +783,50 @@ class QMLGraphCanvas(QQuickPaintedItem):
             'y_max': ylim[1]
         }
 
+    def _dataToPixel(self, x: float, y: float) -> Tuple[float, float]:
+        """Convert data coordinates to pixel coordinates (handles log scale)"""
+        try:
+            px, py = self.axes.transData.transform((x, y))
+            return float(px), float(self.canvas.get_width_height()[1] - py)
+        except Exception:
+            return 0.0, 0.0
+
     def _pixelToData(self, px: float, py: float) -> Tuple[float, float]:
-        """Convert pixel to data coordinates"""
-        if self._data_bounds is None:
-            return 0, 0
-
-        d = self._data_bounds
-        ax_width = d['ax_right'] - d['ax_left']
-        ax_height = d['ax_bottom'] - d['ax_top']
-
-        if ax_width == 0 or ax_height == 0:
-            return 0, 0
-
-        norm_x = (px - d['ax_left']) / ax_width
-        norm_y = (py - d['ax_top']) / ax_height
-
-        x = d['x_min'] + norm_x * (d['x_max'] - d['x_min'])
-        y = d['y_max'] - norm_y * (d['y_max'] - d['y_min'])
-
-        return x, y
+        """Convert pixel to data coordinates (handles log scale)"""
+        try:
+            fig_h = self.canvas.get_width_height()[1]
+            x, y = self.axes.transData.inverted().transform((px, fig_h - py))
+            return float(x), float(y)
+        except Exception:
+            return 0.0, 0.0
 
     def _drawOverlays(self, painter: QPainter):
-        """Draw interactive overlays"""
+        """Draw interactive overlays (uses matplotlib transforms — correct for log scale)"""
         painter.setRenderHint(QPainter.Antialiasing, True)
 
+        if not self._data_bounds:
+            return
+
+        d = self._data_bounds
+
         # Draw cursor crosshairs
-        if self._show_cursor and self._cursor_x is not None and self._data_bounds:
-            d = self._data_bounds
-            ax_width = d['ax_right'] - d['ax_left']
-            ax_height = d['ax_bottom'] - d['ax_top']
+        if self._show_cursor and self._cursor_x is not None:
+            cpx, cpy = self._dataToPixel(self._cursor_x, self._cursor_y or 0)
 
-            # X line
-            norm_x = (self._cursor_x - d['x_min']) / (d['x_max'] - d['x_min'])
-            px = d['ax_left'] + norm_x * ax_width
-
-            if d['ax_left'] <= px <= d['ax_right']:
+            if d['ax_left'] <= cpx <= d['ax_right']:
                 pen = QPen(QColor(255, 255, 100, 100))
                 pen.setWidth(1)
                 pen.setStyle(Qt.DashLine)
                 painter.setPen(pen)
-                painter.drawLine(int(px), int(d['ax_top']), int(px), int(d['ax_bottom']))
+                painter.drawLine(int(cpx), int(d['ax_top']), int(cpx), int(d['ax_bottom']))
 
-            # Y line
-            if self._cursor_y is not None:
-                norm_y = (d['y_max'] - self._cursor_y) / (d['y_max'] - d['y_min'])
-                py = d['ax_top'] + norm_y * ax_height
-
-                if d['ax_top'] <= py <= d['ax_bottom']:
-                    painter.drawLine(int(d['ax_left']), int(py), int(d['ax_right']), int(py))
+            if self._cursor_y is not None and d['ax_top'] <= cpy <= d['ax_bottom']:
+                painter.drawLine(int(d['ax_left']), int(cpy), int(d['ax_right']), int(cpy))
 
         # Draw selection rectangle
-        if self._selection_start is not None and self._selection_end is not None and self._data_bounds:
-            d = self._data_bounds
-            ax_width = d['ax_right'] - d['ax_left']
-            ax_height = d['ax_bottom'] - d['ax_top']
-
-            x1_norm = (self._selection_start[0] - d['x_min']) / (d['x_max'] - d['x_min'])
-            x2_norm = (self._selection_end[0] - d['x_min']) / (d['x_max'] - d['x_min'])
-            y1_norm = (d['y_max'] - self._selection_start[1]) / (d['y_max'] - d['y_min'])
-            y2_norm = (d['y_max'] - self._selection_end[1]) / (d['y_max'] - d['y_min'])
-
-            px1 = d['ax_left'] + x1_norm * ax_width
-            px2 = d['ax_left'] + x2_norm * ax_width
-            py1 = d['ax_top'] + y1_norm * ax_height
-            py2 = d['ax_top'] + y2_norm * ax_height
+        if self._selection_start is not None and self._selection_end is not None:
+            px1, py1 = self._dataToPixel(self._selection_start[0], self._selection_start[1])
+            px2, py2 = self._dataToPixel(self._selection_end[0], self._selection_end[1])
 
             rect = QRectF(min(px1, px2), min(py1, py2),
                          abs(px2 - px1), abs(py2 - py1))
@@ -843,7 +842,7 @@ class QMLGraphCanvas(QQuickPaintedItem):
     # =========================================================================
 
     def mousePressEvent(self, event):
-        """Handle mouse press"""
+        """Handle mouse press — left: select/zoom-rect, right: pan"""
         pos = event.position()
         x, y = self._pixelToData(pos.x(), pos.y())
 
@@ -859,20 +858,18 @@ class QMLGraphCanvas(QQuickPaintedItem):
                 self._needs_redraw = True
                 self.update()
 
-            # Start selection
+            # Start drag-zoom selection
             self._is_selecting = True
             self._selection_start = (x, y)
             self._selection_end = (x, y)
 
         elif event.button() == Qt.RightButton:
-            # Deselect
-            self._selected_curve_id = None
-            self.curveSelected.emit(-1)
-            self._needs_redraw = True
-            self.update()
+            # Start panning (track in pixel space for log-scale correctness)
+            self._is_panning = True
+            self._pan_last_px = (pos.x(), pos.y())
 
     def mouseMoveEvent(self, event):
-        """Handle mouse move"""
+        """Handle mouse move — drag-zoom rect or pan"""
         pos = event.position()
         x, y = self._pixelToData(pos.x(), pos.y())
 
@@ -884,42 +881,96 @@ class QMLGraphCanvas(QQuickPaintedItem):
         if self._is_selecting:
             self._selection_end = (x, y)
             self.update()
+        elif self._is_panning and self._pan_last_px is not None:
+            # Pan in pixel space — works correctly for both linear and log scale
+            dx_px = pos.x() - self._pan_last_px[0]
+            dy_px = pos.y() - self._pan_last_px[1]
+
+            d = self._data_bounds
+            if d:
+                ax_w = d['ax_right'] - d['ax_left']
+                ax_h = d['ax_bottom'] - d['ax_top']
+                if ax_w > 0 and ax_h > 0:
+                    # Convert viewport corners shifted by pixel delta back to data coords
+                    new_xmin, _ = self._pixelToData(d['ax_left'] - dx_px, d['ax_top'])
+                    new_xmax, _ = self._pixelToData(d['ax_right'] - dx_px, d['ax_top'])
+                    _, new_ymin = self._pixelToData(d['ax_left'], d['ax_bottom'] - dy_px)
+                    _, new_ymax = self._pixelToData(d['ax_left'], d['ax_top'] - dy_px)
+
+                    self.setViewRange(new_xmin, new_xmax, new_ymin, new_ymax)
+                    self._pan_last_px = (pos.x(), pos.y())
 
     def mouseReleaseEvent(self, event):
-        """Handle mouse release"""
-        if self._is_selecting and self._selection_start and self._selection_end:
-            x1, y1 = self._selection_start
-            x2, y2 = self._selection_end
+        """Handle mouse release — drag-zoom to selected rectangle"""
+        if event.button() == Qt.LeftButton and self._is_selecting:
+            if self._selection_start and self._selection_end:
+                x1, y1 = self._selection_start
+                x2, y2 = self._selection_end
 
-            # Only emit if significant selection
-            if abs(x2 - x1) > 0.001 or abs(y2 - y1) > 0.001:
-                self.rangeSelected.emit(
-                    min(x1, x2), min(y1, y2),
-                    max(x1, x2), max(y1, y2)
-                )
+                # Check pixel distance to distinguish click from drag
+                px1, py1 = self._dataToPixel(x1, y1)
+                px2, py2 = self._dataToPixel(x2, y2)
+                if abs(px2 - px1) > 5 and abs(py2 - py1) > 5:
+                    xlo, xhi = min(x1, x2), max(x1, x2)
+                    ylo, yhi = min(y1, y2), max(y1, y2)
+                    self.setViewRange(xlo, xhi, ylo, yhi)
+                    self.rangeSelected.emit(xlo, ylo, xhi, yhi)
 
-        self._is_selecting = False
-        self._selection_start = None
-        self._selection_end = None
-        self.update()
+            self._is_selecting = False
+            self._selection_start = None
+            self._selection_end = None
+            self.update()
+
+        elif event.button() == Qt.RightButton:
+            self._is_panning = False
+            self._pan_last_px = None
+
+    def mouseDoubleClickEvent(self, event):
+        """Double-click to reset view"""
+        if event.button() == Qt.LeftButton:
+            self.resetView()
 
     def wheelEvent(self, event):
-        """Handle scroll wheel for zoom"""
+        """Handle scroll wheel for zoom centered on cursor (works with log scale)"""
+        d = self._data_bounds
+        if not d:
+            return
+
+        pos = event.position()
         delta = event.angleDelta().y()
-        if delta > 0:
-            self.zoomIn(1.1)
-        else:
-            self.zoomOut(1.1)
+        shrink = 0.85 if delta > 0 else 1.0 / 0.85  # fraction of current range to keep
+
+        ax_w = d['ax_right'] - d['ax_left']
+        ax_h = d['ax_bottom'] - d['ax_top']
+        if ax_w <= 0 or ax_h <= 0:
+            return
+
+        # Cursor fraction within axes area
+        fx = (pos.x() - d['ax_left']) / ax_w
+        fy = (pos.y() - d['ax_top']) / ax_h
+        fx = max(0.0, min(1.0, fx))
+        fy = max(0.0, min(1.0, fy))
+
+        # New pixel bounds: shrink/expand around cursor pixel
+        new_left = pos.x() - fx * ax_w * shrink
+        new_right = pos.x() + (1 - fx) * ax_w * shrink
+        new_top = pos.y() - fy * ax_h * shrink
+        new_bottom = pos.y() + (1 - fy) * ax_h * shrink
+
+        # Convert back to data coords (handles log scale via matplotlib transform)
+        xmin, ymax = self._pixelToData(new_left, new_top)
+        xmax, ymin = self._pixelToData(new_right, new_bottom)
+
+        self.setViewRange(xmin, xmax, ymin, ymax)
 
     def hoverMoveEvent(self, event):
-        """Handle hover"""
+        """Handle hover — emit cursor position but don't repaint (avoids excessive redraws)"""
         pos = event.position()
         x, y = self._pixelToData(pos.x(), pos.y())
         self._cursor_x = x
         self._cursor_y = y
         self._show_cursor = True
         self.cursorMoved.emit(x, y)
-        self.update()
 
     def hoverLeaveEvent(self, event):
         """Handle hover leave"""
@@ -927,31 +978,40 @@ class QMLGraphCanvas(QQuickPaintedItem):
         self.update()
 
     def _findNearestCurve(self, x: float, y: float) -> Optional[int]:
-        """Find curve nearest to point, within threshold"""
+        """Find curve nearest to click point in pixel space (works with log scale)"""
         if not self._curves or not self._data_bounds:
             return None
 
-        threshold = 0.02  # 2% of range
-        d = self._data_bounds
-        x_thresh = (d['x_max'] - d['x_min']) * threshold
-        y_thresh = (d['y_max'] - d['y_min']) * threshold
+        click_px, click_py = self._dataToPixel(x, y)
+        threshold_px = 15.0  # pixels
 
-        best_dist = float('inf')
+        best_dist = threshold_px
         best_id = None
 
         for cid, curve in self._curves.items():
-            if not curve.visible:
+            if not curve.visible or len(curve.x) == 0:
                 continue
 
-            # Find minimum distance to this curve
-            for i in range(len(curve.x)):
-                dx = abs(curve.x[i] - x) / x_thresh if x_thresh > 0 else 0
-                dy = abs(curve.y[i] - y) / y_thresh if y_thresh > 0 else 0
-                dist = np.sqrt(dx**2 + dy**2)
+            # Downsample for distance check if curve is huge
+            cx, cy = curve.x, curve.y
+            if len(cx) > 500:
+                step = len(cx) // 500
+                cx, cy = cx[::step], cy[::step]
 
-                if dist < best_dist and dist < 2.0:  # Within 2x threshold
-                    best_dist = dist
-                    best_id = cid
+            # Convert curve points to pixel space
+            try:
+                pts = self.axes.transData.transform(np.column_stack([cx, cy]))
+                fig_h = self.canvas.get_width_height()[1]
+                pts[:, 1] = fig_h - pts[:, 1]
+            except Exception:
+                continue
+
+            dists = np.sqrt((pts[:, 0] - click_px)**2 + (pts[:, 1] - click_py)**2)
+            min_dist = float(np.min(dists))
+
+            if min_dist < best_dist:
+                best_dist = min_dist
+                best_id = cid
 
         return best_id
 

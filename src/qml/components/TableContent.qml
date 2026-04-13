@@ -43,6 +43,7 @@ Item {
     property color accentPink: mainWin ? mainWin.accentPink : "#F5A9B8"
     property color accentBlue: mainWin ? mainWin.accentBlue : "#5BCEFA"
     property color borderColor: mainWin ? mainWin.borderColor : "#9B4F96"
+    property string monoFont: mainWin ? mainWin.fontFamilyMono : (Qt.platform.os === "osx" ? "Menlo" : "Consolas")
 
     // Data storage - simple 2D array
     property var tableData: []
@@ -712,7 +713,7 @@ Item {
                 Layout.fillWidth: true
                 text: "i"
                 color: textLight
-                font.family: "monospace"
+                font.family: monoFont
                 background: Rectangle { color: bgDark; border.color: borderColor; radius: 3 }
             }
 

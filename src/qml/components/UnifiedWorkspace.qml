@@ -136,7 +136,7 @@ Rectangle {
     property int fontSizeMedium: mainWin ? mainWin.fontSizeMedium : 12
     property int fontSizeLarge: mainWin ? mainWin.fontSizeLarge : 14
     property int fontSizeHeader: mainWin ? mainWin.fontSizeHeader : 16
-    property string fontFamily: mainWin ? mainWin.fontFamily : "system-ui"
+    property string fontFamily: mainWin ? mainWin.fontFamily : (Qt.platform.os === "osx" ? ".AppleSystemUIFont" : "Segoe UI")
 
     // Signals
     signal modeChanged(string newMode)
@@ -699,8 +699,10 @@ Rectangle {
     }
 
     Component.onCompleted: {
+        var t0 = Date.now()
         console.log("UnifiedWorkspace created, mode:", currentMode)
         applyModePreset(currentMode)
         configurePanelsForMode(currentMode)
+        console.log("[TIMING] UnifiedWorkspace onCompleted: " + (Date.now() - t0) + "ms")
     }
 }

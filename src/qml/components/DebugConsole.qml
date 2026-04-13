@@ -32,6 +32,7 @@ Rectangle {
     property color textMuted: mainWin ? mainWin.textMuted : "#B0A0B8"
     property color accentPink: mainWin ? mainWin.accentPink : "#F5A9B8"
     property color borderColor: mainWin ? mainWin.borderColor : "#7B3F76"
+    property string monoFont: mainWin ? mainWin.fontFamilyMono : (Qt.platform.os === "osx" ? "Menlo" : "Consolas")
     property color accentGreen: "#b3ffb3"   // Keep log-specific colors
     property color accentRed: "#ffb3b3"
     property color accentYellow: "#ffffb3"
@@ -123,7 +124,7 @@ Rectangle {
                 readOnly: true
                 wrapMode: TextArea.Wrap
                 selectByMouse: true
-                font.family: "Consolas, Monaco, Courier New, monospace"
+                font.family: monoFont
                 font.pixelSize: 11
                 color: textLight
 
@@ -221,13 +222,6 @@ Rectangle {
             debugConsoleRoot.logMessage("Project saved: " + projectPath, "success")
         }
 
-        function onTableCreated(tableId, tableTitle) {
-            debugConsoleRoot.logMessage("Created: " + tableTitle, "success")
-        }
-
-        function onGraphCreated(graphId, graphTitle) {
-            debugConsoleRoot.logMessage("Created: " + graphTitle, "success")
-        }
 
         function onWindowClosed(windowType, windowId) {
             debugConsoleRoot.logMessage("Closed " + windowType + ": " + windowId, "info")

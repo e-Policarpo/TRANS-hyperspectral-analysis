@@ -40,6 +40,7 @@ Rectangle {
     property color textLight: mainWin ? mainWin.textLight : "#ffffff"
     property color textMuted: mainWin ? mainWin.textMuted : "#B0A0B8"
     property color borderColor: mainWin ? mainWin.borderColor : "#7B3F76"
+    property string monoFont: mainWin ? mainWin.fontFamilyMono : (Qt.platform.os === "osx" ? "Menlo" : "Consolas")
     property color profileColor: "#ff6b6b"  // Keep profile-specific color
 
     color: bgMedium
@@ -74,7 +75,7 @@ Rectangle {
                           "(" + startPoint.x + ", " + startPoint.y + ") → (" + endPoint.x + ", " + endPoint.y + ")" :
                           "Draw profile on map"
                     font.pixelSize: 10
-                    font.family: "monospace"
+                    font.family: monoFont
                     color: textMuted
                     visible: startPoint.x >= 0 || !hasProfile
                 }
@@ -193,7 +194,7 @@ Rectangle {
                     text: "Min: " + (profileData && profileData.stats ?
                           profileData.stats.min.toFixed(3) : "--")
                     font.pixelSize: 10
-                    font.family: "monospace"
+                    font.family: monoFont
                     color: textMuted
                 }
 
@@ -201,7 +202,7 @@ Rectangle {
                     text: "Max: " + (profileData && profileData.stats ?
                           profileData.stats.max.toFixed(3) : "--")
                     font.pixelSize: 10
-                    font.family: "monospace"
+                    font.family: monoFont
                     color: textMuted
                 }
 
@@ -209,7 +210,7 @@ Rectangle {
                     text: "Mean: " + (profileData && profileData.stats ?
                           profileData.stats.mean.toFixed(3) : "--")
                     font.pixelSize: 10
-                    font.family: "monospace"
+                    font.family: monoFont
                     color: textMuted
                 }
 
@@ -217,7 +218,7 @@ Rectangle {
                     text: "Length: " + (profileData && profileData.distance ?
                           profileData.distance.length + " pts" : "--")
                     font.pixelSize: 10
-                    font.family: "monospace"
+                    font.family: monoFont
                     color: textMuted
                 }
 
@@ -253,5 +254,10 @@ Rectangle {
         startPoint = Qt.point(-1, -1)
         endPoint = Qt.point(-1, -1)
         profileCanvas.clearData()
+    }
+
+    // Cleanup matplotlib resources when destroyed to prevent memory leaks
+    Component.onDestruction: {
+        if (profileCanvas) profileCanvas.cleanup()
     }
 }

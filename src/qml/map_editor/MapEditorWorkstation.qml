@@ -52,6 +52,7 @@ Item {
     property color textLight: mainWin ? mainWin.textLight : "#ffffff"
     property color textMuted: mainWin ? mainWin.textMuted : "#B0A0B8"
     property color borderColor: mainWin ? mainWin.borderColor : "#7B3F76"
+    property string monoFont: mainWin ? mainWin.fontFamilyMono : (Qt.platform.os === "osx" ? "Menlo" : "Consolas")
 
     // Backend instance
     MapEditorBackend {
@@ -868,7 +869,7 @@ Item {
                         id: coordLabel
                         text: "(-, -) = -"
                         font.pixelSize: 11
-                        font.family: "monospace"
+                        font.family: monoFont
                         color: textMuted
                     }
 

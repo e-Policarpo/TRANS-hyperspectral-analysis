@@ -36,7 +36,7 @@ PRESET_COLOR_SCHEMES = {
             "error": "#D60270"
         },
         "font": {
-            "family": "system-ui",
+            "family": ".AppleSystemUIFont",
             "sizeSmall": 10,
             "sizeMedium": 12,
             "sizeLarge": 14,
@@ -65,7 +65,7 @@ PRESET_COLOR_SCHEMES = {
             "error": "#FF1493"
         },
         "font": {
-            "family": "system-ui",
+            "family": ".AppleSystemUIFont",
             "sizeSmall": 10,
             "sizeMedium": 12,
             "sizeLarge": 14,
@@ -94,7 +94,7 @@ PRESET_COLOR_SCHEMES = {
             "error": "#D62900"
         },
         "font": {
-            "family": "system-ui",
+            "family": ".AppleSystemUIFont",
             "sizeSmall": 10,
             "sizeMedium": 12,
             "sizeLarge": 14,
@@ -123,7 +123,7 @@ PRESET_COLOR_SCHEMES = {
             "error": "#FF0018"
         },
         "font": {
-            "family": "system-ui",
+            "family": ".AppleSystemUIFont",
             "sizeSmall": 10,
             "sizeMedium": 12,
             "sizeLarge": 14,
@@ -152,7 +152,7 @@ PRESET_COLOR_SCHEMES = {
             "error": "#FF6B6B"
         },
         "font": {
-            "family": "system-ui",
+            "family": ".AppleSystemUIFont",
             "sizeSmall": 10,
             "sizeMedium": 12,
             "sizeLarge": 14,
@@ -181,7 +181,7 @@ PRESET_COLOR_SCHEMES = {
             "error": "#FF1B8D"
         },
         "font": {
-            "family": "system-ui",
+            "family": ".AppleSystemUIFont",
             "sizeSmall": 10,
             "sizeMedium": 12,
             "sizeLarge": 14,
@@ -210,7 +210,7 @@ PRESET_COLOR_SCHEMES = {
             "error": "#FF6B6B"
         },
         "font": {
-            "family": "system-ui",
+            "family": ".AppleSystemUIFont",
             "sizeSmall": 10,
             "sizeMedium": 12,
             "sizeLarge": 14,
@@ -239,7 +239,7 @@ PRESET_COLOR_SCHEMES = {
             "error": "#FF6B6B"
         },
         "font": {
-            "family": "system-ui",
+            "family": ".AppleSystemUIFont",
             "sizeSmall": 10,
             "sizeMedium": 12,
             "sizeLarge": 14,
@@ -268,7 +268,7 @@ PRESET_COLOR_SCHEMES = {
             "error": "#FF6B6B"
         },
         "font": {
-            "family": "system-ui",
+            "family": ".AppleSystemUIFont",
             "sizeSmall": 10,
             "sizeMedium": 12,
             "sizeLarge": 14,
@@ -297,7 +297,7 @@ PRESET_COLOR_SCHEMES = {
             "error": "#FF6B6B"
         },
         "font": {
-            "family": "system-ui",
+            "family": ".AppleSystemUIFont",
             "sizeSmall": 10,
             "sizeMedium": 12,
             "sizeLarge": 14,
@@ -326,7 +326,7 @@ PRESET_COLOR_SCHEMES = {
             "error": "#FF0018"
         },
         "font": {
-            "family": "system-ui",
+            "family": ".AppleSystemUIFont",
             "sizeSmall": 10,
             "sizeMedium": 12,
             "sizeLarge": 14,
@@ -355,7 +355,7 @@ PRESET_COLOR_SCHEMES = {
             "error": "#FF0000"
         },
         "font": {
-            "family": "system-ui",
+            "family": ".AppleSystemUIFont",
             "sizeSmall": 10,
             "sizeMedium": 12,
             "sizeLarge": 14,
@@ -384,7 +384,7 @@ PRESET_COLOR_SCHEMES = {
             "error": "#FF6666"
         },
         "font": {
-            "family": "system-ui",
+            "family": ".AppleSystemUIFont",
             "sizeSmall": 10,
             "sizeMedium": 12,
             "sizeLarge": 14,
@@ -413,7 +413,7 @@ PRESET_COLOR_SCHEMES = {
             "error": "#8a7070"              # Muted error (grey-red tint)
         },
         "font": {
-            "family": "system-ui",
+            "family": ".AppleSystemUIFont",
             "sizeSmall": 10,
             "sizeMedium": 12,
             "sizeLarge": 14,
@@ -444,7 +444,7 @@ PRESET_COLOR_SCHEMES = {
             "error": "#C41E3A"
         },
         "font": {
-            "family": "system-ui",
+            "family": ".AppleSystemUIFont",
             "sizeSmall": 10,
             "sizeMedium": 12,
             "sizeLarge": 14,
@@ -473,7 +473,7 @@ PRESET_COLOR_SCHEMES = {
             "error": "#CC1144"
         },
         "font": {
-            "family": "system-ui",
+            "family": ".AppleSystemUIFont",
             "sizeSmall": 10,
             "sizeMedium": 12,
             "sizeLarge": 14,
@@ -502,7 +502,7 @@ PRESET_COLOR_SCHEMES = {
             "error": "#B02000"
         },
         "font": {
-            "family": "system-ui",
+            "family": ".AppleSystemUIFont",
             "sizeSmall": 10,
             "sizeMedium": 12,
             "sizeLarge": 14,
@@ -531,7 +531,7 @@ PRESET_COLOR_SCHEMES = {
             "error": "#D04040"
         },
         "font": {
-            "family": "system-ui",
+            "family": ".AppleSystemUIFont",
             "sizeSmall": 10,
             "sizeMedium": 12,
             "sizeLarge": 14,
@@ -560,7 +560,7 @@ PRESET_COLOR_SCHEMES = {
             "error": "#D01070"
         },
         "font": {
-            "family": "system-ui",
+            "family": ".AppleSystemUIFont",
             "sizeSmall": 10,
             "sizeMedium": 12,
             "sizeLarge": 14,
@@ -589,7 +589,7 @@ PRESET_COLOR_SCHEMES = {
             "error": "#CC3333"
         },
         "font": {
-            "family": "system-ui",
+            "family": ".AppleSystemUIFont",
             "sizeSmall": 10,
             "sizeMedium": 12,
             "sizeLarge": 14,
@@ -618,7 +618,7 @@ PRESET_COLOR_SCHEMES = {
             "error": "#706a6a"               # Muted error (grey-ish)
         },
         "font": {
-            "family": "system-ui",
+            "family": ".AppleSystemUIFont",
             "sizeSmall": 10,
             "sizeMedium": 12,
             "sizeLarge": 14,
@@ -647,7 +647,7 @@ PRESET_COLOR_SCHEMES = {
             "error": "#CC0015"
         },
         "font": {
-            "family": "system-ui",
+            "family": ".AppleSystemUIFont",
             "sizeSmall": 10,
             "sizeMedium": 12,
             "sizeLarge": 14,

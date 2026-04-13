@@ -25,6 +25,7 @@ Dialog {
 
     property var selectedItems: []  // Can contain file paths or folder path
     property bool isFolderMode: false
+    property bool isSmartMode: false
 
     // Theme colors - reactive bindings to main window
     property var mainWin: ApplicationWindow.window
@@ -91,6 +92,7 @@ Dialog {
                 onCheckedChanged: {
                     if (checked) {
                         dialog.isFolderMode = false
+                        dialog.isSmartMode = false
                         selectedItems = []
                         updateSelectionInfo()
                     }
@@ -130,6 +132,47 @@ Dialog {
                 onCheckedChanged: {
                     if (checked) {
                         dialog.isFolderMode = true
+                        dialog.isSmartMode = false
+                        selectedItems = []
+                        updateSelectionInfo()
+                    }
+                }
+            }
+
+            RadioButton {
+                id: smartMode
+                text: "Smart Import"
+
+                contentItem: Text {
+                    text: parent.text
+                    font.pixelSize: 13
+                    color: textLight
+                    leftPadding: parent.indicator.width + 8
+                    verticalAlignment: Text.AlignVCenter
+                }
+
+                indicator: Rectangle {
+                    width: 18
+                    height: 18
+                    radius: 9
+                    border.color: textLight
+                    border.width: 2
+                    color: "transparent"
+
+                    Rectangle {
+                        anchors.centerIn: parent
+                        width: 10
+                        height: 10
+                        radius: 5
+                        color: accentPink
+                        visible: parent.parent.checked
+                    }
+                }
+
+                onCheckedChanged: {
+                    if (checked) {
+                        dialog.isFolderMode = false
+                        dialog.isSmartMode = true
                         selectedItems = []
                         updateSelectionInfo()
                     }
@@ -138,7 +181,9 @@ Dialog {
         }
 
         Label {
-            text: dialog.isFolderMode ?
+            text: dialog.isSmartMode ?
+                  "Pick one file from the session — the loader auto-discovers all siblings.\nSupports: .nid (Nanosurf), .mtrx / .I(V)_mtrx (Omicron Matrix)" :
+                  dialog.isFolderMode ?
                   "Click 'Browse' to select a folder containing measurement files:" :
                   "Click 'Browse' to select one or more measurement files:"
             font.pixelSize: 12
@@ -155,6 +200,8 @@ Dialog {
             onClicked: {
                 if (dialog.isFolderMode) {
                     folderDialog.open()
+                } else if (dialog.isSmartMode) {
+                    smartFileDialog.open()
                 } else {
                     fileDialog.open()
                 }
@@ -227,7 +274,7 @@ Dialog {
         }
 
         Label {
-            text: "Supported formats: .nid (Nanosurf), .txt (NeaSpec), .I(V)_mtrx .Z_flat (Omicron Matrix)"
+            text: "Supported formats: .nid (Nanosurf), .txt (NeaSpec), .I(V)_mtrx .Aux2(V)_mtrx .Z_flat .I_flat (Omicron Matrix)"
             font.pixelSize: 10
             color: textMuted
             Layout.fillWidth: true
@@ -271,6 +318,26 @@ Dialog {
         }
     }
 
+    // Smart import dialog — pick one file, loader finds siblings
+    FileDialog {
+        id: smartFileDialog
+        title: "Pick one file from the measurement session"
+        fileMode: FileDialog.OpenFile
+        nameFilters: [
+            "Smart Import Files (*.nid *.mtrx *.I(V)_mtrx *.Aux2(V)_mtrx)",
+            "Nanosurf Files (*.nid)",
+            "Omicron Matrix Header (*.mtrx)",
+            "Omicron Matrix STS (*.I(V)_mtrx)",
+            "All Files (*)"
+        ]
+
+        onAccepted: {
+            var path = selectedFile.toString().replace("file://", "")
+            dialog.selectedItems = [path]
+            updateSelectionInfo()
+        }
+    }
+
     function updateSelectionInfo() {
         if (dialog.selectedItems.length === 0) {
             selectionInfo.text = "Nothing selected"
@@ -279,7 +346,11 @@ Dialog {
             return
         }
 
-        if (dialog.isFolderMode) {
+        if (dialog.isSmartMode) {
+            selectionInfo.text = dialog.selectedItems[0]
+            selectionInfo.color = textLight
+            countLabel.text = "Smart: Will auto-discover sibling files from the same session"
+        } else if (dialog.isFolderMode) {
             selectionInfo.text = dialog.selectedItems[0]
             selectionInfo.color = textLight
             countLabel.text = "Folder: Will import all supported measurement files"
@@ -297,7 +368,9 @@ Dialog {
         }
 
         if (backend) {
-            if (dialog.isFolderMode) {
+            if (dialog.isSmartMode) {
+                backend.importSmartMap(dialog.selectedItems[0])
+            } else if (dialog.isFolderMode) {
                 backend.importFromFolder(dialog.selectedItems[0])
             } else {
                 backend.importFromFiles(dialog.selectedItems)
@@ -308,6 +381,7 @@ Dialog {
     onOpened: {
         filesMode.checked = true
         dialog.isFolderMode = false
+        dialog.isSmartMode = false
         dialog.selectedItems = []
         updateSelectionInfo()
     }

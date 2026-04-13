@@ -57,6 +57,7 @@ Rectangle {
     property color textLight: mainWin ? mainWin.textLight : "#ffffff"
     property color textMuted: mainWin ? mainWin.textMuted : "#B0A0B8"
     property color borderColor: mainWin ? mainWin.borderColor : "#7B3F76"
+    property string monoFont: mainWin ? mainWin.fontFamilyMono : (Qt.platform.os === "osx" ? "Menlo" : "Consolas")
 
     color: bgMedium
 
@@ -190,7 +191,7 @@ Rectangle {
                         anchors.centerIn: parent
                         text: "(-, -) = -"
                         font.pixelSize: 11
-                        font.family: "monospace"
+                        font.family: monoFont
                         color: textLight
                     }
                 }
@@ -455,19 +456,19 @@ Rectangle {
                                 rowSpacing: 4
 
                                 Label { text: "Min:"; font.pixelSize: 10; color: textMuted }
-                                Label { id: statMin; text: "-"; font.pixelSize: 10; color: textLight; font.family: "monospace" }
+                                Label { id: statMin; text: "-"; font.pixelSize: 10; color: textLight; font.family: monoFont }
 
                                 Label { text: "Max:"; font.pixelSize: 10; color: textMuted }
-                                Label { id: statMax; text: "-"; font.pixelSize: 10; color: textLight; font.family: "monospace" }
+                                Label { id: statMax; text: "-"; font.pixelSize: 10; color: textLight; font.family: monoFont }
 
                                 Label { text: "Mean:"; font.pixelSize: 10; color: textMuted }
-                                Label { id: statMean; text: "-"; font.pixelSize: 10; color: accentBlue; font.family: "monospace" }
+                                Label { id: statMean; text: "-"; font.pixelSize: 10; color: accentBlue; font.family: monoFont }
 
                                 Label { text: "Std:"; font.pixelSize: 10; color: textMuted }
-                                Label { id: statStd; text: "-"; font.pixelSize: 10; color: textLight; font.family: "monospace" }
+                                Label { id: statStd; text: "-"; font.pixelSize: 10; color: textLight; font.family: monoFont }
 
                                 Label { text: "Shape:"; font.pixelSize: 10; color: textMuted }
-                                Label { id: statShape; text: "-"; font.pixelSize: 10; color: textLight; font.family: "monospace" }
+                                Label { id: statShape; text: "-"; font.pixelSize: 10; color: textLight; font.family: monoFont }
                             }
                         }
 
@@ -753,10 +754,11 @@ Rectangle {
         exportCsvDialog.open()
     }
 
-    // Check for unsaved changes before destruction
+    // Cleanup resources before destruction
     Component.onDestruction: {
         if (sessionState.hasUnsavedChanges) {
             console.log("Warning: Map", mapName, "has unsaved changes")
         }
+        if (mapCanvas) mapCanvas.cleanup()
     }
 }

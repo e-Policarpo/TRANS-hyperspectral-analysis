@@ -541,7 +541,9 @@ Dialog {
                             ComboBox {
                                 id: fontFamilyCombo
                                 Layout.preferredWidth: 200
-                                model: ["system-ui", "Arial", "Helvetica", "Roboto", "Source Sans Pro", "Open Sans", "Lato", "SF Pro"]
+                                model: Qt.platform.os === "osx"
+                                    ? [".AppleSystemUIFont", "SF Pro", "Helvetica Neue", "Arial", "Roboto", "Source Sans Pro", "Open Sans", "Lato"]
+                                    : ["Segoe UI", "Arial", "Roboto", "Source Sans Pro", "Open Sans", "Lato", "Helvetica"]
 
                                 background: Rectangle {
                                     color: bgLight

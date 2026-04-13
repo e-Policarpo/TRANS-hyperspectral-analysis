@@ -12,10 +12,6 @@ import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
 import Qt.labs.platform 1.1 as Platform
 import "../components"
-import "../dialogs"
-import "../workflow"
-import "../map_editor"
-import TransQML 1.0
 
 ApplicationWindow {
     id: mainWindow
@@ -41,15 +37,17 @@ ApplicationWindow {
 
     // Show startup dialog on launch and apply saved color scheme
     Component.onCompleted: {
+        var t0 = Date.now()
         // Apply saved color scheme from preferences
         applyColorScheme()
+        console.log("[TIMING] applyColorScheme: " + (Date.now() - t0) + "ms")
 
-        // Register map editor backend for state persistence
-        backend.setMapEditorBackend(mapEditorWorkstation.mapEditorBackend)
+        // Map editor backend is registered lazily when MapEditorWorkstation loads
 
         if (!backend.projectReady) {
-            projectStartupDialog.open()
+            startupDialogLoader.active = true
         }
+        console.log("[TIMING] Main.qml Component.onCompleted total: " + (Date.now() - t0) + "ms")
     }
 
     // Reactive tools list based on current tab
@@ -93,7 +91,8 @@ ApplicationWindow {
     property int fontSizeLarge: 14
     property int fontSizeHeader: 16
     property int fontSizeTitle: 18
-    property string fontFamily: "system-ui"
+    property string fontFamily: Qt.platform.os === "osx" ? ".AppleSystemUIFont" : "Segoe UI"
+    property string fontFamilyMono: Qt.platform.os === "osx" ? "Menlo" : "Consolas"
 
     // Computed scaled sizes for convenience
     property int fontSizeXSmall: Math.max(8, fontSizeSmall - 2)
@@ -157,7 +156,10 @@ ApplicationWindow {
             fontSizeLarge = scheme.font.sizeLarge || 14
             fontSizeHeader = scheme.font.sizeHeader || 16
             fontSizeTitle = scheme.font.sizeTitle || 18
-            fontFamily = scheme.font.family || "system-ui"
+            var ff = scheme.font.family || ""
+            if (!ff || ff === "system-ui")
+                ff = Qt.platform.os === "osx" ? ".AppleSystemUIFont" : "Segoe UI"
+            fontFamily = ff
             console.log("Applied font sizes: small=" + fontSizeSmall + ", medium=" + fontSizeMedium + ", large=" + fontSizeLarge)
         }
 
@@ -284,7 +286,7 @@ ApplicationWindow {
             }
             MenuItem {
                 text: "Preferences..."
-                onTriggered: preferencesDialog.open()
+                onTriggered: openPreferencesDialog()
             }
             MenuSeparator {
                 contentItem: Rectangle {
@@ -356,7 +358,7 @@ ApplicationWindow {
             MenuItem {
                 text: "Import Measurement..."
                 enabled: backend.projectReady
-                onTriggered: importMeasurementDialog.open()
+                onTriggered: openLazyDialog(importMeasurementLoader)
             }
             MenuItem {
                 text: "Import Image..."
@@ -636,7 +638,12 @@ ApplicationWindow {
                         opacity: workflowMenuItem.highlighted ? 0.3 : 1
                     }
                     onTriggered: {
-                        loadWorkflowDialog.loadWorkflowFromFile(workflowMenuItem.path)
+                        if (loadWorkflowLoader.item) {
+                            loadWorkflowLoader.item.loadWorkflowFromFile(workflowMenuItem.path)
+                        } else {
+                            loadWorkflowLoader.pendingPath = workflowMenuItem.path
+                            loadWorkflowLoader.active = true
+                        }
                     }
                 }
                 onObjectAdded: function(index, object) {
@@ -662,7 +669,7 @@ ApplicationWindow {
 
             MenuItem {
                 text: "Load Workflow..."
-                onTriggered: loadWorkflowDialog.open()
+                onTriggered: openLazyDialog(loadWorkflowLoader)
             }
 
             MenuItem {
@@ -724,11 +731,11 @@ ApplicationWindow {
 
             MenuItem {
                 text: "Save Layout..."
-                onTriggered: saveLayoutDialog.open()
+                onTriggered: openLazyDialog(saveLayoutLoader)
             }
             MenuItem {
                 text: "Load Layout..."
-                onTriggered: loadLayoutDialog.open()
+                onTriggered: openLazyDialog(loadLayoutLoader)
             }
             MenuItem {
                 text: "Reset Layout"
@@ -816,7 +823,7 @@ ApplicationWindow {
             MenuItem {
                 text: "Preferences..."
                 visible: Qt.platform.os !== "osx"
-                onTriggered: preferencesDialog.open()
+                onTriggered: openPreferencesDialog()
             }
             MenuSeparator {
                 contentItem: Rectangle {
@@ -892,6 +899,10 @@ ApplicationWindow {
                             onCurrentIndexChanged: {
                                 currentTabIndex = currentIndex
                                 backend.currentTab = currentIndex
+                                // Lazy-load MapEditorWorkstation on first switch to Hyperspectral tab
+                                if (currentIndex === 1) {
+                                    mapEditorLoader.ensureLoaded()
+                                }
                             }
 
                             background: Rectangle {
@@ -1032,51 +1043,78 @@ ApplicationWindow {
                 }
             }
 
-            // Map Editor Workstation (for Hyperspectral Analysis tab)
-            MapEditorWorkstation {
-                id: mapEditorWorkstation
+            // Map Editor Workstation (for Hyperspectral Analysis tab) — lazy loaded
+            Loader {
+                id: mapEditorLoader
+                active: false  // Activated on first tab switch or map load
+                source: ""
+                property bool initialized: false
 
-                onSpectrumRequested: function(row, col) {
-                    console.log("Spectrum requested at:", row, col)
+                function ensureLoaded() {
+                    if (!active) {
+                        source = "../map_editor/MapEditorWorkstation.qml"
+                        active = true
+                    }
                 }
 
-                onBlockSelectionChanged: function(count) {
-                    console.log("Block selection changed:", count, "blocks")
-                }
+                onLoaded: {
+                    if (!initialized && item) {
+                        initialized = true
+                        var mew = item
+                        backend.setMapEditorBackend(mew.mapEditorBackend)
+                        mew.linkDatasetsFromBackend(backend)
 
-                onOpenSpectrumPlotRequested: function(datasetName, spectra, forceNewWindow) {
-                    console.log("Open spectrum plot requested:", datasetName, "with", spectra.length, "spectra")
-                    if (!spectra || spectra.length === 0) return
-
-                    var curves = []
-                    for (var i = 0; i < spectra.length; i++) {
-                        curves.push({
-                            x: spectra[i].x,
-                            y: spectra[i].y,
-                            label: spectra[i].title || ("Spectrum " + (i+1)),
-                            color: ""
+                        mew.spectrumRequested.connect(function(row, col) {
+                            console.log("Spectrum requested at:", row, col)
                         })
-                    }
-                    var title = datasetName + " Spectra"
-                    var xl = spectra[0].x_name || "X"
-                    var yl = spectra[0].y_name || "Intensity"
+                        mew.blockSelectionChanged.connect(function(count) {
+                            console.log("Block selection changed:", count, "blocks")
+                        })
+                        mew.openSpectrumPlotRequested.connect(function(datasetName, spectra, forceNewWindow) {
+                            console.log("Open spectrum plot requested:", datasetName, "with", spectra.length, "spectra")
+                            if (!spectra || spectra.length === 0) return
 
-                    // Reuse existing spectrum window if possible (prevents memory bloat)
-                    if (!forceNewWindow && mainSpectrumWindowId
-                            && toolWindowManager.hasWindow(mainSpectrumWindowId)) {
-                        toolWindowManager.updateGraphWindow(
-                            mainSpectrumWindowId, title, curves, xl, yl)
-                    } else {
-                        mainSpectrumWindowId = toolWindowManager.openGraphWindow(
-                            title, curves, xl, yl)
-                    }
-                }
+                            var curves = []
+                            for (var i = 0; i < spectra.length; i++) {
+                                curves.push({
+                                    x: spectra[i].x,
+                                    y: spectra[i].y,
+                                    label: spectra[i].title || ("Spectrum " + (i+1)),
+                                    color: ""
+                                })
+                            }
+                            var title = datasetName + " Spectra"
+                            var xl = spectra[0].x_name || "X"
+                            var yl = spectra[0].y_name || "Intensity"
 
-                onOpenMultiDatasetSpectraRequested: function(datasetSpectraList, forceNewWindow) {
-                    console.log("Open multi-dataset spectra requested:", datasetSpectraList.length, "datasets")
-                    openMultiDatasetSpectra(datasetSpectraList, forceNewWindow || false)
+                            if (!forceNewWindow && mainSpectrumWindowId
+                                    && toolWindowManager.hasWindow(mainSpectrumWindowId)) {
+                                toolWindowManager.updateGraphWindow(
+                                    mainSpectrumWindowId, title, curves, xl, yl)
+                            } else {
+                                mainSpectrumWindowId = toolWindowManager.openGraphWindow(
+                                    title, curves, xl, yl)
+                            }
+                        })
+                        mew.openMultiDatasetSpectraRequested.connect(function(datasetSpectraList, forceNewWindow) {
+                            console.log("Open multi-dataset spectra requested:", datasetSpectraList.length, "datasets")
+                            openMultiDatasetSpectra(datasetSpectraList, forceNewWindow || false)
+                        })
+
+                        // Process any pending operations
+                        if (_pendingMapLoad) {
+                            mew.loadMap(_pendingMapLoad)
+                            _pendingMapLoad = ""
+                        }
+
+                        console.log("MapEditorWorkstation lazy-loaded and initialized")
+                    }
                 }
             }
+
+            // Convenience accessor
+            property var mapEditorWorkstation: mapEditorLoader.item
+            property string _pendingMapLoad: ""
 
         }  // StackLayout
 
@@ -1096,6 +1134,17 @@ ApplicationWindow {
                 backend: backend
                 z: 50  // Above workspace content
 
+                onWindowOpened: function(windowId, windowType) {
+                    // Add to ProjectBrowser models
+                    var info = toolWindowManager.getWindow(windowId)
+                    var title = info ? info.title : windowId
+                    if (windowType === "table") {
+                        projectBrowser.addTableEntry(windowId, title)
+                    } else if (windowType === "graph") {
+                        projectBrowser.addGraphEntry(windowId, title)
+                    }
+                }
+
                 onWindowClosed: function(windowId) {
                     // Remove from open tools tracking
                     var tools = openTools.slice()
@@ -1106,6 +1155,8 @@ ApplicationWindow {
                         }
                     }
                     openTools = tools
+                    // Also notify ProjectBrowser
+                    projectBrowser.removeWindowEntry(windowId)
                 }
             }
         }  // Item (workspaceContainer)
@@ -1265,13 +1316,13 @@ ApplicationWindow {
             statusText.text = "Loaded: " + datasetName
 
             // Refresh Map Editor datasets when new data is loaded
-            mapEditorWorkstation.linkDatasetsFromBackend(backend)
+            if (mapEditorWorkstation) mapEditorWorkstation.linkDatasetsFromBackend(backend)
         }
 
         function onToolCompleted(toolName, outputPath) {
             console.log("Tool completed:", toolName, "output:", outputPath)
             // Refresh Map Editor dataset links after tool completion
-            mapEditorWorkstation.linkDatasetsFromBackend(backend)
+            if (mapEditorWorkstation) mapEditorWorkstation.linkDatasetsFromBackend(backend)
         }
 
         function onErrorOccurred(title, message) {
@@ -1294,27 +1345,29 @@ ApplicationWindow {
 
         function onImageImported(mapName, filePath, mapId) {
             console.log("Image imported:", mapName, "from", filePath)
-            // Switch to Hyperspectral Analysis tab
             tabBar.currentIndex = 1
             currentTabIndex = 1
-
-            // Load the map data into the Map Editor
-            mapEditorWorkstation.loadMap(filePath)
+            mapEditorLoader.ensureLoaded()
+            if (mapEditorWorkstation) {
+                mapEditorWorkstation.loadMap(filePath)
+            } else {
+                _pendingMapLoad = filePath
+            }
         }
 
         function onLoadMapInEditor(mapPath) {
             console.log("Loading map in editor:", mapPath)
-            // Switch to Hyperspectral Analysis tab
             tabBar.currentIndex = 1
             currentTabIndex = 1
-
-            // Close the current active map if any (force close without save dialog)
-            if (mapEditorWorkstation.openMaps && mapEditorWorkstation.openMaps.length > 0) {
-                mapEditorWorkstation.forceCloseMap(mapEditorWorkstation.activeMapIndex)
+            mapEditorLoader.ensureLoaded()
+            if (mapEditorWorkstation) {
+                if (mapEditorWorkstation.openMaps && mapEditorWorkstation.openMaps.length > 0) {
+                    mapEditorWorkstation.forceCloseMap(mapEditorWorkstation.activeMapIndex)
+                }
+                mapEditorWorkstation.loadMap(mapPath)
+            } else {
+                _pendingMapLoad = mapPath
             }
-
-            // Load the new map
-            mapEditorWorkstation.loadMap(mapPath)
         }
     }
 
@@ -1446,6 +1499,9 @@ ApplicationWindow {
     // Track the main spectrum plot window ID (reused for click-to-plot)
     property string mainSpectrumWindowId: ""
 
+    // Expose the WindowManager so embedded table contents can create graph windows
+    function getToolWindowManager() { return toolWindowManager }
+
     // Open spectra from multiple datasets at once
     function openMultiDatasetSpectra(datasetSpectraList, forceNewWindow) {
         // datasetSpectraList is array of {datasetName, spectra}
@@ -1557,25 +1613,61 @@ ApplicationWindow {
         openWorkflowWindows = []
     }
 
-    // Dialogs
-    ImportMeasurementDialog {
-        id: importMeasurementDialog
-        anchors.centerIn: Overlay.overlay
+    // Dialogs — lazy loaded to reduce startup time
+    Loader {
+        id: importMeasurementLoader
+        active: false
+        source: "../dialogs/ImportMeasurementDialog.qml"
+        property bool openOnLoad: false
+        onLoaded: {
+            item.anchors.centerIn = Overlay.overlay
+            if (openOnLoad) { openOnLoad = false; item.open() }
+        }
     }
 
-    // Preferences Dialog
-    PreferencesDialog {
-        id: preferencesDialog
-        anchors.centerIn: Overlay.overlay
-        preferencesManager: backend.preferencesManager
-        bgDark: mainWindow.bgDark
-        bgMedium: mainWindow.bgMedium
-        bgLight: mainWindow.bgLight
-        textLight: mainWindow.textLight
-        textMuted: mainWindow.textMuted
-        borderColor: mainWindow.borderColor
-        accentPink: mainWindow.accentPink
-        accentBlue: mainWindow.accentBlue
+    // Preferences Dialog — lazy loaded (1174 lines, only needed on user action)
+    Loader {
+        id: preferencesLoader
+        active: false
+        source: "../dialogs/PreferencesDialog.qml"
+        property bool openOnLoad: false
+
+        onLoaded: {
+            item.anchors.centerIn = Overlay.overlay
+            item.preferencesManager = backend.preferencesManager
+            item.bgDark = Qt.binding(function() { return mainWindow.bgDark })
+            item.bgMedium = Qt.binding(function() { return mainWindow.bgMedium })
+            item.bgLight = Qt.binding(function() { return mainWindow.bgLight })
+            item.textLight = Qt.binding(function() { return mainWindow.textLight })
+            item.textMuted = Qt.binding(function() { return mainWindow.textMuted })
+            item.borderColor = Qt.binding(function() { return mainWindow.borderColor })
+            item.accentPink = Qt.binding(function() { return mainWindow.accentPink })
+            item.accentBlue = Qt.binding(function() { return mainWindow.accentBlue })
+            console.log("[TIMING] PreferencesDialog lazy-loaded")
+            if (openOnLoad) {
+                openOnLoad = false
+                item.open()
+            }
+        }
+    }
+
+    function openPreferencesDialog() {
+        if (preferencesLoader.item) {
+            preferencesLoader.item.open()
+        } else {
+            preferencesLoader.openOnLoad = true
+            preferencesLoader.active = true
+        }
+    }
+
+    // Generic helper for lazy-loaded dialogs
+    function openLazyDialog(loader) {
+        if (loader.item) {
+            loader.item.open()
+        } else {
+            loader.openOnLoad = true
+            loader.active = true
+        }
     }
 
     // Import Image Dialog
@@ -1606,46 +1698,72 @@ ApplicationWindow {
         }
     }
 
-    SaveLayoutDialog {
-        id: saveLayoutDialog
-        anchors.centerIn: Overlay.overlay
-    }
-
-    LoadLayoutDialog {
-        id: loadLayoutDialog
-        anchors.centerIn: Overlay.overlay
-    }
-
-    LoadWorkflowDialog {
-        id: loadWorkflowDialog
-        anchors.centerIn: Overlay.overlay
-    }
-
-    // Project Startup Dialog - shown when app starts without a project
-    ProjectStartupDialog {
-        id: projectStartupDialog
-        anchors.centerIn: Overlay.overlay
-
-        onProjectCreated: function(projectPath, projectName) {
-            console.log("Creating project:", projectName, "at", projectPath)
-            backend.createProject(projectPath, projectName)
-        }
-
-        onProjectOpened: function(projectPath, projectName) {
-            console.log("Opening project:", projectName, "at", projectPath)
-            backend.openProject(projectPath, projectName)
-        }
-
-        onDialogCancelled: {
-            console.log("Project dialog cancelled, quitting...")
+    Loader {
+        id: saveLayoutLoader
+        active: false
+        source: "../dialogs/SaveLayoutDialog.qml"
+        property bool openOnLoad: false
+        onLoaded: {
+            item.anchors.centerIn = Overlay.overlay
+            if (openOnLoad) { openOnLoad = false; item.open() }
         }
     }
+
+    Loader {
+        id: loadLayoutLoader
+        active: false
+        source: "../dialogs/LoadLayoutDialog.qml"
+        property bool openOnLoad: false
+        onLoaded: {
+            item.anchors.centerIn = Overlay.overlay
+            if (openOnLoad) { openOnLoad = false; item.open() }
+        }
+    }
+
+    Loader {
+        id: loadWorkflowLoader
+        active: false
+        source: "../dialogs/LoadWorkflowDialog.qml"
+        property bool openOnLoad: false
+        property string pendingPath: ""
+        onLoaded: {
+            item.anchors.centerIn = Overlay.overlay
+            if (pendingPath) {
+                var p = pendingPath; pendingPath = ""
+                item.loadWorkflowFromFile(p)
+            }
+            if (openOnLoad) { openOnLoad = false; item.open() }
+        }
+    }
+
+    // Project Startup Dialog — lazy loaded
+    Loader {
+        id: startupDialogLoader
+        active: false
+        source: "../dialogs/ProjectStartupDialog.qml"
+        onLoaded: {
+            item.anchors.centerIn = Overlay.overlay
+            item.projectCreated.connect(function(projectPath, projectName) {
+                console.log("Creating project:", projectName, "at", projectPath)
+                backend.createProject(projectPath, projectName)
+            })
+            item.projectOpened.connect(function(projectPath, projectName) {
+                console.log("Opening project:", projectName, "at", projectPath)
+                backend.openProject(projectPath, projectName)
+            })
+            item.dialogCancelled.connect(function() {
+                console.log("Project dialog cancelled, quitting...")
+            })
+            item.open()
+        }
+    }
+    property var projectStartupDialog: startupDialogLoader.item
 
     // Close startup dialog whenever a project becomes ready
     Connections {
         target: backend
         function onProjectReadyChanged() {
-            if (backend.projectReady && projectStartupDialog.visible) {
+            if (backend.projectReady && projectStartupDialog && projectStartupDialog.visible) {
                 projectStartupDialog.close()
             }
         }
@@ -1662,8 +1780,9 @@ ApplicationWindow {
         MouseArea {
             anchors.fill: parent
             onClicked: {
-                if (!projectStartupDialog.visible) {
-                    projectStartupDialog.open()
+                if (!projectStartupDialog || !projectStartupDialog.visible) {
+                    startupDialogLoader.active = true
+                    if (projectStartupDialog) projectStartupDialog.open()
                 }
             }
         }
@@ -1855,10 +1974,8 @@ ApplicationWindow {
             if (state.tables) {
                 for (var j = 0; j < state.tables.length; j++) {
                     var t = state.tables[j]
-                    toolWindowManager.createEnhancedTableWindow(t.title || t.id || "Table", {
-                        dataRows: t.data || [],
-                        headers: t.columns || []
-                    })
+                    // Request backend to create TableDataModel and emit openTableEmbedded
+                    backend.restoreTableFromState(t.title || t.id || "Table", t.data || [], t.columns || [])
                 }
             }
         }
@@ -1873,9 +1990,9 @@ ApplicationWindow {
             toolWindowManager.openGraphWindow(name, curves, xLabel, yLabel)
         }
 
-        function onOpenTableEmbedded(title, headers, dataRows) {
+        function onOpenTableEmbedded(title, tableModel) {
             if (currentTabIndex !== 0) tabBar.currentIndex = 0
-            toolWindowManager.createEnhancedTableWindow(title, {headers: headers, dataRows: dataRows})
+            toolWindowManager.createEnhancedTableWindow(title, {tableModel: tableModel})
         }
 
         function onCollectWindowStatesRequested() {

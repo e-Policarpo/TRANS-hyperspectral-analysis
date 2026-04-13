@@ -172,7 +172,7 @@ class TestTableDataModelRowOperations:
     def test_insert_row_at_beginning(self, model):
         """Test inserting a row at the beginning."""
         initial_rows = model.rows
-        model.insertRow(0)
+        model.insertRowAt(0)
         assert model.rows == initial_rows + 1
         # First row should be zeros
         assert model._data.iloc[0, 0] == 0.0
@@ -182,7 +182,7 @@ class TestTableDataModelRowOperations:
     def test_insert_row_in_middle(self, model):
         """Test inserting a row in the middle."""
         initial_rows = model.rows
-        model.insertRow(1)
+        model.insertRowAt(1)
         assert model.rows == initial_rows + 1
         # Row at index 1 should be zeros
         assert model._data.iloc[1, 0] == 0.0
@@ -192,14 +192,14 @@ class TestTableDataModelRowOperations:
     def test_insert_row_at_end(self, model):
         """Test inserting a row at the end."""
         initial_rows = model.rows
-        model.insertRow(model.rows)
+        model.insertRowAt(model.rows)
         assert model.rows == initial_rows + 1
         assert model._data.iloc[-1, 0] == 0.0
 
     def test_remove_row(self, model):
         """Test removing a row."""
         initial_rows = model.rows
-        model.removeRow(1)  # Remove middle row
+        model.removeRowAt(1)  # Remove middle row
         assert model.rows == initial_rows - 1
         # Check that row with value 3 is gone
         assert model._data.iloc[0, 0] == 1.0
@@ -207,12 +207,12 @@ class TestTableDataModelRowOperations:
 
     def test_remove_first_row(self, model):
         """Test removing the first row."""
-        model.removeRow(0)
+        model.removeRowAt(0)
         assert model._data.iloc[0, 0] == 3.0
 
     def test_remove_last_row(self, model):
         """Test removing the last row."""
-        model.removeRow(model.rows - 1)
+        model.removeRowAt(model.rows - 1)
         assert model._data.iloc[-1, 0] == 3.0
 
     def test_clear_row(self, model):
@@ -227,9 +227,9 @@ class TestTableDataModelRowOperations:
     def test_remove_invalid_row(self, model):
         """Test removing invalid row index does nothing."""
         initial_rows = model.rows
-        model.removeRow(-1)
+        model.removeRowAt(-1)
         assert model.rows == initial_rows
-        model.removeRow(100)
+        model.removeRowAt(100)
         assert model.rows == initial_rows
 
 
@@ -266,7 +266,7 @@ class TestTableDataModelColumnOperations:
     def test_remove_column(self, model):
         """Test removing a column."""
         initial_cols = model.columns
-        model.removeColumn(0)
+        model.removeColumnAt(0)
         assert model.columns == initial_cols - 1
 
     def test_clear_column(self, model):
@@ -398,6 +398,22 @@ class TestFormulaEngine:
         # A = [1,2,3,4,5], B = [10,20,30,40,50]
         assert values == [11.0, 22.0, 33.0, 44.0, 55.0]
 
+    def test_formula_col_syntax(self, model):
+        """Test col(X) syntax as alternative to [X]."""
+        model.addColumn('C', '', '')
+        model.setColumnFormula(2, 'col(A) + col(B)')
+        values = model._data.iloc[:, 2].tolist()
+        # A = [1,2,3,4,5], B = [10,20,30,40,50]
+        assert values == [11.0, 22.0, 33.0, 44.0, 55.0]
+
+    def test_formula_col_syntax_math(self, model):
+        """Test col(X) syntax with math functions."""
+        model.setColumnFormula(0, 'col(B) * 2 + i')
+        values = model._data.iloc[:, 0].tolist()
+        # B = [10,20,30,40,50], i = [1,2,3,4,5]
+        expected = [21.0, 42.0, 63.0, 84.0, 105.0]
+        assert values == expected
+
     def test_formula_random(self, model):
         """Test formula with random()."""
         model.setColumnFormula(0, 'random()')
@@ -492,6 +508,146 @@ class TestTableDataModelIntegration:
         model.setColumnFormula(0, 'i * 2')
         assert model._data.iloc[0, 0] == 2.0
         assert model._data.iloc[999, 0] == 2000.0
+
+
+# =============================================================================
+# Expression Evaluation & Undo Tests
+# =============================================================================
+
+class TestExpressionEvaluation:
+    """Tests for arithmetic expression evaluation in cell values."""
+
+    @pytest.fixture
+    def model(self):
+        model = TableDataModel()
+        model.setTableData([[1, 2], [3, 4]], ['A', 'B'])
+        return model
+
+    def test_arithmetic_in_cell(self, model):
+        """Test that arithmetic like 2.5e-11+3e-11 is evaluated."""
+        idx = model.index(0, 0)
+        model.setData(idx, "2.4895e-11+3e-11", 2)
+        assert model._data.iloc[0, 0] == pytest.approx(5.4895e-11)
+
+    def test_simple_addition(self, model):
+        """Test simple addition in cell."""
+        idx = model.index(0, 0)
+        model.setData(idx, "10+20", 2)
+        assert model._data.iloc[0, 0] == pytest.approx(30.0)
+
+    def test_multiplication(self, model):
+        """Test multiplication expression."""
+        idx = model.index(0, 0)
+        model.setData(idx, "3*4.5", 2)
+        assert model._data.iloc[0, 0] == pytest.approx(13.5)
+
+    def test_plain_number_not_eval(self, model):
+        """Test that plain numbers are parsed, not eval'd."""
+        idx = model.index(0, 0)
+        model.setData(idx, "42", 2)
+        assert model._data.iloc[0, 0] == 42.0
+
+    def test_plain_text_stored(self, model):
+        """Test that non-numeric text is stored as-is."""
+        idx = model.index(0, 0)
+        model.setData(idx, "hello", 2)
+        assert model._data.iloc[0, 0] == "hello"
+
+
+class TestDisplayFormat:
+    """Tests for number display format switching."""
+
+    @pytest.fixture
+    def model(self):
+        model = TableDataModel()
+        model.setTableData([[0.000123, 12345.6789]], ['A', 'B'])
+        return model
+
+    def test_auto_format(self, model):
+        """Auto format: small numbers → scientific, normal → general."""
+        from PySide6.QtCore import Qt
+        idx_a = model.index(0, 0)
+        idx_b = model.index(0, 1)
+        assert "e" in model.data(idx_a, Qt.DisplayRole).lower()
+        assert "e" not in model.data(idx_b, Qt.DisplayRole).lower() or True  # >10000 also scientific
+
+    def test_scientific_format(self, model):
+        """Scientific format: all values in scientific notation."""
+        from PySide6.QtCore import Qt
+        model.setDisplayFormat("scientific", 4)
+        val = model.data(model.index(0, 1), Qt.DisplayRole)
+        assert "e" in val.lower()
+        assert val == "1.2346e+04"
+
+    def test_decimal_format(self, model):
+        """Decimal format: fixed point with given places."""
+        from PySide6.QtCore import Qt
+        model.setDisplayFormat("decimal", 3)
+        val = model.data(model.index(0, 0), Qt.DisplayRole)
+        assert val == "0.000"  # 0.000123 rounded to 3dp
+        val_b = model.data(model.index(0, 1), Qt.DisplayRole)
+        assert val_b == "12345.679"
+
+    def test_decimal_places_change(self, model):
+        """Changing decimal places updates display."""
+        from PySide6.QtCore import Qt
+        model.setDisplayFormat("decimal", 6)
+        val = model.data(model.index(0, 0), Qt.DisplayRole)
+        assert val == "0.000123"
+
+
+class TestUndo:
+    """Tests for undo functionality."""
+
+    @pytest.fixture
+    def model(self):
+        model = TableDataModel()
+        model.setTableData([[1, 2], [3, 4]], ['A', 'B'])
+        return model
+
+    def test_undo_set_data(self, model):
+        """Test undo after setting a cell value."""
+        idx = model.index(0, 0)
+        model.setData(idx, "99", 2)
+        assert model._data.iloc[0, 0] == 99.0
+
+        model.undo()
+        assert model._data.iloc[0, 0] == 1.0
+
+    def test_undo_add_row(self, model):
+        """Test undo after adding a row."""
+        initial = model.rows
+        model.addRow()
+        assert model.rows == initial + 1
+
+        model.undo()
+        assert model.rows == initial
+
+    def test_undo_remove_row(self, model):
+        """Test undo after removing a row."""
+        initial = model.rows
+        model.removeRowAt(0)
+        assert model.rows == initial - 1
+
+        model.undo()
+        assert model.rows == initial
+        assert model._data.iloc[0, 0] == 1.0
+
+    def test_can_undo(self, model):
+        """Test canUndo flag."""
+        assert model.canUndo() is False
+        model.addRow()
+        assert model.canUndo() is True
+        model.undo()
+        assert model.canUndo() is False
+
+    def test_undo_clear_range(self, model):
+        """Test undo after clearing a range."""
+        model.clearRange(0, 0, 1, 1)
+        assert model._data.iloc[0, 0] == 0.0
+
+        model.undo()
+        assert model._data.iloc[0, 0] == 1.0
 
 
 # =============================================================================

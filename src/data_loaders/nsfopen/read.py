@@ -236,17 +236,24 @@ class nid_read:
             n = int(header[key]["SubSectionCount"])
             secNames = [header[key]["SubSection" + str(i)] for i in range(n)]
 
-            specMode = header[key + "\\" + secNames[0]]["SpecMode"]
+            # [TRANS PATCH] Guard against missing subsections (e.g. SpecMapTable
+            # can be declared but absent in "Repeat position list" mode files)
+            try:
+                specMode = header[key + "\\" + secNames[0]]["SpecMode"]
 
-            count = int(header[key + "\\" + secNames[1]]["Count"])
+                mapTableKey = key + "\\" + secNames[1]
+                if mapTableKey in header:
+                    count = int(header[mapTableKey]["Count"])
 
-            mapTable = [
-                header[key + "\\" + secNames[1]][specMode[:3] + str(i)].split(
-                    ";"
-                )
-                for i in range(count)
-            ]
-            mapTable = np.array(mapTable).astype(float)[0]
+                    mapTable = [
+                        header[mapTableKey][specMode[:3] + str(i)].split(";")
+                        for i in range(count)
+                    ]
+                    mapTable = np.array(mapTable).astype(float)[0]
+                else:
+                    logger.debug("SpecMapTable section declared but not present in file")
+            except (KeyError, IndexError) as e:
+                logger.debug("Could not parse SpecInfos: %s", e)
 
         specParam = {}
         modFw, modBw, pauseFw, pauseBw, rangeFw, rangeBw, stopFw = (

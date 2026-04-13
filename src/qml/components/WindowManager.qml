@@ -276,12 +276,17 @@ Item {
 
         // Apply config to the content item
         function applyTableConfig(content) {
-            if (!content) return
+            if (!content) {
+                console.warn("applyTableConfig: content is null")
+                return
+            }
             content.entityId = windowId
-            if (config && config.dataRows)
-                content.dataRows = config.dataRows
-            if (config && config.headers)
-                content.headers = config.headers
+            if (config && config.tableModel) {
+                content.tableModel = config.tableModel
+                console.log("Table model set on content: rows=" + config.tableModel.rows + " cols=" + config.tableModel.columns)
+            } else {
+                console.warn("applyTableConfig: no tableModel in config")
+            }
         }
 
         // Get the window and set up the content (defer if Loader hasn't finished)
@@ -289,14 +294,19 @@ Item {
         if (windowInfo && windowInfo.window) {
             var win = windowInfo.window
             if (win.contentItem) {
+                console.log("Table content available immediately")
                 applyTableConfig(win.contentItem)
             } else {
+                console.log("Table content not yet loaded, deferring...")
                 win.contentItemChanged.connect(function() {
                     if (win.contentItem) {
+                        console.log("Table content now available (deferred)")
                         applyTableConfig(win.contentItem)
                     }
                 })
             }
+        } else {
+            console.warn("createEnhancedTableWindow: window not found for id " + windowId)
         }
 
         return windowId

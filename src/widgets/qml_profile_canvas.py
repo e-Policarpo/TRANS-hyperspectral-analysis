@@ -95,6 +95,25 @@ class QMLProfileCanvas(QQuickPaintedItem):
         # Coordinate transform
         self._data_bounds: Optional[Dict] = None
 
+    @Slot()
+    def cleanup(self):
+        """Release matplotlib resources to prevent memory leaks."""
+        import matplotlib.pyplot as plt
+        try:
+            if hasattr(self, 'figure') and self.figure is not None:
+                self.figure.clear()
+                plt.close(self.figure)
+                self.figure = None
+                self.axes = None
+                self.canvas = None
+            self._cached_image = None
+            self._curves.clear()
+            self._x_data = None
+            self._y_data = None
+            logger.debug("ProfileCanvas cleaned up matplotlib resources")
+        except Exception as e:
+            logger.warning(f"Error during ProfileCanvas cleanup: {e}")
+
     def _setupAxesStyle(self):
         """Configure axes appearance for dark theme"""
         self.axes.set_facecolor('#1a1a1a')

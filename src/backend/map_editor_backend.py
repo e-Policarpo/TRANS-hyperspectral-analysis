@@ -397,6 +397,57 @@ class MapEditorBackend(QObject):
             logger.error(f"Failed to load map: {e}")
             self.processingFinished.emit("load", False, str(e))
 
+    def loadTopographyWithOverlay(self, topo_data: np.ndarray,
+                                  map_geometry: dict, topo_geometry: dict,
+                                  channel_name: str = "Topography"):
+        """
+        Load topography as a map channel with an STS grid region overlay.
+
+        Parameters
+        ----------
+        topo_data : np.ndarray
+            2D topography array
+        map_geometry : dict
+            STS grid bounds: x_start, y_start, x_end, y_end (meters)
+        topo_geometry : dict
+            Topography scan bounds: x_min, x_max, y_min, y_max (meters)
+        channel_name : str
+            Name for the topography channel
+        """
+        if self._multi_channel_map is None:
+            self._multi_channel_map = MultiChannelMap()
+
+        self._multi_channel_map.add_channel(
+            channel_name, topo_data, ChannelType.HEIGHT, replace=True
+        )
+
+        if self._canvas:
+            self._canvas.setMapData(topo_data)
+
+            # Compute fractional coordinates for the STS region rectangle
+            topo_xrange = topo_geometry['x_max'] - topo_geometry['x_min']
+            topo_yrange = topo_geometry['y_max'] - topo_geometry['y_min']
+
+            if topo_xrange > 0 and topo_yrange > 0:
+                # Map0 coordinates to fractional position on topography
+                fx0 = (map_geometry['x_start'] - topo_geometry['x_min']) / topo_xrange
+                fy0 = (map_geometry['y_start'] - topo_geometry['y_min']) / topo_yrange
+                fx1 = (map_geometry['x_end'] - topo_geometry['x_min']) / topo_xrange
+                fy1 = (map_geometry['y_end'] - topo_geometry['y_min']) / topo_yrange
+
+                # Invert Y axis (image convention: top=0, bottom=1)
+                fy0 = 1.0 - fy0
+                fy1 = 1.0 - fy1
+
+                self._canvas.setStsRegionRect(fx0, fy0, fx1, fy1)
+                logger.info(
+                    f"STS grid overlay set: frac ({fx0:.3f},{fy0:.3f})-({fx1:.3f},{fy1:.3f})"
+                )
+
+        self.mapDataChanged.emit()
+        self.channelListChanged.emit()
+        self.activeChannelChanged.emit(channel_name)
+
     def setMultiChannelMap(self, mcmap: MultiChannelMap):
         """Set map data programmatically from Python"""
         self._multi_channel_map = mcmap

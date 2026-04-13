@@ -22,8 +22,9 @@ build/
 *.swp
 *.swo
 
-# Test artifacts
-testeeeeeeeee.hrt
+# Project data files (large binary)
+*.hrt
+projects/
 
 # Environment
 .env

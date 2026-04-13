@@ -335,14 +335,10 @@ Rectangle {
                                                     }
                                                     break
                                                 case "Graphs":
-                                                    if (model.id) {
-                                                        backend.openGraph(model.id)
-                                                    }
+                                                    console.log("Graphs are now embedded windows")
                                                     break
                                                 case "Tables":
-                                                    if (model.id) {
-                                                        backend.openTable(model.id)
-                                                    }
+                                                    console.log("Tables are now embedded windows")
                                                     break
                                                 case "Notes":
                                                     if (model.path) {
@@ -515,14 +511,10 @@ Rectangle {
                         }
                         break
                     case "Graphs":
-                        if (contextMenu.itemData.id) {
-                            backend.openGraph(contextMenu.itemData.id)
-                        }
+                        console.log("Graphs are now embedded windows")
                         break
                     case "Tables":
-                        if (contextMenu.itemData.id) {
-                            backend.openTable(contextMenu.itemData.id)
-                        }
+                        console.log("Tables are now embedded windows")
                         break
                 }
             }
@@ -758,29 +750,9 @@ Rectangle {
             })
         }
 
-        // Refresh tables
-        var tables = backend.getTableList()
+        // Tables and graphs are now embedded windows managed by WindowManager
         tablesModel.clear()
-        for (i = 0; i < tables.length; i++) {
-            tablesModel.append({
-                id: tables[i].id,
-                title: tables[i].title,
-                icon: "",
-                type: "Table"
-            })
-        }
-
-        // Refresh graphs
-        var graphs = backend.getGraphList()
         graphsModel.clear()
-        for (i = 0; i < graphs.length; i++) {
-            graphsModel.append({
-                id: graphs[i].id,
-                title: graphs[i].title,
-                icon: "",
-                type: "Graph"
-            })
-        }
 
         // Refresh maps
         var maps = backend.getMapList()
@@ -834,6 +806,43 @@ Rectangle {
         metaStr += "Independent Variable: " + (info.independent_var || "N/A")
 
         metadataText.text = metaStr
+    }
+
+    // Add/remove entries from Main.qml when embedded windows open/close
+    function addTableEntry(windowId, title) {
+        tablesModel.append({
+            id: windowId,
+            title: title,
+            name: title,
+            icon: "",
+            type: "Table"
+        })
+    }
+
+    function addGraphEntry(windowId, title) {
+        graphsModel.append({
+            id: windowId,
+            title: title,
+            name: title,
+            icon: "",
+            type: "Graph"
+        })
+    }
+
+    function removeWindowEntry(windowId) {
+        var i
+        for (i = 0; i < tablesModel.count; i++) {
+            if (tablesModel.get(i).id === windowId) {
+                tablesModel.remove(i)
+                return
+            }
+        }
+        for (i = 0; i < graphsModel.count; i++) {
+            if (graphsModel.get(i).id === windowId) {
+                graphsModel.remove(i)
+                return
+            }
+        }
     }
 
     function updateMetadataForTable(model) {
@@ -934,22 +943,7 @@ Rectangle {
             // Full refresh after project load to catch all restored state (maps, outputs, etc.)
             browserRoot.refreshBrowser()
         }
-        function onTableCreated(tableId, tableTitle) {
-            tablesModel.append({
-                id: tableId,
-                title: tableTitle,
-                icon: "",
-                type: "Table"
-            })
-        }
-        function onGraphCreated(graphId, graphTitle) {
-            graphsModel.append({
-                id: graphId,
-                title: graphTitle,
-                icon: "",
-                type: "Graph"
-            })
-        }
+
         function onMapCreated(mapId, mapTitle) {
             mapsModel.append({
                 id: mapId,
@@ -1027,6 +1021,8 @@ Rectangle {
     }
 
     Component.onCompleted: {
+        var t0 = Date.now()
         refreshBrowser()
+        console.log("[TIMING] ProjectBrowser onCompleted: " + (Date.now() - t0) + "ms")
     }
 }

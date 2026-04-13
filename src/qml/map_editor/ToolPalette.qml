@@ -35,6 +35,7 @@ Rectangle {
     property color textLight: mainWin ? mainWin.textLight : "#ffffff"
     property color textMuted: mainWin ? mainWin.textMuted : "#B0A0B8"
     property color borderColor: mainWin ? mainWin.borderColor : "#7B3F76"
+    property string monoFont: mainWin ? mainWin.fontFamilyMono : (Qt.platform.os === "osx" ? "Menlo" : "Consolas")
 
     color: bgMedium
     width: 52
@@ -359,7 +360,7 @@ Rectangle {
                               filterSizeSlider.value.toFixed(1) :
                               filterSizeSlider.value.toFixed(0)
                         font.pixelSize: 11
-                        font.family: "monospace"
+                        font.family: monoFont
                         color: accentBlue
                         Layout.preferredWidth: 30
                     }

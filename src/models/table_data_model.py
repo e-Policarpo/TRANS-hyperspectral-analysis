@@ -153,6 +153,9 @@ class FormulaEngine:
             expr = formula
             result = np.zeros(num_rows)
 
+            # Support col(X) syntax — convert to [X] before processing
+            expr = re.sub(r'col\(([^)]+)\)', r'[\1]', expr)
+
             # Replace column references with array operations
             col_pattern = r'\[([^\]]+)\]'
             col_refs = re.findall(col_pattern, expr)
@@ -366,6 +369,11 @@ class TableDataModel(QAbstractTableModel):
     columnMetadataChanged = Signal(int, arguments=['index'])
     dataModified = Signal()
     statisticsCalculated = Signal(int, 'QVariant', arguments=['column', 'stats'])
+    rowsChanged = Signal()
+    columnsChanged = Signal()
+    isEmptyChanged = Signal()
+    dataRevisionChanged = Signal()
+    displayFormatChanged = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -383,6 +391,18 @@ class TableDataModel(QAbstractTableModel):
 
         # Linked graph
         self._linked_graph_id: Optional[str] = None
+
+        # Revision counter for QML data-binding refresh
+        self._data_revision: int = 0
+
+        # Display format: "auto" (current behavior), "scientific", "decimal"
+        self._display_format: str = "auto"
+        self._decimal_places: int = 6
+
+        # Undo stack: list of (DataFrame snapshot, metadata snapshot, formulas snapshot)
+        self._undo_stack: List[Tuple[pd.DataFrame, List[ColumnMetadata], Dict]] = []
+        self._max_undo: int = 50
+        self._batch_mode: bool = False  # suppress per-cell undo during bulk ops
 
     # =========================================================================
     # QAbstractTableModel required methods
@@ -416,10 +436,7 @@ class TableDataModel(QAbstractTableModel):
                 if pd.isna(value):
                     return ""
                 if isinstance(value, float):
-                    # Format floats nicely
-                    if abs(value) < 0.001 or abs(value) > 10000:
-                        return f"{value:.4e}"
-                    return f"{value:.6g}"
+                    return self._format_float(value)
                 return str(value)
             except (IndexError, KeyError):
                 return ""
@@ -436,6 +453,8 @@ class TableDataModel(QAbstractTableModel):
         row, col = index.row(), index.column()
 
         try:
+            if not self._batch_mode:
+                self._save_undo()
             str_value = str(value).strip()
 
             # Check if it's a formula
@@ -450,9 +469,15 @@ class TableDataModel(QAbstractTableModel):
                 try:
                     self._data.iloc[row, col] = parse_number(str_value)
                 except (ValueError, TypeError):
-                    self._data.iloc[row, col] = str_value
+                    # parse_number failed — try evaluating as arithmetic expression
+                    result = self._try_eval_expression(str_value)
+                    if result is not None:
+                        self._data.iloc[row, col] = result
+                    else:
+                        self._data.iloc[row, col] = str_value
 
             self.dataChanged.emit(index, index, [Qt.DisplayRole])
+            self._bump_revision()
             self.dataModified.emit()
             return True
 
@@ -495,6 +520,74 @@ class TableDataModel(QAbstractTableModel):
         except (IndexError, KeyError):
             return 0
 
+    def _format_float(self, value: float) -> str:
+        """Format a float according to current display settings."""
+        if value == 0.0:
+            if self._display_format == "decimal":
+                return f"{value:.{self._decimal_places}f}"
+            return "0"
+
+        fmt = self._display_format
+        dp = self._decimal_places
+        if fmt == "scientific":
+            return f"{value:.{dp}e}"
+        elif fmt == "decimal":
+            return f"{value:.{dp}f}"
+        else:  # auto
+            if abs(value) < 0.001 or abs(value) > 10000:
+                return f"{value:.4e}"
+            return f"{value:.6g}"
+
+    def _try_eval_expression(self, expr: str) -> Optional[float]:
+        """Try to evaluate a string as a simple arithmetic expression.
+        Returns float result or None if it's not a valid expression."""
+        # Only attempt if it contains arithmetic operators
+        if not any(op in expr for op in ['+', '-', '*', '/', '^', '(', ')']):
+            return None
+        # Don't eval things that look like plain text
+        if any(c.isalpha() and c not in ('e', 'E') for c in expr):
+            return None
+        try:
+            safe_expr = expr.replace('^', '**')
+            result = eval(safe_expr, {"__builtins__": {}}, {})
+            return float(result)
+        except Exception:
+            return None
+
+    def _save_undo(self):
+        """Save current state to undo stack."""
+        import copy
+        snapshot = (
+            self._data.copy(),
+            copy.deepcopy(self._column_metadata),
+            dict(self._cell_formulas),
+        )
+        self._undo_stack.append(snapshot)
+        if len(self._undo_stack) > self._max_undo:
+            self._undo_stack.pop(0)
+
+    @Slot()
+    def undo(self):
+        """Restore previous state from undo stack."""
+        if not self._undo_stack:
+            return
+
+        data, metadata, formulas = self._undo_stack.pop()
+
+        self.beginResetModel()
+        self._data = data
+        self._column_metadata = metadata
+        self._cell_formulas = formulas
+        self._update_formula_engine_columns()
+        self.endResetModel()
+
+        self._emit_size_changed()
+        self.dataModified.emit()
+
+    @Slot(result=bool)
+    def canUndo(self) -> bool:
+        return len(self._undo_stack) > 0
+
     def _update_formula_engine_columns(self):
         """Update formula engine with current column names"""
         names = [meta.name for meta in self._column_metadata]
@@ -527,6 +620,7 @@ class TableDataModel(QAbstractTableModel):
         self._cell_formulas.clear()
         self._update_formula_engine_columns()
         self.endResetModel()
+        self._emit_size_changed()
         self.dataModified.emit()
 
     @Slot('QVariant', list)
@@ -549,6 +643,7 @@ class TableDataModel(QAbstractTableModel):
 
         self._update_formula_engine_columns()
         self.endResetModel()
+        self._emit_size_changed()
         self.dataModified.emit()
 
     @Slot(result='QVariant')
@@ -578,6 +673,8 @@ class TableDataModel(QAbstractTableModel):
     @Slot(str, str, str)
     def addColumn(self, name: str, unit: str = "", comment: str = ""):
         """Add a new empty column"""
+        if not self._batch_mode:
+            self._save_undo()
         col_idx = len(self._data.columns)
 
         self.beginInsertColumns(QModelIndex(), col_idx, col_idx)
@@ -593,12 +690,14 @@ class TableDataModel(QAbstractTableModel):
         self._update_formula_engine_columns()
 
         self.endInsertColumns()
+        self._emit_size_changed()
         self.columnAdded.emit(col_idx, name)
         self.dataModified.emit()
 
     @Slot(str, list)
     def addColumnWithData(self, name: str, data: List[float]):
         """Add a new column with data"""
+        self._save_undo()
         col_idx = len(self._data.columns)
 
         self.beginInsertColumns(QModelIndex(), col_idx, col_idx)
@@ -617,14 +716,16 @@ class TableDataModel(QAbstractTableModel):
         self._update_formula_engine_columns()
 
         self.endInsertColumns()
+        self._emit_size_changed()
         self.columnAdded.emit(col_idx, name)
         self.dataModified.emit()
 
     @Slot(int)
-    def removeColumn(self, col_idx: int):
+    def removeColumnAt(self, col_idx: int):
         """Remove a column by index"""
         if col_idx < 0 or col_idx >= len(self._data.columns):
             return
+        self._save_undo()
 
         self.beginRemoveColumns(QModelIndex(), col_idx, col_idx)
 
@@ -645,6 +746,7 @@ class TableDataModel(QAbstractTableModel):
         self._update_formula_engine_columns()
 
         self.endRemoveColumns()
+        self._emit_size_changed()
         self.columnRemoved.emit(col_idx)
         self.dataModified.emit()
 
@@ -653,6 +755,7 @@ class TableDataModel(QAbstractTableModel):
         """Set a column-wide formula"""
         if col_idx < 0 or col_idx >= len(self._column_metadata):
             return
+        self._save_undo()
 
         self._column_metadata[col_idx].formula = formula
 
@@ -667,6 +770,7 @@ class TableDataModel(QAbstractTableModel):
                 top = self.index(0, col_idx)
                 bottom = self.index(len(self._data) - 1, col_idx)
                 self.dataChanged.emit(top, bottom, [Qt.DisplayRole])
+                self._bump_revision()
 
             except Exception as e:
                 logger.error(f"Column formula error: {e}")
@@ -727,6 +831,8 @@ class TableDataModel(QAbstractTableModel):
     @Slot()
     def addRow(self):
         """Add an empty row"""
+        if not self._batch_mode:
+            self._save_undo()
         row_idx = len(self._data)
         self.beginInsertRows(QModelIndex(), row_idx, row_idx)
 
@@ -735,11 +841,13 @@ class TableDataModel(QAbstractTableModel):
         self._data = pd.concat([self._data, new_row], ignore_index=True)
 
         self.endInsertRows()
+        self._emit_size_changed()
         self.dataModified.emit()
 
     @Slot(int)
-    def insertRow(self, row_idx: int):
+    def insertRowAt(self, row_idx: int):
         """Insert an empty row at specific index"""
+        self._save_undo()
         if row_idx < 0:
             row_idx = 0
         if row_idx > len(self._data):
@@ -771,13 +879,15 @@ class TableDataModel(QAbstractTableModel):
         self._cell_formulas = new_formulas
 
         self.endInsertRows()
+        self._emit_size_changed()
         self.dataModified.emit()
 
     @Slot(int)
-    def removeRow(self, row_idx: int):
+    def removeRowAt(self, row_idx: int):
         """Remove a row by index"""
         if row_idx < 0 or row_idx >= len(self._data):
             return
+        self._save_undo()
 
         self.beginRemoveRows(QModelIndex(), row_idx, row_idx)
 
@@ -794,6 +904,7 @@ class TableDataModel(QAbstractTableModel):
         self._cell_formulas = new_formulas
 
         self.endRemoveRows()
+        self._emit_size_changed()
         self.dataModified.emit()
 
     @Slot(int)
@@ -801,6 +912,7 @@ class TableDataModel(QAbstractTableModel):
         """Clear all values in a row (set to 0)"""
         if row_idx < 0 or row_idx >= len(self._data):
             return
+        self._save_undo()
 
         for col_idx in range(len(self._data.columns)):
             self._data.iloc[row_idx, col_idx] = 0.0
@@ -812,6 +924,7 @@ class TableDataModel(QAbstractTableModel):
         left = self.index(row_idx, 0)
         right = self.index(row_idx, len(self._data.columns) - 1)
         self.dataChanged.emit(left, right, [Qt.DisplayRole])
+        self._bump_revision()
         self.dataModified.emit()
 
     @Slot(int)
@@ -819,6 +932,7 @@ class TableDataModel(QAbstractTableModel):
         """Clear all values in a column (set to 0)"""
         if col_idx < 0 or col_idx >= len(self._data.columns):
             return
+        self._save_undo()
 
         col_name = self._data.columns[col_idx]
         self._data[col_name] = 0.0
@@ -837,6 +951,7 @@ class TableDataModel(QAbstractTableModel):
         top = self.index(0, col_idx)
         bottom = self.index(len(self._data) - 1, col_idx)
         self.dataChanged.emit(top, bottom, [Qt.DisplayRole])
+        self._bump_revision()
         self.dataModified.emit()
 
     @Slot(int, bool)
@@ -844,6 +959,7 @@ class TableDataModel(QAbstractTableModel):
         """Sort the table by a column"""
         if col_idx < 0 or col_idx >= len(self._data.columns):
             return
+        self._save_undo()
 
         self.beginResetModel()
 
@@ -966,17 +1082,62 @@ class TableDataModel(QAbstractTableModel):
     def linkedGraphId(self, value: str):
         self._linked_graph_id = value if value else None
 
-    @Property(int)
+    @Property(int, notify=rowsChanged)
     def rows(self) -> int:
         return len(self._data)
 
-    @Property(int)
+    @Property(int, notify=columnsChanged)
     def columns(self) -> int:
         return len(self._data.columns) if not self._data.empty else 0
 
-    @Property(bool)
+    @Property(bool, notify=isEmptyChanged)
     def isEmpty(self) -> bool:
         return self._data.empty
+
+    @Property(str, notify=displayFormatChanged)
+    def displayFormat(self) -> str:
+        return self._display_format
+
+    @displayFormat.setter
+    def displayFormat(self, value: str):
+        if value in ("auto", "scientific", "decimal") and value != self._display_format:
+            self._display_format = value
+            self.displayFormatChanged.emit()
+            self._bump_revision()
+
+    @Property(int, notify=displayFormatChanged)
+    def decimalPlaces(self) -> int:
+        return self._decimal_places
+
+    @decimalPlaces.setter
+    def decimalPlaces(self, value: int):
+        value = max(0, min(15, value))
+        if value != self._decimal_places:
+            self._decimal_places = value
+            self.displayFormatChanged.emit()
+            self._bump_revision()
+
+    @Slot(str, int)
+    def setDisplayFormat(self, fmt: str, decimals: int):
+        """Set display format from QML."""
+        self.displayFormat = fmt
+        self.decimalPlaces = decimals
+
+    @Property(int, notify=dataRevisionChanged)
+    def dataRevision(self) -> int:
+        return self._data_revision
+
+    def _bump_revision(self):
+        """Increment revision counter so QML re-reads cell values."""
+        self._data_revision += 1
+        self.dataRevisionChanged.emit()
+
+    def _emit_size_changed(self):
+        """Emit all size-related signals for QML property updates."""
+        self.rowsChanged.emit()
+        self.columnsChanged.emit()
+        self.isEmptyChanged.emit()
+        self._bump_revision()
 
     # =========================================================================
     # Export & Clipboard
@@ -1039,11 +1200,77 @@ class TableDataModel(QAbstractTableModel):
             logger.error(f"Copy range failed: {e}")
             return ""
 
+    @Slot(int, int, int, int, result=str)
+    def copyRangeWithHeaders(self, startRow: int, startCol: int, endRow: int, endCol: int) -> str:
+        """Copy cell range with column headers as first row."""
+        try:
+            from PySide6.QtGui import QGuiApplication
+
+            r1, r2 = min(startRow, endRow), max(startRow, endRow)
+            c1, c2 = min(startCol, endCol), max(startCol, endCol)
+            r1 = max(0, r1)
+            c1 = max(0, c1)
+            r2 = min(r2, len(self._data) - 1)
+            c2 = min(c2, len(self._data.columns) - 1)
+
+            # Header row
+            headers = []
+            for col in range(c1, c2 + 1):
+                h = self.headerData(col, Qt.Horizontal, Qt.DisplayRole)
+                headers.append(str(h) if h else "")
+            lines = ["\t".join(headers)]
+
+            # Data rows
+            for row in range(r1, r2 + 1):
+                cells = []
+                for col in range(c1, c2 + 1):
+                    idx = self.index(row, col)
+                    val = self.data(idx, Qt.DisplayRole)
+                    cells.append(str(val) if val is not None else "")
+                lines.append("\t".join(cells))
+
+            tsv = "\n".join(lines)
+
+            clipboard = QGuiApplication.clipboard()
+            if clipboard:
+                clipboard.setText(tsv)
+
+            logger.info(f"Copied range with headers ({r1},{c1})-({r2},{c2})")
+            return tsv
+        except Exception as e:
+            logger.error(f"Copy with headers failed: {e}")
+            return ""
+
+    @Slot(int, int, int, int)
+    def clearRange(self, startRow: int, startCol: int, endRow: int, endCol: int):
+        """Clear all cells in a range (set to 0)."""
+        self._save_undo()
+        r1, r2 = min(startRow, endRow), max(startRow, endRow)
+        c1, c2 = min(startCol, endCol), max(startCol, endCol)
+        r1 = max(0, r1)
+        c1 = max(0, c1)
+        r2 = min(r2, len(self._data) - 1)
+        c2 = min(c2, len(self._data.columns) - 1)
+
+        for row in range(r1, r2 + 1):
+            for col in range(c1, c2 + 1):
+                self._data.iloc[row, col] = 0.0
+                if (row, col) in self._cell_formulas:
+                    del self._cell_formulas[(row, col)]
+
+        if r1 <= r2 and c1 <= c2:
+            top = self.index(r1, c1)
+            bottom = self.index(r2, c2)
+            self.dataChanged.emit(top, bottom, [Qt.DisplayRole])
+            self._bump_revision()
+            self.dataModified.emit()
+
     @Slot(int, int, str)
     def pasteFromClipboard(self, startRow: int, startCol: int, text: str = ""):
         """
         Paste tab-separated text into table starting at (startRow, startCol).
         If text is empty, reads from system clipboard.
+        Handles Excel/Google Sheets \\r\\n line endings.
         """
         try:
             from PySide6.QtGui import QGuiApplication
@@ -1056,7 +1283,13 @@ class TableDataModel(QAbstractTableModel):
             if not text:
                 return
 
-            lines = text.strip().split("\n")
+            self._save_undo()
+            self._batch_mode = True
+
+            # Normalize line endings (Excel uses \r\n)
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
+            lines = text.strip("\n").split("\n")
+
             for row_offset, line in enumerate(lines):
                 cells = line.split("\t")
                 for col_offset, cell_value in enumerate(cells):
@@ -1066,12 +1299,20 @@ class TableDataModel(QAbstractTableModel):
                     # Expand table if needed
                     while row >= len(self._data):
                         self.addRow()
-                    if col >= len(self._data.columns):
-                        continue  # Don't add columns automatically
+                    while col >= len(self._data.columns):
+                        self.addColumn(self._index_to_letters(len(self._data.columns)))
 
-                    idx = self.index(row, col)
-                    self.setData(idx, cell_value, Qt.EditRole)
+                    # Set value directly to avoid per-cell revision bumps
+                    try:
+                        self._data.iloc[row, col] = parse_number(cell_value.strip())
+                    except (ValueError, TypeError):
+                        self._data.iloc[row, col] = cell_value.strip()
 
+            self._batch_mode = False
+            # Single refresh at end
+            self._bump_revision()
+            self.dataModified.emit()
             logger.info(f"Pasted {len(lines)} rows starting at ({startRow},{startCol})")
         except Exception as e:
+            self._batch_mode = False
             logger.error(f"Paste failed: {e}")

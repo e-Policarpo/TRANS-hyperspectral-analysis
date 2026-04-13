@@ -28,6 +28,7 @@ Rectangle {
     property color textLight: workflowWindow ? workflowWindow.textLight : "#ffffff"
     property color textMuted: workflowWindow ? workflowWindow.textMuted : "#cccccc"
     property color borderColor: workflowWindow ? workflowWindow.borderColor : "#9B4F96"
+    property string monoFont: Qt.platform.os === "osx" ? "Menlo" : "Consolas"
 
     color: "transparent"
 
@@ -1102,7 +1103,7 @@ Rectangle {
                     anchors.margins: 6
                     text: currentValue
                     color: textLight
-                    font.family: "monospace"
+                    font.family: monoFont
                     font.pixelSize: 12
                     wrapMode: TextEdit.Wrap
                     selectByMouse: true
@@ -1147,7 +1148,7 @@ Rectangle {
                             text: modelData
                             color: textMuted
                             font.pixelSize: 9
-                            font.family: "monospace"
+                            font.family: monoFont
                         }
 
                         MouseArea {
@@ -1191,7 +1192,7 @@ Rectangle {
                             text: modelData
                             color: accentBlue
                             font.pixelSize: 9
-                            font.family: "monospace"
+                            font.family: monoFont
                         }
 
                         MouseArea {
@@ -1241,7 +1242,7 @@ Rectangle {
                             text: modelData.name
                             color: accentPink
                             font.pixelSize: 9
-                            font.family: "monospace"
+                            font.family: monoFont
                         }
 
                         MouseArea {
@@ -1455,7 +1456,7 @@ Rectangle {
                                 color: bgDark
                                 font.pixelSize: 14
                                 font.bold: true
-                                font.family: "monospace"
+                                font.family: monoFont
                             }
                         }
 
@@ -1613,7 +1614,7 @@ Rectangle {
                     Layout.preferredWidth: 80
                     text: colorPreview.color.toString().toUpperCase()
                     color: textLight
-                    font.family: "monospace"
+                    font.family: monoFont
                     font.pixelSize: 11
 
                     background: Rectangle {

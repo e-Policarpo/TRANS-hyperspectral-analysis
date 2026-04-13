@@ -134,6 +134,9 @@ class QMLMapCanvas(QQuickPaintedItem):
         self._grid_block_v: int = 1  # Vertical block size in pixels
         self._hover_block: Optional[Tuple[int, int]] = None  # Grid block under cursor
 
+        # STS grid region overlay (topography with spectral grid position)
+        self._sts_region_rect: Optional[Tuple[float, float, float, float]] = None  # (x0, y0, x1, y1) in fractional coords
+
         # Spectral cube link for reconstruction
         self._spectral_cube: Optional[np.ndarray] = None  # Shape: (n_spectral_pts, rows, cols)
         self._independent_var: Optional[np.ndarray] = None  # Wavenumber/voltage axis
@@ -360,6 +363,22 @@ class QMLMapCanvas(QQuickPaintedItem):
     def setGridOverlayVisible(self, visible: bool):
         """Show or hide the grid overlay."""
         self._show_grid_overlay = visible
+        self.update()
+
+    def setStsRegionRect(self, x0: float, y0: float, x1: float, y1: float):
+        """
+        Set the STS grid region rectangle overlay in fractional coordinates.
+
+        (x0, y0) and (x1, y1) are opposite corners, each in [0,1] range
+        relative to the map data extents.
+        """
+        self._sts_region_rect = (x0, y0, x1, y1)
+        self._needs_redraw = True
+        self.update()
+
+    def clearStsRegionRect(self):
+        """Remove the STS grid region rectangle overlay."""
+        self._sts_region_rect = None
         self.update()
 
     @Slot()
@@ -663,6 +682,29 @@ class QMLMapCanvas(QQuickPaintedItem):
     def _drawOverlays(self, painter: QPainter):
         """Draw interactive overlay elements"""
         painter.setRenderHint(QPainter.Antialiasing, True)
+
+        # Draw STS grid region rectangle overlay
+        if self._sts_region_rect and self._data_to_pixel is not None:
+            d = self._data_to_pixel
+            ax_width = d['ax_right'] - d['ax_left']
+            ax_height = d['ax_bottom'] - d['ax_top']
+            x0, y0, x1, y1 = self._sts_region_rect
+
+            # Convert fractional coords to pixel coords
+            px_left = d['ax_left'] + min(x0, x1) * ax_width
+            px_right = d['ax_left'] + max(x0, x1) * ax_width
+            px_top = d['ax_top'] + min(y0, y1) * ax_height
+            px_bottom = d['ax_top'] + max(y0, y1) * ax_height
+
+            # Semi-transparent red fill
+            painter.setBrush(QColor(245, 169, 184, 50))
+            pen = QPen(QColor(245, 169, 184, 200))
+            pen.setWidth(2)
+            painter.setPen(pen)
+            painter.drawRect(
+                int(px_left), int(px_top),
+                int(px_right - px_left), int(px_bottom - px_top)
+            )
 
         # Draw grid overlay for discretization
         if self._show_grid_overlay and self._data_to_pixel is not None and self._map_data is not None:

@@ -33,6 +33,7 @@ Rectangle {
     property color textLight: mainWin ? mainWin.textLight : "#ffffff"
     property color textMuted: mainWin ? mainWin.textMuted : "#B0A0B8"
     property color borderColor: mainWin ? mainWin.borderColor : "#7B3F76"
+    property string monoFont: mainWin ? mainWin.fontFamilyMono : (Qt.platform.os === "osx" ? "Menlo" : "Consolas")
 
     color: bgMedium
     height: 160
@@ -107,7 +108,7 @@ Rectangle {
                 Label {
                     text: hasStats && stats.min !== undefined ? stats.min.toFixed(4) : "--"
                     font.pixelSize: 10
-                    font.family: "monospace"
+                    font.family: monoFont
                     color: textLight
                     Layout.fillWidth: true
                 }
@@ -120,7 +121,7 @@ Rectangle {
                 Label {
                     text: hasStats && stats.max !== undefined ? stats.max.toFixed(4) : "--"
                     font.pixelSize: 10
-                    font.family: "monospace"
+                    font.family: monoFont
                     color: textLight
                     Layout.fillWidth: true
                 }
@@ -134,7 +135,7 @@ Rectangle {
                 Label {
                     text: hasStats && stats.mean !== undefined ? stats.mean.toFixed(4) : "--"
                     font.pixelSize: 10
-                    font.family: "monospace"
+                    font.family: monoFont
                     color: accentBlue
                     Layout.fillWidth: true
                 }
@@ -147,7 +148,7 @@ Rectangle {
                 Label {
                     text: hasStats && stats.std !== undefined ? stats.std.toFixed(4) : "--"
                     font.pixelSize: 10
-                    font.family: "monospace"
+                    font.family: monoFont
                     color: textLight
                     Layout.fillWidth: true
                 }
@@ -161,7 +162,7 @@ Rectangle {
                 Label {
                     text: hasStats && stats.median !== undefined ? stats.median.toFixed(4) : "--"
                     font.pixelSize: 10
-                    font.family: "monospace"
+                    font.family: monoFont
                     color: textLight
                     Layout.fillWidth: true
                 }
@@ -174,7 +175,7 @@ Rectangle {
                 Label {
                     text: hasStats && stats.rms !== undefined ? stats.rms.toFixed(4) : "--"
                     font.pixelSize: 10
-                    font.family: "monospace"
+                    font.family: monoFont
                     color: textLight
                     Layout.fillWidth: true
                 }
@@ -188,7 +189,7 @@ Rectangle {
                 Label {
                     text: hasStats && stats.range !== undefined ? stats.range.toFixed(4) : "--"
                     font.pixelSize: 10
-                    font.family: "monospace"
+                    font.family: monoFont
                     color: textLight
                     Layout.fillWidth: true
                 }
