@@ -182,7 +182,7 @@ Dialog {
 
         Label {
             text: dialog.isSmartMode ?
-                  "Pick one file from the session — the loader auto-discovers all siblings.\nSupports: .nid (Nanosurf), .mtrx / .I(V)_mtrx (Omicron Matrix)" :
+                  "Pick one file from the session — the loader auto-discovers all siblings.\nSupports: .nid (Nanosurf), .mtrx / .I(V)_mtrx (Omicron Matrix), .ps-ppt / .tiff (Park AFM)" :
                   dialog.isFolderMode ?
                   "Click 'Browse' to select a folder containing measurement files:" :
                   "Click 'Browse' to select one or more measurement files:"
@@ -274,7 +274,7 @@ Dialog {
         }
 
         Label {
-            text: "Supported formats: .nid (Nanosurf), .txt (NeaSpec), .I(V)_mtrx .Aux2(V)_mtrx .Z_flat .I_flat (Omicron Matrix)"
+            text: "Supported formats: .nid (Nanosurf), .txt (NeaSpec), .I(V)_mtrx .Aux2(V)_mtrx .Z_flat .I_flat (Omicron Matrix), .ps-ppt .tiff (Park AFM)"
             font.pixelSize: 10
             color: textMuted
             Layout.fillWidth: true
@@ -288,11 +288,13 @@ Dialog {
         title: "Select Measurement Files"
         fileMode: FileDialog.OpenFiles
         nameFilters: [
-            "All Measurement Files (*.nid *.txt *.I(V)_mtrx *.Z_flat *.I_flat)",
+            "All Measurement Files (*.nid *.txt *.I(V)_mtrx *.Z_flat *.I_flat *.ps-ppt *.tiff)",
             "Nanosurf Files (*.nid)",
             "NeaSpec Files (*.txt)",
             "Omicron Matrix STS (*.I(V)_mtrx)",
             "Omicron Matrix Images (*.Z_flat *.I_flat)",
+            "Park AFM PinPoint (*.ps-ppt)",
+            "Park AFM Maps (*.tiff)",
             "All Files (*)"
         ]
 
@@ -324,10 +326,11 @@ Dialog {
         title: "Pick one file from the measurement session"
         fileMode: FileDialog.OpenFile
         nameFilters: [
-            "Smart Import Files (*.nid *.mtrx *.I(V)_mtrx *.Aux2(V)_mtrx)",
+            "Smart Import Files (*.nid *.mtrx *.I(V)_mtrx *.Aux2(V)_mtrx *.ps-ppt *.tiff)",
             "Nanosurf Files (*.nid)",
             "Omicron Matrix Header (*.mtrx)",
             "Omicron Matrix STS (*.I(V)_mtrx)",
+            "Park AFM (*.ps-ppt *.tiff)",
             "All Files (*)"
         ]
 

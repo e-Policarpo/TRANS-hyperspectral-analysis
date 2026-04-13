@@ -27,6 +27,7 @@ from src.data_loaders.nanosurf_sts_enhanced import NanosurfSTSEnhancedLoader
 from src.data_loaders.neaspec_snom_enhanced import NeaSpecSNOMEnhancedLoader
 from src.data_loaders.omicron_mtrx_loader import OmicronMatrixSTSLoader
 from src.data_loaders.omicron_flat_loader import OmicronFlatLoader
+from src.data_loaders.park_afm_loader import ParkAFMLoader
 from src.backend.tool_implementations import ToolImplementations
 from src.backend.worker import WorkerManager
 from src.backend.project_manager import ProjectManager
@@ -137,6 +138,14 @@ class AppBackend(ToolImplementations, QObject):
         except Exception as e:
             logger.warning(f"Could not initialize Omicron Flat loader: {e}")
             self.omicron_flat_loader = None
+
+        # Initialize Park AFM loader
+        try:
+            self.park_loader = ParkAFMLoader()
+            logger.info("Park AFM loader initialized")
+        except Exception as e:
+            logger.warning(f"Could not initialize Park AFM loader: {e}")
+            self.park_loader = None
 
         # Initialize discretizer for spatial averaging
         self.discretizer = Discretizer()
@@ -898,6 +907,7 @@ class AppBackend(ToolImplementations, QObject):
         - .nid files (Nanosurf) — discovers sibling .nid files
         - .mtrx / .I(V)_mtrx / etc (Omicron Matrix) — reads _0001.mtrx header
           to enumerate all session files via FERB blocks
+        - .ps-ppt / .tiff (Park AFM) — discovers siblings by naming convention
         """
         filepath = Path(str(file_path))
         logger.info(f"Smart map import from: {filepath}")
@@ -924,6 +934,8 @@ class AppBackend(ToolImplementations, QObject):
             return self._do_smart_load_nanosurf(filepath, progress_callback)
         elif name.endswith('_mtrx') or name.endswith('.mtrx'):
             return self._do_smart_load_matrix(filepath, progress_callback)
+        elif name.endswith('.ps-ppt') or name.endswith('.tiff'):
+            return self._do_smart_load_park(filepath, progress_callback)
         else:
             raise ValueError(f"Smart import not supported for: {filepath.name}")
 
@@ -979,6 +991,40 @@ class AppBackend(ToolImplementations, QObject):
             result['active_dataset'] = f"{base_name}_Mixed"
         else:
             dataset_name = self._apply_naming_convention(folder_name, 'IV')
+            result['datasets'][dataset_name] = spectral_data
+            result['active_dataset'] = dataset_name
+
+        return result
+
+    def _do_smart_load_park(self, filepath: Path, progress_callback=None):
+        """Smart load for Park AFM files (.ps-ppt / .tiff)."""
+        if not self.park_loader:
+            raise RuntimeError("Park AFM loader not available")
+
+        spectral_data, topography = self.park_loader.smart_load_from_file(
+            filepath, progress_callback=progress_callback
+        )
+
+        result = {'datasets': {}, 'active_dataset': None}
+        folder_name = filepath.parent.name
+
+        channels = spectral_data.metadata.additional_info.get('channels', {})
+        if channels:
+            for channel_name, channel_data in channels.items():
+                dataset_name = f"{folder_name}_{channel_name}"
+                result['datasets'][dataset_name] = channel_data
+                logger.info(f"Smart-loaded Park channel: {dataset_name}")
+
+            result['active_dataset'] = f"{folder_name}_Force Backward"
+            # If that key doesn't exist, pick the first Force channel or first overall
+            if result['active_dataset'] not in result['datasets']:
+                force_keys = [k for k in result['datasets'] if 'Force' in k]
+                if force_keys:
+                    result['active_dataset'] = force_keys[0]
+                else:
+                    result['active_dataset'] = next(iter(result['datasets']))
+        else:
+            dataset_name = f"{folder_name}_{filepath.stem}"
             result['datasets'][dataset_name] = spectral_data
             result['active_dataset'] = dataset_name
 
@@ -1104,6 +1150,17 @@ class AppBackend(ToolImplementations, QObject):
 
             # No spectral data for pure image files
             result['active_dataset'] = None
+
+        elif filepath.suffix == '.ps-ppt':
+            # Park AFM PinPoint spectroscopy file
+            if not self.park_loader:
+                raise RuntimeError("Park AFM loader not available")
+
+            spectral_data = self.park_loader.load_single_file(filepath)
+            dataset_name = self._apply_naming_convention(filepath.stem, 'Force')
+            result['datasets'][dataset_name] = spectral_data
+            result['active_dataset'] = dataset_name
+            logger.info(f"Loaded Park ps-ppt: {dataset_name}")
 
         else:
             raise ValueError(f"Cannot load {filepath.suffix} files")

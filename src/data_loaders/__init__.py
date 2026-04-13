@@ -8,6 +8,7 @@ from .nanosurf_sts_loader import NanosurfSTSLoader
 from .neaspec_snom_loader import NeaSpecSNOMLoader
 from .omicron_mtrx_loader import OmicronMatrixSTSLoader
 from .omicron_flat_loader import OmicronFlatLoader, OmicronImageLoader
+from .park_afm_loader import ParkAFMLoader
 
 __all__ = [
     'BaseDataLoader',
@@ -16,4 +17,5 @@ __all__ = [
     'OmicronMatrixSTSLoader',
     'OmicronFlatLoader',
     'OmicronImageLoader',
+    'ParkAFMLoader',
 ]
