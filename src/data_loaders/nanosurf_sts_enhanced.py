@@ -11,7 +11,7 @@ License: GPL
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Optional, Tuple, List, Dict
+from typing import Any, Optional, Tuple, List, Dict
 import logging
 import re
 
@@ -465,6 +465,72 @@ class NanosurfSTSEnhancedLoader(BaseDataLoader):
             logger.warning(f"Could not extract topography: {e}")
             return None
 
+    def _extract_image_channels(self, stm_nid, file_label: str) -> List[Tuple[str, "Any"]]:
+        """Surface every Nanosurf Image channel as an :class:`ImageData`.
+
+        Each ``.nid`` file may contain forward / backward scans of multiple
+        channels (Z-Axis / Amplitude / Phase / Z-Axis Sensor, …). The legacy
+        loader keeps Z-Axis as topography and silently drops the rest;
+        this helper turns each (direction, channel) into a SINGLE_FLOAT
+        :class:`ImageData` so the user can browse them under the new
+        Images category.
+
+        Z-Axis channels are returned as well — useful when the file is
+        image-only (no spectra) and the topography path doesn't run.
+        """
+        out: List[Tuple[str, Any]] = []
+        if not hasattr(stm_nid.data, "Image"):
+            return out
+        # Local imports to avoid pulling Qt-optional ImageData when this
+        # loader runs in a headless context that doesn't need it.
+        try:
+            from src.models.image_data import ImageData, ImageMode, ImageMetadata
+        except Exception:
+            return out
+
+        # ``stm_nid.data`` is a pandas Series indexed by (category, direction,
+        # channel). Iterate the Image rows directly so we don't depend on the
+        # ``.Image.Forward`` accessor working when only one direction is present.
+        try:
+            entries = list(stm_nid.data.items())
+        except Exception:
+            return out
+
+        for key, value in entries:
+            try:
+                category, direction, channel = key
+            except Exception:
+                continue
+            if category != "Image":
+                continue
+            try:
+                arr = np.asarray(value)
+            except Exception:
+                continue
+            if arr.ndim != 2 or arr.size == 0:
+                continue
+            name = f"{file_label} · {channel} ({direction})".strip()
+            try:
+                img = ImageData(
+                    array=arr.astype(np.float32, copy=False),
+                    mode=ImageMode.SINGLE_FLOAT,
+                    metadata=ImageMetadata(
+                        source="nanosurf_nid_image",
+                        original_filename=Path(stm_nid.filename).name
+                            if getattr(stm_nid, "filename", None) else None,
+                        additional_info={
+                            "nid_category": category,
+                            "nid_direction": direction,
+                            "nid_channel": channel,
+                        },
+                    ),
+                    name=name,
+                )
+                out.append((name, img))
+            except Exception as e:
+                logger.debug("Skipping NID image %s/%s: %s", direction, channel, e)
+        return out
+
     def _extract_scan_geometry(self, filepath: Path) -> Optional[Dict]:
         """
         Extract the topography scan geometry from an NID file header.
@@ -673,7 +739,14 @@ class NanosurfSTSEnhancedLoader(BaseDataLoader):
                 continue
 
         if not all_spectra_mixed:
-            raise ValueError("No spectral data could be extracted")
+            # Image-only NID files (no Spec channels) take this branch.
+            # Build a placeholder dataset that just carries the images so
+            # the user can browse them under the Images category. The
+            # loader contract still returns a SpectralData; a stub
+            # 1-point DataFrame keeps existing callers from blowing up.
+            return self._build_image_only_result(
+                nid_files, directory, progress_callback,
+            )
 
         # Check file count vs expected grid size
         if dimensions is not None:
@@ -858,6 +931,64 @@ class NanosurfSTSEnhancedLoader(BaseDataLoader):
         logger.info(f"Inferred dimensions: {dims}")
         return dims
 
+    def _build_image_only_result(
+        self, nid_files: List[Path], directory: Path, progress_callback,
+    ) -> Tuple[SpectralData, Optional[TopographyData]]:
+        """Return a placeholder dataset carrying images-only Nanosurf data.
+
+        Used when ``.nid`` files contain just AFM image channels (no Spec
+        section) — for example, a topography-only scan. Each image channel
+        is surfaced via ``additional_info['images']`` so it appears under
+        the Images browser category. The "primary" SpectralData is a
+        1-point stub so the existing dispatcher contract still holds.
+        """
+        session_images: List[Tuple[str, Any]] = []
+        topography: Optional[TopographyData] = None
+        topo_geometry: Optional[Dict] = None
+        for filepath in nid_files:
+            try:
+                stm_nid = nid_read(str(filepath))
+            except Exception as e:
+                logger.debug(f"Could not read {filepath.name}: {e}")
+                continue
+            session_images.extend(self._extract_image_channels(stm_nid, filepath.stem))
+            if topography is None:
+                topography = self._extract_topography(stm_nid)
+                if topography is not None:
+                    topo_geometry = self._extract_scan_geometry(filepath)
+
+        if not session_images and topography is None:
+            raise ValueError(
+                "No spectroscopy and no image channels could be extracted "
+                f"from {directory}"
+            )
+
+        df = pd.DataFrame({"V": [0.0], "Empty": [0.0]})
+        meta = SpectralMetadata(
+            source_type="nanosurf_sts",
+            dimensions=(0, 0),
+            scan_mode="image-only",
+            units={"independent": "n/a", "dependent": "n/a"},
+            additional_info={
+                "placeholder": True,
+                "n_files": len(nid_files),
+                "source_directory": str(directory),
+            },
+        )
+        sd = SpectralData(df, meta, topography.data if topography else None)
+        if session_images:
+            sd.metadata.additional_info["images"] = session_images
+            logger.info(
+                f"Image-only NID load: surfaced {len(session_images)} channel(s) "
+                f"from {len(nid_files)} file(s)"
+            )
+        if topo_geometry is not None:
+            sd.metadata.additional_info["topo_geometry"] = topo_geometry
+        if progress_callback:
+            progress_callback(len(nid_files), len(nid_files), "Complete!")
+        self.last_loaded_path = directory
+        return sd, topography
+
     def _build_result(self, all_fwd, all_bwd, all_mix, V_common,
                       dimensions, topography, nid_files, directory,
                       progress_callback, n_repetitions=None,
@@ -914,6 +1045,28 @@ class NanosurfSTSEnhancedLoader(BaseDataLoader):
         # Return the mixed channel as primary, but store others in metadata
         primary_data = results['Mixed']
         primary_data.metadata.additional_info['channels'] = results
+
+        # Surface every Image channel (Z-Axis / Amplitude / Phase / Sensor,
+        # forward + backward) as ImageData entries so the browser's Images
+        # category shows them. Cheap second pass over the .nid headers — the
+        # raw arrays are already cached by NSFopen on first read.
+        try:
+            session_images = []
+            for filepath in nid_files:
+                try:
+                    stm_nid = nid_read(str(filepath))
+                except Exception:
+                    continue
+                session_images.extend(
+                    self._extract_image_channels(stm_nid, filepath.stem)
+                )
+            if session_images:
+                primary_data.metadata.additional_info['images'] = session_images
+                logger.info(
+                    f"Surfaced {len(session_images)} Nanosurf image channel(s)"
+                )
+        except Exception as e:
+            logger.debug(f"Nanosurf image-channel surfacing failed: {e}")
 
         return primary_data, topography
 

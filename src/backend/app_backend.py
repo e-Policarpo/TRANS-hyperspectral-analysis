@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Any
+import tempfile
 from PySide6.QtCore import QObject, Signal, Slot, Property, QUrl
 from PySide6.QtWidgets import QFileDialog, QApplication
 from PySide6.QtGui import QDesktopServices
@@ -23,11 +24,24 @@ from src.models.spectral_data import SpectralData, SpectralMetadata
 from src.models.table_data_model import TableDataModel
 from src.models.topography_data import TopographyData
 from src.models.discretizer import Discretizer
+from src.models.image_data import ImageData, ImageMode
+from src.backend.spectral_axis import (
+    AxisUnit,
+    convert_dataframe_axis,
+    default_column_name,
+    parse_unit,
+)
+from src.backend.peak_fitting import (
+    PeakShape,
+    detect_peaks,
+    fit_multipeak,
+)
 from src.data_loaders.nanosurf_sts_enhanced import NanosurfSTSEnhancedLoader
 from src.data_loaders.neaspec_snom_enhanced import NeaSpecSNOMEnhancedLoader
 from src.data_loaders.omicron_mtrx_loader import OmicronMatrixSTSLoader
 from src.data_loaders.omicron_flat_loader import OmicronFlatLoader
 from src.data_loaders.park_afm_loader import ParkAFMLoader
+from src.data_loaders.witec_wip_loader import WitecWipLoader
 from src.backend.tool_implementations import ToolImplementations
 from src.backend.worker import WorkerManager
 from src.backend.project_manager import ProjectManager
@@ -70,11 +84,20 @@ class AppBackend(ToolImplementations, QObject):
     activeDatasetChanged = Signal(str)  # active dataset name changed
     projectPathChanged = Signal(str)  # project path changed
     namingConventionChanged = Signal(str)  # naming convention pattern changed
-    loadMapInEditor = Signal(str)  # map_path - request to load map in the map editor
+    loadMapInEditor = Signal(str)  # map_path - request to load map in the map editor (file-based path)
+    loadMapInEditorById = Signal(str)  # map_id - request to load an in-memory map by ID
     projectStateRestored = Signal(str)  # stateJson - emitted after loading project to restore tables/graphs/workspace
     openDatasetEmbedded = Signal(str, 'QVariantList', str, str)  # name, curves, xLabel, yLabel
     openTableEmbedded = Signal(str, QObject)  # title, TableDataModel
+    openImageEmbedded = Signal(str, str)  # title, image_id (canvas pulls QImage via image:// URL provider)
+    openNoteEmbedded = Signal(str, str, str)  # title, body_text, source_label
     collectWindowStatesRequested = Signal()  # ask QML for embedded window states before saving
+    imageAdded = Signal(str, str)  # image_id, name
+    imageDeleted = Signal(str)  # image_id
+    imageRenamed = Signal(str, str)  # image_id, new_name
+    noteAdded = Signal(str, str)  # note_id, name
+    noteDeleted = Signal(str)  # note_id
+    noteRenamed = Signal(str, str)  # note_id, new_name
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -147,6 +170,14 @@ class AppBackend(ToolImplementations, QObject):
             logger.warning(f"Could not initialize Park AFM loader: {e}")
             self.park_loader = None
 
+        # Initialize WITec WIP loader (PL/Raman)
+        try:
+            self.witec_loader = WitecWipLoader()
+            logger.info("WITec WIP loader initialized")
+        except Exception as e:
+            logger.warning(f"Could not initialize WITec WIP loader: {e}")
+            self.witec_loader = None
+
         # Initialize discretizer for spatial averaging
         self.discretizer = Discretizer()
 
@@ -193,8 +224,24 @@ class AppBackend(ToolImplementations, QObject):
         # Track maps and output files from tools
         self.maps = []  # List of {'id': str, 'title': str, 'path': str, 'timestamp': str}
         self._map_id_counter = 0
+        # In-memory map registry — populated when a loader returns a
+        # MultiChannelMap directly (no on-disk TIFF). Used by openMap to
+        # route the map to the editor without going through the filesystem.
+        # Keyed by map_id; values are MultiChannelMap-shaped objects (the
+        # map editor consumes them via loadMapById).
+        self._maps_inmem: Dict[str, Any] = {}
         self.output_files = []  # List of {'id': str, 'tool': str, 'path': str, 'timestamp': str}
         self._output_id_counter = 0
+
+        # Image entities (first-class, alongside datasets and maps)
+        self._images: Dict[str, ImageData] = {}
+
+        # Note entities — text annotations surfaced from measurement files
+        # (e.g. WITec ``TDText`` blocks) plus user-added notes. Stored as a
+        # plain dict so the browser can list them by id without round-tripping
+        # through a richer model class.
+        self._notes: Dict[str, Dict[str, Any]] = {}
+        self._note_id_counter = 0
 
         logger.info("AppBackend initialized with all tools")
 
@@ -366,8 +413,15 @@ class AppBackend(ToolImplementations, QObject):
 
     @Slot(QObject)
     def setMapEditorBackend(self, backend):
-        """Store reference to map editor backend (called from QML)."""
+        """Store reference to map editor backend (called from QML).
+
+        Also installs the reverse reference so the map editor can resolve
+        in-memory ``MultiChannelMap`` entities by id without disk I/O —
+        this is the backbone of the project-browser map double-click fix.
+        """
         self._map_editor_backend = backend
+        if backend is not None and hasattr(backend, "set_app_backend"):
+            backend.set_app_backend(self)
         logger.info("Map editor backend registered with app backend")
 
     @Slot('QVariantList')
@@ -565,7 +619,10 @@ class AppBackend(ToolImplementations, QObject):
         self._datasets.clear()
         self._active_dataset = None
         self.maps.clear()
+        self._maps_inmem.clear()
         self.output_files.clear()
+        self._images.clear()
+        self._notes.clear()
 
         # Add to recent projects
         self._add_to_recent_projects(project_path, project_name)
@@ -626,7 +683,10 @@ class AppBackend(ToolImplementations, QObject):
         self._datasets.clear()
         self._active_dataset = None
         self.maps.clear()
+        self._maps_inmem.clear()
         self.output_files.clear()
+        self._images.clear()
+        self._notes.clear()
 
         # Scan for existing outputs if the project has them
         if self._outputs_created:
@@ -683,7 +743,10 @@ class AppBackend(ToolImplementations, QObject):
         self._datasets.clear()
         self._active_dataset = None
         self.maps.clear()
+        self._maps_inmem.clear()
         self.output_files.clear()
+        self._images.clear()
+        self._notes.clear()
 
         self.projectReadyChanged.emit(False)
         self.status = "No project open"
@@ -785,6 +848,28 @@ class AppBackend(ToolImplementations, QObject):
             for o in loaded_outputs:
                 self.output_files.append(o)
 
+            # Restore image entities (embedded as bytes in the .hrt file)
+            loaded_images = project_data.get('images', {}) or {}
+            for image_id, image in loaded_images.items():
+                self._images[image_id] = image
+                self.imageAdded.emit(image_id, image.name)
+            logger.info(f"Restored {len(loaded_images)} images from project")
+
+            # Restore note entities (text annotations from measurement files
+            # and user-added notes).
+            loaded_notes = project_data.get('notes', {}) or {}
+            for note_id, note in loaded_notes.items():
+                self._notes[note_id] = note
+                # Keep the counter ahead of any restored ids so future
+                # auto-generated ids don't collide.
+                try:
+                    n = int(str(note_id).split('_', 1)[1])
+                    self._note_id_counter = max(self._note_id_counter, n)
+                except Exception:
+                    pass
+                self.noteAdded.emit(note_id, note.get('name', 'Note'))
+            logger.info(f"Restored {len(loaded_notes)} notes from project")
+
             # Scan for additional outputs in the outputs directory
             if self._outputs_created:
                 self._scan_existing_outputs()
@@ -814,13 +899,15 @@ class AppBackend(ToolImplementations, QObject):
                     except Exception as e:
                         logger.warning(f"Could not restore map editor state: {e}")
 
-            # Emit signal for tables and graphs to be restored by QML
+            # Emit signal for tables, graphs, and image windows to be restored by QML
             tables = project_data.get('tables', [])
             graphs = project_data.get('graphs', [])
-            if tables or graphs:
+            image_windows = project_data.get('image_windows', [])
+            if tables or graphs or image_windows:
                 self.projectStateRestored.emit(json.dumps({
                     'tables': tables,
                     'graphs': graphs,
+                    'image_windows': image_windows,
                     'workspace': workspace
                 }))
 
@@ -936,6 +1023,8 @@ class AppBackend(ToolImplementations, QObject):
             return self._do_smart_load_matrix(filepath, progress_callback)
         elif name.endswith('.ps-ppt') or name.endswith('.tiff'):
             return self._do_smart_load_park(filepath, progress_callback)
+        elif name.endswith('.wip'):
+            return self._do_smart_load_witec(filepath, progress_callback)
         else:
             raise ValueError(f"Smart import not supported for: {filepath.name}")
 
@@ -994,6 +1083,36 @@ class AppBackend(ToolImplementations, QObject):
             result['datasets'][dataset_name] = spectral_data
             result['active_dataset'] = dataset_name
 
+        return result
+
+    def _do_smart_load_witec(self, filepath: Path, progress_callback=None):
+        """Smart load for WITec WIP files (PL/Raman session containers)."""
+        if not self.witec_loader:
+            raise RuntimeError("WITec WIP loader not available")
+
+        spectral_data, _topography = self.witec_loader.smart_load_from_file(
+            filepath, progress_callback=progress_callback
+        )
+
+        result = {'datasets': {}, 'active_dataset': None}
+        stem = filepath.stem
+        channels = spectral_data.metadata.additional_info.get('channels', {}) or {}
+        if channels:
+            for channel_name, channel_data in channels.items():
+                dataset_name = f"{stem} · {channel_name}" if len(channels) > 1 else stem
+                result['datasets'][dataset_name] = channel_data
+                logger.info(f"Smart-loaded WITec channel: {dataset_name}")
+            result['active_dataset'] = next(iter(result['datasets']))
+        else:
+            result['datasets'][stem] = spectral_data
+            result['active_dataset'] = stem
+
+        # Carry the additional_info forward on the active dataset so the
+        # post-load hooks can pull images and map geometries from it.
+        active = result['datasets'][result['active_dataset']]
+        active.metadata.additional_info.update(
+            spectral_data.metadata.additional_info
+        )
         return result
 
     def _do_smart_load_park(self, filepath: Path, progress_callback=None):
@@ -1162,17 +1281,57 @@ class AppBackend(ToolImplementations, QObject):
             result['active_dataset'] = dataset_name
             logger.info(f"Loaded Park ps-ppt: {dataset_name}")
 
+        elif filepath.suffix.lower() == '.wip':
+            # WITec PL/Raman project file
+            if not self.witec_loader:
+                raise RuntimeError("WITec WIP loader not available")
+
+            spectral_data = self.witec_loader.load_single_file(filepath)
+            channels = spectral_data.metadata.additional_info.get('channels', {}) or {}
+            stem = filepath.stem
+            if channels:
+                for channel_name, channel_data in channels.items():
+                    dataset_name = (
+                        f"{stem} · {channel_name}" if len(channels) > 1 else stem
+                    )
+                    result['datasets'][dataset_name] = channel_data
+                    logger.info(f"Loaded WITec channel: {dataset_name}")
+                result['active_dataset'] = next(iter(result['datasets']))
+                # Forward images / map_geometries via the active dataset's metadata
+                active = result['datasets'][result['active_dataset']]
+                active.metadata.additional_info.update(
+                    spectral_data.metadata.additional_info
+                )
+            else:
+                result['datasets'][stem] = spectral_data
+                result['active_dataset'] = stem
+
         else:
             raise ValueError(f"Cannot load {filepath.suffix} files")
 
         return result
 
     def _on_file_loaded(self, result: dict):
-        """Handle file loading completion in main thread."""
+        """Handle file loading completion in main thread.
+
+        Order matters here: image / note absorption must happen BEFORE the
+        ``dataLoaded`` signal fires so that the browser's
+        ``onDataLoaded → refreshBrowser`` cycle sees a populated registry.
+        Otherwise refreshBrowser clears ``imagesModel`` / ``notesModel``,
+        queries an empty ``getImageList`` / ``getNotesList``, and the
+        subsequently-fired per-entity ``imageAdded`` / ``noteAdded`` signals
+        end up appending to a model that the next refresh wipes again.
+        """
         # Add datasets to application state
         self._datasets.update(result['datasets'])
 
-        # Set active dataset
+        # Surface images and notes attached by loaders BEFORE the broadcast
+        # signal so the subsequent browser refresh sees them.
+        self._absorb_dataset_images(result)
+        self._absorb_dataset_notes(result)
+
+        # Set active dataset (browser's onDataLoaded will refresh and now
+        # find the registered images/notes via getImageList / getNotesList).
         if result['active_dataset']:
             self._active_dataset = result['active_dataset']
             self.dataLoaded.emit(self._active_dataset)
@@ -1181,7 +1340,10 @@ class AppBackend(ToolImplementations, QObject):
         self._try_load_topo_overlay(result)
 
         self.status = f"Loaded {len(result['datasets'])} datasets"
-        logger.info(f"File loading complete: {len(result['datasets'])} datasets")
+        logger.info(
+            f"File loading complete: {len(result['datasets'])} datasets, "
+            f"{len(self._images)} images total, {len(self._notes)} notes total"
+        )
 
         # Process events to keep UI responsive during batch imports
         app = QApplication.instance()
@@ -1519,27 +1681,803 @@ class AppBackend(ToolImplementations, QObject):
 
     @Slot(str)
     def openMap(self, map_id: str):
-        """Load a map into the Map Editor tab."""
+        """Load a map into the Map Editor tab.
+
+        Three resolution paths, in order:
+
+        1. **In-memory map** (``self._maps_inmem``) — preferred when present.
+           Emits :attr:`loadMapInEditorById` so the editor consumes the
+           ``MultiChannelMap`` directly without disk I/O.
+
+        2. **On-disk path** (``self.maps[map_id].path``) — when the file
+           actually exists at one of the supported extensions, emits the
+           legacy :attr:`loadMapInEditor` signal with the resolved path.
+
+        3. **Failure** — neither available: emit :attr:`errorOccurred` so
+           the user gets a toast (replaces the previous silent
+           ``logger.warning`` that caused the broken double-click).
+        """
+        if map_id in self._maps_inmem:
+            self.loadMapInEditorById.emit(map_id)
+            logger.info(f"Requested in-memory map load in editor: {map_id}")
+            return
+
         for map_info in self.maps:
             if map_info['id'] == map_id:
                 map_path = Path(map_info['path'])
-                # Try different formats
                 for ext in ['.tiff', '.tif', '.png', '.gsf', '']:
                     check_path = map_path.with_suffix(ext) if ext else map_path
                     if check_path.exists():
-                        # Emit signal to load in map editor
                         self.loadMapInEditor.emit(str(check_path))
                         logger.info(f"Requested map load in editor: {check_path}")
                         return
-                logger.warning(f"Map file not found for: {map_path}")
+                msg = (f"Map '{map_info['title']}' has no on-disk file "
+                       f"and no in-memory backing.")
+                logger.warning(msg)
+                self.errorOccurred.emit("Map Open Failed", msg)
                 return
-        logger.warning(f"Map ID not found: {map_id}")
+
+        msg = f"Map id not found: {map_id}"
+        logger.warning(msg)
+        self.errorOccurred.emit("Map Open Failed", msg)
 
     @Slot(str)
     def requestLoadMapInEditor(self, map_path: str):
         """Request to load a map file in the Map Editor (callable from QML)."""
         self.loadMapInEditor.emit(map_path)
         logger.info(f"Requested map load in editor: {map_path}")
+
+    @Slot(str, result='QVariant')
+    def getInMemoryMap(self, map_id: str):
+        """Return the in-memory MultiChannelMap for ``map_id``, or ``None``.
+
+        Used by :class:`MapEditorBackend.loadMapById` to pull the map data
+        directly without touching disk.
+        """
+        return self._maps_inmem.get(map_id)
+
+    # ------------------------------------------------------------------
+    # Image entity slots (open / list / convert / persist)
+    # ------------------------------------------------------------------
+
+    def _images_dir(self) -> Path:
+        """Return the directory where image entities are saved as TIFFs.
+
+        Prefers ``<project_outputs>/images/`` so images travel with the
+        project. Falls back to a per-process temp directory when no
+        project is open yet (still openable by the OS).
+        """
+        if self._output_base_dir is not None:
+            d = Path(self._output_base_dir) / "images"
+        else:
+            if not hasattr(self, "_tmp_images_dir") or self._tmp_images_dir is None:
+                self._tmp_images_dir = Path(
+                    tempfile.mkdtemp(prefix="trans_images_")
+                )
+            d = self._tmp_images_dir
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _save_image_to_tiff(self, image: "ImageData") -> Optional[str]:
+        """Persist ``image`` as a TIFF on disk and return its absolute path.
+
+        Returns the existing ``image.file_path`` when one is already set
+        (avoids re-writing the same data when an image is registered twice).
+        """
+        if getattr(image, "file_path", None):
+            try:
+                if Path(image.file_path).exists():
+                    return image.file_path
+            except Exception:
+                pass
+        try:
+            import tifffile
+        except ImportError:
+            logger.error("tifffile is required to save image entities")
+            return None
+        safe = self._sanitize_filename(image.name or image.id) or image.id
+        target = self._images_dir() / f"{image.id}_{safe}.tiff"
+        try:
+            tifffile.imwrite(str(target), image.array)
+        except Exception as e:
+            logger.error("Could not write %s: %s", target, e)
+            return None
+        image.file_path = str(target)
+        return image.file_path
+
+    def _absorb_dataset_images(self, result: dict):
+        """Pull images out of any loaded dataset's metadata into the registry.
+
+        Each absorbed image is saved as a TIFF under
+        ``<project_outputs>/images/`` so the project browser's double-click
+        handler can hand the file straight to the OS image viewer.
+        """
+        seen_ids = set()
+        for ds_name, sd in result.get('datasets', {}).items():
+            if not hasattr(sd, 'metadata'):
+                continue
+            entries = sd.metadata.additional_info.get('images') or []
+            for name, image in entries:
+                if not isinstance(image, ImageData):
+                    continue
+                if image.id in seen_ids:
+                    continue  # same image referenced from multiple datasets
+                seen_ids.add(image.id)
+                if image.id in self._images:
+                    continue
+                if name and name != image.name:
+                    image.name = name
+                # Persist to disk so the OS can open it directly.
+                self._save_image_to_tiff(image)
+                self._images[image.id] = image
+                self.imageAdded.emit(image.id, image.name)
+                logger.info(
+                    "Registered image %s (%r) from dataset %r → %s",
+                    image.id, image.name, ds_name, image.file_path,
+                )
+
+    @Slot(str)
+    def openImage(self, image_id: str):
+        """Open an embedded image-viewer window for ``image_id``.
+
+        Default action — emits ``openImageEmbedded`` so QML opens an
+        embedded ``ImageWindowContent`` window that pulls the QImage from
+        the registered ``image://trans/<id>`` provider. The image is also
+        written to disk as a TIFF so :meth:`openImageInOS` is available
+        from the right-click menu when the user prefers Preview / external
+        viewers.
+        """
+        image = self._images.get(image_id)
+        if image is None:
+            logger.warning("openImage: unknown image_id %r", image_id)
+            self.errorOccurred.emit(
+                "Image Open Failed", f"Image not found: {image_id}",
+            )
+            return
+        # Save to TIFF eagerly so the file is ready when the user picks
+        # "Open in OS viewer" later (and so projects persist nicely).
+        if not image.file_path or not Path(image.file_path).exists():
+            self._save_image_to_tiff(image)
+        title = image.name or "Image"
+        self.openImageEmbedded.emit(title, image_id)
+        logger.info("Requested image open: %s (%r)", image_id, title)
+
+    @Slot(str)
+    def openImageInOS(self, image_id: str):
+        """Open ``image_id`` with the OS default image viewer (fallback)."""
+        image = self._images.get(image_id)
+        if image is None:
+            self.errorOccurred.emit(
+                "Image Open Failed", f"Image not found: {image_id}",
+            )
+            return
+        path = image.file_path
+        if not path or not Path(path).exists():
+            path = self._save_image_to_tiff(image)
+        if not path:
+            self.errorOccurred.emit(
+                "Image Open Failed",
+                f"Could not write image '{image.name}' to disk.",
+            )
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+            self.errorOccurred.emit(
+                "Image Open Failed", f"OS could not open {path}",
+            )
+            return
+        logger.info("Opened image %s via OS: %s", image_id, path)
+
+    @Slot(result='QVariantList')
+    def getImageList(self):
+        """Get list of image entities for the project browser."""
+        out: List[Dict[str, Any]] = []
+        for image_id, img in self._images.items():
+            out.append({
+                'id': image_id,
+                'name': img.name,
+                'mode': img.mode.value,
+                'width': img.width,
+                'height': img.height,
+                'source': img.metadata.source,
+            })
+        return out
+
+    @Slot(str, result='QVariant')
+    def getImage(self, image_id: str):
+        """Return the :class:`ImageData` for the given id, or ``None``."""
+        return self._images.get(image_id)
+
+    @Slot(str)
+    def addImageFromFile(self, file_path: str):
+        """Load an image from disk and register it as a project entity.
+
+        ``ImageData.from_file`` already records the source path in
+        ``image.file_path``, so opening the entity later just re-opens
+        the original file with the OS viewer.
+        """
+        path = Path(str(file_path).replace("file://", ""))
+        try:
+            image = ImageData.from_file(path)
+        except Exception as e:
+            logger.error("Could not load image %s: %s", path, e)
+            self.errorOccurred.emit(
+                "Image Load Failed", f"Could not load {path.name}: {e}",
+            )
+            return
+        self._images[image.id] = image
+        self.imageAdded.emit(image.id, image.name)
+        logger.info("Loaded image from file: %s (%s)", path, image.id)
+
+    @Slot(str)
+    def deleteImage(self, image_id: str):
+        """Remove an image entity from the project."""
+        if image_id in self._images:
+            del self._images[image_id]
+            self.imageDeleted.emit(image_id)
+            logger.info("Deleted image %s", image_id)
+
+    @Slot(str, str)
+    def renameImage(self, image_id: str, new_name: str):
+        """Rename an image entity."""
+        image = self._images.get(image_id)
+        if image is None:
+            return
+        image.name = new_name
+        self.imageRenamed.emit(image_id, new_name)
+
+    # ------------------------------------------------------------------
+    # Note entity slots
+    # ------------------------------------------------------------------
+
+    def _notes_dir(self) -> Path:
+        """Where note entities are saved as ``.txt`` files."""
+        if self._output_base_dir is not None:
+            d = Path(self._output_base_dir) / "notes"
+        else:
+            if not hasattr(self, "_tmp_notes_dir") or self._tmp_notes_dir is None:
+                self._tmp_notes_dir = Path(
+                    tempfile.mkdtemp(prefix="trans_notes_")
+                )
+            d = self._tmp_notes_dir
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _save_note_to_txt(self, note: dict) -> Optional[str]:
+        """Persist ``note`` as a ``.txt`` file. Returns the absolute path.
+
+        File starts with the caption + source as a small header so the user
+        sees context in the OS text editor, then the body text (which is
+        empty for caption-only WITec annotations).
+        """
+        existing = note.get('file_path')
+        if existing and Path(existing).exists():
+            return existing
+        safe = self._sanitize_filename(note.get('name', 'note')) or note.get('id', 'note')
+        target = self._notes_dir() / f"{note.get('id', 'note')}_{safe}.txt"
+        body = note.get('text', '') or ''
+        header = (
+            f"# {note.get('name', 'Note')}\n"
+            f"# Source: {note.get('source', 'unknown')}\n\n"
+        )
+        try:
+            target.write_text(header + body, encoding='utf-8')
+        except Exception as e:
+            logger.error("Could not write note %s: %s", target, e)
+            return None
+        note['file_path'] = str(target)
+        return note['file_path']
+
+    def _absorb_dataset_notes(self, result: dict):
+        """Pull notes out of any loaded dataset's metadata into the registry.
+
+        Each absorbed note is saved as a ``.txt`` file under
+        ``<project_outputs>/notes/`` so double-click opens it in the OS
+        default text editor (TextEdit on macOS, Notepad on Windows).
+        """
+        seen = set()
+        for ds_name, sd in result.get('datasets', {}).items():
+            if not hasattr(sd, 'metadata'):
+                continue
+            entries = sd.metadata.additional_info.get('notes') or []
+            for entry in entries:
+                if isinstance(entry, str):
+                    entry = {'name': 'Note', 'text': entry, 'source': 'unknown'}
+                if not isinstance(entry, dict):
+                    continue
+                if not entry.get('name') and not entry.get('text'):
+                    continue
+                key = (entry.get('name', ''), entry.get('text', ''))
+                if key in seen:
+                    continue
+                seen.add(key)
+                self._note_id_counter += 1
+                note_id = f"note_{self._note_id_counter}"
+                note = {
+                    'id': note_id,
+                    'name': entry.get('name', 'Note'),
+                    'text': entry.get('text', ''),
+                    'source': entry.get('source', 'unknown'),
+                }
+                self._save_note_to_txt(note)
+                self._notes[note_id] = note
+                self.noteAdded.emit(note_id, note['name'])
+                logger.info(
+                    "Registered note %s (%r) from dataset %r → %s",
+                    note_id, note['name'], ds_name, note.get('file_path'),
+                )
+
+    @Slot(result='QVariantList')
+    def getNotesList(self):
+        """Get list of note entities for the project browser."""
+        return [
+            {
+                'id': n['id'],
+                'name': n['name'],
+                'source': n.get('source', ''),
+                'preview': (n.get('text', '')[:60]
+                            + ('…' if len(n.get('text', '')) > 60 else '')),
+            }
+            for n in self._notes.values()
+        ]
+
+    @Slot(str, result='QVariantMap')
+    def getNote(self, note_id: str):
+        """Return the full note record for ``note_id`` (with full text)."""
+        return self._notes.get(note_id, {})
+
+    @Slot(str, str, str)
+    def addNote(self, name: str, text: str, source: str = "user"):
+        """Register a new note entity."""
+        self._note_id_counter += 1
+        note_id = f"note_{self._note_id_counter}"
+        self._notes[note_id] = {
+            'id': note_id, 'name': name, 'text': text, 'source': source,
+        }
+        self.noteAdded.emit(note_id, name)
+
+    @Slot(str)
+    def deleteNote(self, note_id: str):
+        """Remove a note entity."""
+        if note_id in self._notes:
+            del self._notes[note_id]
+            self.noteDeleted.emit(note_id)
+
+    @Slot(str, str)
+    def renameNote(self, note_id: str, new_name: str):
+        """Rename a note entity."""
+        if note_id in self._notes:
+            self._notes[note_id]['name'] = new_name
+            self.noteRenamed.emit(note_id, new_name)
+
+    @Slot(str)
+    def openNote(self, note_id: str):
+        """Open an embedded note-viewer window for ``note_id``.
+
+        Default action — emits ``openNoteEmbedded`` so QML pops a small
+        read-only text window. The note is also persisted as ``.txt`` so
+        :meth:`openNoteInOS` is available as a fallback (TextEdit / Notepad).
+        """
+        note = self._notes.get(note_id)
+        if note is None:
+            self.errorOccurred.emit(
+                "Note Open Failed", f"Note not found: {note_id}",
+            )
+            return
+        # Eagerly persist for the OS fallback / project portability.
+        if not note.get('file_path') or not Path(note['file_path']).exists():
+            self._save_note_to_txt(note)
+        title = note.get('name', 'Note')
+        body = note.get('text', '') or ''
+        if not body.strip():
+            body = (
+                f"(No body text in this annotation.)\n\n"
+                f"Caption: {title}\n"
+                f"Source:  {note.get('source', 'unknown')}"
+            )
+        self.openNoteEmbedded.emit(title, body, note.get('source', ''))
+        logger.info("Requested note open: %s (%r)", note_id, title)
+
+    @Slot(str)
+    def openNoteInOS(self, note_id: str):
+        """Open ``note_id`` with the OS default text editor (fallback)."""
+        note = self._notes.get(note_id)
+        if note is None:
+            self.errorOccurred.emit(
+                "Note Open Failed", f"Note not found: {note_id}",
+            )
+            return
+        path = note.get('file_path')
+        if not path or not Path(path).exists():
+            path = self._save_note_to_txt(note)
+        if not path:
+            self.errorOccurred.emit(
+                "Note Open Failed",
+                f"Could not write note '{note.get('name')}' to disk.",
+            )
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+            self.errorOccurred.emit(
+                "Note Open Failed", f"OS could not open {path}",
+            )
+            return
+        logger.info("Opened note %s via OS: %s", note_id, path)
+
+    # ------------------------------------------------------------------
+    # Spectral-axis unit conversion
+    # ------------------------------------------------------------------
+
+    @Slot(str, str, float, str, result=str)
+    def convertDatasetAxis(
+        self, dataset_name: str, target_unit: str,
+        excitation_nm: float = 0.0, new_dataset_name: str = "",
+    ) -> str:
+        """Create a new dataset with the spectral axis converted to ``target_unit``.
+
+        Parameters
+        ----------
+        dataset_name
+            Existing dataset key in ``self._datasets``.
+        target_unit
+            Any string accepted by :func:`spectral_axis.parse_unit`
+            (``"nm"``, ``"eV"``, ``"cm-1"``, ``"raman_cm-1"``, plus aliases).
+        excitation_nm
+            Laser excitation wavelength in nm. Required when the source or
+            target is Raman-shift; ignored otherwise. Pass ``0`` (or omit)
+            for non-Raman conversions.
+        new_dataset_name
+            Override for the resulting dataset name. Defaults to
+            ``f"{source} ({target_unit})"``.
+
+        Returns
+        -------
+        str
+            The name of the newly created dataset, or empty string on
+            failure (an ``errorOccurred`` toast is emitted in that case).
+        """
+        if dataset_name not in self._datasets:
+            self.errorOccurred.emit(
+                "Conversion Failed", f"Dataset {dataset_name!r} not found.",
+            )
+            return ""
+        sd = self._datasets[dataset_name]
+
+        # Infer the source unit from the metadata (preferred) or the
+        # first column's name (fallback).
+        info = sd.metadata.additional_info or {}
+        source_unit_str = info.get("axis_unit") or sd.metadata.units.get("x") \
+            or sd.metadata.units.get("independent")
+        if not source_unit_str:
+            # Last-ditch: parse the column header (e.g. "Wavelength_nm").
+            col = sd.independent_var_name
+            if col.endswith("_nm"):
+                source_unit_str = "nm"
+            elif col.endswith("_eV"):
+                source_unit_str = "eV"
+            elif col.endswith("_cm-1") and "Raman" in col:
+                source_unit_str = "raman_cm-1"
+            elif col.endswith("_cm-1"):
+                source_unit_str = "cm-1"
+            else:
+                self.errorOccurred.emit(
+                    "Conversion Failed",
+                    f"Could not infer the source unit of {dataset_name!r}.",
+                )
+                return ""
+
+        try:
+            source = parse_unit(source_unit_str)
+            target = parse_unit(target_unit)
+        except ValueError as e:
+            self.errorOccurred.emit("Conversion Failed", str(e))
+            return ""
+
+        try:
+            new_df = convert_dataframe_axis(
+                sd.data, source, target,
+                excitation_nm=(excitation_nm if excitation_nm > 0 else None),
+            )
+        except ValueError as e:
+            self.errorOccurred.emit("Conversion Failed", str(e))
+            return ""
+
+        # Carry forward existing metadata, replacing only what the
+        # conversion changed.
+        new_meta = SpectralMetadata(
+            source_type=sd.metadata.source_type,
+            dimensions=sd.metadata.dimensions,
+            scan_mode=sd.metadata.scan_mode,
+            units={
+                **dict(sd.metadata.units or {}),
+                "x": target.value,
+                "independent": target.value,
+            },
+            acquisition_date=sd.metadata.acquisition_date,
+            additional_info={
+                **dict(sd.metadata.additional_info or {}),
+                "axis_unit": target.value,
+                "converted_from": dataset_name,
+                "source_axis_unit": source.value,
+                **({"excitation_nm": excitation_nm} if excitation_nm > 0 else {}),
+            },
+        )
+        new_sd = SpectralData(new_df, new_meta, sd.topography)
+
+        out_name = new_dataset_name or f"{dataset_name} ({target.value})"
+        self._datasets[out_name] = new_sd
+        self._active_dataset = out_name
+        self.dataLoaded.emit(out_name)
+        logger.info(
+            "Converted %s (%s) → %s (%s) — excitation=%s nm",
+            dataset_name, source.value, out_name, target.value,
+            excitation_nm or "n/a",
+        )
+        return out_name
+
+    # ------------------------------------------------------------------
+    # Multi-peak Gaussian / Lorentzian / pseudo-Voigt fitting
+    # ------------------------------------------------------------------
+
+    @Slot(str, str, int, int, int, result='QVariantMap')
+    def multiPeakFit(
+        self, dataset_name: str, peak_shape: str = "gaussian",
+        n_peaks_auto: int = 0, baseline_degree: int = 1,
+        spectrum_index: int = 0,
+    ):
+        """Fit a sum of peaks + polynomial baseline to one column of a dataset.
+
+        Parameters
+        ----------
+        dataset_name
+            Existing dataset key in ``self._datasets``.
+        peak_shape
+            ``"gaussian"`` / ``"lorentzian"`` / ``"pseudo_voigt"``.
+        n_peaks_auto
+            Maximum number of peaks for the auto-detector. ``0`` = unlimited.
+        baseline_degree
+            Polynomial degree for the simultaneously-fitted baseline. ``-1``
+            disables the baseline term.
+        spectrum_index
+            Which spectrum column to fit (0-based, defaults to the first).
+
+        Returns
+        -------
+        dict
+            QVariantMap suitable for QML consumption with keys ``success``,
+            ``message``, ``rsq``, ``rss``, ``peaks`` (list of per-peak dicts:
+            ``shape``, ``amplitude``, ``center``, ``width``, ``fwhm``, ``eta``),
+            ``baseline_coeffs``, ``x``, ``y``, ``fitted``, ``baseline``,
+            ``components`` (one curve per peak).
+        """
+        if dataset_name not in self._datasets:
+            self.errorOccurred.emit(
+                "Fit Failed", f"Dataset {dataset_name!r} not found.",
+            )
+            return {"success": False, "message": "Dataset not found"}
+
+        sd = self._datasets[dataset_name]
+        if sd.num_spectra == 0:
+            return {"success": False, "message": "Dataset has no spectra"}
+        idx = max(0, min(spectrum_index, sd.num_spectra - 1))
+        x = np.asarray(sd.independent_var, dtype=np.float64)
+        y = np.asarray(sd.spectra.values[:, idx], dtype=np.float64)
+
+        try:
+            shape = PeakShape(peak_shape)
+        except ValueError:
+            self.errorOccurred.emit(
+                "Fit Failed", f"Unknown peak shape: {peak_shape!r}",
+            )
+            return {"success": False, "message": f"Unknown peak shape {peak_shape!r}"}
+
+        try:
+            res = fit_multipeak(
+                x, y, shape=shape, baseline_degree=baseline_degree,
+                n_peaks_auto=(n_peaks_auto if n_peaks_auto > 0 else None),
+            )
+        except Exception as e:
+            logger.exception("multiPeakFit failed: %s", e)
+            self.errorOccurred.emit("Fit Failed", str(e))
+            return {"success": False, "message": str(e)}
+
+        # Optionally surface the fit as a new dataset so the user can plot
+        # the fitted curve / residuals alongside the source data. We store
+        # everything on a fresh DataFrame (axis + each component + sum).
+        try:
+            cols = {sd.independent_var_name: x, "Data": y, "Fit": res.fitted_curve,
+                    "Baseline": res.baseline_curve, "Residuals": res.residuals}
+            for i, comp in enumerate(res.components):
+                cols[f"Peak {i+1}"] = comp
+            df = pd.DataFrame(cols)
+            new_meta = SpectralMetadata(
+                source_type=sd.metadata.source_type,
+                dimensions=sd.metadata.dimensions,
+                scan_mode=sd.metadata.scan_mode,
+                units=dict(sd.metadata.units or {}),
+                additional_info={
+                    **dict(sd.metadata.additional_info or {}),
+                    "fit_source": dataset_name,
+                    "fit_shape": shape.value,
+                    "fit_baseline_degree": baseline_degree,
+                    "fit_peak_count": len(res.peaks),
+                    "fit_rsq": res.rsq,
+                },
+            )
+            out_name = f"{dataset_name} · fit ({shape.value}, {len(res.peaks)} peaks)"
+            self._datasets[out_name] = SpectralData(df, new_meta)
+            self.dataLoaded.emit(out_name)
+        except Exception as e:
+            logger.warning("Could not create fit-result dataset: %s", e)
+
+        return {
+            "success": bool(res.success),
+            "message": res.message,
+            "rsq": float(res.rsq),
+            "rss": float(res.rss),
+            "peaks": [
+                {
+                    "shape": p.shape.value,
+                    "amplitude": p.amplitude,
+                    "center": p.center,
+                    "width": p.width,
+                    "fwhm": p.fwhm,
+                    "eta": p.eta if p.eta is not None else -1.0,
+                }
+                for p in res.peaks
+            ],
+            "baseline_coeffs": res.baseline_coeffs.tolist(),
+            "x": x.tolist(),
+            "y": y.tolist(),
+            "fitted": res.fitted_curve.tolist(),
+            "baseline": res.baseline_curve.tolist(),
+            "components": [c.tolist() for c in res.components],
+        }
+
+    @Slot(str, str)
+    def convertMapChannelToImage(self, map_id: str, channel_name: str = ""):
+        """Right-click "Convert to Image (raw)" — copy a map channel as float image.
+
+        Uses the active channel when ``channel_name`` is empty. The new
+        :class:`ImageData` is in :attr:`ImageMode.SINGLE_FLOAT`, so the
+        image-viewer's range and colormap controls drive display.
+
+        Resolution order:
+
+        1. ``self._maps_inmem[map_id]`` — preferred, no disk I/O.
+        2. The map's on-disk TIFF (``self.maps[*].path``) loaded via
+           ``tifffile``. This makes converted-back maps and project-loaded
+           maps round-trippable without going through the map editor first.
+        """
+        title = next(
+            (m['title'] for m in self.maps if m['id'] == map_id),
+            f"Map {map_id}",
+        )
+
+        # ----- Path 1: in-memory MultiChannelMap ------------------------
+        mcm = self._maps_inmem.get(map_id)
+        if mcm is not None:
+            channel = None
+            if channel_name and hasattr(mcm, 'channels'):
+                ch_dict = mcm.channels
+                channel = ch_dict.get(channel_name) if hasattr(ch_dict, 'get') else None
+            if channel is None:
+                channel = getattr(mcm, 'active_channel', None)
+            if channel is None or not hasattr(channel, 'data'):
+                self.errorOccurred.emit(
+                    "Conversion Failed", "Map has no readable channel."
+                )
+                return
+            image = ImageData.from_map_channel(
+                channel.data, map_name=title,
+                channel_name=getattr(channel, 'name', channel_name or "channel"),
+            )
+            self._save_image_to_tiff(image)
+            self._images[image.id] = image
+            self.imageAdded.emit(image.id, image.name)
+            logger.info("Converted in-memory map %s → image %s (%s)",
+                        map_id, image.id, image.file_path)
+            return
+
+        # ----- Path 2: on-disk TIFF -------------------------------------
+        map_info = next((m for m in self.maps if m['id'] == map_id), None)
+        if map_info is None:
+            self.errorOccurred.emit(
+                "Conversion Failed", f"Map {map_id} is unknown.",
+            )
+            return
+        path = Path(map_info.get('path', ''))
+        if not path.exists():
+            for ext in ['.tiff', '.tif', '.png', '.gsf']:
+                candidate = path.with_suffix(ext)
+                if candidate.exists():
+                    path = candidate
+                    break
+        if not path.exists():
+            self.errorOccurred.emit(
+                "Conversion Failed",
+                f"Map '{title}' has no on-disk file at {map_info.get('path', '<unknown>')}.",
+            )
+            return
+        try:
+            import tifffile
+            data = tifffile.imread(str(path))
+        except Exception as e:
+            self.errorOccurred.emit(
+                "Conversion Failed",
+                f"Could not read map file {path.name}: {e}",
+            )
+            return
+        if data.ndim == 3:
+            # Multi-page TIFF: pick the named page if requested, else the first.
+            data = data[0]
+        if data.ndim != 2:
+            self.errorOccurred.emit(
+                "Conversion Failed",
+                f"Map {path.name} has unexpected shape {data.shape}.",
+            )
+            return
+        image = ImageData.from_map_channel(
+            data, map_name=title,
+            channel_name=channel_name or path.stem,
+        )
+        self._save_image_to_tiff(image)
+        self._images[image.id] = image
+        self.imageAdded.emit(image.id, image.name)
+        logger.info("Converted on-disk map %s → image %s (from %s, saved %s)",
+                    map_id, image.id, path, image.file_path)
+
+    @Slot(str)
+    def convertImageToMap(self, image_id: str):
+        """Right-click "Convert to Map (TIFF)" — only for single-channel images.
+
+        Writes the array as a single-page TIFF inside the project's
+        ``_converted_maps`` directory and registers it as a regular map.
+        Round-trip preserves the float32 array exactly.
+        """
+        image = self._images.get(image_id)
+        if image is None:
+            self.errorOccurred.emit(
+                "Conversion Failed", f"Image not found: {image_id}",
+            )
+            return
+        if not image.mode.is_single_channel:
+            self.errorOccurred.emit(
+                "Conversion Failed",
+                "Only single-channel images can be converted to maps.",
+            )
+            return
+        try:
+            import tifffile
+        except ImportError:
+            self.errorOccurred.emit(
+                "Conversion Failed", "tifffile is required to write TIFF maps.",
+            )
+            return
+
+        if self._output_base_dir is None:
+            self.errorOccurred.emit(
+                "Conversion Failed",
+                "No project is open; create or open a project first.",
+            )
+            return
+        out_dir = self._output_base_dir / "_converted_maps"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        safe = self._sanitize_filename(image.name) or image_id
+        out_path = out_dir / f"{safe}.tiff"
+        # Write as float32 if SINGLE_FLOAT, else cast to the image's dtype.
+        tifffile.imwrite(str(out_path), image.array)
+
+        from datetime import datetime
+        self._map_id_counter += 1
+        map_id = f"map_{self._map_id_counter}"
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.maps.append({
+            'id': map_id,
+            'title': image.name,
+            'path': str(out_path),
+            'timestamp': timestamp,
+        })
+        self.mapCreated.emit(map_id, image.name)
+        logger.info("Converted image %s → map %s (%s)", image_id, map_id, out_path)
 
     @Slot(str)
     def setActiveDataset(self, dataset_name: str):
@@ -2008,6 +2946,7 @@ class AppBackend(ToolImplementations, QObject):
         embedded_states = self._embedded_window_states or []
         graph_states = [s for s in embedded_states if s.get('type') == 'graph']
         table_states = [s for s in embedded_states if s.get('type') == 'table']
+        image_window_states = [s for s in embedded_states if s.get('type') == 'image']
 
         # Get map editor state
         map_editor_state = {}
@@ -2027,6 +2966,7 @@ class AppBackend(ToolImplementations, QObject):
             'datasets': self._datasets,
             'tables': table_states,
             'graphs': graph_states,
+            'image_windows': image_window_states,
             'workspace': {
                 'active_dataset': self._active_dataset,
                 'current_tab': self._current_tab,
@@ -2034,6 +2974,8 @@ class AppBackend(ToolImplementations, QObject):
             },
             'output_files': self.output_files,
             'maps': self.maps,
+            'images': self._images,
+            'notes': self._notes,
             'naming_convention': self._naming_convention,
             'map_editor': map_editor_state,
         }

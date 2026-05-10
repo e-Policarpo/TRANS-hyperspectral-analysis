@@ -21,7 +21,13 @@ Item {
     property int baseZ: 100
 
     // Backend reference to pass to tool windows
-    property var backend: null
+    // Renamed from ``backend`` to ``appBackend`` to avoid the QML
+    // self-reference trap when callers write ``backend: backend`` (the RHS
+    // resolves to the not-yet-initialized local property = null).
+    property var appBackend: null
+    // Backwards-compatibility alias — anything still reading
+    // ``windowManager.backend`` keeps working.
+    property alias backend: windowManager.appBackend
 
     // Theme colors
     property var mainWin: ApplicationWindow.window
@@ -262,6 +268,18 @@ Item {
     }
 
     function createEnhancedTableWindow(title, config) {
+        // Jump-to-front when the same table is already open.
+        var existing = findWindowByTitle("table", title)
+        if (existing) {
+            // Refresh the model in case the dataset content was updated.
+            var winInfo = getWindow(existing)
+            if (winInfo && winInfo.window && winInfo.window.contentItem &&
+                config && config.tableModel) {
+                winInfo.window.contentItem.tableModel = config.tableModel
+            }
+            activateWindow(existing)
+            return existing
+        }
         var tableContent = Qt.createComponent("TableWindowContent.qml")
         if (tableContent.status === Component.Error) {
             console.error("Failed to load TableWindowContent:", tableContent.errorString())
@@ -312,8 +330,101 @@ Item {
         return windowId
     }
 
-    // Convenience: open a graph window with curve data directly
+    // Open an embedded text-viewer window for a note entity. Notes are
+    // identified by their title (multiple notes with the same title bring
+    // an existing window to the front instead of duplicating).
+    function openNoteWindow(title, text, source) {
+        var existing = findWindowByTitle("note", title)
+        if (existing) {
+            var info = getWindow(existing)
+            if (info && info.window && info.window.contentItem) {
+                info.window.contentItem.noteText = text || ""
+                info.window.contentItem.noteSource = source || ""
+            }
+            activateWindow(existing)
+            return existing
+        }
+        var noteContent = Qt.createComponent("NoteWindowContent.qml")
+        if (noteContent.status === Component.Error) {
+            console.error("Failed to load NoteWindowContent:", noteContent.errorString())
+            return null
+        }
+        var windowConfig = { width: 520, height: 320 }
+        var windowId = createWindow("note", title || "Note", noteContent, windowConfig)
+        function applyNoteConfig(content) {
+            if (!content) return
+            content.entityId = windowId
+            content.noteTitle = title || "Note"
+            content.noteText = text || ""
+            content.noteSource = source || ""
+        }
+        var winInfo = getWindow(windowId)
+        if (winInfo && winInfo.window) {
+            var win = winInfo.window
+            if (win.contentItem) {
+                applyNoteConfig(win.contentItem)
+            } else {
+                win.contentItemChanged.connect(function() {
+                    if (win.contentItem) applyNoteConfig(win.contentItem)
+                })
+            }
+        }
+        return windowId
+    }
+
+    // Open an embedded image-viewer window for the given image entity id.
+    // Loaded lazily so the canvas widget only initializes when used.
+    // If a window already shows this image, activate it instead of creating
+    // a new one.
+    function openImageWindow(title, imageId) {
+        var existing = findImageWindowById(imageId)
+        if (existing) {
+            activateWindow(existing)
+            return existing
+        }
+        var imgContent = Qt.createComponent("ImageWindowContent.qml")
+        if (imgContent.status === Component.Error) {
+            console.error("Failed to load ImageWindowContent:", imgContent.errorString())
+            return null
+        }
+        var windowConfig = { width: 760, height: 480 }
+        var windowId = createWindow("image", title || "Image", imgContent, windowConfig)
+
+        function applyImageConfig(content) {
+            if (!content) return
+            content.entityId = windowId
+            // Wire the backend explicitly — the EmbeddedWindow loader's
+            // own ``item.backend = …`` only fires when WindowManager.appBackend
+            // is non-null, and we want the canvas to be able to call
+            // backend.getImage(...) regardless. ``appBackend`` is initialized
+            // in ApplicationWindow.Component.onCompleted (Main.qml).
+            content.appBackend = appBackend
+            content.imageId = imageId
+        }
+
+        var windowInfo = getWindow(windowId)
+        if (windowInfo && windowInfo.window) {
+            var win = windowInfo.window
+            if (win.contentItem) {
+                applyImageConfig(win.contentItem)
+            } else {
+                win.contentItemChanged.connect(function() {
+                    if (win.contentItem) applyImageConfig(win.contentItem)
+                })
+            }
+        }
+        return windowId
+    }
+
+    // Convenience: open a graph window with curve data directly. When a graph
+    // window with the same title already exists, refresh its curves and bring
+    // it to the front instead of creating a duplicate.
     function openGraphWindow(title, curves, xLabel, yLabel) {
+        var existing = findWindowByTitle("graph", title)
+        if (existing) {
+            updateGraphWindow(existing, title, curves, xLabel, yLabel)
+            return existing
+        }
         return createEnhancedGraphWindow(title, {
             curves: curves,
             xLabel: xLabel || "X",
@@ -353,6 +464,37 @@ Item {
     // Check if a window exists and is valid
     function hasWindow(windowId) {
         return windowId && getWindow(windowId) !== null
+    }
+
+    // Find an open window of the given ``type`` whose title matches ``title``,
+    // or whose content item has matching ``contentKey`` properties. Returns
+    // the window id, or "" when nothing matches. Used by openGraphWindow /
+    // openImageWindow / createEnhancedTableWindow to bring an already-open
+    // window to the front instead of creating a duplicate.
+    function findWindowByTitle(type, title) {
+        if (!title) return ""
+        for (var i = 0; i < windows.length; i++) {
+            var w = windows[i]
+            if (w.type !== type) continue
+            if (w.window && w.window.windowTitle === title) {
+                return w.id
+            }
+        }
+        return ""
+    }
+
+    // Find an image window already showing the given image entity id.
+    function findImageWindowById(imageId) {
+        if (!imageId) return ""
+        for (var i = 0; i < windows.length; i++) {
+            var w = windows[i]
+            if (w.type !== "image") continue
+            if (w.window && w.window.contentItem &&
+                w.window.contentItem.imageId === imageId) {
+                return w.id
+            }
+        }
+        return ""
     }
 
     // Link a table window to a graph window
@@ -499,8 +641,20 @@ Item {
                     state.xLabel = content.xLabel || ""
                     state.yLabel = content.yLabel || ""
                 } else if (w.type === "table") {
-                    state.headers = content.headers || []
-                    state.dataRows = content.dataRows || []
+                    // The TableWindowContent owns a TableDataModel (Python
+                    // object); pull cells + column names through its slots so
+                    // the saved state actually contains the table data —
+                    // earlier versions saved nonexistent ``content.headers``
+                    // / ``content.dataRows`` and reloaded with empty cells.
+                    if (content.tableModel) {
+                        state.headers = content.tableModel.getColumnNames() || []
+                        state.dataRows = content.tableModel.toList() || []
+                    } else {
+                        state.headers = []
+                        state.dataRows = []
+                    }
+                } else if (w.type === "image") {
+                    state.imageId = content.imageId || ""
                 }
             }
             states.push(state)

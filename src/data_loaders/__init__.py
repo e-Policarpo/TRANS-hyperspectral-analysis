@@ -9,6 +9,7 @@ from .neaspec_snom_loader import NeaSpecSNOMLoader
 from .omicron_mtrx_loader import OmicronMatrixSTSLoader
 from .omicron_flat_loader import OmicronFlatLoader, OmicronImageLoader
 from .park_afm_loader import ParkAFMLoader
+from .witec_wip_loader import WitecWipLoader
 
 __all__ = [
     'BaseDataLoader',
@@ -18,4 +19,5 @@ __all__ = [
     'OmicronFlatLoader',
     'OmicronImageLoader',
     'ParkAFMLoader',
+    'WitecWipLoader',
 ]

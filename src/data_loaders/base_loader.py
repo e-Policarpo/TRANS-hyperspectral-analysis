@@ -325,6 +325,61 @@ class BaseDataLoader(ABC):
         }
         return type_map.get(data_type, 'Unknown Data Type')
     
+    @staticmethod
+    def discover_sidecar_images(
+        directory: Path,
+        extensions: Tuple[str, ...] = (".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"),
+        skip_data_extensions: Tuple[str, ...] = (),
+    ) -> List[Tuple[str, "Any"]]:
+        """Find image files sitting alongside data files and wrap as ImageData.
+
+        Useful for microscope formats that store optical / video previews as
+        loose ``.png``/``.jpg``/``.tiff`` files in the session directory rather
+        than embedding them in the data file. The list returned by this helper
+        is suitable for direct insertion into
+        ``metadata.additional_info['images']``.
+
+        Parameters
+        ----------
+        directory : Path
+            Directory to scan (non-recursive).
+        extensions : tuple of str
+            File extensions to consider as image candidates (case-insensitive).
+        skip_data_extensions : tuple of str
+            File suffixes that should NOT be treated as images even if they
+            match. Useful when a format uses ``.tiff`` for data (e.g. Park
+            Systems) — pass ``(".tiff",)`` to opt out of those.
+
+        Returns
+        -------
+        list of (name, ImageData) tuples
+            Empty when no candidates are found or when Pillow is unavailable.
+        """
+        try:
+            from src.models.image_data import ImageData
+        except Exception:
+            return []
+        out: List[Tuple[str, Any]] = []
+        if not directory.is_dir():
+            return out
+        ext_lower = tuple(e.lower() for e in extensions)
+        skip_lower = tuple(e.lower() for e in skip_data_extensions)
+        for f in sorted(directory.iterdir()):
+            if not f.is_file():
+                continue
+            suf = f.suffix.lower()
+            if suf not in ext_lower:
+                continue
+            if suf in skip_lower:
+                continue
+            try:
+                img = ImageData.from_file(f)
+            except Exception as e:
+                logger.debug("Could not load sidecar image %s: %s", f, e)
+                continue
+            out.append((img.name, img))
+        return out
+
     def get_info(self) -> Dict[str, Any]:
         """
         Get information about the loader.

@@ -35,12 +35,26 @@ ApplicationWindow {
     property var openTools: []
     property int currentTabIndex: 0
 
+    // Pending map-load requests received before the lazy MapEditorWorkstation
+    // finishes instantiating. Lifted from the StackLayout to the root window so
+    // all backend signal handlers can reach them via the file-scoped `mainWindow`
+    // id (signal handlers don't see properties declared on inner items).
+    property string _pendingMapLoad: ""
+    property string _pendingMapLoadById: ""
+
     // Show startup dialog on launch and apply saved color scheme
     Component.onCompleted: {
         var t0 = Date.now()
         // Apply saved color scheme from preferences
         applyColorScheme()
         console.log("[TIMING] applyColorScheme: " + (Date.now() - t0) + "ms")
+
+        // Wire the global ``backend`` context property into WindowManager.
+        // This Component.onCompleted runs in ApplicationWindow's scope, so
+        // ``backend`` resolves to the context property, not WindowManager's
+        // local one. The image/note window plumbing depends on this — see
+        // openImageWindow/openNoteWindow in WindowManager.qml.
+        toolWindowManager.appBackend = backend
 
         // Map editor backend is registered lazily when MapEditorWorkstation loads
 
@@ -60,7 +74,8 @@ ApplicationWindow {
                 "Integration Utility", "Map Generator", "Spatial Average",
                 "Truncate Data", "Curve Analysis", "Peak Indexing",
                 "Average Curves", "Filter Bad Data",
-                "Dirac Point Estimator", "Detect Bandgap & Doping"
+                "Dirac Point Estimator", "Detect Bandgap & Doping",
+                "Spectral Axis Converter", "Multi-Peak Fitting"
             ]
         } else if (currentTabIndex === 1) {
             return ["2D FFT", "Image Smoothing", "Gradient Filter", "Map Discretizer", "Map Processing"]
@@ -1101,10 +1116,17 @@ ApplicationWindow {
                             openMultiDatasetSpectra(datasetSpectraList, forceNewWindow || false)
                         })
 
-                        // Process any pending operations
-                        if (_pendingMapLoad) {
-                            mew.loadMap(_pendingMapLoad)
-                            _pendingMapLoad = ""
+                        // Process any pending operations (properties live on
+                        // the root mainWindow so they're accessible from any
+                        // backend signal handler — see comment near the
+                        // declaration of _pendingMapLoad).
+                        if (mainWindow._pendingMapLoad) {
+                            mew.loadMap(mainWindow._pendingMapLoad)
+                            mainWindow._pendingMapLoad = ""
+                        }
+                        if (mainWindow._pendingMapLoadById && mew.mapEditorBackend) {
+                            mew.mapEditorBackend.loadMapById(mainWindow._pendingMapLoadById)
+                            mainWindow._pendingMapLoadById = ""
                         }
 
                         console.log("MapEditorWorkstation lazy-loaded and initialized")
@@ -1112,9 +1134,12 @@ ApplicationWindow {
                 }
             }
 
-            // Convenience accessor
+            // Convenience accessor (kept as a property for any inner QML
+            // child that reads it via parent-chain). Signal handlers at the
+            // ApplicationWindow level use ``mapEditorLoader.item`` directly,
+            // because property lookup from JS functions doesn't traverse
+            // up into nested items the way property bindings do.
             property var mapEditorWorkstation: mapEditorLoader.item
-            property string _pendingMapLoad: ""
 
         }  // StackLayout
 
@@ -1131,7 +1156,11 @@ ApplicationWindow {
                     if (!workspace.showLeftPanel) return 0
                     return workspace.leftCollapsed ? 32 : workspace.leftPanelWidth
                 }
-                backend: backend
+                // Backend is wired in ApplicationWindow's Component.onCompleted
+                // (further up in this file). ``backend: backend`` doesn't
+                // work because the RHS resolves to the local property,
+                // and Component.onCompleted INSIDE WindowManager has the
+                // same scoping issue.
                 z: 50  // Above workspace content
 
                 onWindowOpened: function(windowId, windowType) {
@@ -1316,13 +1345,15 @@ ApplicationWindow {
             statusText.text = "Loaded: " + datasetName
 
             // Refresh Map Editor datasets when new data is loaded
-            if (mapEditorWorkstation) mapEditorWorkstation.linkDatasetsFromBackend(backend)
+            var mew = mapEditorLoader.item
+            if (mew) mew.linkDatasetsFromBackend(backend)
         }
 
         function onToolCompleted(toolName, outputPath) {
             console.log("Tool completed:", toolName, "output:", outputPath)
             // Refresh Map Editor dataset links after tool completion
-            if (mapEditorWorkstation) mapEditorWorkstation.linkDatasetsFromBackend(backend)
+            var mew = mapEditorLoader.item
+            if (mew) mew.linkDatasetsFromBackend(backend)
         }
 
         function onErrorOccurred(title, message) {
@@ -1348,10 +1379,11 @@ ApplicationWindow {
             tabBar.currentIndex = 1
             currentTabIndex = 1
             mapEditorLoader.ensureLoaded()
-            if (mapEditorWorkstation) {
-                mapEditorWorkstation.loadMap(filePath)
+            var mew = mapEditorLoader.item
+            if (mew) {
+                mew.loadMap(filePath)
             } else {
-                _pendingMapLoad = filePath
+                mainWindow._pendingMapLoad = filePath
             }
         }
 
@@ -1360,13 +1392,30 @@ ApplicationWindow {
             tabBar.currentIndex = 1
             currentTabIndex = 1
             mapEditorLoader.ensureLoaded()
-            if (mapEditorWorkstation) {
-                if (mapEditorWorkstation.openMaps && mapEditorWorkstation.openMaps.length > 0) {
-                    mapEditorWorkstation.forceCloseMap(mapEditorWorkstation.activeMapIndex)
+            var mew = mapEditorLoader.item
+            if (mew) {
+                if (mew.openMaps && mew.openMaps.length > 0) {
+                    mew.forceCloseMap(mew.activeMapIndex)
                 }
-                mapEditorWorkstation.loadMap(mapPath)
+                mew.loadMap(mapPath)
             } else {
-                _pendingMapLoad = mapPath
+                mainWindow._pendingMapLoad = mapPath
+            }
+        }
+
+        function onLoadMapInEditorById(mapId) {
+            console.log("Loading in-memory map in editor: id=", mapId)
+            tabBar.currentIndex = 1
+            currentTabIndex = 1
+            mapEditorLoader.ensureLoaded()
+            var mew = mapEditorLoader.item
+            if (mew && mew.mapEditorBackend) {
+                if (mew.openMaps && mew.openMaps.length > 0) {
+                    mew.forceCloseMap(mew.activeMapIndex)
+                }
+                mew.mapEditorBackend.loadMapById(mapId)
+            } else {
+                mainWindow._pendingMapLoadById = mapId
             }
         }
     }
@@ -1461,7 +1510,9 @@ ApplicationWindow {
             "Filter Bad Data": "../tools/FilterBadDataTool.qml",
             "Average Curves": "../tools/AverageCurvesTool.qml",
             "Dirac Point Estimator": "../tools/DiracPointEstimatorTool.qml",
-            "Detect Bandgap & Doping": "../tools/DetectBandgapDopingTool.qml"
+            "Detect Bandgap & Doping": "../tools/DetectBandgapDopingTool.qml",
+            "Spectral Axis Converter": "../tools/SpectralAxisConvertTool.qml",
+            "Multi-Peak Fitting": "../tools/MultiPeakFitTool.qml"
         }
 
         var toolPath = toolMap[toolName] || "../tools/GenericToolUI.qml"
@@ -1965,17 +2016,32 @@ ApplicationWindow {
                         curves: g.curves || [],
                         xLabel: g.xLabel,
                         yLabel: g.yLabel,
-                        width: g.geometry ? g.geometry.width : undefined,
-                        height: g.geometry ? g.geometry.height : undefined
+                        width: g.width,
+                        height: g.height
                     })
                 }
             }
-            // Restore table windows
+            // Restore table windows. Field names match the save side
+            // (`headers`, `dataRows`) — earlier code read `data` / `columns`
+            // and silently restored empty tables.
             if (state.tables) {
                 for (var j = 0; j < state.tables.length; j++) {
                     var t = state.tables[j]
-                    // Request backend to create TableDataModel and emit openTableEmbedded
-                    backend.restoreTableFromState(t.title || t.id || "Table", t.data || [], t.columns || [])
+                    var rows = t.dataRows || t.data || []
+                    var cols = t.headers || t.columns || []
+                    backend.restoreTableFromState(
+                        t.title || t.id || "Table", rows, cols)
+                }
+            }
+            // Restore image windows by id (image entities themselves were
+            // already loaded from the .hrt by the time this signal fires).
+            if (state.image_windows) {
+                for (var k = 0; k < state.image_windows.length; k++) {
+                    var iw = state.image_windows[k]
+                    if (iw.imageId) {
+                        toolWindowManager.openImageWindow(
+                            iw.title || "Image", iw.imageId)
+                    }
                 }
             }
         }
@@ -1993,6 +2059,16 @@ ApplicationWindow {
         function onOpenTableEmbedded(title, tableModel) {
             if (currentTabIndex !== 0) tabBar.currentIndex = 0
             toolWindowManager.createEnhancedTableWindow(title, {tableModel: tableModel})
+        }
+
+        function onOpenImageEmbedded(title, imageId) {
+            if (currentTabIndex !== 0) tabBar.currentIndex = 0
+            toolWindowManager.openImageWindow(title, imageId)
+        }
+
+        function onOpenNoteEmbedded(title, body, source) {
+            if (currentTabIndex !== 0) tabBar.currentIndex = 0
+            toolWindowManager.openNoteWindow(title, body, source)
         }
 
         function onCollectWindowStatesRequested() {

@@ -921,6 +921,19 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
         spectral_data = SpectralData(df, metadata,
                                       topography.data if topography else None)
 
+        # Surface sidecar reference images (operator photos, optical preview
+        # screenshots) sitting alongside the data files. Omicron's binary
+        # format doesn't embed these — they live as loose .png/.jpg/.tif.
+        try:
+            sidecars = self.discover_sidecar_images(directory)
+            if sidecars:
+                spectral_data.metadata.additional_info['images'] = sidecars
+                logger.info(
+                    f"Attached {len(sidecars)} sidecar image(s) from {directory}"
+                )
+        except Exception as e:
+            logger.debug(f"Sidecar image discovery failed: {e}")
+
         if progress_callback:
             progress_callback(total_files, total_files, "Complete!")
 

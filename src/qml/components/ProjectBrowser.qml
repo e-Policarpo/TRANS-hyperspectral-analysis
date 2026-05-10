@@ -164,6 +164,7 @@ Rectangle {
                                             case "Tables": return tablesModel.count
                                             case "Graphs": return graphsModel.count
                                             case "Maps": return mapsModel.count
+                                            case "Images": return imagesModel.count
                                             case "Notes": return notesModel.count
                                             default: return 0
                                         }
@@ -202,6 +203,7 @@ Rectangle {
                                         case "Tables": return tablesModel
                                         case "Graphs": return graphsModel
                                         case "Maps": return mapsModel
+                                        case "Images": return imagesModel
                                         case "Notes": return notesModel
                                         default: return 0
                                     }
@@ -334,6 +336,11 @@ Rectangle {
                                                         backend.openMap(model.id || model.path)
                                                     }
                                                     break
+                                                case "Images":
+                                                    if (model.id) {
+                                                        backend.openImage(model.id)
+                                                    }
+                                                    break
                                                 case "Graphs":
                                                     console.log("Graphs are now embedded windows")
                                                     break
@@ -341,7 +348,9 @@ Rectangle {
                                                     console.log("Tables are now embedded windows")
                                                     break
                                                 case "Notes":
-                                                    if (model.path) {
+                                                    if (model.id) {
+                                                        backend.openNote(model.id)
+                                                    } else if (model.path) {
                                                         backend.openItem(model.path)
                                                     }
                                                     break
@@ -453,6 +462,11 @@ Rectangle {
         }
 
         ListElement {
+            name: "Images"
+            expanded: false
+        }
+
+        ListElement {
             name: "Notes"
             expanded: false
         }
@@ -476,6 +490,11 @@ Rectangle {
     // Maps model (populated dynamically)
     ListModel {
         id: mapsModel
+    }
+
+    // Images model (populated dynamically — refreshed via Connections below).
+    ListModel {
+        id: imagesModel
     }
 
     // Outputs model (populated dynamically)
@@ -510,6 +529,16 @@ Rectangle {
                             backend.openMap(contextMenu.itemData.id)
                         }
                         break
+                    case "Images":
+                        if (contextMenu.itemData.id) {
+                            backend.openImage(contextMenu.itemData.id)
+                        }
+                        break
+                    case "Notes":
+                        if (contextMenu.itemData.id) {
+                            backend.openNote(contextMenu.itemData.id)
+                        }
+                        break
                     case "Graphs":
                         console.log("Graphs are now embedded windows")
                         break
@@ -521,11 +550,52 @@ Rectangle {
         }
 
         MenuItem {
+            text: "Convert to Image (raw)"
+            visible: contextMenu.itemData && contextMenu.itemData.category === "Maps"
+            onTriggered: {
+                if (backend && contextMenu.itemData && contextMenu.itemData.id) {
+                    backend.convertMapChannelToImage(contextMenu.itemData.id, "")
+                }
+            }
+        }
+
+        MenuItem {
+            text: "Convert to Map (TIFF)"
+            visible: contextMenu.itemData && contextMenu.itemData.category === "Images"
+            onTriggered: {
+                if (backend && contextMenu.itemData && contextMenu.itemData.id) {
+                    backend.convertImageToMap(contextMenu.itemData.id)
+                }
+            }
+        }
+
+        MenuItem {
+            text: "Open in OS viewer…"
+            visible: contextMenu.itemData && contextMenu.itemData.category === "Images"
+            onTriggered: {
+                if (backend && contextMenu.itemData && contextMenu.itemData.id) {
+                    backend.openImageInOS(contextMenu.itemData.id)
+                }
+            }
+        }
+
+        MenuItem {
+            text: "Open in OS editor…"
+            visible: contextMenu.itemData && contextMenu.itemData.category === "Notes"
+            onTriggered: {
+                if (backend && contextMenu.itemData && contextMenu.itemData.id) {
+                    backend.openNoteInOS(contextMenu.itemData.id)
+                }
+            }
+        }
+
+        MenuItem {
             text: "Rename..."
             visible: contextMenu.itemData && (contextMenu.itemData.category === "Datasets" ||
                      contextMenu.itemData.category === "Maps" ||
                      contextMenu.itemData.category === "Tables" ||
-                     contextMenu.itemData.category === "Graphs")
+                     contextMenu.itemData.category === "Graphs" ||
+                     contextMenu.itemData.category === "Images")
             onTriggered: {
                 if (contextMenu.itemData) {
                     renameDialog.itemCategory = contextMenu.itemData.category
@@ -544,7 +614,8 @@ Rectangle {
             visible: contextMenu.itemData && (contextMenu.itemData.category === "Datasets" ||
                      contextMenu.itemData.category === "Maps" ||
                      contextMenu.itemData.category === "Tables" ||
-                     contextMenu.itemData.category === "Graphs")
+                     contextMenu.itemData.category === "Graphs" ||
+                     contextMenu.itemData.category === "Images")
             onTriggered: {
                 if (contextMenu.itemData) {
                     deleteConfirmDialog.itemCategory = contextMenu.itemData.category
@@ -768,6 +839,32 @@ Rectangle {
             })
         }
 
+        // Refresh images (RGB previews, optical/video frames, raw map channels)
+        var images = backend.getImageList ? backend.getImageList() : []
+        imagesModel.clear()
+        for (i = 0; i < images.length; i++) {
+            imagesModel.append({
+                id: images[i].id,
+                title: images[i].name,
+                name: images[i].name,
+                icon: "",
+                type: images[i].mode || "Image"
+            })
+        }
+
+        // Refresh notes (text annotations from measurement files + user notes)
+        var notes = backend.getNotesList ? backend.getNotesList() : []
+        notesModel.clear()
+        for (i = 0; i < notes.length; i++) {
+            notesModel.append({
+                id: notes[i].id,
+                title: notes[i].name,
+                name: notes[i].name,
+                icon: "",
+                type: notes[i].source || "Note"
+            })
+        }
+
         // Refresh outputs
         var outputs = backend.getOutputList()
         outputsModel.clear()
@@ -952,6 +1049,62 @@ Rectangle {
                 icon: "",
                 type: "Map"
             })
+        }
+
+        function onImageAdded(imageId, name) {
+            imagesModel.append({
+                id: imageId,
+                title: name,
+                name: name,
+                icon: "",
+                type: "Image"
+            })
+        }
+
+        function onImageDeleted(imageId) {
+            for (var i = 0; i < imagesModel.count; i++) {
+                if (imagesModel.get(i).id === imageId) {
+                    imagesModel.remove(i)
+                    break
+                }
+            }
+        }
+
+        function onImageRenamed(imageId, newName) {
+            for (var i = 0; i < imagesModel.count; i++) {
+                if (imagesModel.get(i).id === imageId) {
+                    imagesModel.setProperty(i, "name", newName)
+                    imagesModel.setProperty(i, "title", newName)
+                    break
+                }
+            }
+        }
+
+        function onNoteAdded(noteId, name) {
+            notesModel.append({
+                id: noteId,
+                title: name,
+                name: name,
+                icon: "",
+                type: "Note"
+            })
+        }
+        function onNoteDeleted(noteId) {
+            for (var i = 0; i < notesModel.count; i++) {
+                if (notesModel.get(i).id === noteId) {
+                    notesModel.remove(i)
+                    break
+                }
+            }
+        }
+        function onNoteRenamed(noteId, newName) {
+            for (var i = 0; i < notesModel.count; i++) {
+                if (notesModel.get(i).id === noteId) {
+                    notesModel.setProperty(i, "name", newName)
+                    notesModel.setProperty(i, "title", newName)
+                    break
+                }
+            }
         }
         function onOutputCreated(outputId, toolName, filePath) {
             var fileName = filePath.split('/').pop()

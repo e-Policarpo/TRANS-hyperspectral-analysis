@@ -76,6 +76,19 @@ class MapEditorBackend(QObject):
         self._channel_names: List[str] = []
         self._active_channel_name: str = ""
 
+        # Reference to the AppBackend (set by QML), used to look up
+        # in-memory MultiChannelMap entities by id without disk I/O.
+        self._app_backend = None
+
+    def set_app_backend(self, app_backend) -> None:
+        """Inject the AppBackend reference (called from QML at startup).
+
+        Enables ``loadMapById`` to retrieve in-memory maps without going
+        through the filesystem, fixing the broken project-browser
+        double-click for maps that were imported in-memory.
+        """
+        self._app_backend = app_backend
+
     # =========================================================================
     # Properties exposed to QML
     # =========================================================================
@@ -344,6 +357,35 @@ class MapEditorBackend(QObject):
     # =========================================================================
     # Data Loading
     # =========================================================================
+
+    @Slot(str)
+    def loadMapById(self, map_id: str):
+        """Load a map that's already in memory (no disk I/O).
+
+        Resolves the id via the injected :class:`AppBackend` and replaces the
+        currently displayed map. Falls back gracefully when the map is not
+        in-memory — the caller (QML) should instead emit the path-based
+        ``loadMapInEditor`` signal in that case.
+        """
+        if self._app_backend is None:
+            logger.error(
+                "loadMapById called but AppBackend reference not set"
+            )
+            return
+        mcm = self._app_backend.getInMemoryMap(map_id)
+        if mcm is None:
+            logger.warning("loadMapById: no in-memory map for id %r", map_id)
+            return
+
+        logger.info(f"Loading in-memory map id={map_id}")
+        self._multi_channel_map = mcm
+        if self._canvas:
+            active = self._multi_channel_map.active_channel
+            if active:
+                self._canvas.setMapData(active.data)
+        self.mapDataChanged.emit()
+        self.channelListChanged.emit()
+        self.activeChannelChanged.emit(self.activeChannelName)
 
     @Slot(str)
     def loadMapFromFile(self, file_path: str):

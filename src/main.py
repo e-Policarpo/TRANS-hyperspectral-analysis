@@ -26,6 +26,8 @@ from src.backend.app_backend import AppBackend
 from src.widgets.qml_map_canvas import QMLMapCanvas
 from src.widgets.qml_profile_canvas import QMLProfileCanvas
 from src.widgets.qml_graph_canvas import QMLGraphCanvas
+from src.widgets.qml_image_canvas import QMLImageCanvas
+from src.widgets.image_provider import TransImageProvider
 from src.backend.map_editor_backend import MapEditorBackend
 
 # Configure logging
@@ -88,6 +90,7 @@ def main():
     qmlRegisterType(QMLMapCanvas, "TransQML", 1, 0, "MapCanvas")
     qmlRegisterType(QMLProfileCanvas, "TransQML", 1, 0, "ProfileCanvas")
     qmlRegisterType(QMLGraphCanvas, "TransQML", 1, 0, "GraphCanvas")
+    qmlRegisterType(QMLImageCanvas, "TransQML", 1, 0, "ImageCanvas")
     qmlRegisterType(MapEditorBackend, "TransQML", 1, 0, "MapEditorBackend")
 
     # Create QML engine
@@ -98,6 +101,11 @@ def main():
 
     # Expose backend to QML
     engine.rootContext().setContextProperty("backend", backend)
+
+    # Register the image provider so QML's Image element can pull entities
+    # by id via ``image://trans/<image_id>``. The provider keeps a
+    # reference to the backend's _images dict for lookups.
+    engine.addImageProvider("trans", TransImageProvider(backend))
 
     # Setup cleanup on application exit
     cleanup_done = [False]  # Use list to allow modification in nested function

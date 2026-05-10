@@ -494,6 +494,10 @@ class ParkAFMLoader(BaseDataLoader):
         topography = None
         tiff_maps: Dict[str, Tuple[np.ndarray, Dict]] = {}
         tiff_channels: Dict[str, SpectralData] = {}
+        # Optional preview images surfaced as first-class image entities
+        # (the visible 8-bit colormapped thumbnail living inside each Park
+        # .tiff alongside the float32 data tag — used to be silently dropped).
+        preview_images: List[Tuple[str, "ImageData"]] = []
 
         for i, tf in enumerate(siblings_tiff):
             if progress_callback:
@@ -505,6 +509,48 @@ class ParkAFMLoader(BaseDataLoader):
                 direction = meta.get('direction', '')
                 full_name = f"{ch_name} {direction}".strip()
                 tiff_maps[full_name] = (data, meta)
+
+                # Surface the 8-bit colormapped thumbnail as an Image entity.
+                # The visible TIFF view is what AFM operators have been seeing
+                # in their file browsers — keeping it ensures parity.
+                try:
+                    from PIL import Image as _PILImage
+                    from src.models.image_data import (
+                        ImageData as _ImageData,
+                        ImageMetadata as _ImageMetadata,
+                    )
+                    with _PILImage.open(str(tf)) as _im:
+                        _im.load()
+                        thumb_arr = np.asarray(_im.convert("RGB"))
+                    px_h = meta.get('scan_height_um', 0) or 0
+                    px_w = meta.get('scan_width_um', 0) or 0
+                    pixel_size_nm = None
+                    if px_w and px_h and data.shape[0] and data.shape[1]:
+                        pixel_size_nm = (
+                            float(px_h) * 1000.0 / data.shape[0],
+                            float(px_w) * 1000.0 / data.shape[1],
+                        )
+                    img_meta = _ImageMetadata(
+                        source="park_tiff_preview",
+                        original_filename=tf.name,
+                        pixel_size_nm=pixel_size_nm,
+                        additional_info={
+                            'park_channel': ch_name,
+                            'park_direction': direction,
+                        },
+                    )
+                    preview_name = f"{tf.stem} (preview)"
+                    preview_images.append((
+                        preview_name,
+                        _ImageData(
+                            array=thumb_arr, metadata=img_meta,
+                            name=preview_name,
+                        ),
+                    ))
+                except Exception as e:
+                    logger.debug(
+                        "Could not extract preview from %s: %s", tf.name, e
+                    )
 
                 # Use Z Height Backward (or any Z Height) as primary topography
                 if 'z height' in ch_name.lower() and topography is None:
@@ -563,6 +609,10 @@ class ParkAFMLoader(BaseDataLoader):
         all_channels.update(tiff_channels)
         all_channels.update(ppt_channels)
         spectral_data.metadata.additional_info['channels'] = all_channels
+
+        # Surface preview images so the browser's "Images" category picks them up.
+        if preview_images:
+            spectral_data.metadata.additional_info['images'] = preview_images
 
         if progress_callback:
             total = len(siblings_tiff) + len(siblings_ppt)

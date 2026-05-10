@@ -104,11 +104,14 @@ class ProjectManager:
                 'windows': {
                     'tables': project_data.get('tables', []),
                     'graphs': project_data.get('graphs', []),
+                    'image_windows': project_data.get('image_windows', []),
                     'map_editor': project_data.get('map_editor', None)
                 },
                 'workspace': project_data.get('workspace', {}),
                 'output_files': project_data.get('output_files', []),
                 'maps': project_data.get('maps', []),
+                'images': self._serialize_images(project_data.get('images', {})),
+                'notes': self._serialize_notes(project_data.get('notes', {})),
                 'naming_convention': project_data.get('naming_convention'),
             }
 
@@ -176,6 +179,8 @@ class ProjectManager:
 
             # Build project data
             windows = project_json.get('windows', {})
+            images = self._deserialize_images(project_json.get('images', []))
+            notes = self._deserialize_notes(project_json.get('notes', []))
             project_data = {
                 'created': project_json.get('created'),
                 'modified': project_json.get('modified'),
@@ -183,10 +188,13 @@ class ProjectManager:
                 'datasets': datasets,
                 'tables': windows.get('tables', project_json.get('tables', [])),
                 'graphs': windows.get('graphs', project_json.get('plots', [])),
+                'image_windows': windows.get('image_windows', []),
                 'map_editor': windows.get('map_editor', None),
                 'workspace': project_json.get('workspace', {}),
                 'output_files': project_json.get('output_files', []),
                 'maps': project_json.get('maps', []),
+                'images': images,
+                'notes': notes,
                 'naming_convention': project_json.get('naming_convention'),
             }
 
@@ -275,6 +283,86 @@ class ProjectManager:
                 logger.error(f"Error serializing dataset {name}: {e}", exc_info=True)
 
         return serialized
+
+    def _serialize_images(self, images: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Serialize :class:`ImageData` entities for embedding in the project file.
+
+        Each image is encoded as a dict with base64 bytes (PNG for RGB/RGBA/u8/u16,
+        raw float32 buffer for SINGLE_FLOAT). See :meth:`ImageData.to_dict`.
+        Returns ``[]`` when ``images`` is empty so the project file gracefully
+        handles the no-images case.
+        """
+        if not images:
+            return []
+        out: List[Dict[str, Any]] = []
+        for image_id, image in images.items():
+            try:
+                payload = image.to_dict() if hasattr(image, "to_dict") else None
+                if payload is None:
+                    logger.warning(
+                        "Skipping image %s: no to_dict method", image_id,
+                    )
+                    continue
+                payload["id"] = image_id  # ensure id stability
+                out.append(payload)
+            except Exception as e:
+                logger.error(
+                    "Could not serialize image %s: %s", image_id, e,
+                    exc_info=True,
+                )
+        return out
+
+    def _serialize_notes(self, notes: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Serialize note entities (plain dicts) for project storage."""
+        if not notes:
+            return []
+        out: List[Dict[str, Any]] = []
+        for note_id, note in notes.items():
+            try:
+                if isinstance(note, dict):
+                    out.append({
+                        'id': note.get('id', note_id),
+                        'name': note.get('name', 'Note'),
+                        'text': note.get('text', ''),
+                        'source': note.get('source', 'unknown'),
+                    })
+            except Exception as e:
+                logger.error("Could not serialize note %s: %s", note_id, e)
+        return out
+
+    def _deserialize_notes(self, payloads: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Reconstruct note dicts from project payloads, keyed by id."""
+        if not payloads:
+            return {}
+        out: Dict[str, Any] = {}
+        for payload in payloads:
+            note_id = payload.get('id')
+            if not note_id:
+                continue
+            out[note_id] = {
+                'id': note_id,
+                'name': payload.get('name', 'Note'),
+                'text': payload.get('text', ''),
+                'source': payload.get('source', 'unknown'),
+            }
+        return out
+
+    def _deserialize_images(self, payloads: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Reconstruct :class:`ImageData` entities from project payloads."""
+        if not payloads:
+            return {}
+        from src.models.image_data import ImageData
+        out: Dict[str, Any] = {}
+        for payload in payloads:
+            try:
+                image = ImageData.from_dict(payload)
+                out[image.id] = image
+            except Exception as e:
+                logger.error(
+                    "Could not deserialize image %s: %s",
+                    payload.get("id", "?"), e, exc_info=True,
+                )
+        return out
 
     def _make_json_serializable(self, obj):
         """
