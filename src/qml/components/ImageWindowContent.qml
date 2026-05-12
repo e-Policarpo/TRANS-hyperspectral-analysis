@@ -38,6 +38,10 @@ Item {
     // of the viewport's current zoom/pan).
     property bool cropActive: false
     property var cropRect: null   // {x, y, w, h} or null
+    // Spatial cursors saved by the acquisition software (e.g. WITec
+    // ``TDSpaceCursor``). Each entry: ``{x_pixel, y_pixel, label, ...}``.
+    property var spatialCursors: []
+    property bool showCrosshair: false
 
     // Theme colors
     property var mainWin: ApplicationWindow.window
@@ -70,6 +74,7 @@ Item {
             minField.text = displayMin.toFixed(displayMin > 50 ? 1 : 4)
             maxField.text = displayMax.toFixed(displayMax > 50 ? 1 : 4)
         }
+        spatialCursors = info.spatial_cursors || []
         refreshHistogram()
         // Force the Image element to reload so the new info applies.
         img.source = buildSourceUrl()
@@ -192,6 +197,54 @@ Item {
                     height: cropRect ? cropRect.h * viewport.effectiveScale : 0
                 }
 
+                // Crosshair overlays — one per spatial cursor that the
+                // loader resolved to fall inside this image's bounds.
+                // Pixel coords come from TDSpaceTransformation.pixel_xy()
+                // (world µm → image pixels).
+                Repeater {
+                    model: showCrosshair ? spatialCursors : []
+                    delegate: Item {
+                        visible: modelData.x_pixel >= 0 && modelData.y_pixel >= 0
+                        x: viewport.renderX + modelData.x_pixel * viewport.effectiveScale
+                        y: viewport.renderY + modelData.y_pixel * viewport.effectiveScale
+                        z: 5
+                        Rectangle {  // horizontal arm
+                            x: -20; y: -1
+                            width: 40; height: 2
+                            color: accentBlue
+                            opacity: 0.9
+                        }
+                        Rectangle {  // vertical arm
+                            x: -1; y: -20
+                            width: 2; height: 40
+                            color: accentBlue
+                            opacity: 0.9
+                        }
+                        Rectangle {  // small center marker
+                            x: -3; y: -3
+                            width: 6; height: 6
+                            radius: 3
+                            color: "transparent"
+                            border.color: accentBlue
+                            border.width: 2
+                        }
+                        Label {
+                            x: 8; y: -22
+                            text: modelData.label || "Cursor"
+                            color: accentBlue
+                            font.pixelSize: 10
+                            font.bold: true
+                            // subtle background for legibility
+                            background: Rectangle {
+                                color: bgDarker
+                                opacity: 0.75
+                                radius: 2
+                            }
+                            leftPadding: 4; rightPadding: 4
+                        }
+                    }
+                }
+
                 MouseArea {
                     id: viewMouse
                     anchors.fill: parent
@@ -303,6 +356,17 @@ Item {
                                 viewport.panX = 0; viewport.panY = 0
                             }
                         }
+                    }
+
+                    // -------- Crosshair (spatial cursors from WITec, etc.) -----
+                    Button {
+                        Layout.fillWidth: true
+                        enabled: spatialCursors.length > 0
+                        text: spatialCursors.length === 0
+                              ? "No crosshair in file"
+                              : (showCrosshair ? "Hide crosshair (" + spatialCursors.length + ")"
+                                               : "Show crosshair (" + spatialCursors.length + ")")
+                        onClicked: showCrosshair = !showCrosshair
                     }
 
                     // -------- Histogram --------------------------------------

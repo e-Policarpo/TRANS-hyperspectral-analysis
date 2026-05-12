@@ -283,19 +283,115 @@ class WipSpectralTransformation:
 
 @dataclass
 class WipSpaceTransformation:
-    """A ``TDSpaceTransformation`` — XY pixel grid mapping (offset/scale)."""
+    """A ``TDSpaceTransformation`` — pixel ↔ world (µm) calibration.
+
+    The WITec viewport stores:
+
+    - ``WorldOrigin`` — translation vector ``[x0, y0, z0]`` in world units.
+    - ``Scale`` — 3×3 row-major scale/skew matrix flattened to 9 doubles.
+    - ``Rotation`` — 3×3 row-major rotation matrix flattened to 9 doubles.
+    - ``ModelOrigin`` — pre-translation origin in model coords.
+
+    ``world_xy(pixel_x, pixel_y)`` evaluates the affine to map pixel
+    coordinates → world units; ``pixel_xy(wx, wy)`` is the inverse.
+    """
     entry: WipDataEntry
-    standard_unit: str
+    standard_unit: str = ""
+    is_calibrated: bool = True
+    unit_kind: int = 0
+    model_origin: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    world_origin: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    scale: np.ndarray = field(default_factory=lambda: np.eye(3))
+    rotation: np.ndarray = field(default_factory=lambda: np.eye(3))
     raw: Dict[str, Any] = field(default_factory=dict)
+
+    def _forward_matrix(self) -> np.ndarray:
+        """3×3 ``rotation @ scale`` matrix for pixel → world mapping."""
+        return self.rotation @ self.scale
+
+    def world_xy(self, px: float, py: float) -> Tuple[float, float]:
+        """Map ``(px, py)`` pixel coords → ``(wx, wy)`` world units (XY plane)."""
+        m = self._forward_matrix()
+        # Apply model-origin offset, then matrix, then world-origin offset.
+        local = np.array(
+            [px - self.model_origin[0], py - self.model_origin[1], 0.0]
+        )
+        world = m @ local + self.world_origin
+        return float(world[0]), float(world[1])
+
+    def pixel_xy(self, wx: float, wy: float) -> Tuple[float, float]:
+        """Inverse mapping: ``(wx, wy)`` world → ``(px, py)`` pixel."""
+        m = self._forward_matrix()
+        try:
+            inv = np.linalg.inv(m)
+        except np.linalg.LinAlgError:
+            return 0.0, 0.0
+        rhs = np.array(
+            [wx - self.world_origin[0], wy - self.world_origin[1], 0.0]
+        )
+        local = inv @ rhs
+        return (
+            float(local[0] + self.model_origin[0]),
+            float(local[1] + self.model_origin[1]),
+        )
+
+    @property
+    def pixel_size_world(self) -> Tuple[float, float]:
+        """Magnitude of one pixel step in world units along x and y."""
+        m = self._forward_matrix()
+        return float(np.linalg.norm(m[:, 0])), float(np.linalg.norm(m[:, 1]))
 
 
 @dataclass
 class WipInterpretation:
-    """Generic ``TD*Interpretation`` payload (axis label, unit)."""
+    """Generic ``TD*Interpretation`` payload (axis label, unit).
+
+    For ``TDSpectralInterpretation`` the parser also reads the optional
+    ``ExcitationWaveLength`` field — that's where WITec stores the laser
+    wavelength used during acquisition.
+    """
     entry: WipDataEntry
     standard_unit: str = ""
     unit_kind: int = 0
+    excitation_wavelength_nm: Optional[float] = None
     raw: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class WipSpaceCursor:
+    """A ``TDSpaceCursor`` — single or multi-point cursor in world units."""
+    entry: WipDataEntry
+    positions: List[Tuple[float, float, float]] = field(default_factory=list)
+    standard_unit: str = ""
+
+
+@dataclass
+class WipSpectralCursor:
+    """A ``TDSpectralCursor`` — wavelength / wavenumber marker(s)."""
+    entry: WipDataEntry
+    positions: List[float] = field(default_factory=list)
+    standard_unit: str = ""
+
+
+@dataclass
+class WipColorProfile:
+    """A ``TDColorProfile`` — display colormap saved in WITec."""
+    entry: WipDataEntry
+    table_id: int = 0
+    colors: np.ndarray = field(default_factory=lambda: np.empty((0, 4), dtype=np.uint8))
+    top_color: int = 0xFFFFFF
+    bottom_color: int = 0x000000
+    color_cycle: int = 1
+
+
+@dataclass
+class WipSystemInfo:
+    """``SystemInformation`` block contents."""
+    application_versions: List[str] = field(default_factory=list)
+    license_ids: str = ""
+    service_id: str = ""
+    system_id: str = ""
+    last_session_ids: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -327,13 +423,23 @@ class WipBitmap:
     bits_per_pixel: int = 0
     data_type_code: int = 0
     source: str = ""  # "dib" for thumbnail-style, "raw" for TDBitmap-style
+    space_transformation_id: int = 0
+    secondary_transformation_id: int = 0
 
 
 @dataclass
 class WipText:
-    """A ``TDText`` payload — annotation/comment."""
+    """A ``TDText`` payload — annotation/comment.
+
+    WITec stores the body as an RTF blob inside ``TDStream.StreamData``;
+    the parser retains the raw bytes (so callers can save it as ``.rtf``
+    for native viewers) and a best-effort plain-text decoding stripped of
+    the RTF markup. Older or hand-written entries may use the simpler
+    ``Text`` string field — that path is still honored.
+    """
     entry: WipDataEntry
-    text: str = ""
+    text: str = ""              # plain-text body (best effort)
+    rtf_bytes: bytes = b""      # raw RTF blob, when present
 
 
 @dataclass
@@ -348,12 +454,22 @@ class WipProject:
     interpretations: Dict[int, WipInterpretation] = field(default_factory=dict)
     bitmaps: List[WipBitmap] = field(default_factory=list)
     texts: List[WipText] = field(default_factory=list)
+    space_cursors: List[WipSpaceCursor] = field(default_factory=list)
+    spectral_cursors: List[WipSpectralCursor] = field(default_factory=list)
+    color_profiles: List[WipColorProfile] = field(default_factory=list)
     thumbnail: Optional[WipBitmap] = None
+    system_info: WipSystemInfo = field(default_factory=WipSystemInfo)
+    excitation_wavelength_nm: Optional[float] = None
 
     def get_spectral_transformation(
         self, transformation_id: int
     ) -> Optional[WipSpectralTransformation]:
         return self.spectral_transformations.get(transformation_id)
+
+    def get_space_transformation(
+        self, transformation_id: int
+    ) -> Optional[WipSpaceTransformation]:
+        return self.space_transformations.get(transformation_id)
 
     def get_interpretation(
         self, interpretation_id: int
@@ -506,43 +622,82 @@ def _parse_spectral_transformation(
 def _parse_space_transformation(
     buf: bytes, entry: WipDataEntry, outer: WipTag,
 ) -> WipSpaceTransformation:
+    """Parse a ``TDSpaceTransformation`` entry, pulling out the affine
+    coefficients needed to map pixel coords to world (µm) coords.
+    """
     standard_unit = ""
+    is_calibrated = True
+    unit_kind = 0
+    model_origin = np.zeros(3)
+    world_origin = np.zeros(3)
+    scale = np.eye(3)
+    rotation = np.eye(3)
     raw: Dict[str, Any] = {}
+
     for child in iter_children(buf, outer.data_start, outer.data_end):
         if child.name == "TDTransformation" and child.type_code == TYPE_CONTAINER:
             for gc in iter_children(buf, child.data_start, child.data_end):
                 if gc.name == "StandardUnit" and gc.type_code == TYPE_STRING:
                     standard_unit = read_string(buf, gc)
+                elif gc.name == "UnitKind" and gc.type_code == TYPE_INT32:
+                    unit_kind = read_int(buf, gc)
+                elif gc.name == "IsCalibrated" and gc.type_code == TYPE_BOOL:
+                    is_calibrated = read_bool(buf, gc)
         elif child.name == "TDSpaceTransformation" and child.type_code == TYPE_CONTAINER:
             for gc in iter_children(buf, child.data_start, child.data_end):
-                if gc.type_code == TYPE_FLOAT64 and gc.size in (8, 16, 24):
+                if gc.name == "ViewPort3D" and gc.type_code == TYPE_CONTAINER:
+                    for vp in iter_children(buf, gc.data_start, gc.data_end):
+                        if vp.type_code != TYPE_FLOAT64:
+                            continue
+                        if vp.name == "ModelOrigin" and vp.size >= 24:
+                            model_origin = read_double_array(buf, vp)[:3]
+                        elif vp.name == "WorldOrigin" and vp.size >= 24:
+                            world_origin = read_double_array(buf, vp)[:3]
+                        elif vp.name == "Scale" and vp.size >= 72:
+                            scale = read_double_array(buf, vp)[:9].reshape(3, 3)
+                        elif vp.name == "Rotation" and vp.size >= 72:
+                            rotation = read_double_array(buf, vp)[:9].reshape(3, 3)
+                elif gc.type_code == TYPE_FLOAT64 and gc.size in (8, 16, 24):
                     raw[gc.name] = read_double_array(buf, gc).tolist()
                 elif gc.type_code == TYPE_INT32:
-                    raw[gc.name] = read_int(buf, gc)
+                    try:
+                        raw[gc.name] = read_int(buf, gc)
+                    except Exception:
+                        pass
     return WipSpaceTransformation(
-        entry=entry, standard_unit=standard_unit, raw=raw,
+        entry=entry, standard_unit=standard_unit,
+        is_calibrated=is_calibrated, unit_kind=unit_kind,
+        model_origin=model_origin, world_origin=world_origin,
+        scale=scale, rotation=rotation, raw=raw,
     )
 
 
 def _parse_interpretation(
     buf: bytes, entry: WipDataEntry, outer: WipTag,
 ) -> WipInterpretation:
+    """Parse any ``TD*Interpretation``. For ``TDSpectralInterpretation`` we
+    additionally pluck the ``ExcitationWaveLength`` field (laser λ in nm)
+    so Raman-shift conversion can auto-populate the excitation."""
     standard_unit = ""
     unit_kind = 0
+    excitation_nm: Optional[float] = None
     raw: Dict[str, Any] = {}
     for child in iter_children(buf, outer.data_start, outer.data_end):
-        # All interpretation classes share TDInterpretation with StandardUnit.
         if child.type_code == TYPE_CONTAINER:
             for gc in iter_children(buf, child.data_start, child.data_end):
                 if gc.name == "StandardUnit" and gc.type_code == TYPE_STRING:
                     standard_unit = read_string(buf, gc)
                 elif gc.name == "UnitKind" and gc.type_code == TYPE_INT32:
                     unit_kind = read_int(buf, gc)
+                elif gc.name == "ExcitationWaveLength" and gc.type_code == TYPE_FLOAT64:
+                    excitation_nm = read_double(buf, gc)
                 elif gc.type_code == TYPE_STRING:
                     raw[gc.name] = read_string(buf, gc)
     return WipInterpretation(
         entry=entry, standard_unit=standard_unit,
-        unit_kind=unit_kind, raw=raw,
+        unit_kind=unit_kind,
+        excitation_wavelength_nm=excitation_nm,
+        raw=raw,
     )
 
 
@@ -682,6 +837,8 @@ def _parse_bitmap(
     raw_data_blob = b""
     data_type_code = 0
     source = ""
+    space_xform_id = 0
+    secondary_xform_id = 0
     for child in iter_children(buf, outer.data_start, outer.data_end):
         if child.name == "SizeX" and child.type_code == TYPE_INT32:
             width = read_int(buf, child)
@@ -689,6 +846,10 @@ def _parse_bitmap(
             height = read_int(buf, child)
         elif child.name == "BitsPerPixel" and child.type_code == TYPE_INT32:
             bpp = read_int(buf, child)
+        elif child.name == "SpaceTransformationID" and child.type_code == TYPE_INT32:
+            space_xform_id = read_int(buf, child)
+        elif child.name == "SecondaryTransformationID" and child.type_code == TYPE_INT32:
+            secondary_xform_id = read_int(buf, child)
         elif child.name == "BitmapData":
             if child.type_code == TYPE_BLOB:
                 dib_pixels = read_blob(buf, child)
@@ -725,18 +886,187 @@ def _parse_bitmap(
         bits_per_pixel=bpp,
         data_type_code=data_type_code,
         source=source,
+        space_transformation_id=space_xform_id,
+        secondary_transformation_id=secondary_xform_id,
     )
+
+
+def _strip_rtf(rtf: str) -> str:
+    """Best-effort RTF → plain text. Strips control words and braces.
+
+    Not a full RTF parser — handles the simple body that WITec writes
+    (paragraphs of latin-1 text with the usual ``\\b``, ``\\par`` etc.
+    control words). Falls back to the raw string when in doubt.
+    """
+    import re
+    # Drop binary embedded objects.
+    s = re.sub(r"\\\*\\[a-zA-Z]+[^{}]*", "", rtf)
+    # Drop {\fonttbl ...}, {\colortbl ...} groups.
+    s = re.sub(r"\{\\(?:fonttbl|colortbl|stylesheet|info)[^{}]*\}", "", s)
+    # Translate \uNNNN? escapes (signed 16-bit) to actual chars.
+    def _u(m):
+        try:
+            n = int(m.group(1))
+            if n < 0:
+                n += 65536
+            return chr(n)
+        except Exception:
+            return ""
+    s = re.sub(r"\\u(-?\d+)\??", _u, s)
+    # Translate \'XX hex escapes (latin-1 byte values).
+    s = re.sub(
+        r"\\'([0-9a-fA-F]{2})",
+        lambda m: bytes([int(m.group(1), 16)]).decode("latin-1", errors="replace"),
+        s,
+    )
+    # \par / \line → newline.
+    s = re.sub(r"\\par[d]?\b", "\n", s)
+    s = re.sub(r"\\line\b", "\n", s)
+    # Remove all remaining control words: backslash + name + optional arg.
+    s = re.sub(r"\\[a-zA-Z]+-?\d*\s?", "", s)
+    # Remove stray braces.
+    s = s.replace("{", "").replace("}", "")
+    # Collapse runs of whitespace.
+    s = re.sub(r"[ \t]+", " ", s).strip()
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s
+
+
+def _parse_space_cursor(
+    buf: bytes, entry: WipDataEntry, outer: WipTag,
+) -> WipSpaceCursor:
+    """Parse a ``TDSpaceCursor`` into one or more ``(x, y, z)`` tuples."""
+    positions: List[Tuple[float, float, float]] = []
+    standard_unit = ""
+    n_positions = 1
+    for child in iter_children(buf, outer.data_start, outer.data_end):
+        if child.name != "TDCursor" or child.type_code != TYPE_CONTAINER:
+            continue
+        for gc in iter_children(buf, child.data_start, child.data_end):
+            if gc.name == "NumberOfPositions" and gc.type_code == TYPE_INT32:
+                n_positions = max(1, read_int(buf, gc))
+            elif gc.name == "StandardUnit" and gc.type_code == TYPE_STRING:
+                standard_unit = read_string(buf, gc)
+            elif gc.name == "Positions" and gc.type_code == TYPE_FLOAT64:
+                arr = read_double_array(buf, gc)
+                # Each position is up to 3 doubles (X, Y, Z). The blob
+                # holds ``n_positions × 3`` doubles for a space cursor.
+                arr = arr[: n_positions * 3]
+                for i in range(0, len(arr), 3):
+                    chunk = list(arr[i:i + 3])
+                    while len(chunk) < 3:
+                        chunk.append(0.0)
+                    positions.append((float(chunk[0]), float(chunk[1]), float(chunk[2])))
+    return WipSpaceCursor(
+        entry=entry, positions=positions, standard_unit=standard_unit,
+    )
+
+
+def _parse_spectral_cursor(
+    buf: bytes, entry: WipDataEntry, outer: WipTag,
+) -> WipSpectralCursor:
+    """Parse a ``TDSpectralCursor`` — list of wavelength / wavenumber marks."""
+    positions: List[float] = []
+    standard_unit = ""
+    for child in iter_children(buf, outer.data_start, outer.data_end):
+        if child.name != "TDCursor" or child.type_code != TYPE_CONTAINER:
+            continue
+        for gc in iter_children(buf, child.data_start, child.data_end):
+            if gc.name == "StandardUnit" and gc.type_code == TYPE_STRING:
+                standard_unit = read_string(buf, gc)
+            elif gc.name == "Positions" and gc.type_code == TYPE_FLOAT64:
+                positions = [float(v) for v in read_double_array(buf, gc)]
+    return WipSpectralCursor(
+        entry=entry, positions=positions, standard_unit=standard_unit,
+    )
+
+
+def _parse_color_profile(
+    buf: bytes, entry: WipDataEntry, outer: WipTag,
+) -> WipColorProfile:
+    """Parse a ``TDColorProfile`` — palette index, color count, RGBA LUT."""
+    table_id = 0
+    color_count = 0
+    colors_bytes = b""
+    top_color = 0xFFFFFF
+    bottom_color = 0x000000
+    color_cycle = 1
+    for child in iter_children(buf, outer.data_start, outer.data_end):
+        if child.name != "TDColorProfile" or child.type_code != TYPE_CONTAINER:
+            continue
+        for gc in iter_children(buf, child.data_start, child.data_end):
+            if gc.name == "StandardColorProfileTable" and gc.type_code == TYPE_INT32:
+                table_id = read_int(buf, gc)
+            elif gc.name == "ColorCount" and gc.type_code == TYPE_INT32:
+                color_count = read_int(buf, gc)
+            elif gc.name == "Colors" and gc.type_code == TYPE_INT32 and gc.size > 4:
+                colors_bytes = bytes(buf[gc.data_start:gc.data_end])
+            elif gc.name == "TopColor" and gc.type_code == TYPE_INT32:
+                top_color = read_int(buf, gc)
+            elif gc.name == "BottomColor" and gc.type_code == TYPE_INT32:
+                bottom_color = read_int(buf, gc)
+            elif gc.name == "ColorCycle" and gc.type_code == TYPE_INT32:
+                color_cycle = read_int(buf, gc)
+    colors = np.empty((0, 4), dtype=np.uint8)
+    if colors_bytes and color_count > 0:
+        expected = color_count * 4
+        if len(colors_bytes) >= expected:
+            colors = (np.frombuffer(colors_bytes[:expected], dtype=np.uint8)
+                       .reshape(color_count, 4).copy())
+    return WipColorProfile(
+        entry=entry, table_id=table_id, colors=colors,
+        top_color=top_color, bottom_color=bottom_color, color_cycle=color_cycle,
+    )
+
+
+def _parse_system_information(
+    buf: bytes, outer: WipTag,
+) -> WipSystemInfo:
+    """Walk ``SystemInformation`` and pluck out application / license / id strings."""
+    info = WipSystemInfo()
+    for child in iter_children(buf, outer.data_start, outer.data_end):
+        if child.type_code != TYPE_CONTAINER:
+            continue
+        items = list(iter_children(buf, child.data_start, child.data_end))
+        # Each sub-block holds a single nested tag whose *name* is the value.
+        if not items:
+            continue
+        nested = items[0]
+        value_str = nested.name
+        if child.name == "ApplicationVersions":
+            info.application_versions.append(value_str)
+        elif child.name == "LicenseID":
+            info.license_ids = value_str
+        elif child.name == "ServiceID":
+            info.service_id = value_str
+        elif child.name == "SystemID":
+            info.system_id = value_str
+        elif child.name == "LastApplicationSessionIDs":
+            info.last_session_ids.append(value_str)
+    return info
 
 
 def _parse_text(buf: bytes, entry: WipDataEntry, outer: WipTag) -> WipText:
     text = ""
+    rtf_bytes = b""
     for child in iter_children(buf, outer.data_start, outer.data_end):
-        if child.type_code == TYPE_CONTAINER:
-            for gc in iter_children(buf, child.data_start, child.data_end):
-                if gc.name == "Text" and gc.type_code == TYPE_STRING:
-                    text = read_string(buf, gc)
-                    break
-    return WipText(entry=entry, text=text)
+        if child.type_code != TYPE_CONTAINER:
+            continue
+        for gc in iter_children(buf, child.data_start, child.data_end):
+            # Modern WITec: body lives in TDStream.StreamData as RTF.
+            if gc.name == "StreamData" and gc.type_code == TYPE_BLOB and gc.size > 0:
+                rtf_bytes = read_blob(buf, gc)
+                try:
+                    rtf_text = rtf_bytes.decode("latin-1", errors="replace")
+                    text = _strip_rtf(rtf_text)
+                except Exception as e:
+                    logger.debug("Could not strip RTF for TDText %s: %s",
+                                 entry.id, e)
+                    text = ""
+            # Legacy hand-written: a plain string field named "Text".
+            elif gc.name == "Text" and gc.type_code == TYPE_STRING and not text:
+                text = read_string(buf, gc)
+    return WipText(entry=entry, text=text, rtf_bytes=rtf_bytes)
 
 
 # ---------------------------------------------------------------------------
@@ -777,6 +1107,8 @@ def parse_wip(path: Union[str, Path]) -> WipProject:
             project.version = read_int(buf, child)
         elif child.name == "Data" and child.type_code == TYPE_CONTAINER:
             data_block = child
+        elif child.name == "SystemInformation" and child.type_code == TYPE_CONTAINER:
+            project.system_info = _parse_system_information(buf, child)
         elif child.name == "ShellExtensionInfo" and child.type_code == TYPE_CONTAINER:
             for gc in iter_children(buf, child.data_start, child.data_end):
                 if gc.name == "ThumbnailPreviewBitmap" and gc.type_code == TYPE_CONTAINER:
@@ -819,6 +1151,9 @@ def parse_wip(path: Union[str, Path]) -> WipProject:
     deferred_interp: List[Tuple[WipDataEntry, WipTag]] = []
     deferred_bitmap: List[Tuple[WipDataEntry, WipTag]] = []
     deferred_text: List[Tuple[WipDataEntry, WipTag]] = []
+    deferred_space_cursor: List[Tuple[WipDataEntry, WipTag]] = []
+    deferred_spec_cursor: List[Tuple[WipDataEntry, WipTag]] = []
+    deferred_color_profile: List[Tuple[WipDataEntry, WipTag]] = []
 
     for idx in sorted(data_blocks):
         outer = data_blocks[idx]
@@ -853,7 +1188,13 @@ def parse_wip(path: Union[str, Path]) -> WipProject:
             deferred_bitmap.append((entry, class_block))
         elif class_name == "TDText":
             deferred_text.append((entry, outer))
-        # Other classes (TDColorProfile, TDSpaceCursor, …) are recorded
+        elif class_name == "TDSpaceCursor":
+            deferred_space_cursor.append((entry, outer))
+        elif class_name == "TDSpectralCursor":
+            deferred_spec_cursor.append((entry, outer))
+        elif class_name == "TDColorProfile":
+            deferred_color_profile.append((entry, outer))
+        # Other classes (TDSpaceInterpretation siblings, etc.) are recorded
         # as bare entries but otherwise ignored.
 
     for entry, outer, block in deferred_graphs:
@@ -883,6 +1224,23 @@ def parse_wip(path: Union[str, Path]) -> WipProject:
 
     for entry, outer in deferred_text:
         project.texts.append(_parse_text(buf, entry, outer))
+
+    for entry, outer in deferred_space_cursor:
+        project.space_cursors.append(_parse_space_cursor(buf, entry, outer))
+
+    for entry, outer in deferred_spec_cursor:
+        project.spectral_cursors.append(_parse_spectral_cursor(buf, entry, outer))
+
+    for entry, outer in deferred_color_profile:
+        project.color_profiles.append(_parse_color_profile(buf, entry, outer))
+
+    # Pick the first ``ExcitationWaveLength`` we saw across interpretations
+    # — WITec stores it on TDSpectralInterpretation; multiple identical
+    # entries are common (per-graph copies), all carrying the same value.
+    for ip in project.interpretations.values():
+        if ip.excitation_wavelength_nm and ip.excitation_wavelength_nm > 0:
+            project.excitation_wavelength_nm = ip.excitation_wavelength_nm
+            break
 
     return project
 

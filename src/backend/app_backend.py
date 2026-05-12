@@ -1945,16 +1945,21 @@ class AppBackend(ToolImplementations, QObject):
 
     @Slot(str, result='QVariantMap')
     def getImageInfo(self, image_id: str):
-        """Return image-info record used by the side-panel readout."""
+        """Return image-info record used by the side-panel readout.
+
+        Includes any spatial cursors and pixel calibration the loader
+        attached to ``image.metadata.additional_info`` — the viewer uses
+        these to render crosshair overlays and a scale-bar legend.
+        """
         image = self._images.get(image_id)
         if image is None:
             return {}
-        # Auto-range for the display min/max sliders.
         try:
             lo, hi = image.auto_range()
         except Exception:
             lo, hi = 0.0, 1.0
-        return {
+        ai = image.metadata.additional_info or {}
+        result = {
             'id': image_id,
             'name': image.name,
             'mode': image.mode.value,
@@ -1967,6 +1972,13 @@ class AppBackend(ToolImplementations, QObject):
             'data_min': float(np.min(image.array)) if image.array.ndim < 3 else 0.0,
             'data_max': float(np.max(image.array)) if image.array.ndim < 3 else 255.0,
         }
+        if 'pixel_size' in ai:
+            result['pixel_size'] = ai['pixel_size']
+        if 'world_bounds' in ai:
+            result['world_bounds'] = ai['world_bounds']
+        if 'spatial_cursors' in ai:
+            result['spatial_cursors'] = ai['spatial_cursors']
+        return result
 
     @Slot(str, int, int, int, int, result=str)
     def cropImage(self, image_id: str, x0: int, y0: int, x1: int, y1: int) -> str:
@@ -2015,27 +2027,37 @@ class AppBackend(ToolImplementations, QObject):
         return d
 
     def _save_note_to_txt(self, note: dict) -> Optional[str]:
-        """Persist ``note`` as a ``.txt`` file. Returns the absolute path.
+        """Persist ``note`` to disk. Returns the absolute path.
 
-        File starts with the caption + source as a small header so the user
-        sees context in the OS text editor, then the body text (which is
-        empty for caption-only WITec annotations).
+        When the note carries a raw RTF blob (``rtf_bytes``, set by the
+        WITec loader for ``TDText`` entries), write a ``.rtf`` so the OS
+        opens TextEdit / WordPad with proper formatting. Otherwise fall
+        back to a ``.txt`` with a small caption + source header.
         """
         existing = note.get('file_path')
         if existing and Path(existing).exists():
             return existing
         safe = self._sanitize_filename(note.get('name', 'note')) or note.get('id', 'note')
-        target = self._notes_dir() / f"{note.get('id', 'note')}_{safe}.txt"
-        body = note.get('text', '') or ''
-        header = (
-            f"# {note.get('name', 'Note')}\n"
-            f"# Source: {note.get('source', 'unknown')}\n\n"
-        )
-        try:
-            target.write_text(header + body, encoding='utf-8')
-        except Exception as e:
-            logger.error("Could not write note %s: %s", target, e)
-            return None
+        rtf_bytes = note.get('rtf_bytes') or b''
+        if rtf_bytes:
+            target = self._notes_dir() / f"{note.get('id', 'note')}_{safe}.rtf"
+            try:
+                target.write_bytes(rtf_bytes)
+            except Exception as e:
+                logger.error("Could not write RTF note %s: %s", target, e)
+                return None
+        else:
+            target = self._notes_dir() / f"{note.get('id', 'note')}_{safe}.txt"
+            body = note.get('text', '') or ''
+            header = (
+                f"# {note.get('name', 'Note')}\n"
+                f"# Source: {note.get('source', 'unknown')}\n\n"
+            )
+            try:
+                target.write_text(header + body, encoding='utf-8')
+            except Exception as e:
+                logger.error("Could not write note %s: %s", target, e)
+                return None
         note['file_path'] = str(target)
         return note['file_path']
 
@@ -2070,6 +2092,8 @@ class AppBackend(ToolImplementations, QObject):
                     'text': entry.get('text', ''),
                     'source': entry.get('source', 'unknown'),
                 }
+                if entry.get('rtf_bytes'):
+                    note['rtf_bytes'] = entry['rtf_bytes']
                 self._save_note_to_txt(note)
                 self._notes[note_id] = note
                 self.noteAdded.emit(note_id, note['name'])

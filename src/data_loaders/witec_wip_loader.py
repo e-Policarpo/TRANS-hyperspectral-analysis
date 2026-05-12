@@ -182,16 +182,19 @@ class WitecWipLoader(BaseDataLoader):
         for txt in project.texts:
             text_value = (txt.text or "").strip()
             caption = (txt.entry.caption or "").strip()
-            if not text_value and not caption:
+            if not text_value and not caption and not txt.rtf_bytes:
                 continue
-            # Keep ``text`` empty when there's no real body — the backend's
-            # openNote slot then shows a clear "no body text" placeholder
-            # instead of repeating the caption inside the window content.
-            notes.append({
+            note = {
                 'name': caption or "Note",
                 'text': text_value,
                 'source': f"witec_wip:{filepath.name}",
-            })
+            }
+            # Hand over the raw RTF too — the backend can save it as ``.rtf``
+            # so the OS opens a properly-formatted document, while the
+            # embedded note window uses the stripped plain-text body.
+            if txt.rtf_bytes:
+                note['rtf_bytes'] = txt.rtf_bytes
+            notes.append(note)
 
         if progress_callback:
             progress_callback(3, 4, "Building dataset")
@@ -219,6 +222,30 @@ class WitecWipLoader(BaseDataLoader):
 
         primary.metadata.additional_info["wip_version"] = project.version
         primary.metadata.additional_info["source_file"] = str(filepath)
+
+        # Acquisition info, excitation wavelength, and spectral cursors —
+        # all attached to the primary dataset's additional_info so the
+        # backend / UI can find them via a single lookup.
+        if project.system_info.application_versions:
+            primary.metadata.additional_info['acquisition'] = {
+                'software': project.system_info.application_versions[0],
+                'license_ids': project.system_info.license_ids,
+                'service_id': project.system_info.service_id,
+                'system_id': project.system_info.system_id,
+            }
+        if project.excitation_wavelength_nm:
+            primary.metadata.additional_info['excitation_wavelength_nm'] = (
+                float(project.excitation_wavelength_nm)
+            )
+        if project.spectral_cursors:
+            primary.metadata.additional_info['spectral_cursors'] = [
+                {
+                    'positions': list(c.positions),
+                    'unit': c.standard_unit,
+                    'label': (c.entry.caption or 'Cursor').strip(),
+                }
+                for c in project.spectral_cursors
+            ]
 
         if progress_callback:
             progress_callback(4, 4, "Complete!")
@@ -436,18 +463,74 @@ class WitecWipLoader(BaseDataLoader):
     def _extract_images(
         self, project: WipProject, file_stem: str,
     ) -> List[Tuple[str, ImageData]]:
-        """Wrap every WipBitmap (and the project thumbnail) as ImageData."""
+        """Wrap every WipBitmap (and the project thumbnail) as ImageData.
+
+        For each bitmap, the loader resolves its ``SpaceTransformationID`` to
+        the matching ``TDSpaceTransformation`` and stamps the image's
+        metadata with the pixel size and world-coord bounds. Any global
+        ``TDSpaceCursor`` whose position falls inside those bounds is
+        attached as ``spatial_cursor`` so the viewer can draw a crosshair.
+        """
         out: List[Tuple[str, ImageData]] = []
+        cursors = project.space_cursors or []
+
         for bm in project.bitmaps:
             img = self._wip_bitmap_to_image(bm, file_stem)
-            if img is not None:
-                out.append((img.name, img))
+            if img is None:
+                continue
+            self._attach_spatial_metadata(img, bm, project, cursors)
+            out.append((img.name, img))
+
         if project.thumbnail is not None:
             img = self._wip_bitmap_to_image(project.thumbnail, file_stem)
             if img is not None:
                 img.name = f"{file_stem} (thumbnail)"
                 out.append((img.name, img))
         return out
+
+    @staticmethod
+    def _attach_spatial_metadata(
+        img: ImageData, bm: WipBitmap, project: WipProject, cursors: list,
+    ) -> None:
+        """Stamp pixel-size, world-bounds, and any in-bounds cursor onto
+        the image's metadata. No-op when no calibrated transformation
+        exists for the bitmap."""
+        st = project.get_space_transformation(bm.space_transformation_id)
+        if st is None or not st.is_calibrated:
+            return
+        # Pixel-size in world units. WITec stores µm by default; pass the
+        # unit through unchanged so callers know what they're looking at.
+        dx, dy = st.pixel_size_world
+        img.metadata.additional_info['pixel_size'] = {
+            'dx': float(dx), 'dy': float(dy), 'unit': st.standard_unit or 'µm',
+        }
+        if st.standard_unit in ('µm', 'um', 'micron', 'microns'):
+            img.metadata.pixel_size_nm = (float(dy) * 1000.0, float(dx) * 1000.0)
+        # World-coord bounds of the image rectangle.
+        wx0, wy0 = st.world_xy(0, 0)
+        wx1, wy1 = st.world_xy(bm.width, bm.height)
+        x_min, x_max = min(wx0, wx1), max(wx0, wx1)
+        y_min, y_max = min(wy0, wy1), max(wy0, wy1)
+        img.metadata.additional_info['world_bounds'] = {
+            'x_min': x_min, 'x_max': x_max,
+            'y_min': y_min, 'y_max': y_max,
+            'unit': st.standard_unit or 'µm',
+        }
+        # Attach any TDSpaceCursor that falls inside this image.
+        cursor_pts = []
+        for c in cursors:
+            for (wx, wy, _wz) in c.positions:
+                if not (x_min <= wx <= x_max and y_min <= wy <= y_max):
+                    continue
+                px, py = st.pixel_xy(wx, wy)
+                cursor_pts.append({
+                    'x_world': float(wx), 'y_world': float(wy),
+                    'x_pixel': float(px), 'y_pixel': float(py),
+                    'label': (c.entry.caption or 'Cursor').strip(),
+                    'unit': c.standard_unit or st.standard_unit,
+                })
+        if cursor_pts:
+            img.metadata.additional_info['spatial_cursors'] = cursor_pts
 
     @staticmethod
     def _wip_bitmap_to_image(

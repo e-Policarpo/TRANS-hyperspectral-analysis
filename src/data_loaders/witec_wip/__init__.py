@@ -18,6 +18,10 @@ from .wip_parser import (
     WipSpectralTransformation,
     WipSpaceTransformation,
     WipInterpretation,
+    WipSpaceCursor,
+    WipSpectralCursor,
+    WipColorProfile,
+    WipSystemInfo,
     WipProject,
     parse_wip,
 )
@@ -32,6 +36,10 @@ __all__ = [
     "WipSpectralTransformation",
     "WipSpaceTransformation",
     "WipInterpretation",
+    "WipSpaceCursor",
+    "WipSpectralCursor",
+    "WipColorProfile",
+    "WipSystemInfo",
     "WipProject",
     "parse_wip",
 ]

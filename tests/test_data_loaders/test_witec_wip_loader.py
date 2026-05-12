@@ -26,10 +26,20 @@ from src.models.spectral_data import SpectralData
 from tests.test_data_loaders.test_witec_wip_parser import WipBuilder
 
 
-REAL_WIP = Path(
-    "/Users/eduardapolicarpo/Documents/Doutorado/Sheffield - UFMG/"
-    "Raman/DtBuTPZ series.wip"
-)
+def _resolve_real_wip() -> Path:
+    candidates = [
+        Path("/Users/eduardapolicarpo/Documents/Doutorado/Sheffield - UFMG/"
+             "Raman/DtBuTPZ series.wip"),
+        Path("/Users/eduardapolicarpo/Documents/Doutorado/Colab Sheffield - UFMG/"
+             "Raman/DtBuTPZ series.wip"),
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[0]
+
+
+REAL_WIP = _resolve_real_wip()
 
 
 # =============================================================================
@@ -422,3 +432,52 @@ def test_real_file_surfaces_images(real_load):
     # At least one image must be tagged as the WIP source.
     sources = [img.metadata.source for _, img in images]
     assert any(s == "witec_wip_bitmap" for s in sources)
+
+
+def test_real_file_attaches_pixel_size_and_cursor_to_image(real_load):
+    """When an image has a calibrated TDSpaceTransformation AND a spatial
+    cursor falls within it, the loader stamps both onto image metadata."""
+    images = real_load.metadata.additional_info.get("images") or []
+    with_cursor = [
+        img for _, img in images
+        if (img.metadata.additional_info or {}).get("spatial_cursors")
+    ]
+    assert with_cursor, "Expected at least one image to carry a spatial_cursor"
+    img = with_cursor[0]
+    cursors = img.metadata.additional_info["spatial_cursors"]
+    c = cursors[0]
+    assert "x_pixel" in c and "y_pixel" in c
+    assert "x_world" in c and "y_world" in c
+    assert c["unit"] in ("µm", "um")
+    # Pixel coords should land inside the image.
+    assert 0 <= c["x_pixel"] <= img.width
+    assert 0 <= c["y_pixel"] <= img.height
+    # Pixel size + world bounds present.
+    assert "pixel_size" in img.metadata.additional_info
+    assert "world_bounds" in img.metadata.additional_info
+
+
+def test_real_file_surfaces_excitation_and_acquisition_info(real_load):
+    """ExcitationWaveLength and software/system metadata surface on the dataset."""
+    ai = real_load.metadata.additional_info or {}
+    assert "excitation_wavelength_nm" in ai
+    assert 450 < ai["excitation_wavelength_nm"] < 470
+    assert "acquisition" in ai
+    assert "Control FIVE" in ai["acquisition"]["software"]
+
+
+def test_real_file_surfaces_spectral_cursor(real_load):
+    ai = real_load.metadata.additional_info or {}
+    assert "spectral_cursors" in ai
+    sc = ai["spectral_cursors"][0]
+    assert sc["unit"] == "nm"
+    assert sc["positions"] and 400 < sc["positions"][0] < 900
+
+
+def test_real_file_notes_carry_rtf(real_load):
+    """TDText notes should carry the RTF bytes alongside the stripped body."""
+    notes = real_load.metadata.additional_info.get("notes") or []
+    assert any(n.get("rtf_bytes") for n in notes)
+    # And the stripped body is meaningful.
+    bodies = " ".join(n.get("text", "") for n in notes)
+    assert "System ID" in bodies or "Start Time" in bodies

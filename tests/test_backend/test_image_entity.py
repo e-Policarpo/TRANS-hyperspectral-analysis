@@ -231,6 +231,36 @@ def test_get_image_info_returns_metadata(backend):
     assert info["is_single_channel"] is False
 
 
+def test_note_with_rtf_bytes_saved_as_rtf_file(backend, tmp_path):
+    """When _absorb_dataset_notes sees ``rtf_bytes`` on a note entry, the
+    persisted file should be a ``.rtf`` so the OS opens TextEdit/WordPad."""
+    backend._output_base_dir = tmp_path
+    rtf_payload = (
+        b"{\\rtf1\\ansi\\ansicpg1252\\cocoartf2761"
+        b"\\fonttbl\\f0\\fnil Arial;}\\f0\\fs24 Hello\\par}"
+    )
+    df = pd.DataFrame({"x": [0.0], "y": [0.0]})
+    meta = SpectralMetadata(
+        source_type="test", dimensions=(1, 1), scan_mode="point", units={},
+    )
+    sd = SpectralData(df, meta)
+    sd.metadata.additional_info["notes"] = [{
+        'name': 'Embedded RTF',
+        'text': 'Hello',
+        'source': 'witec_wip:test.wip',
+        'rtf_bytes': rtf_payload,
+    }]
+    backend._absorb_dataset_notes({"datasets": {"d": sd}})
+
+    # Pick the absorbed note and check its file_path lands in .rtf.
+    assert backend._notes
+    note = list(backend._notes.values())[-1]
+    fp = note.get('file_path')
+    assert fp is not None
+    assert fp.endswith('.rtf')
+    assert Path(fp).read_bytes() == rtf_payload
+
+
 def test_open_note_in_os_writes_txt_and_opens_via_os(backend, tmp_path, monkeypatch):
     """``openNoteInOS`` fallback path uses QDesktopServices."""
     backend._output_base_dir = tmp_path

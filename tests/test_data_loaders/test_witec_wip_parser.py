@@ -45,10 +45,21 @@ from src.data_loaders.witec_wip.wip_parser import (
 )
 
 
-REAL_WIP = Path(
-    "/Users/eduardapolicarpo/Documents/Doutorado/Sheffield - UFMG/"
-    "Raman/DtBuTPZ series.wip"
-)
+def _resolve_real_wip() -> Path:
+    """Find the user's WITec test file across known locations."""
+    candidates = [
+        Path("/Users/eduardapolicarpo/Documents/Doutorado/Sheffield - UFMG/"
+             "Raman/DtBuTPZ series.wip"),
+        Path("/Users/eduardapolicarpo/Documents/Doutorado/Colab Sheffield - UFMG/"
+             "Raman/DtBuTPZ series.wip"),
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[0]  # used in skip message
+
+
+REAL_WIP = _resolve_real_wip()
 
 
 # =============================================================================
@@ -481,5 +492,68 @@ def test_real_file_video_image_decodes_as_array(real_project):
     assert candidates, "Expected at least one raw-pixel TDBitmap entry"
     bm = candidates[0]
     assert bm.array is not None
-    assert bm.array.shape == (bm.height, bm.width)
+    # BGRA bitmaps decode to (H, W, 3); single-channel to (H, W).
+    assert bm.array.shape[:2] == (bm.height, bm.width)
     assert bm.data_type_code in (1, 2, 3, 4, 5, 6, 7, 9, 10)
+
+
+def test_real_file_extracts_excitation_wavelength(real_project):
+    """ExcitationWaveLength from TDSpectralInterpretation is captured."""
+    assert real_project.excitation_wavelength_nm is not None
+    # DtBuTPZ file uses ~457 nm Ar+ laser.
+    assert 450 < real_project.excitation_wavelength_nm < 470
+
+
+def test_real_file_extracts_space_cursor(real_project):
+    """At least one TDSpaceCursor in the file."""
+    assert len(real_project.space_cursors) >= 1
+    c = real_project.space_cursors[0]
+    assert c.standard_unit in ("µm", "um")
+    assert len(c.positions) >= 1
+    x, y, z = c.positions[0]
+    assert x != 0 or y != 0  # non-trivial position
+
+
+def test_real_file_extracts_spectral_cursor(real_project):
+    """TDSpectralCursor position recovered as a wavelength."""
+    assert len(real_project.spectral_cursors) >= 1
+    c = real_project.spectral_cursors[0]
+    assert c.standard_unit == "nm"
+    assert c.positions and 400 < c.positions[0] < 900
+
+
+def test_real_file_extracts_color_profile(real_project):
+    """TDColorProfile palette decoded into an N×4 uint8 LUT."""
+    assert len(real_project.color_profiles) >= 1
+    cp = real_project.color_profiles[0]
+    assert cp.colors.ndim == 2 and cp.colors.shape[1] == 4
+    assert cp.colors.dtype == np.uint8
+
+
+def test_real_file_extracts_system_info(real_project):
+    """SystemInformation block exposed (software version, system id)."""
+    si = real_project.system_info
+    assert si.application_versions
+    assert "Control FIVE" in si.application_versions[0]
+    assert si.system_id  # non-empty
+
+
+def test_real_file_tdtext_has_rtf_body(real_project):
+    """TDText entries surface RTF stream content (not just captions)."""
+    texts_with_body = [t for t in real_project.texts if t.text]
+    assert texts_with_body
+    assert any(len(t.rtf_bytes) > 100 for t in real_project.texts)
+    # Plain-text strip pulled WITec metadata strings.
+    bodies = " ".join(t.text for t in texts_with_body)
+    assert "System ID" in bodies or "Start Time" in bodies
+
+
+def test_real_file_space_transformation_calibrated(real_project):
+    """At least one TDSpaceTransformation is calibrated with non-trivial scale."""
+    for tid, st in real_project.space_transformations.items():
+        if not st.is_calibrated:
+            continue
+        dx, dy = st.pixel_size_world
+        if dx > 0 and dy > 0:
+            return
+    raise AssertionError("No calibrated space transformation with non-zero pixel size")
