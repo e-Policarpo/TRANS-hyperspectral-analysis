@@ -2523,22 +2523,27 @@ class AppBackend(ToolImplementations, QObject):
 
     @Slot(str)
     def convertImageToMap(self, image_id: str):
-        """Right-click "Convert to Map (TIFF)" — only for single-channel images.
+        """Right-click "Convert to Map (TIFF)".
 
-        Writes the array as a single-page TIFF inside the project's
+        Writes the image as a single-channel TIFF inside the project's
         ``_converted_maps`` directory and registers it as a regular map.
-        Round-trip preserves the float32 array exactly.
+
+        - Single-channel images (GRAY_U8 / GRAY_U16 / SINGLE_FLOAT) round-trip
+          as-is (pixel-exact).
+        - RGB / RGBA images are converted to grayscale via the standard
+          luminance formula (``0.299·R + 0.587·G + 0.114·B``) so the map
+          editor — which only displays single-channel maps — can show them.
+          Alpha is ignored.
+
+        Spatial metadata (``pixel_size``, ``world_bounds``,
+        ``spatial_cursors``) is also persisted to a sidecar JSON next to
+        the TIFF so the map editor can render the WITec-saved crosshair on
+        top of the map.
         """
         image = self._images.get(image_id)
         if image is None:
             self.errorOccurred.emit(
                 "Conversion Failed", f"Image not found: {image_id}",
-            )
-            return
-        if not image.mode.is_single_channel:
-            self.errorOccurred.emit(
-                "Conversion Failed",
-                "Only single-channel images can be converted to maps.",
             )
             return
         try:
@@ -2555,12 +2560,56 @@ class AppBackend(ToolImplementations, QObject):
                 "No project is open; create or open a project first.",
             )
             return
+
+        # ----- Pixel-data conversion -----------------------------------
+        arr = image.array
+        if image.mode.is_single_channel:
+            map_data = arr
+        elif image.mode.is_rgb:
+            # Convert to grayscale via Rec. 601 luminance. Result is uint8
+            # for RGB(A) inputs to mirror the original dynamic range; the
+            # WITec optical frames are typically 8-bit per channel.
+            rgb = arr[..., :3].astype(np.float32)
+            luma = (0.299 * rgb[..., 0] + 0.587 * rgb[..., 1]
+                    + 0.114 * rgb[..., 2])
+            map_data = np.clip(luma, 0, 255).astype(np.uint8)
+        else:
+            self.errorOccurred.emit(
+                "Conversion Failed",
+                f"Image mode {image.mode.value!r} not convertible to a map.",
+            )
+            return
+
         out_dir = self._output_base_dir / "_converted_maps"
         out_dir.mkdir(parents=True, exist_ok=True)
         safe = self._sanitize_filename(image.name) or image_id
         out_path = out_dir / f"{safe}.tiff"
-        # Write as float32 if SINGLE_FLOAT, else cast to the image's dtype.
-        tifffile.imwrite(str(out_path), image.array)
+        tifffile.imwrite(str(out_path), map_data)
+
+        # ----- Spatial sidecar -----------------------------------------
+        # Persist pixel_size / world_bounds / spatial_cursors so the map
+        # editor can show the WITec crosshair next to the converted map.
+        sidecar = {}
+        ai = image.metadata.additional_info or {}
+        for key in ("pixel_size", "world_bounds", "spatial_cursors"):
+            if key in ai:
+                sidecar[key] = ai[key]
+        if image.metadata.pixel_size_nm:
+            sidecar.setdefault(
+                "pixel_size_nm",
+                list(image.metadata.pixel_size_nm),
+            )
+        sidecar_path = out_path.with_suffix(".meta.json")
+        if sidecar:
+            try:
+                import json
+                sidecar_path.write_text(
+                    json.dumps(sidecar, indent=2), encoding="utf-8",
+                )
+            except Exception as e:
+                logger.warning(
+                    "Could not write map sidecar %s: %s", sidecar_path, e,
+                )
 
         from datetime import datetime
         self._map_id_counter += 1
@@ -2571,9 +2620,15 @@ class AppBackend(ToolImplementations, QObject):
             'title': image.name,
             'path': str(out_path),
             'timestamp': timestamp,
+            'sidecar': str(sidecar_path) if sidecar else "",
+            'source_image_id': image_id,
         })
         self.mapCreated.emit(map_id, image.name)
-        logger.info("Converted image %s → map %s (%s)", image_id, map_id, out_path)
+        logger.info(
+            "Converted image %s → map %s (%s)%s",
+            image_id, map_id, out_path,
+            f" + sidecar with {list(sidecar)}" if sidecar else "",
+        )
 
     @Slot(str)
     def setActiveDataset(self, dataset_name: str):
