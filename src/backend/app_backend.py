@@ -1925,6 +1925,78 @@ class AppBackend(ToolImplementations, QObject):
         image.name = new_name
         self.imageRenamed.emit(image_id, new_name)
 
+    @Slot(str, int, result='QVariantList')
+    def getImageHistogram(self, image_id: str, bins: int = 64):
+        """Return histogram counts for ``image_id`` as a flat list.
+
+        Computed on the Python side via :meth:`ImageData.histogram`. QML
+        renders the bars in the side panel. Returns empty list when the
+        image isn't found.
+        """
+        image = self._images.get(image_id)
+        if image is None:
+            return []
+        try:
+            counts, _edges = image.histogram(bins=int(bins))
+        except Exception as e:
+            logger.warning("getImageHistogram failed for %s: %s", image_id, e)
+            return []
+        return [int(c) for c in counts]
+
+    @Slot(str, result='QVariantMap')
+    def getImageInfo(self, image_id: str):
+        """Return image-info record used by the side-panel readout."""
+        image = self._images.get(image_id)
+        if image is None:
+            return {}
+        # Auto-range for the display min/max sliders.
+        try:
+            lo, hi = image.auto_range()
+        except Exception:
+            lo, hi = 0.0, 1.0
+        return {
+            'id': image_id,
+            'name': image.name,
+            'mode': image.mode.value,
+            'width': image.width,
+            'height': image.height,
+            'is_rgb': image.mode.is_rgb,
+            'is_single_channel': image.mode.is_single_channel,
+            'auto_min': float(lo),
+            'auto_max': float(hi),
+            'data_min': float(np.min(image.array)) if image.array.ndim < 3 else 0.0,
+            'data_max': float(np.max(image.array)) if image.array.ndim < 3 else 255.0,
+        }
+
+    @Slot(str, int, int, int, int, result=str)
+    def cropImage(self, image_id: str, x0: int, y0: int, x1: int, y1: int) -> str:
+        """Crop ``image_id`` to ``[x0..x1, y0..y1)`` and register the result.
+
+        The new entity has its own id; the original is left untouched.
+        Returns the new id, or empty string on failure.
+        """
+        image = self._images.get(image_id)
+        if image is None:
+            self.errorOccurred.emit(
+                "Crop Failed", f"Image not found: {image_id}",
+            )
+            return ""
+        try:
+            cropped = image.crop(int(x0), int(y0), int(x1), int(y1))
+        except ValueError as e:
+            self.errorOccurred.emit("Crop Failed", str(e))
+            return ""
+        # Persist to disk and register.
+        self._save_image_to_tiff(cropped)
+        self._images[cropped.id] = cropped
+        self.imageAdded.emit(cropped.id, cropped.name)
+        logger.info(
+            "Cropped image %s → %s (%d×%d, file=%s)",
+            image_id, cropped.id, cropped.width, cropped.height,
+            cropped.file_path,
+        )
+        return cropped.id
+
     # ------------------------------------------------------------------
     # Note entity slots
     # ------------------------------------------------------------------

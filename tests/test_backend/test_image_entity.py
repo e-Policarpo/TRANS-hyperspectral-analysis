@@ -176,6 +176,61 @@ def test_open_note_emits_embedded_signal_and_writes_txt(backend, tmp_path):
     assert Path(backend._notes["note_test"]["file_path"]).exists()
 
 
+def test_crop_image_creates_new_entity(backend, tmp_path):
+    """cropImage produces a new image entity with its own id + on-disk TIFF."""
+    backend._output_base_dir = tmp_path
+    arr = np.arange(20 * 30, dtype=np.uint8).reshape(20, 30)
+    img = ImageData.from_array(arr, name="src")
+    backend._images[img.id] = img
+
+    received = []
+    backend.imageAdded.connect(lambda iid, n: received.append((iid, n)))
+
+    new_id = backend.cropImage(img.id, 5, 2, 15, 12)
+
+    assert new_id
+    assert new_id != img.id
+    assert new_id in backend._images
+    cropped = backend._images[new_id]
+    assert cropped.shape == (10, 10)
+    assert np.array_equal(cropped.array, arr[2:12, 5:15])
+    assert cropped.file_path is not None
+    assert Path(cropped.file_path).exists()
+    assert received and received[-1][0] == new_id
+
+
+def test_crop_image_empty_rect_emits_error(backend, tmp_path):
+    backend._output_base_dir = tmp_path
+    arr = np.zeros((10, 10), dtype=np.uint8)
+    img = ImageData.from_array(arr, name="src")
+    backend._images[img.id] = img
+    errors = []
+    backend.errorOccurred.connect(lambda t, m: errors.append((t, m)))
+    new_id = backend.cropImage(img.id, 5, 5, 5, 5)
+    assert new_id == ""
+    assert errors
+
+
+def test_get_image_histogram_returns_counts(backend):
+    arr = np.tile(np.arange(0, 256, dtype=np.uint8), (16, 1))
+    img = ImageData.from_array(arr, name="hist_src")
+    backend._images[img.id] = img
+    counts = backend.getImageHistogram(img.id, 64)
+    assert len(counts) == 64
+    assert sum(counts) == arr.size
+
+
+def test_get_image_info_returns_metadata(backend):
+    arr = np.zeros((20, 30, 3), dtype=np.uint8)
+    img = ImageData.from_array(arr, name="rgb")
+    backend._images[img.id] = img
+    info = backend.getImageInfo(img.id)
+    assert info["width"] == 30 and info["height"] == 20
+    assert info["mode"] == "rgb"
+    assert info["is_rgb"] is True
+    assert info["is_single_channel"] is False
+
+
 def test_open_note_in_os_writes_txt_and_opens_via_os(backend, tmp_path, monkeypatch):
     """``openNoteInOS`` fallback path uses QDesktopServices."""
     backend._output_base_dir = tmp_path
