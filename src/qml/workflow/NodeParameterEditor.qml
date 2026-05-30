@@ -339,6 +339,15 @@ Rectangle {
                     }
                 }
             }
+
+            Text {
+                visible: paramDef.description !== undefined && paramDef.description !== ""
+                text: paramDef.description || ""
+                color: textMuted
+                font.pixelSize: 10
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+            }
         }
     }
 

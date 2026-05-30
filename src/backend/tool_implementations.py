@@ -188,6 +188,184 @@ class ToolImplementations:
             return ""
 
     # ========================================================================
+    # Cosmic Ray / Hot Pixel Filter (CCD spikes)
+    # ========================================================================
+
+    def remove_cosmic_rays(self, task, dataset_name: str,
+                           threshold_sigmas: float = 5.0,
+                           window: int = 5,
+                           max_width: int = 2) -> str:
+        """Remove narrow CCD spikes (cosmic rays / hot pixels) from spectra.
+
+        See :func:`src.processing.cosmic_ray.remove_cosmic_rays` for the
+        detection model. Produces a new dataset suffixed ``- CR Cleaned``
+        and a small report logging how many samples were replaced per
+        spectrum.
+        """
+        try:
+            if dataset_name not in self._datasets:
+                self.errorOccurred.emit("Error", "Dataset not found")
+                return ""
+
+            from src.processing.cosmic_ray import remove_cosmic_rays_2d
+
+            spectral_data = self._datasets[dataset_name]
+            spectra = spectral_data.spectra.values
+            logger.info(
+                f"Cosmic-ray filter on {dataset_name}: "
+                f"shape={spectra.shape}, threshold={threshold_sigmas}σ, "
+                f"window={window}, max_width={max_width}"
+            )
+
+            cleaned, mask = remove_cosmic_rays_2d(
+                spectra,
+                threshold_sigmas=threshold_sigmas,
+                window=window,
+                max_width=max_width,
+            )
+
+            total_replaced = int(mask.sum())
+            spectra_hit = int((mask.any(axis=0)).sum())
+            logger.info(
+                f"Cosmic-ray filter: replaced {total_replaced} samples "
+                f"across {spectra_hit}/{spectra.shape[1]} spectra"
+            )
+
+            cleaned_df = pd.DataFrame(cleaned, columns=spectral_data.spectra.columns)
+            cleaned_df.insert(
+                0, spectral_data.independent_var_name, spectral_data.independent_var,
+            )
+
+            base_name = self._extract_clean_base_name(dataset_name)
+            convention_name = self._apply_naming_convention(
+                dataset_name, operation="CRCleaned",
+            )
+            output_path = self._ensure_output_dir('cosmic_ray') / f"{convention_name}.csv"
+            cleaned_df.to_csv(output_path, index=False)
+
+            friendly_name = f"{base_name} - CR Cleaned"
+            metadata = SpectralMetadata(
+                source_type=spectral_data.metadata.source_type,
+                dimensions=spectral_data.metadata.dimensions,
+                scan_mode=spectral_data.metadata.scan_mode,
+                units=spectral_data.metadata.units.copy(),
+                additional_info={
+                    **dict(spectral_data.metadata.additional_info or {}),
+                    'cosmic_ray_filter': {
+                        'threshold_sigmas': threshold_sigmas,
+                        'window': window,
+                        'max_width': max_width,
+                        'samples_replaced': total_replaced,
+                        'spectra_hit': spectra_hit,
+                    },
+                    'original': dataset_name,
+                },
+            )
+            cleaned_spectral_data = SpectralData(cleaned_df, metadata)
+            self._datasets[friendly_name] = cleaned_spectral_data
+            if not self._workflow_mode:
+                self.dataLoaded.emit(friendly_name)
+
+            return str(output_path)
+
+        except Exception as e:
+            logger.error(f"Cosmic-ray filter error: {e}", exc_info=True)
+            self.errorOccurred.emit("Cosmic-Ray Filter Error", str(e))
+            return ""
+
+    # ========================================================================
+    # Background Subtraction (luminescence / Raman)
+    # ========================================================================
+
+    def subtract_background_datasets(self, task, signal_names: list,
+                                      background_name: str) -> str:
+        """Subtract one background dataset from N signal datasets.
+
+        Creates one ``- BgSub`` dataset per input. When a signal's axis
+        does not fully overlap the background's, the corrected output is
+        truncated to the overlap interval (the helper handles this and
+        records it in the new dataset's metadata).
+        """
+        try:
+            from src.processing.background_subtraction import subtract_background
+
+            if background_name not in self._datasets:
+                self.errorOccurred.emit(
+                    "Background Subtraction Error",
+                    f"Background dataset {background_name!r} not found",
+                )
+                return ""
+            background = self._datasets[background_name]
+
+            missing = [n for n in signal_names if n not in self._datasets]
+            if missing:
+                self.errorOccurred.emit(
+                    "Background Subtraction Error",
+                    f"Datasets not found: {', '.join(missing)}",
+                )
+                return ""
+
+            last_output_path = ""
+            truncated_any = False
+            for signal_name in signal_names:
+                if task.cancelled:
+                    return last_output_path
+                signal = self._datasets[signal_name]
+                try:
+                    result = subtract_background(signal, background)
+                except Exception as e:
+                    logger.warning(
+                        "Background subtraction skipped %s: %s",
+                        signal_name, e,
+                    )
+                    self.errorOccurred.emit(
+                        "Background Subtraction",
+                        f"{signal_name}: {e}",
+                    )
+                    continue
+
+                truncated_any = truncated_any or result.truncated
+
+                base_name = self._extract_clean_base_name(signal_name)
+                friendly_name = f"{base_name} - BgSub"
+                convention_name = self._apply_naming_convention(
+                    signal_name, operation="BgSubtracted",
+                )
+                output_path = (
+                    self._ensure_output_dir('background_subtracted')
+                    / f"{convention_name}.csv"
+                )
+                corrected_df = result.corrected.spectra.copy()
+                corrected_df.insert(
+                    0, result.corrected.independent_var_name,
+                    result.corrected.independent_var,
+                )
+                corrected_df.to_csv(output_path, index=False)
+
+                self._datasets[friendly_name] = result.corrected
+                if not self._workflow_mode:
+                    self.dataLoaded.emit(friendly_name)
+                last_output_path = str(output_path)
+                logger.info(
+                    "Background subtracted from %s → %s%s",
+                    signal_name, friendly_name,
+                    " (truncated)" if result.truncated else "",
+                )
+
+            if truncated_any:
+                self.status = (
+                    "Background subtraction complete. Some outputs were "
+                    "truncated to the overlap with the background."
+                )
+
+            return last_output_path
+
+        except Exception as e:
+            logger.error(f"Background subtraction error: {e}", exc_info=True)
+            self.errorOccurred.emit("Background Subtraction Error", str(e))
+            return ""
+
+    # ========================================================================
     # Image Smoothing
     # ========================================================================
 
@@ -1097,7 +1275,7 @@ class ToolImplementations:
     # Peak Indexing
     # ========================================================================
 
-    def find_peaks(self, task, dataset_name: str, prominence: float = 0.1,
+    def find_peaks(self, task, dataset_name: str, prominence: float = 0.0,
                   min_distance: int = 5, fwhm_multiplier: float = 1.5) -> dict:
         """
         Find and index peaks in spectral data, returning FWHM-based integration intervals.
@@ -1107,7 +1285,10 @@ class ToolImplementations:
         dataset_name : str
             Dataset to analyze
         prominence : float
-            Minimum peak prominence
+            Minimum peak prominence. Pass ``0`` (or any non-positive value)
+            to use a noise-aware adaptive threshold computed per spectrum;
+            this is the recommended default so the same call works across
+            measurements with very different signal levels.
         min_distance : int
             Minimum distance between peaks (in indices)
         fwhm_multiplier : float
@@ -1131,24 +1312,37 @@ class ToolImplementations:
             spectra = spectral_data.spectra.values
             x_step = np.mean(np.diff(independent_var))
 
+            adaptive = prominence is None or prominence <= 0
+
             # Debug logging
             logger.info(f"PeakFinder: Dataset has {spectra.shape[1]} spectra, {spectra.shape[0]} points each")
             logger.info(f"PeakFinder: Data range: min={np.nanmin(spectra):.6f}, max={np.nanmax(spectra):.6f}")
             logger.info(f"PeakFinder: X range: {independent_var[0]:.4f} to {independent_var[-1]:.4f}")
-            logger.info(f"PeakFinder: Using prominence={prominence}, min_distance={min_distance}")
+            logger.info(
+                f"PeakFinder: Prominence mode={'adaptive' if adaptive else 'fixed'} "
+                f"(value={prominence}), min_distance={min_distance}"
+            )
 
             # Storage for peak data
             all_peaks = []
             raw_intervals = []  # Store all intervals before merging
+            adaptive_values: list = []  # for diagnostic logging
 
             # Find peaks in each spectrum
+            from src.backend.peak_fitting import adaptive_prominence as _adaptive_prominence
             for i, spectrum in enumerate(spectra.T):
                 if task.cancelled:
                     return {'peaks_path': '', 'intervals': []}
 
+                if adaptive:
+                    spectrum_prominence = _adaptive_prominence(spectrum)
+                    adaptive_values.append(spectrum_prominence)
+                else:
+                    spectrum_prominence = prominence
+
                 peaks, properties = signal.find_peaks(
                     spectrum,
-                    prominence=prominence,
+                    prominence=spectrum_prominence,
                     distance=min_distance
                 )
 
@@ -1188,6 +1382,14 @@ class ToolImplementations:
                     }
                     all_peaks.append(peak_info)
                     raw_intervals.append([interval_start, interval_end, peak_position, properties['prominences'][j]])
+
+            if adaptive and adaptive_values:
+                vals = np.asarray(adaptive_values, dtype=np.float64)
+                logger.info(
+                    f"PeakFinder: adaptive prominence per spectrum — "
+                    f"median={float(np.median(vals)):.4g}, "
+                    f"min={float(vals.min()):.4g}, max={float(vals.max()):.4g}"
+                )
 
             # Merge overlapping intervals and remove duplicates
             merged_intervals = self._merge_peak_intervals(raw_intervals, independent_var)

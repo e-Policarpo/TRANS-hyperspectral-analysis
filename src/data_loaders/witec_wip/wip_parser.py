@@ -259,17 +259,29 @@ class WipSpectralTransformation:
     is_calibrated: bool
 
     def axis(self, n_bins: int) -> np.ndarray:
-        """Evaluate ``c0 + c1·i + c2·i² + …`` for ``i = 0..n_bins-1``."""
-        if self.transformation_type != 0:
-            logger.warning(
-                "SpectralTransformationType %d is not yet supported; "
-                "returning bin index axis",
-                self.transformation_type,
-            )
-            return np.arange(n_bins, dtype=np.float64)
+        """Compute the calibrated spectral axis for ``i = 0..n_bins-1``.
+
+        Two encodings cover the WITec project files we see in practice:
+
+        * **Polynomial** (``SpectralTransformationType == 0``, and falls back
+          for unknown types when the ``Polynom`` array is short): evaluate
+          ``c0 + c1·i + c2·i² + …`` using ``FreePolynomOrder`` if set.
+        * **Direct lookup table** (``SpectralTransformationType in {2, ...}``
+          with ``Polynom.size == n_bins``): the ``Polynom`` array stores one
+          axis value per bin and is returned verbatim. This is the WITec
+          encoding used for non-polynomial wavelength calibrations and was
+          previously falling back to bin indices.
+        """
         if self.polynom.size == 0:
             return np.arange(n_bins, dtype=np.float64)
-        # If FreePolynomOrder is set, restrict to that many coefficients.
+
+        # Direct lookup table: one calibrated value per bin. This covers the
+        # SpectralTransformationType-2 case that used to be skipped.
+        if self.polynom.size == n_bins:
+            return np.asarray(self.polynom, dtype=np.float64)
+
+        # Polynomial evaluation (the standard Type-0 case, and the safest
+        # fallback for unknown types whose Polynom field is short).
         if 0 <= self.free_polynom_order < self.polynom.size:
             coeffs = self.polynom[: self.free_polynom_order + 1]
         else:
@@ -278,6 +290,18 @@ class WipSpectralTransformation:
         out = np.zeros_like(bins)
         for power, c in enumerate(coeffs):
             out += c * (bins ** power)
+
+        if self.transformation_type not in (0,):
+            # Still log so a wildly-out-of-range fallback is visible in the
+            # log, but don't drop the polynomial result outright.
+            logger.warning(
+                "SpectralTransformationType %d with %d polynom value(s) "
+                "(n_bins=%d): evaluated as polynomial — axis range "
+                "%.3f..%.3f %s",
+                self.transformation_type, int(self.polynom.size), n_bins,
+                float(out[0]), float(out[-1]),
+                self.standard_unit or "",
+            )
         return out
 
 

@@ -603,8 +603,10 @@ class AppBackend(ToolImplementations, QObject):
     @Slot(str, str)
     def createProject(self, project_path: str, project_name: str):
         """
-        Create a new project. Does NOT create directories until outputs are saved.
-        Use saveProjectFile() to save the project state to a .hrt file.
+        Create a new project. Writes an initial .hrt so the project exists on
+        disk from the moment it is created — without this, importing data and
+        quitting before a manual save would lose everything because
+        openProject() would find no .hrt to load.
         """
         logger.info(f"Creating project: {project_name} at {project_path}")
 
@@ -633,8 +635,39 @@ class AppBackend(ToolImplementations, QObject):
         self.projectPathChanged.emit(project_path)
         self.projectLoaded.emit(project_path)
 
+        # Write an initial empty .hrt so reopening the project folder finds it,
+        # and register it as the current project file so subsequent saves and
+        # autosaves target the right path.
+        try:
+            self._project_path.mkdir(parents=True, exist_ok=True)
+            initial_hrt = self._project_path / f"{project_name}.hrt"
+            project_data = {
+                'metadata': {'name': project_name, 'description': 'TRANS-QML Project'},
+                'datasets': {},
+                'tables': [],
+                'graphs': [],
+                'image_windows': [],
+                'workspace': {},
+                'output_files': [],
+                'maps': [],
+                'images': {},
+                'notes': {},
+                'naming_convention': self._naming_convention,
+                'map_editor': {},
+            }
+            if self.project_manager.save_project(initial_hrt, project_data):
+                logger.info(f"Initial project file written: {initial_hrt}")
+            else:
+                logger.warning(f"Could not write initial project file: {initial_hrt}")
+        except Exception as e:
+            logger.warning(f"Could not write initial project file for {project_name}: {e}")
+
+        # Start autosave so any imports done before the next manual save are
+        # still persisted within the autosave interval.
+        self._autosave_manager.start()
+
         self.status = f"Project '{project_name}' created"
-        logger.info(f"Project created: {project_name} (directories will be created on first output)")
+        logger.info(f"Project created: {project_name}")
 
     @Slot(str, str)
     def openProject(self, project_path: str, project_name: str):
@@ -700,6 +733,11 @@ class AppBackend(ToolImplementations, QObject):
         self.projectReadyChanged.emit(True)
         self.projectPathChanged.emit(str(project_path))
         self.projectLoaded.emit(str(project_path))
+
+        # Start autosave so imports done into this folder-based project are
+        # persisted even if the user never invokes Save manually. The autosave
+        # path is derived from _project_path / _project_name.
+        self._autosave_manager.start()
 
         self.status = f"Project '{project_name}' opened"
         logger.info(f"Project opened: {project_name}")
@@ -1338,6 +1376,13 @@ class AppBackend(ToolImplementations, QObject):
 
         # Auto-load topography overlay if Nanosurf data has map geometry
         self._try_load_topo_overlay(result)
+
+        # Imports create state that needs to be saved. Flag the project dirty
+        # so the UI surfaces the unsaved-changes indicator and so the autosave
+        # timer's next tick has a clear "needs persisting" signal.
+        if result.get('datasets'):
+            self.project_manager.mark_modified()
+            self.projectModifiedChanged.emit(True)
 
         self.status = f"Loaded {len(result['datasets'])} datasets"
         logger.info(
@@ -3831,6 +3876,50 @@ class AppBackend(ToolImplementations, QObject):
             on_finished=lambda path: self._on_tool_completed("Curve Smoothing", path)
         )
 
+    @Slot('QStringList', str)
+    def subtractBackground(self, signal_names, background_name: str):
+        """QML wrapper for N-dataset background subtraction.
+
+        ``signal_names`` is a QStringList of N dataset keys; ``background_name``
+        is the dataset to subtract from each. One ``- BgSub`` dataset is
+        produced per input; axes that don't fully overlap the background are
+        truncated to the overlap interval.
+        """
+        names = [str(n) for n in signal_names]
+        logger.info(
+            f"Submitting background subtraction: {len(names)} signal(s) "
+            f"minus {background_name!r}"
+        )
+        self.status = f"Subtracting background from {len(names)} dataset(s)..."
+        self.worker_manager.submit(
+            name=f"Subtract Background ({len(names)})",
+            operation=self.subtract_background_datasets,
+            signal_names=names,
+            background_name=background_name,
+            on_finished=lambda path: self._on_tool_completed("Background Subtraction", path),
+        )
+
+    @Slot(str, float, int, int)
+    def cosmicRayFilter(self, dataset_name: str, threshold_sigmas: float,
+                        window: int, max_width: int):
+        """QML wrapper for cosmic-ray / hot-pixel removal.
+
+        Runs in the background worker. Defaults (5σ, 5-sample median window,
+        max 2-sample run width) are appropriate for typical PL / Raman CCD
+        data; widen ``max_width`` only if real lines are 1 px wide.
+        """
+        logger.info(f"Submitting cosmic-ray filter for {dataset_name} to worker")
+        self.status = f"Filtering cosmic rays in {dataset_name}..."
+        self.worker_manager.submit(
+            name=f"Cosmic Ray Filter {dataset_name}",
+            operation=self.remove_cosmic_rays,
+            dataset_name=dataset_name,
+            threshold_sigmas=threshold_sigmas,
+            window=window,
+            max_width=max_width,
+            on_finished=lambda path: self._on_tool_completed("Cosmic Ray Filter", path),
+        )
+
     @Slot(str, str, int)
     def smoothImage(self, image_path: str, filter_type: str, kernel_size: int):
         """QML wrapper for image smoothing - runs in background thread."""
@@ -4371,7 +4460,12 @@ class AppBackend(ToolImplementations, QObject):
 
     @Slot(str, float, int)
     def findPeaks(self, dataset_name: str, prominence: float, min_distance: int):
-        """QML wrapper for peak finding - runs in background thread."""
+        """QML wrapper for peak finding - runs in background thread.
+
+        Pass ``prominence <= 0`` to use a noise-aware adaptive threshold
+        computed per spectrum. The QML PeakIndexingTool "Adaptive" checkbox
+        wires this sentinel through.
+        """
         logger.info(f"Submitting peak finding for {dataset_name} to worker")
         self.status = f"Finding peaks in {dataset_name}..."
         self.worker_manager.submit(

@@ -31,7 +31,9 @@ from src.data_loaders.witec_wip.wip_parser import (
     TYPE_BLOB,
     TYPE_BOOL,
     TYPE_STRING,
+    WipDataEntry,
     WipParseError,
+    WipSpectralTransformation,
     iter_children,
     parse_wip,
     read_blob,
@@ -460,6 +462,62 @@ def test_real_file_axis_first_sample_in_visible_range(real_project):
             f"Axis start {axis[0]} for {g.entry.caption!r} "
             "is outside expected range"
         )
+
+
+def _make_spectral_transform(*, transformation_type, polynom,
+                              free_polynom_order=-1, standard_unit="nm"):
+    """Shortcut for unit-testing ``WipSpectralTransformation.axis()`` without
+    going through the parser."""
+    return WipSpectralTransformation(
+        entry=WipDataEntry(index=0, class_name="TDSpectralTransformation", id=0, caption=""),
+        transformation_type=transformation_type,
+        polynom=np.asarray(polynom, dtype=np.float64),
+        free_polynom_order=free_polynom_order,
+        standard_unit=standard_unit,
+        unit_kind=0,
+        is_calibrated=True,
+    )
+
+
+def test_spectral_transformation_type0_polynomial_axis():
+    """Type 0 stays a polynomial — regression guard for the existing path."""
+    st = _make_spectral_transform(transformation_type=0,
+                                  polynom=[400.0, 1.0, 0.0])
+    axis = st.axis(5)
+    assert np.allclose(axis, [400.0, 401.0, 402.0, 403.0, 404.0])
+
+
+def test_spectral_transformation_type2_lut_axis():
+    """Type 2 with Polynom.size == n_bins is a direct lookup table.
+
+    Previously the loader fell back to bin indices for any non-zero
+    transformation type, so spectra came in labelled ``nm`` but indexed
+    0..N-1. The fix: when ``Polynom`` matches ``n_bins`` the array IS the
+    axis.
+    """
+    lut = np.linspace(461.0, 841.0, 1600)
+    st = _make_spectral_transform(transformation_type=2, polynom=lut.tolist(),
+                                   standard_unit="nm")
+    axis = st.axis(1600)
+    np.testing.assert_allclose(axis, lut)
+    # First sample should be in the visible-light range, not 0.
+    assert axis[0] > 100.0
+
+
+def test_spectral_transformation_unknown_type_falls_back_to_polynomial():
+    """An unknown transformation type with a short Polynom array is treated
+    as a polynomial rather than discarded — better to surface *something*
+    than to silently return bin indices."""
+    st = _make_spectral_transform(transformation_type=7,
+                                  polynom=[500.0, 0.5])
+    axis = st.axis(4)
+    assert np.allclose(axis, [500.0, 500.5, 501.0, 501.5])
+
+
+def test_spectral_transformation_empty_polynom_returns_bins():
+    st = _make_spectral_transform(transformation_type=2, polynom=[])
+    axis = st.axis(5)
+    np.testing.assert_array_equal(axis, np.arange(5, dtype=np.float64))
 
 
 def test_real_file_has_bitmaps(real_project):

@@ -128,6 +128,46 @@ def _eval_peak(x, shape: PeakShape, amplitude, center, width, eta=0.5):
 # Peak detection
 # ---------------------------------------------------------------------------
 
+_DEFAULT_AUTO_PEAK_CAP = 10  # safety cap when callers ask for "all peaks"
+
+
+def estimate_noise_sigma(y: np.ndarray) -> float:
+    """Estimate the noise σ of a 1-D spectrum from MAD of first differences.
+
+    The median absolute deviation of ``diff(y)`` is robust to outliers and
+    smooth structure (slow trends contribute negligibly to a single-step
+    difference). 1.4826 converts MAD → σ for Gaussian noise; the √2 corrects
+    for taking the difference of two independent samples.
+
+    Returns ``0.0`` for arrays with fewer than two samples.
+    """
+    y = np.asarray(y, dtype=np.float64)
+    if y.size < 2:
+        return 0.0
+    diffs = np.diff(y)
+    mad = float(np.median(np.abs(diffs - np.median(diffs))))
+    return 1.4826 * mad / np.sqrt(2.0)
+
+
+def adaptive_prominence(y: np.ndarray, *, span_fraction: float = 0.05,
+                        noise_sigmas: float = 3.0) -> float:
+    """Compute an adaptive peak-prominence threshold for a 1-D spectrum.
+
+    Returns ``max(span_fraction × (max−min), noise_sigmas × σ_noise)`` so the
+    same threshold protects flat / noisy spectra (where the noise term
+    dominates) and well-resolved spectra (where the span fraction dominates).
+    Use this everywhere the user might otherwise have to hand-tune a
+    prominence number per measurement.
+    """
+    y = np.asarray(y, dtype=np.float64)
+    if y.size == 0:
+        return 0.0
+    span = float(np.max(y) - np.min(y))
+    span_floor = span_fraction * span if span > 0 else 0.0
+    noise_floor = noise_sigmas * estimate_noise_sigma(y)
+    return max(span_floor, noise_floor)
+
+
 def detect_peaks(
     x: np.ndarray,
     y: np.ndarray,
@@ -147,22 +187,29 @@ def detect_peaks(
     Parameters
     ----------
     prominence
-        Minimum prominence required. Defaults to 5 % of the data span.
+        Minimum prominence required. Defaults to ``max(5 % of data span,
+        3 × noise σ)`` where σ is estimated from the median absolute deviation
+        of first differences. The noise floor prevents flat / noisy spectra
+        from seeding the multi-peak fitter with dozens of spurious peaks.
     height
         Minimum absolute height. Defaults to baseline-subtracted threshold.
     distance
         Minimum sample spacing between detected peaks.
     n_max
-        Cap the returned peak count (highest-prominence first).
+        Cap the returned peak count (highest-prominence first). When ``None``,
+        a default safety cap is applied so a noisy spectrum can't seed an
+        unbounded fit.
     """
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
     if x.shape != y.shape or x.size < 5:
         return []
 
-    span = float(np.max(y) - np.min(y))
     if prominence is None:
-        prominence = 0.05 * span if span > 0 else 0.0
+        prominence = adaptive_prominence(y)
+
+    if n_max is None:
+        n_max = _DEFAULT_AUTO_PEAK_CAP
 
     indices, props = find_peaks(
         y, prominence=prominence, height=height,

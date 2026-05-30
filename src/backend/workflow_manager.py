@@ -325,6 +325,58 @@ class WorkflowExecutor:
                 if result_name in self.app_backend._datasets:
                     outputs['smoothed'] = self.app_backend._datasets[result_name]
 
+        elif tool_name == "CosmicRayFilter":
+            dataset = inputs.get('dataset')
+            if dataset:
+                if isinstance(dataset, str):
+                    logger.error(f"CosmicRayFilter received string instead of dataset: {dataset}")
+                    return outputs
+
+                dataset_name = self._get_temp_dataset_name(dataset)
+                self.app_backend._datasets[dataset_name] = dataset
+
+                class MockTask:
+                    cancelled = False
+                    progress = 0
+
+                self.app_backend.remove_cosmic_rays(
+                    MockTask(), dataset_name,
+                    threshold_sigmas=params.get('threshold_sigmas', 5.0),
+                    window=params.get('window', 5),
+                    max_width=params.get('max_width', 2),
+                )
+                base_name = self.app_backend._extract_clean_base_name(dataset_name)
+                result_name = f"{base_name} - CR Cleaned"
+                if result_name in self.app_backend._datasets:
+                    outputs['cleaned'] = self.app_backend._datasets[result_name]
+
+        elif tool_name == "BackgroundSubtraction":
+            signal = inputs.get('signal')
+            background = inputs.get('background')
+            if signal is not None and background is not None:
+                if isinstance(signal, str) or isinstance(background, str):
+                    logger.error(
+                        "BackgroundSubtraction received string instead of dataset"
+                    )
+                    return outputs
+
+                signal_name = self._get_temp_dataset_name(signal)
+                bg_name = self._get_temp_dataset_name(background)
+                self.app_backend._datasets[signal_name] = signal
+                self.app_backend._datasets[bg_name] = background
+
+                class MockTask:
+                    cancelled = False
+                    progress = 0
+
+                self.app_backend.subtract_background_datasets(
+                    MockTask(), [signal_name], bg_name,
+                )
+                base_name = self.app_backend._extract_clean_base_name(signal_name)
+                result_name = f"{base_name} - BgSub"
+                if result_name in self.app_backend._datasets:
+                    outputs['corrected'] = self.app_backend._datasets[result_name]
+
         elif tool_name == "CurveFitting":
             dataset = inputs.get('dataset')
             if dataset:
@@ -554,10 +606,11 @@ class WorkflowExecutor:
                     cancelled = False
                     progress = 0
 
-                # find_peaks now returns a dict with 'peaks_path' and 'intervals'
+                # find_peaks now returns a dict with 'peaks_path' and 'intervals'.
+                # Default prominence=0 → adaptive per-spectrum threshold.
                 result = self.app_backend.find_peaks(
                     MockTask(), dataset_name,
-                    prominence=params.get('prominence', 0.1),
+                    prominence=params.get('prominence', 0.0),
                     min_distance=params.get('min_distance', 5),
                     fwhm_multiplier=params.get('fwhm_multiplier', 1.5)
                 )

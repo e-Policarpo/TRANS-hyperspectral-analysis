@@ -17,7 +17,9 @@ from src.backend.peak_fitting import (
     FittedPeak,
     MultiPeakFitResult,
     PeakShape,
+    adaptive_prominence,
     detect_peaks,
+    estimate_noise_sigma,
     fit_multipeak,
     gaussian,
     lorentzian,
@@ -160,6 +162,67 @@ def test_fit_multipeak_with_explicit_seeds():
         initial_peaks=[(30.0, 1.0, 2.0), (70.0, 0.6, 3.0)],
     )
     assert res.success and len(res.peaks) == 2
+
+
+def test_estimate_noise_sigma_recovers_white_noise_level():
+    rng = np.random.default_rng(1)
+    true_sigma = 0.05
+    y = true_sigma * rng.standard_normal(5000)
+    est = estimate_noise_sigma(y)
+    assert abs(est - true_sigma) / true_sigma < 0.15
+
+
+def test_estimate_noise_sigma_ignores_smooth_baseline():
+    """A slowly-varying baseline should not inflate the noise estimate."""
+    rng = np.random.default_rng(2)
+    x = np.linspace(0, 100, 5000)
+    true_sigma = 0.02
+    y = 0.5 * x + 3.0 + true_sigma * rng.standard_normal(x.size)
+    est = estimate_noise_sigma(y)
+    assert abs(est - true_sigma) / true_sigma < 0.2
+
+
+def test_adaptive_prominence_scales_with_signal():
+    """Strong-signal spectra get a span-driven floor; noisy-flat ones get a
+    noise-driven floor."""
+    rng = np.random.default_rng(3)
+    x = np.linspace(0, 100, 2001)
+    strong = gaussian(x, 1.0, 50.0, 2.0) + 0.005 * rng.standard_normal(x.size)
+    flat = 0.01 * rng.standard_normal(x.size)
+    strong_floor = adaptive_prominence(strong)
+    flat_floor = adaptive_prominence(flat)
+    # Strong-signal floor should be dominated by 5% of the peak span (~0.05).
+    assert strong_floor > 0.04
+    # Flat floor should be ~3σ ≈ 0.03; well below the strong-signal floor.
+    assert flat_floor < strong_floor
+
+
+def test_fit_multipeak_terminates_quickly_on_noisy_flat_signal():
+    """Pure noise must not seed dozens of spurious peaks and stall the fitter.
+
+    Reproduces the symptom of the multi-peak fit "never reaching an end
+    condition" reported on flat curves: without a noise-aware prominence
+    floor and a default cap on auto-detected peaks, find_peaks returns
+    many low-prominence noise spikes and least_squares burns through its
+    full nfev budget while the UI appears frozen.
+    """
+    import time
+    rng = np.random.default_rng(0)
+    x = np.linspace(0, 100, 2001)
+    y = 0.01 * rng.standard_normal(x.size)  # pure noise, no signal
+
+    t0 = time.monotonic()
+    res = fit_multipeak(x, y, shape=PeakShape.GAUSSIAN, baseline_degree=1)
+    elapsed = time.monotonic() - t0
+
+    # Must reach a clear end condition, not exhaust nfev mid-iteration.
+    assert res.success
+    # Must complete within a tight budget — the regression here is a stall
+    # that takes many seconds even on small spectra.
+    assert elapsed < 2.0
+    # Either zero seeds (baseline only) or at most the default safety cap;
+    # never the unbounded "many noise peaks" behaviour.
+    assert len(res.peaks) <= 10
 
 
 def test_fit_multipeak_no_peaks_returns_baseline_only():

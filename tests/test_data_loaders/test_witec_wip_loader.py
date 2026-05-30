@@ -466,6 +466,27 @@ def test_real_file_surfaces_excitation_and_acquisition_info(real_load):
     assert "Control FIVE" in ai["acquisition"]["software"]
 
 
+def test_real_file_every_channel_has_excitation_wavelength(real_load):
+    """Each individual channel must carry the laser excitation, not just
+    whichever channel happens to be promoted as primary. A single wip
+    project can mix acquisitions from different lasers, and downstream
+    tools (Raman-shift conversion, fluorescence/Raman discrimination)
+    need the per-channel value to work without rummaging through the
+    parent dataset.
+    """
+    channels = real_load.metadata.additional_info["channels"]
+    assert channels, "Expected at least one channel"
+    for name, ch in channels.items():
+        ai = ch.metadata.additional_info or {}
+        assert "excitation_wavelength_nm" in ai, (
+            f"Channel {name!r} is missing excitation_wavelength_nm"
+        )
+        assert 450 < ai["excitation_wavelength_nm"] < 470, (
+            f"Channel {name!r} excitation {ai['excitation_wavelength_nm']!r} "
+            "outside expected visible range"
+        )
+
+
 def test_real_file_surfaces_spectral_cursor(real_load):
     ai = real_load.metadata.additional_info or {}
     assert "spectral_cursors" in ai

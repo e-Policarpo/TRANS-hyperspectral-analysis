@@ -76,18 +76,36 @@ Item {
                 anchors.fill: parent
                 columns: 2
 
-                Label { text: "Minimum Prominence:" }
+                Label { text: "Prominence:" }
+                CheckBox {
+                    id: adaptiveProminenceCheck
+                    text: "Adaptive (recommended)"
+                    checked: true
+                    contentItem: Text {
+                        text: parent.text
+                        color: textLight
+                        leftPadding: parent.indicator.width + 6
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                }
+
+                Label {
+                    text: "Minimum Prominence:"
+                    color: adaptiveProminenceCheck.checked ? textMuted : textLight
+                }
                 SpinBox {
                     id: prominenceSpin
                     from: 1
                     to: 100
                     value: 10
+                    enabled: !adaptiveProminenceCheck.checked
                     property real realValue: value / 100.0
 
                     Label {
                         anchors.left: parent.right
                         anchors.leftMargin: 5
                         text: (prominenceSpin.realValue).toFixed(2)
+                        color: adaptiveProminenceCheck.checked ? textMuted : textLight
                     }
                 }
 
@@ -101,7 +119,8 @@ Item {
 
                 Label {
                     Layout.columnSpan: 2
-                    text: "\nProminence: How much peak stands out from surroundings\n" +
+                    text: "\nAdaptive prominence is estimated per spectrum from the noise level\n" +
+                          "(max of 5% of signal span and 3× the noise σ). Uncheck to set it manually.\n" +
                           "Min Distance: Minimum spacing between peaks"
                     font.pixelSize: 10
                     color: textMuted
@@ -158,13 +177,15 @@ Item {
     }
 
     function performPeakFinding() {
+        // 0 is the backend sentinel for "use adaptive prominence per spectrum".
+        var prominence = adaptiveProminenceCheck.checked ? 0.0 : prominenceSpin.realValue
         console.log("Finding peaks in:", datasetCombo.currentText,
-                   "Prominence:", prominenceSpin.realValue,
+                   "Prominence:", adaptiveProminenceCheck.checked ? "adaptive" : prominence,
                    "Min distance:", minDistanceSpin.value)
 
         var result = backend.findPeaks(
             datasetCombo.currentText,
-            prominenceSpin.realValue,
+            prominence,
             minDistanceSpin.value
         )
 

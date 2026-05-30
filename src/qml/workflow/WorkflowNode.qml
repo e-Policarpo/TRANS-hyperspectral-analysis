@@ -115,7 +115,12 @@ Rectangle {
         } else if (nodeData.tool_name === "BaselineCorrection") {
             parts.push((params.fit_type || "polynomial") + " deg " + (params.degree || 2))
         } else if (nodeData.tool_name === "PeakFinder") {
-            parts.push("prominence: " + (params.prominence || 0.01))
+            var prom = params.prominence
+            if (prom === undefined || prom === null || prom <= 0) {
+                parts.push("prominence: auto")
+            } else {
+                parts.push("prominence: " + prom)
+            }
         } else if (nodeData.tool_name === "MapGenerator") {
             if (params.column_index !== undefined) {
                 parts.push("col: " + params.column_index)

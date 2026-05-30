@@ -90,6 +90,11 @@ class ProjectManager:
             if project_path.suffix.lower() != '.hrt':
                 project_path = project_path.with_suffix('.hrt')
 
+            # Ensure parent directory exists — newly-created projects defer
+            # directory creation until first save, so the project folder may
+            # not yet exist on disk.
+            project_path.parent.mkdir(parents=True, exist_ok=True)
+
             # Create project structure
             project_json = {
                 'format_version': FORMAT_VERSION,

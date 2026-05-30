@@ -73,7 +73,8 @@ ApplicationWindow {
                 "Derivative Calculator", "Curve Fitting", "Gradient Filter",
                 "Integration Utility", "Map Generator", "Spatial Average",
                 "Truncate Data", "Curve Analysis", "Peak Indexing",
-                "Average Curves", "Filter Bad Data",
+                "Average Curves", "Filter Bad Data", "Cosmic Ray Filter",
+                "Background Subtraction",
                 "Dirac Point Estimator", "Detect Bandgap & Doping",
                 "Spectral Axis Converter", "Multi-Peak Fitting"
             ]
@@ -567,6 +568,18 @@ ApplicationWindow {
             }
             MenuItem {
                 text: "Filter Bad Data"
+                visible: currentTabIndex === 0
+                height: visible ? implicitHeight : 0
+                onTriggered: openToolWindow(text)
+            }
+            MenuItem {
+                text: "Cosmic Ray Filter"
+                visible: currentTabIndex === 0
+                height: visible ? implicitHeight : 0
+                onTriggered: openToolWindow(text)
+            }
+            MenuItem {
+                text: "Background Subtraction"
                 visible: currentTabIndex === 0
                 height: visible ? implicitHeight : 0
                 onTriggered: openToolWindow(text)
@@ -1508,6 +1521,8 @@ ApplicationWindow {
             "Truncate Data": "../tools/TruncateTool.qml",
             "Peak Indexing": "../tools/PeakIndexingTool.qml",
             "Filter Bad Data": "../tools/FilterBadDataTool.qml",
+            "Cosmic Ray Filter": "../tools/CosmicRayFilterTool.qml",
+            "Background Subtraction": "../tools/BackgroundSubtractionTool.qml",
             "Average Curves": "../tools/AverageCurvesTool.qml",
             "Dirac Point Estimator": "../tools/DiracPointEstimatorTool.qml",
             "Detect Bandgap & Doping": "../tools/DetectBandgapDopingTool.qml",

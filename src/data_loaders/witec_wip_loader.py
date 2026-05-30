@@ -286,6 +286,15 @@ class WitecWipLoader(BaseDataLoader):
             sig = self._axis_signature(axis, unit)
             buckets.setdefault(sig, []).append((g, axis, unit))
 
+        # Laser excitation lives on each spectrum's TDSpectralInterpretation
+        # (one wip project can mix acquisitions taken with different lasers,
+        # so a single project-level value would lose that distinction). We
+        # collect the per-spectrum excitation and record it on every channel.
+        project_excitation = (
+            float(project.excitation_wavelength_nm)
+            if project.excitation_wavelength_nm else None
+        )
+
         channels: Dict[str, SpectralData] = {}
         used_names: Dict[str, int] = {}
         for sig, group in buckets.items():
@@ -296,6 +305,33 @@ class WitecWipLoader(BaseDataLoader):
             df = self._build_dataframe(axis, unit, group)
             zint = project.get_interpretation(group[0][0].z_interpretation_id)
             y_unit = zint.standard_unit if zint else "counts"
+
+            # Per-spectrum excitation: pull from each graph's own
+            # interpretation, falling back to the project-level value when
+            # missing. If they all agree we store a scalar; otherwise we
+            # store the list so callers can match it to ``captions``.
+            excitations: List[Optional[float]] = []
+            for g, _, _ in group:
+                gi = project.get_interpretation(g.z_interpretation_id)
+                gi_exc = (
+                    float(gi.excitation_wavelength_nm)
+                    if gi is not None and gi.excitation_wavelength_nm
+                    else project_excitation
+                )
+                excitations.append(gi_exc)
+            non_null = [e for e in excitations if e is not None]
+            additional_info: Dict[str, Any] = {
+                "captions": [g.entry.caption for g, _, _ in group],
+                "wip_data_ids": [g.entry.id for g, _, _ in group],
+                "axis_unit": unit,
+            }
+            if non_null:
+                if len(set(non_null)) == 1 and len(non_null) == len(excitations):
+                    additional_info["excitation_wavelength_nm"] = non_null[0]
+                else:
+                    additional_info["excitation_wavelength_nm_per_spectrum"] = excitations
+                    # Also expose a single representative value when most agree.
+                    additional_info["excitation_wavelength_nm"] = non_null[0]
             metadata = SpectralMetadata(
                 source_type=self.loader_type,
                 dimensions=(len(group), 1),
@@ -305,11 +341,7 @@ class WitecWipLoader(BaseDataLoader):
                     "independent": unit,
                     "dependent": y_unit or "counts",
                 },
-                additional_info={
-                    "captions": [g.entry.caption for g, _, _ in group],
-                    "wip_data_ids": [g.entry.id for g, _, _ in group],
-                    "axis_unit": unit,
-                },
+                additional_info=additional_info,
             )
             channels[channel_name] = SpectralData(df, metadata)
         return channels
@@ -446,7 +478,7 @@ class WitecWipLoader(BaseDataLoader):
         # Spatial calibration: WITec stores it on TDSpaceTransformation,
         # which we expose as a raw dict for downstream consumption.
         space = project.space_transformations.get(graph.space_transformation_id)
-        return {
+        geometry = {
             "caption": graph.entry.caption,
             "wip_data_id": graph.entry.id,
             "size_x": graph.size_x,
@@ -458,6 +490,17 @@ class WitecWipLoader(BaseDataLoader):
             "space_transformation": space.raw if space is not None else {},
             "spatial_unit": space.standard_unit if space is not None else "",
         }
+        # Excitation: prefer this graph's own z-interpretation; only fall
+        # back to the project-level field when the per-graph value is absent.
+        zi = project.get_interpretation(graph.z_interpretation_id)
+        exc_nm = None
+        if zi is not None and zi.excitation_wavelength_nm:
+            exc_nm = float(zi.excitation_wavelength_nm)
+        elif project.excitation_wavelength_nm:
+            exc_nm = float(project.excitation_wavelength_nm)
+        if exc_nm is not None:
+            geometry["excitation_wavelength_nm"] = exc_nm
+        return geometry
 
     # --------------------------------------------------------- images
     def _extract_images(

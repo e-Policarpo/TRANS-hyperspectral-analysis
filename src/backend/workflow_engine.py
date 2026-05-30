@@ -606,6 +606,37 @@ TOOL_DEFINITIONS = {
         }
     },
 
+    "CosmicRayFilter": {
+        "display_name": "Cosmic Ray Filter",
+        "category": "Processing",
+        "description": "Remove narrow CCD spikes (cosmic rays / hot pixels) from spectra",
+        "inputs": [
+            {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
+        ],
+        "outputs": [
+            {"id": "cleaned", "name": "Cleaned", "port_type": "dataset", "description": "Spectra with spikes replaced by the local median"}
+        ],
+        "parameters": {
+            "threshold_sigmas": {"type": "float", "label": "Threshold (σ)", "default": 5.0, "min": 2.0, "max": 20.0, "description": "Sample is flagged when local residual exceeds this × MAD-σ."},
+            "window": {"type": "int", "label": "Median Window", "default": 5, "min": 3, "max": 21, "description": "Sliding-median window length; forced odd."},
+            "max_width": {"type": "int", "label": "Max Spike Width", "default": 2, "min": 1, "max": 5, "description": "Flagged runs wider than this are kept (likely real peaks)."}
+        }
+    },
+
+    "BackgroundSubtraction": {
+        "display_name": "Background Subtraction",
+        "category": "Processing",
+        "description": "Subtract a reference background dataset from a signal; truncates to axis overlap if needed",
+        "inputs": [
+            {"id": "signal", "name": "Signal", "port_type": "dataset", "required": True},
+            {"id": "background", "name": "Background", "port_type": "dataset", "required": True}
+        ],
+        "outputs": [
+            {"id": "corrected", "name": "Corrected", "port_type": "dataset", "description": "Signal minus mean background, optionally truncated to overlap"}
+        ],
+        "parameters": {}
+    },
+
     "CurveFitting": {
         "display_name": "Baseline",
         "category": "Processing",
@@ -710,7 +741,7 @@ TOOL_DEFINITIONS = {
             {"id": "intervals", "name": "Peak Intervals", "port_type": "intervals", "description": "Non-overlapping intervals around peaks for integration"}
         ],
         "parameters": {
-            "prominence": {"type": "float", "label": "Min Prominence", "default": 0.1, "min": 0, "description": "Minimum peak prominence to detect"},
+            "prominence": {"type": "float", "label": "Min Prominence", "default": 0.0, "min": 0, "description": "Minimum peak prominence to detect. Leave at 0 for adaptive (noise-aware) per-spectrum threshold."},
             "min_distance": {"type": "int", "label": "Min Distance", "default": 5, "min": 1, "description": "Minimum distance between peaks (indices)"},
             "fwhm_multiplier": {"type": "float", "label": "FWHM Multiplier", "default": 1.5, "min": 0.5, "max": 5.0, "description": "Interval width as multiplier of FWHM"}
         }
@@ -1082,6 +1113,8 @@ def get_tool_categories() -> List[Dict]:
         "DataManipulation": 6,
         "FFT1D": 7,
         "FilterBadData": 8,
+        "CosmicRayFilter": 9,
+        "BackgroundSubtraction": 10,
         # Analysis tools
         "PeakFinder": 0,
         "DetectBandgapDoping": 1,
