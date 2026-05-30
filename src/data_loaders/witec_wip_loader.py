@@ -17,6 +17,7 @@ License: GPL
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -37,6 +38,187 @@ from .witec_wip.wip_parser import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# WITec writes one Info-text TDText entry per data entry — the id is
+# ``data_id + 1``. The RTF body lists fields like ``Start Time: 2:11:43 PM``,
+# but RTF stripping sometimes glues a section header onto the next line
+# (``Objective: Objective Name: Nikon …``) so a generic ``key:value``
+# regex misclassifies fields. Instead we look up the specific fields we
+# care about with explicit anchored searches.
+
+
+def _lookup_field(text: str, field: str) -> Optional[str]:
+    """Find ``field: value`` in ``text`` and return the value.
+
+    Handles WITec's mashed-up headers (``Objective: Objective Name: X``):
+    the regex looks for the field name even when another header precedes
+    it on the same line. Value runs until end-of-line or until the next
+    ``Capitalised Word [unit]:`` pair on the same line.
+    """
+    if not text or not field:
+        return None
+    # ``\b`` around the field so we don't match ``Objective Magnification``
+    # when looking up ``Objective``.
+    pat = re.compile(
+        r"(?:^|[\s])"
+        + re.escape(field)
+        + r"\s*:\s*([^\n\r]+?)\s*$",
+        re.MULTILINE,
+    )
+    m = pat.search(text)
+    if not m:
+        return None
+    val = m.group(1).strip()
+    # Truncate at any subsequent ``Capitalised Word [unit]:`` chunk that
+    # got glued on by the RTF strip — e.g. ``X [µm]:1.0 Y [µm]:2.0``.
+    cut = re.search(
+        r"\s+[A-Z][A-Za-z0-9 /\[\]°µ%.\-]*?\s*:\s*",
+        val,
+    )
+    if cut:
+        val = val[: cut.start()].strip()
+    return val or None
+
+
+def _parse_info_text(text: str) -> Dict[str, Any]:
+    """Pull the per-acquisition fields we actually use out of WITec's RTF.
+
+    Returns a dict with whatever fields are present; missing fields are
+    simply omitted. Keys: ``start_time`` (``HH:MM``), ``start_date``,
+    ``objective`` (trimmed lens label), ``magnification`` (float),
+    ``origin_xy`` (absolute stage µm), plus ``raw_fields`` containing
+    every field we successfully read.
+    """
+    if not text:
+        return {}
+    out: Dict[str, Any] = {}
+    raw: Dict[str, str] = {}
+    for fld in (
+        "Start Time", "Start Date", "Duration", "User Name",
+        "Objective Name", "Objective Magnification",
+        "Position X [µm]", "Position Y [µm]", "Position Z [µm]",
+        "Origin X [µm]", "Origin Y [µm]", "Origin Z [µm]",
+        "Image Width [µm]", "Image Height [µm]",
+        "Excitation Wavelength [nm]",
+    ):
+        v = _lookup_field(text, fld)
+        if v is not None:
+            raw[fld] = v
+    if raw:
+        out["raw_fields"] = raw
+    st = _hhmm_from_start_time(raw.get("Start Time") or "")
+    if st:
+        out["start_time"] = st
+    if raw.get("Start Date"):
+        out["start_date"] = raw["Start Date"]
+    obj = _parse_objective_name(raw.get("Objective Name") or "")
+    if obj:
+        out["objective"] = obj
+    try:
+        if raw.get("Objective Magnification"):
+            out["magnification"] = float(raw["Objective Magnification"])
+    except ValueError:
+        pass
+    # Absolute stage centre of the acquisition. Images use the
+    # ``Origin X/Y`` field (centre in stage µm); spectra use the
+    # ``Sample Location → Position X/Y`` field (same semantics, different
+    # section header). We pick whichever yields non-zero values — the
+    # Scan-Table ``Position X/Y`` lives in the same info text but is
+    # always near (0, 0) and would otherwise mask the useful Origin.
+    candidates: List[Tuple[float, float]] = []
+    for x_key, y_key in (
+        ("Origin X [µm]", "Origin Y [µm]"),
+        ("Position X [µm]", "Position Y [µm]"),
+    ):
+        if x_key in raw and y_key in raw:
+            try:
+                candidates.append((float(raw[x_key]), float(raw[y_key])))
+            except ValueError:
+                pass
+    # Prefer the first candidate whose magnitude is non-trivial; fall
+    # back to whichever we got otherwise.
+    chosen: Optional[Tuple[float, float]] = None
+    for x, y in candidates:
+        if abs(x) > 0.1 or abs(y) > 0.1:
+            chosen = (x, y)
+            break
+    if chosen is None and candidates:
+        chosen = candidates[0]
+    if chosen is not None:
+        out["origin_xy"] = chosen
+    return out
+
+
+_TIME_24H_RE = re.compile(
+    r"^\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM|am|pm)?\s*$"
+)
+
+
+def _hhmm_from_start_time(raw: str) -> Optional[str]:
+    """Convert ``"2:11:43 PM"`` / ``"14:11"`` into a 24-h ``HH:MM`` string.
+
+    Returns ``None`` when the field is missing or unparseable so callers
+    can fall back gracefully.
+    """
+    if not raw:
+        return None
+    m = _TIME_24H_RE.match(raw)
+    if not m:
+        return None
+    h = int(m.group(1)); mm = int(m.group(2)); ampm = m.group(4)
+    if ampm:
+        ampm = ampm.upper()
+        if ampm == "PM" and h < 12:
+            h += 12
+        elif ampm == "AM" and h == 12:
+            h = 0
+    if not (0 <= h <= 23 and 0 <= mm <= 59):
+        return None
+    return f"{h:02d}:{mm:02d}"
+
+
+def _parse_objective_name(raw: str) -> Optional[str]:
+    """Trim WITec's verbose objective string to a short label.
+
+    ``"Nikon CF Plan ELWD 50x / 0.55"`` → ``"Nikon 50x/0.55"``;
+    ``"Zeiss EC Epiplan 10x / 0.25"`` → ``"Zeiss 10x/0.25"``.
+
+    Falls back to the raw string when no obvious pattern matches.
+    """
+    if not raw:
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    # Pull manufacturer (first word) + the ``NNx / NA`` tail.
+    m = re.search(r"^(\S+).*?(\d+(?:\.\d+)?)\s*[xX]\s*/\s*([\d.]+)\s*$", raw)
+    if m:
+        return f"{m.group(1)} {m.group(2)}x/{m.group(3)}"
+    return raw
+
+
+def _build_info_index(project: WipProject) -> Dict[int, Dict[str, Any]]:
+    """Build ``data_id → parsed info dict`` from the project's TDText entries.
+
+    WITec's convention: every data entry (image or graph) has a sibling
+    Info-text TDText with ``id == data_id + 1`` and a body listing
+    acquisition parameters. We accept any TDText whose ID exceeds an
+    existing data entry's ID by exactly one and whose body parses to
+    something useful — the caption itself isn't a reliable filter (some
+    entries don't carry the ``Info``/``Information`` suffix).
+    """
+    out: Dict[int, Dict[str, Any]] = {}
+    data_ids = {int(e.id) for e in project.entries if e.id is not None}
+    for txt in project.texts:
+        tid = int(txt.entry.id)
+        candidate_data_id = tid - 1
+        if candidate_data_id not in data_ids:
+            continue
+        record = _parse_info_text(txt.text or "")
+        if record:
+            out[candidate_data_id] = record
+    return out
 
 
 class WitecWipLoader(BaseDataLoader):
@@ -157,10 +339,17 @@ class WitecWipLoader(BaseDataLoader):
                 f"{filepath.name}: no spectra or maps found in WIP file"
             )
 
+        # ----- info-text index (per-entry RTF "Field: value" lookup) ----
+        # Each acquisition has an "<caption> Info" TDText entry that holds
+        # the precise per-acquisition metadata (Start Time, Objective,
+        # absolute stage position…). Indexed by data-entry id so the
+        # downstream extractors can stamp it onto images and spectra.
+        info_by_id = _build_info_index(project)
+
         # ----- single-point spectra grouped by axis ---------------------
         channels: Dict[str, SpectralData] = {}
         if single_graphs:
-            channels = self._group_single_spectra(project, single_graphs)
+            channels = self._group_single_spectra(project, single_graphs, info_by_id)
 
         # ----- hyperspectral maps ---------------------------------------
         map_geometries: List[Dict[str, Any]] = []
@@ -175,7 +364,7 @@ class WitecWipLoader(BaseDataLoader):
         # ----- images ---------------------------------------------------
         if progress_callback:
             progress_callback(2, 4, "Extracting images")
-        images = self._extract_images(project, filepath.stem)
+        images = self._extract_images(project, filepath.stem, info_by_id)
 
         # ----- notes (TDText annotations) -------------------------------
         notes: List[Dict[str, Any]] = []
@@ -261,6 +450,7 @@ class WitecWipLoader(BaseDataLoader):
         self,
         project: WipProject,
         graphs: List[WipGraph],
+        info_by_id: Optional[Dict[int, Dict[str, Any]]] = None,
     ) -> Dict[str, SpectralData]:
         """Bucket spectra by their resolved spectral axis.
 
@@ -320,11 +510,67 @@ class WitecWipLoader(BaseDataLoader):
                 )
                 excitations.append(gi_exc)
             non_null = [e for e in excitations if e is not None]
+            # Per-spectrum acquisition position. WITec stores the stage
+            # coordinate as the spectrum's TDSpaceTransformation.world_origin
+            # — even for a 1×1 graph it's a calibrated affine whose origin
+            # is the acquisition point in stage µm. Each entry also carries
+            # the spectrum's ``wip_data_id`` so the backend can use WITec's
+            # monotonic acquisition-order IDs to assign each spectrum to
+            # the most recently captured image (the WITec stage typically
+            # gets rezeroed when a new image is taken, so absolute world
+            # coords across image boundaries are not comparable — see
+            # project_witec_compatibility).
+            acquisition_positions: List[Optional[Dict[str, Any]]] = []
+            for g, _, _ in group:
+                gst = project.get_space_transformation(g.space_transformation_id)
+                if gst is None or not gst.is_calibrated:
+                    acquisition_positions.append(None)
+                    continue
+                acquisition_positions.append({
+                    "x_world": float(gst.world_origin[0]),
+                    "y_world": float(gst.world_origin[1]),
+                    "unit": gst.standard_unit or "µm",
+                    "space_transformation_id": int(g.space_transformation_id),
+                    "wip_data_id": int(g.entry.id),
+                })
+            # Per-spectrum acquisition-info records (start time, lens, …).
+            # Aligned to ``captions``. ``None`` when the WITec file has no
+            # info text for that spectrum.
+            info_by_id = info_by_id or {}
+            per_spectrum_info: List[Optional[Dict[str, Any]]] = [
+                info_by_id.get(int(g.entry.id)) for g, _, _ in group
+            ]
             additional_info: Dict[str, Any] = {
                 "captions": [g.entry.caption for g, _, _ in group],
                 "wip_data_ids": [g.entry.id for g, _, _ in group],
                 "axis_unit": unit,
+                "acquisition_positions": acquisition_positions,
+                "acquisition_info_per_spectrum": per_spectrum_info,
+                "wip_source_stem": (
+                    project.file_path.stem if project.file_path else None
+                ),
             }
+            # Roll up a channel-level tag: earliest start time + the most
+            # common objective. Shown by the backend in the dataset label.
+            start_times = sorted(
+                {i.get("start_time") for i in per_spectrum_info
+                 if i and i.get("start_time")}
+            )
+            objectives = [i.get("objective") for i in per_spectrum_info
+                          if i and i.get("objective")]
+            tag_bits: List[str] = []
+            if start_times:
+                tag_bits.append(
+                    start_times[0] if len(start_times) == 1
+                    else f"{start_times[0]}–{start_times[-1]}"
+                )
+            if objectives:
+                # Most-common objective wins; ties go to the first seen.
+                from collections import Counter
+                obj_label = Counter(objectives).most_common(1)[0][0]
+                tag_bits.append(obj_label)
+            if tag_bits:
+                additional_info["channel_tag"] = " · ".join(tag_bits)
             if non_null:
                 if len(set(non_null)) == 1 and len(non_null) == len(excitations):
                     additional_info["excitation_wavelength_nm"] = non_null[0]
@@ -505,6 +751,7 @@ class WitecWipLoader(BaseDataLoader):
     # --------------------------------------------------------- images
     def _extract_images(
         self, project: WipProject, file_stem: str,
+        info_by_id: Optional[Dict[int, Dict[str, Any]]] = None,
     ) -> List[Tuple[str, ImageData]]:
         """Wrap every WipBitmap (and the project thumbnail) as ImageData.
 
@@ -513,15 +760,27 @@ class WitecWipLoader(BaseDataLoader):
         metadata with the pixel size and world-coord bounds. Any global
         ``TDSpaceCursor`` whose position falls inside those bounds is
         attached as ``spatial_cursor`` so the viewer can draw a crosshair.
+        When ``info_by_id`` is supplied, the per-acquisition Info-text
+        record (start time, objective, …) is stamped under
+        ``acquisition_info``.
         """
         out: List[Tuple[str, ImageData]] = []
         cursors = project.space_cursors or []
+        info_by_id = info_by_id or {}
 
         for bm in project.bitmaps:
             img = self._wip_bitmap_to_image(bm, file_stem)
             if img is None:
                 continue
             self._attach_spatial_metadata(img, bm, project, cursors)
+            info = info_by_id.get(int(bm.entry.id))
+            if info:
+                img.metadata.additional_info["acquisition_info"] = info
+                # Tack the start time + objective into the display name so
+                # the user can disambiguate sibling images at a glance.
+                tag = self._naming_tag(info)
+                if tag and tag not in img.name:
+                    img.name = f"{img.name} · {tag}"
             out.append((img.name, img))
 
         if project.thumbnail is not None:
@@ -530,6 +789,21 @@ class WitecWipLoader(BaseDataLoader):
                 img.name = f"{file_stem} (thumbnail)"
                 out.append((img.name, img))
         return out
+
+    @staticmethod
+    def _naming_tag(info: Optional[Dict[str, Any]]) -> str:
+        """Short ``HH:MM · lens`` suffix for display names. Empty when no
+        info is available."""
+        if not info:
+            return ""
+        bits: List[str] = []
+        st = info.get("start_time")
+        if st:
+            bits.append(str(st))
+        obj = info.get("objective")
+        if obj:
+            bits.append(str(obj))
+        return " · ".join(bits)
 
     @staticmethod
     def _attach_spatial_metadata(
@@ -557,6 +831,22 @@ class WitecWipLoader(BaseDataLoader):
         img.metadata.additional_info['world_bounds'] = {
             'x_min': x_min, 'x_max': x_max,
             'y_min': y_min, 'y_max': y_max,
+            'unit': st.standard_unit or 'µm',
+        }
+        # Stash the affine so the backend can compute pixel coords for
+        # overlay points (e.g. spectrum acquisition positions in
+        # another dataset) without re-parsing the .wip project.
+        fwd2 = (st.rotation @ st.scale)[:2, :2]
+        img.metadata.additional_info['space_transformation_affine'] = {
+            'world_origin_xy': [
+                float(st.world_origin[0]), float(st.world_origin[1]),
+            ],
+            'model_origin_xy': [
+                float(st.model_origin[0]), float(st.model_origin[1]),
+            ],
+            'forward_2x2': [[float(fwd2[0, 0]), float(fwd2[0, 1])],
+                            [float(fwd2[1, 0]), float(fwd2[1, 1])]],
+            'space_transformation_id': int(bm.space_transformation_id),
             'unit': st.standard_unit or 'µm',
         }
         # Attach any TDSpaceCursor that falls inside this image.

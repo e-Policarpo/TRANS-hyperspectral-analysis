@@ -1137,7 +1137,9 @@ class AppBackend(ToolImplementations, QObject):
         channels = spectral_data.metadata.additional_info.get('channels', {}) or {}
         if channels:
             for channel_name, channel_data in channels.items():
-                dataset_name = f"{stem} · {channel_name}" if len(channels) > 1 else stem
+                tag = channel_data.metadata.additional_info.get('channel_tag', '')
+                base = f"{stem} · {channel_name}" if len(channels) > 1 else stem
+                dataset_name = f"{base} · {tag}" if tag else base
                 result['datasets'][dataset_name] = channel_data
                 logger.info(f"Smart-loaded WITec channel: {dataset_name}")
             result['active_dataset'] = next(iter(result['datasets']))
@@ -1329,9 +1331,11 @@ class AppBackend(ToolImplementations, QObject):
             stem = filepath.stem
             if channels:
                 for channel_name, channel_data in channels.items():
-                    dataset_name = (
+                    tag = channel_data.metadata.additional_info.get('channel_tag', '')
+                    base = (
                         f"{stem} · {channel_name}" if len(channels) > 1 else stem
                     )
+                    dataset_name = f"{base} · {tag}" if tag else base
                     result['datasets'][dataset_name] = channel_data
                     logger.info(f"Loaded WITec channel: {dataset_name}")
                 result['active_dataset'] = next(iter(result['datasets']))
@@ -1803,6 +1807,43 @@ class AppBackend(ToolImplementations, QObject):
         d.mkdir(parents=True, exist_ok=True)
         return d
 
+    @staticmethod
+    def _pixel_scale_tiff_kwargs(image: "ImageData") -> Dict[str, Any]:
+        """Build tifffile kwargs that encode the image's µm/pixel scale.
+
+        Returns ``{}`` when the image carries no calibration, so the call
+        site can ``**`` the result unconditionally. Metadata only — does
+        not bake a scale bar into pixels.
+
+        Canonical ImageJ-style encoding: ``XResolution`` / ``YResolution``
+        as pixels-per-unit (TIFF rationals), ``ResolutionUnit = NONE`` (1),
+        and a free-form ``ImageDescription`` carrying ``unit=…`` so Fiji /
+        ImageJ pick up the physical scale.
+        """
+        meta = getattr(image, "metadata", None)
+        ai = getattr(meta, "additional_info", None) or {}
+        ps = ai.get("pixel_size")
+        if not isinstance(ps, dict):
+            return {}
+        try:
+            dx = float(ps.get("dx") or 0.0)
+            dy = float(ps.get("dy") or 0.0)
+        except (TypeError, ValueError):
+            return {}
+        if dx <= 0 or dy <= 0:
+            return {}
+        unit = str(ps.get("unit") or "µm").strip()
+        ij_unit = {
+            "µm": "micron", "um": "micron", "micron": "micron",
+            "microns": "micron",
+            "nm": "nm", "mm": "mm", "cm": "cm", "m": "meter",
+        }.get(unit, unit)
+        return {
+            "resolution": (1.0 / dx, 1.0 / dy),
+            "resolutionunit": "NONE",
+            "description": f"ImageJ=1.54p\nunit={ij_unit}\n",
+        }
+
     def _save_image_to_tiff(self, image: "ImageData") -> Optional[str]:
         """Persist ``image`` as a TIFF on disk and return its absolute path.
 
@@ -1823,7 +1864,10 @@ class AppBackend(ToolImplementations, QObject):
         safe = self._sanitize_filename(image.name or image.id) or image.id
         target = self._images_dir() / f"{image.id}_{safe}.tiff"
         try:
-            tifffile.imwrite(str(target), image.array)
+            tifffile.imwrite(
+                str(target), image.array,
+                **self._pixel_scale_tiff_kwargs(image),
+            )
         except Exception as e:
             logger.error("Could not write %s: %s", target, e)
             return None
@@ -2024,6 +2068,408 @@ class AppBackend(ToolImplementations, QObject):
         if 'spatial_cursors' in ai:
             result['spatial_cursors'] = ai['spatial_cursors']
         return result
+
+    @staticmethod
+    def _apply_affine_inverse(
+        affine: Dict[str, Any], wx: float, wy: float,
+    ) -> Optional[Tuple[float, float]]:
+        """World ``(wx, wy)`` → pixel ``(px, py)`` using a stashed affine."""
+        if not isinstance(affine, dict):
+            return None
+        try:
+            wox, woy = affine["world_origin_xy"]
+            mox, moy = affine["model_origin_xy"]
+            fwd = np.asarray(affine["forward_2x2"], dtype=np.float64)
+            inv = np.linalg.inv(fwd)
+        except (KeyError, ValueError, TypeError, np.linalg.LinAlgError):
+            return None
+        local = inv @ np.array([wx - wox, wy - woy], dtype=np.float64)
+        return float(local[0] + mox), float(local[1] + moy)
+
+    @staticmethod
+    def _apply_affine_forward(
+        affine: Dict[str, Any], px: float, py: float,
+    ) -> Optional[Tuple[float, float]]:
+        """Pixel ``(px, py)`` → world ``(wx, wy)`` using a stashed affine."""
+        if not isinstance(affine, dict):
+            return None
+        try:
+            wox, woy = affine["world_origin_xy"]
+            mox, moy = affine["model_origin_xy"]
+            fwd = np.asarray(affine["forward_2x2"], dtype=np.float64)
+        except (KeyError, ValueError, TypeError):
+            return None
+        world = fwd @ np.array([px - mox, py - moy], dtype=np.float64)
+        return float(world[0] + wox), float(world[1] + woy)
+
+    @staticmethod
+    def _image_pixel_xy_for_world(
+        image: "ImageData", wx: float, wy: float,
+    ) -> Optional[Tuple[float, float]]:
+        """Map ``(wx, wy)`` world coords → image pixel coords.
+
+        Uses the ``space_transformation_affine`` stashed by the WITec
+        loader. Returns ``None`` when the image carries no calibration.
+        """
+        ai = (image.metadata.additional_info or {}) if image.metadata else {}
+        return AppBackend._apply_affine_inverse(
+            ai.get("space_transformation_affine"), wx, wy,
+        )
+
+    @Slot(str, result='QVariantList')
+    def getDatasetOverlaysForImage(self, image_id: str):
+        """Find every single-point spectrum compatible with ``image_id``.
+
+        A spectrum is *compatible* when:
+        - it shares the same WITec source file stem as ``image_id``,
+        - and its acquisition coord, mapped through the image's affine,
+          lands inside the image's pixel bounds.
+
+        We deliberately do *not* restrict spectra to a single parent
+        image: a single WITec session may produce several images that
+        share a stage frame, and the user wants to see overlapping
+        spectra on each of them. The dataset-rezero detection happens
+        further upstream (datasets get split by stage frame in the
+        loader).
+        """
+        image = self._images.get(image_id)
+        if image is None:
+            return []
+        ai = image.metadata.additional_info or {}
+        if "space_transformation_affine" not in ai:
+            return []
+        orig = getattr(image.metadata, "original_filename", "") or ""
+        img_stem = Path(orig).stem if orig else None
+        if not img_stem:
+            return []
+
+        # WITec-only probe-vs-video calibration: each spectrum's stored
+        # ``WorldOrigin`` is actually the *video-cursor / image-center*
+        # position in absolute stage µm at the moment of acquisition
+        # (not the laser focus). The laser fires at a fixed mechanical
+        # offset from the camera optical axis, recorded here as
+        # ``(probe_dx, probe_dy) = (X_laser - X_center, Y_laser - Y_center)``.
+        # So to display the crosshair at the actual laser hit point we
+        # *add* the offset to the wip-stored centre coord. Only WITec
+        # data reaches this slot (the ``wip_source_stem`` match guards
+        # the loop), so other instruments are untouched.
+        try:
+            probe_dx = float(self._preferences_manager.getProbeOffsetX())
+            probe_dy = float(self._preferences_manager.getProbeOffsetY())
+        except Exception:
+            probe_dx = probe_dy = 0.0
+
+        w, h = image.width, image.height
+        out: List[Dict[str, Any]] = []
+        for ds_name, sd in self._datasets.items():
+            ds_ai = getattr(sd.metadata, "additional_info", None) or {}
+            if ds_ai.get("wip_source_stem") != img_stem:
+                continue
+            positions = ds_ai.get("acquisition_positions") or []
+            captions = ds_ai.get("captions") or []
+            for idx, pos in enumerate(positions):
+                if not isinstance(pos, dict):
+                    continue
+                try:
+                    # WITec stores the video-cursor (image centre) here.
+                    wx_center = float(pos["x_world"])
+                    wy_center = float(pos["y_world"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                # Pixel for the raw wip-stored centre (no offset) — kept
+                # so QML can draw a secondary marker for debugging.
+                center_pxy = self._image_pixel_xy_for_world(
+                    image, wx_center, wy_center,
+                )
+                # Add the configured laser-vs-centre offset to get the
+                # actual laser hit world coord.
+                wx = wx_center + probe_dx
+                wy = wy_center + probe_dy
+                pxy = self._image_pixel_xy_for_world(image, wx, wy)
+                if pxy is None:
+                    continue
+                px, py = pxy
+                if not (0.0 <= px <= w and 0.0 <= py <= h):
+                    continue
+                if center_pxy is None:
+                    center_px, center_py = px, py
+                else:
+                    center_px, center_py = center_pxy
+                caption = (
+                    captions[idx] if idx < len(captions)
+                    else f"spectrum {idx}"
+                )
+                # Per-spectrum info — when present, prepend ``HH:MM`` to
+                # the label so the user can read acquisition order off
+                # the legend directly.
+                info_list = ds_ai.get("acquisition_info_per_spectrum") or []
+                info = info_list[idx] if idx < len(info_list) else None
+                start_time = info.get("start_time") if isinstance(info, dict) else None
+                label = (
+                    f"{start_time} · {caption}" if start_time else caption
+                )
+                out.append({
+                    "type": "crosshair",
+                    "dataset_name": ds_name,
+                    "spectrum_index": idx,
+                    "label": label,
+                    "caption": caption,
+                    "start_time": start_time,
+                    # Primary crosshair = laser-focus pixel (after the
+                    # probe-offset correction is added to the stored
+                    # image-centre coord).
+                    "x_pixel": px,
+                    "y_pixel": py,
+                    # Wip-stored centre pixel — QML draws a secondary
+                    # marker here so the user can see both positions and
+                    # debug the offset calibration. Field name kept as
+                    # ``x_pixel_laser`` for QML compatibility, but it's
+                    # really the *video-centre* pixel now.
+                    "x_pixel_laser": center_px,
+                    "y_pixel_laser": center_py,
+                    # World coords: ``x_world`` is the displayed laser
+                    # hit point; ``x_laser_world`` (legacy name) holds
+                    # the wip-stored video-centre coord.
+                    "x_world": wx,
+                    "y_world": wy,
+                    "x_laser_world": wx_center,
+                    "y_laser_world": wy_center,
+                    "unit": pos.get("unit", "µm"),
+                })
+        return out
+
+    @Slot(str, result='QVariantList')
+    def getZoomRegionsForImage(self, image_id: str):
+        """Find sibling images that share this image's coordinate frame.
+
+        Two WITec images are only safe to overlay when their stage frame
+        is the same. WITec typically rezeros each time it captures a new
+        image, but the physical stage often hasn't been moved — so a
+        rezero between two images produces *identical* world origins.
+        We use that signature: an image B is a valid zoom region of A
+        iff B's affine ``world_origin_xy`` matches A's within ~1 µm.
+
+        Each returned entry is the sibling's pixel rectangle on *this*
+        image (computed by mapping the sibling's 4 corners through its
+        own affine into world coords, then through this image's inverse
+        affine into pixel coords). Non-overlapping rectangles are
+        dropped.
+        """
+        parent = self._images.get(image_id)
+        if parent is None:
+            return []
+        p_ai = parent.metadata.additional_info or {}
+        p_aff = p_ai.get("space_transformation_affine")
+        if not isinstance(p_aff, dict):
+            return []
+        p_orig = getattr(parent.metadata, "original_filename", "") or ""
+        p_stem = Path(p_orig).stem if p_orig else None
+        if not p_stem:
+            return []
+        try:
+            p_origin = (float(p_aff["world_origin_xy"][0]),
+                        float(p_aff["world_origin_xy"][1]))
+        except (KeyError, TypeError, ValueError, IndexError):
+            return []
+        pw, ph = parent.width, parent.height
+        # Tolerance: 1 µm is generous for WITec stages but well below
+        # any meaningful image-to-image translation.
+        ORIGIN_TOL = 1.0
+
+        out: List[Dict[str, Any]] = []
+        for other_id, other in self._images.items():
+            if other_id == image_id:
+                continue
+            o_ai = other.metadata.additional_info or {}
+            o_aff = o_ai.get("space_transformation_affine")
+            if not isinstance(o_aff, dict):
+                continue
+            o_orig = getattr(other.metadata, "original_filename", "") or ""
+            if Path(o_orig).stem != p_stem:
+                continue
+            # Same physical stage point? Mismatched world origins mean a
+            # rezero happened and the affines are not in the same frame.
+            try:
+                o_origin = (float(o_aff["world_origin_xy"][0]),
+                            float(o_aff["world_origin_xy"][1]))
+            except (KeyError, TypeError, ValueError, IndexError):
+                continue
+            if (abs(o_origin[0] - p_origin[0]) > ORIGIN_TOL
+                    or abs(o_origin[1] - p_origin[1]) > ORIGIN_TOL):
+                continue
+            # Map the other image's 4 corners (its own pixel space) →
+            # world → this image's pixel space. A non-skewed affine sends
+            # corners to corners, so the bounding box of those 4 points
+            # is the zoom rectangle on the parent.
+            cw, ch = other.width, other.height
+            corners_px = [(0.0, 0.0), (cw, 0.0), (0.0, ch), (cw, ch)]
+            mapped: List[Tuple[float, float]] = []
+            for (cpx, cpy) in corners_px:
+                wxy = self._apply_affine_forward(o_aff, cpx, cpy)
+                if wxy is None:
+                    mapped = []
+                    break
+                pxy = self._apply_affine_inverse(p_aff, *wxy)
+                if pxy is None:
+                    mapped = []
+                    break
+                mapped.append(pxy)
+            if len(mapped) != 4:
+                continue
+            xs = [m[0] for m in mapped]
+            ys = [m[1] for m in mapped]
+            x_min, x_max = min(xs), max(xs)
+            y_min, y_max = min(ys), max(ys)
+            # Skip non-overlapping siblings (zoom is entirely outside
+            # this image's pixel bounds).
+            if x_max < 0 or x_min > pw or y_max < 0 or y_min > ph:
+                continue
+            # Precise world-space extent of the other image (from its
+            # own affine). Width / height in µm via the magnitude of the
+            # forward matrix columns × pixel count.
+            try:
+                fwd = np.asarray(o_aff["forward_2x2"], dtype=np.float64)
+                w_um = float(np.linalg.norm(fwd[:, 0])) * cw
+                h_um = float(np.linalg.norm(fwd[:, 1])) * ch
+            except (KeyError, TypeError, ValueError):
+                w_um = h_um = 0.0
+            # Image names already carry "name · HH:MM · lens" — just
+            # append the precise dimensions for the rect-overlay label.
+            o_info = o_ai.get("acquisition_info") or {}
+            start_time = o_info.get("start_time") if isinstance(o_info, dict) else None
+            base_label = other.name
+            dims = (
+                f"{w_um:.0f}×{h_um:.0f} µm" if w_um and h_um else ""
+            )
+            label = f"{base_label} · {dims}" if dims else base_label
+            out.append({
+                "type": "rect",
+                "image_id": other_id,
+                "label": label,
+                "name": base_label,
+                "start_time": start_time,
+                "x_min_pixel": x_min,
+                "y_min_pixel": y_min,
+                "x_max_pixel": x_max,
+                "y_max_pixel": y_max,
+                "width_um": w_um,
+                "height_um": h_um,
+                "corner_pixels": mapped,
+            })
+        return out
+
+    @Slot(str, 'QVariantList', str, str, result=str)
+    def exportImageWithOverlays(
+        self,
+        image_id: str,
+        overlays,
+        file_path: str,
+        fmt: str = "tiff",
+    ) -> str:
+        """Save ``image_id`` with crosshair overlays baked into pixels.
+
+        ``overlays`` is a list of dicts with ``x_pixel``, ``y_pixel``,
+        ``label``, and a CSS-style ``color`` string. ``fmt`` is ``"tiff"``
+        or ``"png"``. TIFF output carries the pixel-scale tags from
+        :meth:`_pixel_scale_tiff_kwargs`. Returns the saved path, or empty
+        string on failure.
+        """
+        image = self._images.get(image_id)
+        if image is None:
+            self.errorOccurred.emit(
+                "Export Failed", f"Image not found: {image_id}",
+            )
+            return ""
+        try:
+            from PIL import Image as PILImage, ImageDraw, ImageFont
+        except ImportError:
+            self.errorOccurred.emit(
+                "Export Failed", "Pillow is required for image export.",
+            )
+            return ""
+
+        # Convert array → PIL RGB so we can draw coloured overlays even on
+        # single-channel sources. The display range mirrors auto_range so
+        # the saved frame looks like what the user sees.
+        if image.mode.is_rgb:
+            pil = PILImage.fromarray(image.array[..., :3].astype(np.uint8), "RGB")
+        else:
+            lo, hi = image.auto_range()
+            arr = np.clip(
+                (image.array.astype(np.float32) - lo) / max(hi - lo, 1e-9),
+                0.0, 1.0,
+            )
+            pil = PILImage.fromarray((arr * 255).astype(np.uint8), "L").convert("RGB")
+
+        draw = ImageDraw.Draw(pil)
+        try:
+            font = ImageFont.load_default()
+        except Exception:
+            font = None
+        arm = 20  # px arm length, mirrors the QML overlay
+        for ov in (overlays or []):
+            color = ov.get("color") or "#5BCEFA"
+            label = (ov.get("label") or "").strip()
+            kind = (ov.get("type") or "crosshair").lower()
+            if kind == "rect":
+                try:
+                    x0 = float(ov.get("x_min_pixel"))
+                    y0 = float(ov.get("y_min_pixel"))
+                    x1 = float(ov.get("x_max_pixel"))
+                    y1 = float(ov.get("y_max_pixel"))
+                except (TypeError, ValueError):
+                    continue
+                draw.rectangle(
+                    [(x0, y0), (x1, y1)],
+                    outline=color, width=2,
+                )
+                if label and font is not None:
+                    draw.text(
+                        (x0 + 4, y0 + 4),
+                        label, fill=color, font=font,
+                    )
+                continue
+            try:
+                px = float(ov.get("x_pixel"))
+                py = float(ov.get("y_pixel"))
+            except (TypeError, ValueError):
+                continue
+            draw.line([(px - arm, py), (px + arm, py)], fill=color, width=2)
+            draw.line([(px, py - arm), (px, py + arm)], fill=color, width=2)
+            draw.ellipse(
+                [(px - 3, py - 3), (px + 3, py + 3)],
+                outline=color, width=2,
+            )
+            if label and font is not None:
+                draw.text(
+                    (px + arm + 4, py - arm),
+                    label, fill=color, font=font,
+                )
+
+        out = Path(str(file_path).replace("file://", ""))
+        out.parent.mkdir(parents=True, exist_ok=True)
+        fmt_norm = (fmt or "tiff").lower().lstrip(".")
+        try:
+            if fmt_norm in ("tif", "tiff"):
+                # Save via tifffile so the pixel-scale tags survive.
+                import tifffile
+                tifffile.imwrite(
+                    str(out), np.array(pil),
+                    **self._pixel_scale_tiff_kwargs(image),
+                )
+            else:
+                pil.save(str(out), format=fmt_norm.upper())
+        except Exception as e:
+            logger.error("Export with overlays failed: %s", e)
+            self.errorOccurred.emit(
+                "Export Failed", f"Could not write {out.name}: {e}",
+            )
+            return ""
+        logger.info(
+            "Exported %s with %d overlays → %s",
+            image_id, len(overlays or []), out,
+        )
+        return str(out)
 
     @Slot(str, int, int, int, int, result=str)
     def cropImage(self, image_id: str, x0: int, y0: int, x1: int, y1: int) -> str:
@@ -2629,7 +3075,10 @@ class AppBackend(ToolImplementations, QObject):
         out_dir.mkdir(parents=True, exist_ok=True)
         safe = self._sanitize_filename(image.name) or image_id
         out_path = out_dir / f"{safe}.tiff"
-        tifffile.imwrite(str(out_path), map_data)
+        tifffile.imwrite(
+            str(out_path), map_data,
+            **self._pixel_scale_tiff_kwargs(image),
+        )
 
         # ----- Spatial sidecar -----------------------------------------
         # Persist pixel_size / world_bounds / spatial_cursors so the map

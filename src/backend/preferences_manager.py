@@ -688,6 +688,13 @@ class PreferencesManager(QObject):
     preferencesSaved = Signal()
     autosaveEnabledChanged = Signal(bool)
     autosaveIntervalChanged = Signal(int)
+    probeOffsetChanged = Signal(float, float)  # dx_um, dy_um
+
+    # Default WITec probe-vs-video offset measured on the Sheffield rig
+    # (laser focus minus video crosshair, in stage µm). Use as the
+    # fallback when the user hasn't customised the setting yet.
+    DEFAULT_PROBE_OFFSET_X = -11.8
+    DEFAULT_PROBE_OFFSET_Y = -7.9
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -701,6 +708,13 @@ class PreferencesManager(QObject):
         # Autosave settings
         self._autosave_enabled = True
         self._autosave_interval_minutes = 5
+
+        # WITec probe-vs-video calibration offset (µm). Applies only to
+        # WITec spectrum overlays — it shifts each crosshair from the
+        # recorded laser focus back to the video-cursor position the user
+        # originally aimed at.
+        self._probe_offset_x = self.DEFAULT_PROBE_OFFSET_X
+        self._probe_offset_y = self.DEFAULT_PROBE_OFFSET_Y
 
         self._ensure_dirs()
         self._load_preferences()
@@ -722,6 +736,14 @@ class PreferencesManager(QObject):
                     # Load autosave settings
                     self._autosave_enabled = data.get('autosave_enabled', True)
                     self._autosave_interval_minutes = data.get('autosave_interval_minutes', 5)
+
+                    # Load WITec probe-offset calibration.
+                    self._probe_offset_x = float(
+                        data.get('witec_probe_offset_x', self.DEFAULT_PROBE_OFFSET_X)
+                    )
+                    self._probe_offset_y = float(
+                        data.get('witec_probe_offset_y', self.DEFAULT_PROBE_OFFSET_Y)
+                    )
 
                     # Load custom schemes
                     for scheme_file in self._schemes_dir.glob("*.json"):
@@ -751,6 +773,8 @@ class PreferencesManager(QObject):
                 'version': '1.0',
                 'autosave_enabled': self._autosave_enabled,
                 'autosave_interval_minutes': self._autosave_interval_minutes,
+                'witec_probe_offset_x': self._probe_offset_x,
+                'witec_probe_offset_y': self._probe_offset_y,
             }
             with open(self._preferences_file, 'w') as f:
                 json.dump(data, f, indent=2)
@@ -914,3 +938,41 @@ class PreferencesManager(QObject):
             self._save_preferences()
             self.autosaveIntervalChanged.emit(minutes)
             logger.info(f"Autosave interval set to {minutes} minutes")
+
+    # -------------------- WITec probe-offset calibration -------------------
+    # WITec records each spectrum's position as the *laser focus* in
+    # absolute stage µm. On the saved image, that maps to a pixel
+    # slightly offset from the video-cursor crosshair the user aimed
+    # with. Storing (Dx, Dy) here lets the overlay backend subtract that
+    # constant so spectrum crosshairs land where the user actually
+    # targeted. Only the WITec overlay path applies the correction.
+
+    @Slot(result=float)
+    def getProbeOffsetX(self) -> float:
+        return self._probe_offset_x
+
+    @Slot(result=float)
+    def getProbeOffsetY(self) -> float:
+        return self._probe_offset_y
+
+    @Slot(float, float)
+    def setProbeOffset(self, dx_um: float, dy_um: float):
+        """Persist the WITec probe-vs-video offset (in stage µm)."""
+        try:
+            dx = float(dx_um); dy = float(dy_um)
+        except (TypeError, ValueError):
+            return
+        if (dx, dy) == (self._probe_offset_x, self._probe_offset_y):
+            return
+        self._probe_offset_x = dx
+        self._probe_offset_y = dy
+        self._save_preferences()
+        self.probeOffsetChanged.emit(dx, dy)
+        logger.info(f"WITec probe offset set to ({dx:.3f}, {dy:.3f}) µm")
+
+    @Slot()
+    def resetProbeOffsetToDefault(self):
+        """Reset the WITec probe-vs-video offset to the factory default."""
+        self.setProbeOffset(
+            self.DEFAULT_PROBE_OFFSET_X, self.DEFAULT_PROBE_OFFSET_Y,
+        )
