@@ -8,6 +8,8 @@ Date: December 2025
 License: GPL
 """
 
+import math
+import os
 import numpy as np
 from typing import Optional, List, Dict, Any, Tuple
 import logging
@@ -16,21 +18,42 @@ from scipy import signal
 from scipy.ndimage import gaussian_filter1d
 
 from PySide6.QtCore import (
-    Qt, Signal, Slot, Property, QPointF, QRectF, QObject, QTimer
+    Qt, Signal, Slot, Property, QPointF, QRectF, QObject, QTimer,
 )
-from PySide6.QtGui import QImage, QPainter, QColor, QPen, QBrush, QFont
+from PySide6.QtGui import (
+    QImage, QPainter, QColor, QPen, QBrush, QFont,
+    QFontMetricsF, QPainterPath, QTransform,
+)
 from PySide6.QtQuick import QQuickPaintedItem
 
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 
+from src.widgets._pyqtgraph_ports.curve_path import (
+    DOWNSAMPLE_PEAK,
+    array_to_qpainterpath,
+    prepare_curve_xy,
+)
 from src.widgets._pyqtgraph_ports.mpl_apply import apply_pyqtgraph_ticks
+from src.widgets._pyqtgraph_ports.ticks import tick_strings, tick_values
 from src.widgets._pyqtgraph_ports.viewbox import (
     MOUSE_MODE_PAN,
     MOUSE_MODE_RECT,
     ViewBoxState,
     ViewRect,
 )
+
+
+def _fast_render_enabled_default() -> bool:
+    """Read ``TRANS_FAST_RENDER`` once at import time.
+
+    Phase 3 ships native rendering off by default — set the env var to
+    ``1``/``true``/``yes`` to opt in. Phase 4 will flip the default
+    after parity is verified on the rest of the canvas (legend, axes,
+    overlays). Removing the toggle entirely is Phase 4's job.
+    """
+    val = os.environ.get("TRANS_FAST_RENDER", "").strip().lower()
+    return val in ("1", "true", "yes", "on")
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +175,18 @@ class QMLGraphCanvas(QQuickPaintedItem):
         # in Phase 2; Phase 3 swaps it for a QTransform).
         self._data_bounds: Optional[Dict] = None
 
+        # Phase 3 — native QPainterPath rendering. Off by default;
+        # ``TRANS_FAST_RENDER=1`` opts in. Path cache is keyed on
+        # ``(curve_id, x_log, y_log)`` so a scale flip invalidates
+        # the cached paths automatically. ``_native_transform`` is
+        # the data→pixel ``QTransform`` rebuilt every paint; its
+        # inverse drives ``_pixelToData`` while fast-render is on.
+        self._use_fast_render: bool = _fast_render_enabled_default()
+        self._curve_paths: Dict[Tuple[int, bool, bool], QPainterPath] = {}
+        self._dirty_curve_ids: set[int] = set()
+        self._native_transform: Optional[QTransform] = None
+        self._native_inv_transform: Optional[QTransform] = None
+
     # =====================================================================
     # ViewBox shims — keep the existing render-side writes
     # (``self._x_min = ...``, ``self._auto_scale = False``) flowing
@@ -219,6 +254,20 @@ class QMLGraphCanvas(QQuickPaintedItem):
         """Dirty callback the viewbox calls after any state mutation."""
         self._needs_redraw = True
         self.update()
+
+    def _invalidate_curve_path(self, curve_id: int) -> None:
+        """Drop every cached path for ``curve_id`` (across log/linear
+        variants). Cheap; the next paint rebuilds on demand."""
+        for key in list(self._curve_paths.keys()):
+            if key[0] == curve_id:
+                del self._curve_paths[key]
+        self._dirty_curve_ids.discard(curve_id)
+
+    def _invalidate_all_curve_paths(self) -> None:
+        """Drop every cached path — used when curves are cleared or
+        an axis scale flips so the next paint rebuilds from scratch."""
+        self._curve_paths.clear()
+        self._dirty_curve_ids.clear()
 
     def componentComplete(self):
         """Called when QML component is fully constructed"""
@@ -437,6 +486,7 @@ class QMLGraphCanvas(QQuickPaintedItem):
         if curve_id in self._curves:
             label = self._curves[curve_id].label
             del self._curves[curve_id]
+            self._invalidate_curve_path(curve_id)
 
             if self._selected_curve_id == curve_id:
                 self._selected_curve_id = None
@@ -451,6 +501,7 @@ class QMLGraphCanvas(QQuickPaintedItem):
     def clearCurves(self):
         """Remove all curves"""
         self._curves.clear()
+        self._invalidate_all_curve_paths()
         self._selected_curve_id = None
         self._curve_counter = 0
         self._needs_redraw = True
@@ -708,9 +759,15 @@ class QMLGraphCanvas(QQuickPaintedItem):
     # =========================================================================
 
     def paint(self, painter: QPainter):
-        """Render matplotlib figure and overlays"""
-        # Don't render until component is complete and has valid size
+        """Render path: native QPainter (Phase 3) or matplotlib
+        (legacy fallback). The branch is the ``_use_fast_render``
+        toggle read once from ``TRANS_FAST_RENDER`` at startup."""
         if not self._component_complete:
+            return
+
+        if self._use_fast_render:
+            self._renderNative(painter)
+            self._needs_redraw = False
             return
 
         if self._needs_redraw:
@@ -830,6 +887,394 @@ class QMLGraphCanvas(QQuickPaintedItem):
         # Update coordinate transform
         self._updateDataBounds()
 
+    # =========================================================================
+    # Native rendering (Phase 3) — QPainter / QPainterPath, no matplotlib.
+    # =========================================================================
+
+    # Layout margins inside the widget (left/right/top/bottom px).
+    _AX_MARGIN_LEFT = 60
+    _AX_MARGIN_RIGHT = 20
+    _AX_MARGIN_TOP = 20
+    _AX_MARGIN_BOTTOM = 45
+    _AX_LABEL_PAD = 4
+    # Cap path size so a million-point curve still builds in tens of ms.
+    _MAX_PATH_POINTS = 50_000
+    # Min log-axis value (avoid log10(0) when the user fills a zero-floor curve).
+    _LOG_EPS = 1e-30
+
+    # Dark-theme colours (mirror the matplotlib path so the visuals
+    # match when the user toggles ``TRANS_FAST_RENDER``).
+    _NATIVE_BG_COLOR = QColor("#1a1a1a")
+    _NATIVE_AXIS_COLOR = QColor("#444444")
+    _NATIVE_TICK_COLOR = QColor("#888888")
+    _NATIVE_LABEL_COLOR = QColor("#cccccc")
+    _NATIVE_TITLE_COLOR = QColor("#ffffff")
+    _NATIVE_GRID_COLOR = QColor(51, 51, 51, 127)
+    _NATIVE_LEGEND_BG = QColor(42, 42, 42, 230)
+    _NATIVE_LEGEND_BORDER = QColor(68, 68, 68)
+
+    def _renderNative(self, painter: QPainter) -> None:
+        """Render the entire plot with QPainter primitives.
+
+        Pipeline:
+
+        1. Compute the axes rect inside the widget (accounting for
+           margins).
+        2. Run ``_calculateAutoBounds`` if auto-range is on (same code
+           the matplotlib path uses).
+        3. Build a data → pixel ``QTransform`` from the view range and
+           axes rect. In log mode the transform sees the *post-log*
+           data range and the path was built from ``log10(...)``.
+        4. Paint the background, axes, grid, ticks, tick labels,
+           axis labels and title — all with QPainter primitives + the
+           ported tick algorithm from Phase 1.
+        5. For each visible curve: pen + ``setTransform`` + ``drawPath``.
+        6. Register the transform with the viewbox + ``_data_bounds``
+           so the interaction handlers and ``_drawOverlays`` keep
+           working unchanged.
+        7. Legend + overlays.
+        """
+        w, h = int(self.width()), int(self.height())
+        if w <= 0 or h <= 0:
+            return
+
+        painter.fillRect(QRectF(0, 0, w, h), self._NATIVE_BG_COLOR)
+
+        ax_left = self._AX_MARGIN_LEFT
+        ax_top = self._AX_MARGIN_TOP + (16 if self._title else 0)
+        ax_right = w - self._AX_MARGIN_RIGHT
+        ax_bottom = h - self._AX_MARGIN_BOTTOM
+        if ax_right <= ax_left or ax_bottom <= ax_top:
+            return
+        ax_rect = QRectF(
+            ax_left, ax_top, ax_right - ax_left, ax_bottom - ax_top,
+        )
+
+        if self._auto_scale:
+            self._calculateAutoBounds()
+
+        x_log = (self._x_scale == "log")
+        y_log = (self._y_scale == "log")
+
+        # View range in post-log coords (transform stays linear).
+        x_vmin, x_vmax = self._native_log_safe(self._x_min, self._x_max, x_log)
+        y_vmin, y_vmax = self._native_log_safe(self._y_min, self._y_max, y_log)
+        if x_vmax == x_vmin or y_vmax == y_vmin:
+            return
+
+        transform = self._native_build_transform(
+            x_vmin, x_vmax, y_vmin, y_vmax, ax_rect,
+        )
+
+        # Title.
+        if self._title:
+            painter.setPen(self._NATIVE_TITLE_COLOR)
+            f = painter.font(); f.setPointSize(11); f.setBold(True)
+            painter.setFont(f)
+            painter.drawText(
+                QRectF(0, 2, w, ax_top - 4),
+                Qt.AlignHCenter | Qt.AlignVCenter, self._title,
+            )
+
+        # Background grid + ticks + axis labels.
+        self._native_draw_axes(
+            painter, ax_rect,
+            x_vmin, x_vmax, y_vmin, y_vmax,
+            x_log=x_log, y_log=y_log,
+        )
+
+        # Curves (clipped to the axes rect).
+        painter.save()
+        painter.setClipRect(ax_rect)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        for cid, curve in self._curves.items():
+            if not curve.visible:
+                continue
+            path = self._native_get_path(cid, curve, x_log, y_log)
+            if path is None or path.elementCount() == 0:
+                continue
+            pen = QPen(QColor(curve.color))
+            width = float(curve.linewidth)
+            if cid == self._selected_curve_id:
+                width += 1.0
+            pen.setWidthF(width)
+            ls = (curve.linestyle or "-").strip()
+            if ls in ("--", "dashed"):
+                pen.setStyle(Qt.DashLine)
+            elif ls in (":", "dotted"):
+                pen.setStyle(Qt.DotLine)
+            elif ls in ("-.", "dashdot"):
+                pen.setStyle(Qt.DashDotLine)
+            else:
+                pen.setStyle(Qt.SolidLine)
+            painter.setPen(pen)
+            painter.setTransform(transform, combine=False)
+            painter.drawPath(path)
+        painter.setTransform(QTransform())
+        painter.restore()
+
+        # Store transforms for interaction (viewbox + ``_pixelToData``).
+        inv, ok = transform.inverted()
+        self._native_transform = transform
+        self._native_inv_transform = inv if ok else QTransform()
+        self._data_bounds = {
+            'ax_left': ax_left, 'ax_right': ax_right,
+            'ax_top': ax_top, 'ax_bottom': ax_bottom,
+            'x_min': self._x_min, 'x_max': self._x_max,
+            'y_min': self._y_min, 'y_max': self._y_max,
+        }
+        self._viewbox.set_transforms(self._pixelToData, self._dataToPixel)
+        self._viewbox.set_axes_pixel_rect(
+            (ax_left, ax_top, ax_right, ax_bottom),
+        )
+        self._viewbox.set_auto_range_data(ViewRect(
+            self._x_min, self._x_max, self._y_min, self._y_max,
+        ))
+        self._viewbox.set_auto_range_margin(0.0)
+
+        # Legend + overlays.
+        if self._show_legend and self._curves:
+            self._native_draw_legend(painter, ax_rect)
+        self._drawOverlays(painter)
+
+    @staticmethod
+    def _native_log_safe(
+        lo: float, hi: float, log: bool,
+    ) -> Tuple[float, float]:
+        """Return the view range in post-log coords when ``log`` is
+        on; clamp non-positive endpoints to ``_LOG_EPS`` first."""
+        if not log:
+            return float(lo), float(hi)
+        lo_c = max(float(lo), QMLGraphCanvas._LOG_EPS)
+        hi_c = max(float(hi), QMLGraphCanvas._LOG_EPS)
+        return math.log10(lo_c), math.log10(hi_c)
+
+    @staticmethod
+    def _native_build_transform(
+        x_min: float, x_max: float, y_min: float, y_max: float,
+        ax_rect: QRectF,
+    ) -> QTransform:
+        """Affine that maps post-log data coords → axes-rect pixels.
+
+        Y is flipped because pixel Y grows downward but data Y grows
+        upward.
+        """
+        ax_w = ax_rect.width()
+        ax_h = ax_rect.height()
+        sx = ax_w / (x_max - x_min)
+        sy = -ax_h / (y_max - y_min)
+        tx = ax_rect.left() - x_min * sx
+        ty = ax_rect.bottom() - y_min * sy
+        return QTransform(sx, 0.0, 0.0, sy, tx, ty)
+
+    def _native_get_path(
+        self,
+        cid: int,
+        curve: "CurveData",
+        x_log: bool,
+        y_log: bool,
+    ) -> Optional[QPainterPath]:
+        """Return the cached path for ``(cid, x_log, y_log)``,
+        building (and caching) it on first request."""
+        key = (cid, bool(x_log), bool(y_log))
+        cached = self._curve_paths.get(key)
+        if cached is not None:
+            return cached
+        try:
+            x_p, y_p = prepare_curve_xy(
+                curve.x, curve.y,
+                log_x=x_log, log_y=y_log,
+                max_points=self._MAX_PATH_POINTS,
+                downsample_mode=DOWNSAMPLE_PEAK,
+            )
+            path = array_to_qpainterpath(x_p, y_p)
+        except Exception as exc:
+            logger.warning(
+                "Failed to build native path for curve %s: %s", cid, exc,
+            )
+            return None
+        self._curve_paths[key] = path
+        return path
+
+    def _native_draw_axes(
+        self,
+        painter: QPainter,
+        ax_rect: QRectF,
+        x_vmin: float, x_vmax: float,
+        y_vmin: float, y_vmax: float,
+        *,
+        x_log: bool,
+        y_log: bool,
+    ) -> None:
+        """Border + grid + tick marks + tick labels + axis labels."""
+        # Axes pen + frame.
+        pen_axis = QPen(self._NATIVE_AXIS_COLOR)
+        pen_axis.setWidthF(1.0)
+        painter.setPen(pen_axis)
+        painter.drawRect(ax_rect)
+
+        # Ticks (Phase 1 port).
+        x_levels = tick_values(x_vmin, x_vmax, ax_rect.width(), log=x_log)
+        y_levels = tick_values(y_vmin, y_vmax, ax_rect.height(), log=y_log)
+
+        # First (major) level only — sub-ticks are Phase 4.
+        x_major_spacing, x_majors = (
+            x_levels[0] if x_levels else (1.0, [])
+        )
+        y_major_spacing, y_majors = (
+            y_levels[0] if y_levels else (1.0, [])
+        )
+        x_labels = tick_strings(
+            x_majors, scale=1.0, spacing=x_major_spacing, log=x_log,
+        ) if x_majors else []
+        y_labels = tick_strings(
+            y_majors, scale=1.0, spacing=y_major_spacing, log=y_log,
+        ) if y_majors else []
+
+        # Grid.
+        if self._show_grid:
+            grid_pen = QPen(self._NATIVE_GRID_COLOR)
+            grid_pen.setWidthF(0.5)
+            painter.setPen(grid_pen)
+            for x in x_majors:
+                px = self._native_data_x_to_pixel(x, x_vmin, x_vmax, ax_rect)
+                if ax_rect.left() <= px <= ax_rect.right():
+                    painter.drawLine(
+                        QPointF(px, ax_rect.top()),
+                        QPointF(px, ax_rect.bottom()),
+                    )
+            for y in y_majors:
+                py = self._native_data_y_to_pixel(y, y_vmin, y_vmax, ax_rect)
+                if ax_rect.top() <= py <= ax_rect.bottom():
+                    painter.drawLine(
+                        QPointF(ax_rect.left(), py),
+                        QPointF(ax_rect.right(), py),
+                    )
+
+        # Tick marks.
+        tick_pen = QPen(self._NATIVE_TICK_COLOR)
+        tick_pen.setWidthF(1.0)
+        painter.setPen(tick_pen)
+        tick_len = 5.0
+        for x in x_majors:
+            px = self._native_data_x_to_pixel(x, x_vmin, x_vmax, ax_rect)
+            if ax_rect.left() <= px <= ax_rect.right():
+                painter.drawLine(
+                    QPointF(px, ax_rect.bottom()),
+                    QPointF(px, ax_rect.bottom() + tick_len),
+                )
+        for y in y_majors:
+            py = self._native_data_y_to_pixel(y, y_vmin, y_vmax, ax_rect)
+            if ax_rect.top() <= py <= ax_rect.bottom():
+                painter.drawLine(
+                    QPointF(ax_rect.left() - tick_len, py),
+                    QPointF(ax_rect.left(), py),
+                )
+
+        # Tick labels.
+        painter.setPen(self._NATIVE_LABEL_COLOR)
+        f = painter.font(); f.setPointSize(9); f.setBold(False)
+        painter.setFont(f)
+        fm = QFontMetricsF(painter.font())
+        for x, label in zip(x_majors, x_labels):
+            px = self._native_data_x_to_pixel(x, x_vmin, x_vmax, ax_rect)
+            if ax_rect.left() <= px <= ax_rect.right():
+                tw = fm.horizontalAdvance(label)
+                painter.drawText(
+                    QPointF(px - tw / 2, ax_rect.bottom() + tick_len + fm.ascent() + 2),
+                    label,
+                )
+        for y, label in zip(y_majors, y_labels):
+            py = self._native_data_y_to_pixel(y, y_vmin, y_vmax, ax_rect)
+            if ax_rect.top() <= py <= ax_rect.bottom():
+                tw = fm.horizontalAdvance(label)
+                painter.drawText(
+                    QPointF(ax_rect.left() - tick_len - tw - 4, py + fm.ascent() / 2 - 1),
+                    label,
+                )
+
+        # Axis labels.
+        if self._x_label:
+            painter.setPen(self._NATIVE_LABEL_COLOR)
+            painter.drawText(
+                QRectF(ax_rect.left(), ax_rect.bottom() + 22,
+                       ax_rect.width(), 20),
+                Qt.AlignHCenter | Qt.AlignTop, self._x_label,
+            )
+        if self._y_label:
+            painter.save()
+            painter.translate(14.0, ax_rect.top() + ax_rect.height() / 2)
+            painter.rotate(-90.0)
+            painter.setPen(self._NATIVE_LABEL_COLOR)
+            painter.drawText(
+                QRectF(-ax_rect.height() / 2, -10,
+                       ax_rect.height(), 20),
+                Qt.AlignHCenter | Qt.AlignVCenter, self._y_label,
+            )
+            painter.restore()
+
+    @staticmethod
+    def _native_data_x_to_pixel(
+        x: float, x_vmin: float, x_vmax: float, ax_rect: QRectF,
+    ) -> float:
+        if x_vmax == x_vmin:
+            return ax_rect.left()
+        return ax_rect.left() + (x - x_vmin) / (x_vmax - x_vmin) * ax_rect.width()
+
+    @staticmethod
+    def _native_data_y_to_pixel(
+        y: float, y_vmin: float, y_vmax: float, ax_rect: QRectF,
+    ) -> float:
+        if y_vmax == y_vmin:
+            return ax_rect.bottom()
+        return ax_rect.bottom() - (y - y_vmin) / (y_vmax - y_vmin) * ax_rect.height()
+
+    def _native_draw_legend(
+        self, painter: QPainter, ax_rect: QRectF,
+    ) -> None:
+        """Top-right legend with pen samples — small replacement for
+        matplotlib's legend that gets a richer Phase 5 port later."""
+        visible = [c for c in self._curves.values() if c.visible]
+        if not visible:
+            return
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        f = painter.font(); f.setPointSize(9); f.setBold(False)
+        painter.setFont(f)
+        fm = QFontMetricsF(painter.font())
+        sample_w = 24.0
+        sample_gap = 6.0
+        row_h = max(fm.height(), 14.0)
+        pad_x = 8.0
+        pad_y = 6.0
+        max_label_w = max(fm.horizontalAdvance(c.label) for c in visible)
+        box_w = sample_w + sample_gap + max_label_w + pad_x * 2
+        box_h = row_h * len(visible) + pad_y * 2
+        box_x = ax_rect.right() - box_w - 6.0
+        box_y = ax_rect.top() + 6.0
+        box = QRectF(box_x, box_y, box_w, box_h)
+
+        painter.setPen(QPen(self._NATIVE_LEGEND_BORDER))
+        painter.setBrush(QBrush(self._NATIVE_LEGEND_BG))
+        painter.drawRoundedRect(box, 3.0, 3.0)
+
+        for i, curve in enumerate(visible):
+            y_centre = box_y + pad_y + row_h * (i + 0.5)
+            sample_left = box_x + pad_x
+            sample_right = sample_left + sample_w
+            pen = QPen(QColor(curve.color))
+            pen.setWidthF(float(curve.linewidth))
+            painter.setPen(pen)
+            painter.drawLine(
+                QPointF(sample_left, y_centre),
+                QPointF(sample_right, y_centre),
+            )
+            painter.setPen(self._NATIVE_LABEL_COLOR)
+            painter.drawText(
+                QPointF(sample_right + sample_gap,
+                        y_centre + fm.ascent() / 2 - 1),
+                curve.label,
+            )
+
     def _calculateAutoBounds(self):
         """Calculate auto-scale bounds from all curves"""
         if not self._curves:
@@ -914,7 +1359,16 @@ class QMLGraphCanvas(QQuickPaintedItem):
         self._viewbox.set_auto_range_margin(0.0)
 
     def _dataToPixel(self, x: float, y: float) -> Tuple[float, float]:
-        """Convert data coordinates to pixel coordinates (handles log scale)"""
+        """Data → pixel mapping. Uses the native ``QTransform`` while
+        fast-render is on (pre-logging in log mode); falls back to
+        matplotlib's ``transData`` otherwise."""
+        if self._use_fast_render and self._native_transform is not None:
+            x_log = (self._x_scale == "log")
+            y_log = (self._y_scale == "log")
+            x_d = math.log10(max(x, self._LOG_EPS)) if x_log else float(x)
+            y_d = math.log10(max(y, self._LOG_EPS)) if y_log else float(y)
+            pt = self._native_transform.map(QPointF(x_d, y_d))
+            return float(pt.x()), float(pt.y())
         try:
             px, py = self.axes.transData.transform((x, y))
             return float(px), float(self.canvas.get_width_height()[1] - py)
@@ -922,7 +1376,17 @@ class QMLGraphCanvas(QQuickPaintedItem):
             return 0.0, 0.0
 
     def _pixelToData(self, px: float, py: float) -> Tuple[float, float]:
-        """Convert pixel to data coordinates (handles log scale)"""
+        """Pixel → data mapping. Uses the native ``QTransform`` inverse
+        in fast-render mode (un-logging back to data coords); falls
+        back to matplotlib's ``transData.inverted()`` otherwise."""
+        if self._use_fast_render and self._native_inv_transform is not None:
+            pt = self._native_inv_transform.map(QPointF(px, py))
+            x = float(pt.x()); y = float(pt.y())
+            if self._x_scale == "log":
+                x = 10.0 ** x
+            if self._y_scale == "log":
+                y = 10.0 ** y
+            return x, y
         try:
             fig_h = self.canvas.get_width_height()[1]
             x, y = self.axes.transData.inverted().transform((px, fig_h - py))
