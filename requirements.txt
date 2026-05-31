@@ -61,3 +61,4 @@ pytz>=2023.3                      # Timezone support
 # pytest>=7.0.0                   # Test framework
 # pytest-cov>=4.0.0               # Coverage reporting
 # pytest-qt>=4.0.0                # Qt testing support
+# pytest-benchmark>=4.0.0         # Micro-benchmarks for the pyqtgraph-port rendering work

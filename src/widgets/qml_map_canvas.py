@@ -22,6 +22,8 @@ from PySide6.QtQuick import QQuickPaintedItem
 
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+from src.widgets._pyqtgraph_ports.mpl_apply import apply_pyqtgraph_ticks
 import matplotlib.pyplot as plt
 
 logger = logging.getLogger(__name__)
@@ -600,6 +602,16 @@ class QMLMapCanvas(QQuickPaintedItem):
         self.axes.tick_params(colors='#888888', labelsize=8)
         for spine in self.axes.spines.values():
             spine.set_color('#444444')
+
+        # Ported pyqtgraph tick layout — keeps axis labelling consistent
+        # across the graph/profile/map canvases. Map axes are pixel
+        # indices (linear), so log mode is off.
+        apply_pyqtgraph_ticks(
+            self.axes,
+            x_size_px=float(w),
+            y_size_px=float(h),
+            log_x=False, log_y=False,
+        )
 
         # Tight layout
         self.figure.tight_layout(pad=0.5)

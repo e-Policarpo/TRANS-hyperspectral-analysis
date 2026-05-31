@@ -24,6 +24,8 @@ from PySide6.QtQuick import QQuickPaintedItem
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 
+from src.widgets._pyqtgraph_ports.mpl_apply import apply_pyqtgraph_ticks
+
 logger = logging.getLogger(__name__)
 
 
@@ -712,6 +714,17 @@ class QMLGraphCanvas(QQuickPaintedItem):
             self._calculateAutoBounds()
         self.axes.set_xlim(self._x_min, self._x_max)
         self.axes.set_ylim(self._y_min, self._y_max)
+
+        # Ported pyqtgraph tick layout (1/2/5 × 10ⁿ family, log-aware
+        # superscript formatting). Replaces matplotlib's auto-locator
+        # so the same tick rules apply across all three TRANS canvases.
+        apply_pyqtgraph_ticks(
+            self.axes,
+            x_size_px=float(w),
+            y_size_px=float(h),
+            log_x=(self._x_scale == "log"),
+            log_y=(self._y_scale == "log"),
+        )
 
         self.figure.tight_layout(pad=0.5)
 

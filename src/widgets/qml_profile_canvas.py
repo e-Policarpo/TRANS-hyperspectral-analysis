@@ -21,6 +21,8 @@ from PySide6.QtQuick import QQuickPaintedItem
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 
+from src.widgets._pyqtgraph_ports.mpl_apply import apply_pyqtgraph_ticks
+
 logger = logging.getLogger(__name__)
 
 
@@ -350,6 +352,16 @@ class QMLProfileCanvas(QQuickPaintedItem):
             self.axes.legend(loc='upper right', fontsize=8,
                             facecolor='#2a2a2a', edgecolor='#444444',
                             labelcolor='#cccccc')
+
+        # Apply the ported pyqtgraph tick layout for parity with the
+        # graph canvas (1/2/5 × 10ⁿ family, sensible decimal places).
+        # Profile axes are linear-only today, so log mode is off.
+        apply_pyqtgraph_ticks(
+            self.axes,
+            x_size_px=float(w),
+            y_size_px=float(h),
+            log_x=False, log_y=False,
+        )
 
         self.figure.tight_layout(pad=0.5)
 
