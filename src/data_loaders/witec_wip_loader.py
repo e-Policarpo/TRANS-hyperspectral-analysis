@@ -87,8 +87,9 @@ def _parse_info_text(text: str) -> Dict[str, Any]:
     Returns a dict with whatever fields are present; missing fields are
     simply omitted. Keys: ``start_time`` (``HH:MM``), ``start_date``,
     ``objective`` (trimmed lens label), ``magnification`` (float),
-    ``origin_xy`` (absolute stage µm), plus ``raw_fields`` containing
-    every field we successfully read.
+    ``origin_xy`` (absolute stage µm), ``integration_time_s`` (float,
+    seconds per accumulation), ``accumulation_count`` (int), plus
+    ``raw_fields`` containing every field we successfully read.
     """
     if not text:
         return {}
@@ -101,6 +102,7 @@ def _parse_info_text(text: str) -> Dict[str, Any]:
         "Origin X [µm]", "Origin Y [µm]", "Origin Z [µm]",
         "Image Width [µm]", "Image Height [µm]",
         "Excitation Wavelength [nm]",
+        "Integration Time [s]", "Number Of Accumulations",
     ):
         v = _lookup_field(text, fld)
         if v is not None:
@@ -118,6 +120,23 @@ def _parse_info_text(text: str) -> Dict[str, Any]:
     try:
         if raw.get("Objective Magnification"):
             out["magnification"] = float(raw["Objective Magnification"])
+    except ValueError:
+        pass
+    # Acquisition exposure: WITec writes seconds-per-accumulation and a
+    # count; counts/second-per-accumulation is the standard
+    # spectroscopy normalisation, so we surface both as numeric.
+    try:
+        if raw.get("Integration Time [s]"):
+            t = float(raw["Integration Time [s]"])
+            if t > 0:
+                out["integration_time_s"] = t
+    except ValueError:
+        pass
+    try:
+        if raw.get("Number Of Accumulations"):
+            n = int(float(raw["Number Of Accumulations"]))
+            if n > 0:
+                out["accumulation_count"] = n
     except ValueError:
         pass
     # Absolute stage centre of the acquisition. Images use the
@@ -487,14 +506,51 @@ class WitecWipLoader(BaseDataLoader):
 
         channels: Dict[str, SpectralData] = {}
         used_names: Dict[str, int] = {}
+        info_by_id = info_by_id or {}
         for sig, group in buckets.items():
             unit = group[0][2]
             axis = group[0][1]
             channel_name = self._channel_name_for_axis(axis, unit)
             channel_name = self._dedup(channel_name, used_names)
-            df = self._build_dataframe(axis, unit, group)
+
+            # Per-spectrum exposure (integration time × accumulations).
+            # WITec writes counts as ``time × accumulations``; dividing
+            # by that factor at load time gives counts/s/accumulation,
+            # which is what downstream processing (background
+            # subtraction, peak fitting, cross-spectrum comparison)
+            # actually expects.
+            integration_times: List[Optional[float]] = []
+            accumulation_counts: List[Optional[int]] = []
+            norm_factors: List[Optional[float]] = []
+            for g, _, _ in group:
+                info = info_by_id.get(int(g.entry.id)) or {}
+                t = info.get("integration_time_s")
+                n = info.get("accumulation_count")
+                integration_times.append(
+                    float(t) if isinstance(t, (int, float)) else None
+                )
+                accumulation_counts.append(
+                    int(n) if isinstance(n, (int, float)) else None
+                )
+                if (
+                    isinstance(t, (int, float)) and t > 0
+                    and isinstance(n, (int, float)) and n > 0
+                ):
+                    norm_factors.append(float(t) * float(n))
+                else:
+                    norm_factors.append(None)
+            any_normalized = any(f is not None for f in norm_factors)
+
+            df = self._build_dataframe(
+                axis, unit, group, normalization_factors=norm_factors,
+            )
             zint = project.get_interpretation(group[0][0].z_interpretation_id)
-            y_unit = zint.standard_unit if zint else "counts"
+            y_unit_raw = (
+                (zint.standard_unit if zint else "") or "counts"
+            )
+            y_unit = (
+                f"{y_unit_raw}/s" if any_normalized else y_unit_raw
+            )
 
             # Per-spectrum excitation: pull from each graph's own
             # interpretation, falling back to the project-level value when
@@ -536,13 +592,16 @@ class WitecWipLoader(BaseDataLoader):
             # Per-spectrum acquisition-info records (start time, lens, …).
             # Aligned to ``captions``. ``None`` when the WITec file has no
             # info text for that spectrum.
-            info_by_id = info_by_id or {}
             per_spectrum_info: List[Optional[Dict[str, Any]]] = [
                 info_by_id.get(int(g.entry.id)) for g, _, _ in group
             ]
             additional_info: Dict[str, Any] = {
                 "captions": [g.entry.caption for g, _, _ in group],
                 "wip_data_ids": [g.entry.id for g, _, _ in group],
+                "integration_times_s": integration_times,
+                "accumulation_counts": accumulation_counts,
+                "normalization_factors": norm_factors,
+                "intensity_normalized": any_normalized,
                 "axis_unit": unit,
                 "acquisition_positions": acquisition_positions,
                 "acquisition_info_per_spectrum": per_spectrum_info,
@@ -632,11 +691,21 @@ class WitecWipLoader(BaseDataLoader):
         axis: np.ndarray,
         unit: str,
         group: List[Tuple[WipGraph, np.ndarray, str]],
+        normalization_factors: Optional[List[Optional[float]]] = None,
     ) -> pd.DataFrame:
+        """Build the channel's DataFrame with the spectral axis as
+        column 0 and one float64 column per spectrum.
+
+        When ``normalization_factors`` is supplied (one float-or-None
+        per group entry, aligned with ``group``), each spectrum is
+        divided by its factor before going into the DataFrame.
+        ``None`` factors leave the spectrum at raw counts. Missing or
+        non-positive factors are treated as ``None``.
+        """
         col_name = self._axis_column_name(unit)
         data = {col_name: axis}
         used: Dict[str, int] = {}
-        for g, _ax, _u in group:
+        for idx, (g, _ax, _u) in enumerate(group):
             raw_caption = g.entry.caption.strip() or f"Spectrum_{g.entry.id}"
             label = self._clean_caption(raw_caption) or raw_caption
             label = self._dedup(label, used)
@@ -648,7 +717,16 @@ class WitecWipLoader(BaseDataLoader):
                 if m < axis.size:
                     pad = np.full(axis.size - m, np.nan, dtype=spectrum.dtype)
                     spectrum = np.concatenate([spectrum, pad])
-            data[label] = spectrum.astype(np.float64, copy=False)
+            spectrum = spectrum.astype(np.float64, copy=False)
+            factor: Optional[float] = (
+                normalization_factors[idx]
+                if normalization_factors is not None
+                and idx < len(normalization_factors)
+                else None
+            )
+            if isinstance(factor, (int, float)) and factor > 0:
+                spectrum = spectrum / float(factor)
+            data[label] = spectrum
         return pd.DataFrame(data)
 
     @staticmethod
