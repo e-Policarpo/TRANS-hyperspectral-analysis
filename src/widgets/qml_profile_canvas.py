@@ -22,6 +22,7 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 from src.widgets._pyqtgraph_ports.mpl_apply import apply_pyqtgraph_ticks
+from src.widgets._pyqtgraph_ports.viewbox import ViewBoxState
 
 logger = logging.getLogger(__name__)
 
@@ -85,10 +86,10 @@ class QMLProfileCanvas(QQuickPaintedItem):
         self._cursor_x: Optional[float] = None
         self._show_cursor: bool = False
 
-        # Selection state
-        self._is_selecting: bool = False
-        self._selection_start: Optional[float] = None
-        self._selection_end: Optional[float] = None
+        # Selection / view state is owned by the ported ViewBoxState in
+        # x-mode-only configuration (profile selection is a 1-D x-range).
+        self._viewbox = ViewBoxState(x_mode_only=True)
+        self._viewbox.set_dirty_callback(self._markViewboxDirty)
 
         # Render cache
         self._cached_image: Optional[QImage] = None
@@ -96,6 +97,11 @@ class QMLProfileCanvas(QQuickPaintedItem):
 
         # Coordinate transform
         self._data_bounds: Optional[Dict] = None
+
+    def _markViewboxDirty(self) -> None:
+        """Dirty callback the viewbox calls after any state mutation."""
+        self._needs_redraw = True
+        self.update()
 
     @Slot()
     def cleanup(self):
@@ -378,7 +384,9 @@ class QMLProfileCanvas(QQuickPaintedItem):
         self._updateDataBounds()
 
     def _updateDataBounds(self):
-        """Update pixel-to-data coordinate mapping"""
+        """Refresh pixel↔data mapping and register adapters with the
+        viewbox so its interaction handlers can do the math
+        themselves."""
         if self._x_data is None:
             self._data_bounds = None
             return
@@ -400,24 +408,44 @@ class QMLProfileCanvas(QQuickPaintedItem):
             'y_max': ylim[1]
         }
 
+        self._viewbox.set_transforms(self._pixelToData, self._dataToPixel)
+        self._viewbox.set_axes_pixel_rect((
+            self._data_bounds['ax_left'],
+            self._data_bounds['ax_top'],
+            self._data_bounds['ax_right'],
+            self._data_bounds['ax_bottom'],
+        ))
+
     def _pixelToData(self, px: float, py: float) -> Tuple[float, float]:
-        """Convert pixel to data coordinates"""
+        """Linear pixel→data mapping (matches the profile canvas's
+        original non-log behaviour)."""
         if self._data_bounds is None:
-            return 0, 0
-
+            return 0.0, 0.0
         d = self._data_bounds
-        ax_width = d['ax_right'] - d['ax_left']
-        ax_height = d['ax_bottom'] - d['ax_top']
-
-        # Normalize within axes
-        norm_x = (px - d['ax_left']) / ax_width
-        norm_y = (py - d['ax_top']) / ax_height
-
-        # Convert to data coordinates
+        ax_w = d['ax_right'] - d['ax_left']
+        ax_h = d['ax_bottom'] - d['ax_top']
+        if ax_w <= 0 or ax_h <= 0:
+            return 0.0, 0.0
+        norm_x = (px - d['ax_left']) / ax_w
+        norm_y = (py - d['ax_top']) / ax_h
         x = d['x_min'] + norm_x * (d['x_max'] - d['x_min'])
-        y = d['y_max'] - norm_y * (d['y_max'] - d['y_min'])  # Y is inverted
-
+        y = d['y_max'] - norm_y * (d['y_max'] - d['y_min'])  # Y inverted
         return x, y
+
+    def _dataToPixel(self, x: float, y: float) -> Tuple[float, float]:
+        """Inverse of :meth:`_pixelToData` — needed by the viewbox
+        for rubber-band hit-tests."""
+        if self._data_bounds is None:
+            return 0.0, 0.0
+        d = self._data_bounds
+        ax_w = d['ax_right'] - d['ax_left']
+        ax_h = d['ax_bottom'] - d['ax_top']
+        if d['x_max'] == d['x_min'] or d['y_max'] == d['y_min']:
+            return float(d['ax_left']), float(d['ax_top'])
+        norm_x = (x - d['x_min']) / (d['x_max'] - d['x_min'])
+        norm_y = (d['y_max'] - y) / (d['y_max'] - d['y_min'])
+        return (d['ax_left'] + norm_x * ax_w,
+                d['ax_top'] + norm_y * ax_h)
 
     def _drawOverlays(self, painter: QPainter):
         """Draw interactive overlays"""
@@ -439,14 +467,15 @@ class QMLProfileCanvas(QQuickPaintedItem):
                 painter.drawLine(int(px), int(d['ax_top']),
                                int(px), int(d['ax_bottom']))
 
-        # Draw selection range
-        if self._selection_start is not None and self._selection_end is not None:
+        # Draw selection range — read from the viewbox.
+        sel = self._viewbox.selection_box_data()
+        if sel is not None:
             d = self._data_bounds
             if d:
                 ax_width = d['ax_right'] - d['ax_left']
 
-                x1_norm = (self._selection_start - d['x_min']) / (d['x_max'] - d['x_min'])
-                x2_norm = (self._selection_end - d['x_min']) / (d['x_max'] - d['x_min'])
+                x1_norm = (sel[0] - d['x_min']) / (d['x_max'] - d['x_min'])
+                x2_norm = (sel[2] - d['x_min']) / (d['x_max'] - d['x_min'])
 
                 px1 = d['ax_left'] + x1_norm * ax_width
                 px2 = d['ax_left'] + x2_norm * ax_width
@@ -465,39 +494,30 @@ class QMLProfileCanvas(QQuickPaintedItem):
     # =========================================================================
 
     def mousePressEvent(self, event):
-        """Handle mouse press"""
+        """Start an x-range selection via the viewbox."""
         pos = event.position()
         x, y = self._pixelToData(pos.x(), pos.y())
         self.pointClicked.emit(x, y)
-
-        # Start selection
-        self._is_selecting = True
-        self._selection_start = x
-        self._selection_end = x
+        self._viewbox.handle_press_left((pos.x(), pos.y()))
 
     def mouseMoveEvent(self, event):
-        """Handle mouse move"""
+        """Update cursor read-out + active rubber-band selection."""
         pos = event.position()
         x, y = self._pixelToData(pos.x(), pos.y())
         self.cursorMoved.emit(x, y)
-
         self._cursor_x = x
         self._show_cursor = True
-
-        if self._is_selecting:
-            self._selection_end = x
-            self.update()
+        self._viewbox.handle_move((pos.x(), pos.y()))
 
     def mouseReleaseEvent(self, event):
-        """Handle mouse release"""
-        if self._is_selecting and self._selection_start != self._selection_end:
-            x1 = min(self._selection_start, self._selection_end)
-            x2 = max(self._selection_start, self._selection_end)
-            self.rangeSelected.emit(x1, x2)
-
-        self._is_selecting = False
-        self._selection_start = None
-        self._selection_end = None
+        """Finalise the x-range selection, emit ``rangeSelected``."""
+        pos = event.position()
+        result = self._viewbox.handle_release_left(
+            (pos.x(), pos.y()), drag_threshold_px=2.0,
+        )
+        if result is not None:
+            x_min, _y_min, x_max, _y_max = result
+            self.rangeSelected.emit(x_min, x_max)
         self.update()
 
     def hoverMoveEvent(self, event):

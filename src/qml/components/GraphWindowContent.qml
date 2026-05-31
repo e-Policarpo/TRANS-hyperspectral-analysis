@@ -194,6 +194,45 @@ Item {
                             color: borderColor
                         }
 
+                        // Mouse-mode toggle (pan vs rectangle-zoom).
+                        // Wired to the ViewBox's ``mouseMode`` property
+                        // on the canvas — flipping it switches what a
+                        // left-drag does without restarting the window.
+                        ToolButton {
+                            id: mouseModeToggle
+                            checkable: true
+                            checked: graphCanvas
+                                ? graphCanvas.mouseMode === "rect"
+                                : false
+                            ToolTip.text: checked
+                                ? "Mode: rectangle zoom (click for pan)"
+                                : "Mode: pan (click for rectangle zoom)"
+                            ToolTip.visible: hovered
+                            onClicked: {
+                                graphCanvas.mouseMode = checked ? "rect" : "pan"
+                            }
+                            background: Rectangle {
+                                color: mouseModeToggle.checked
+                                    ? accentBlue
+                                    : (parent.hovered ? bgLight : "transparent")
+                                radius: 3
+                            }
+                            contentItem: Text {
+                                text: mouseModeToggle.checked ? "▭" : "✥"
+                                color: textLight
+                                font.pixelSize: 13
+                                font.bold: true
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                            }
+                        }
+
+                        Rectangle {
+                            width: 1
+                            height: 24
+                            color: borderColor
+                        }
+
                         CheckBox {
                             id: gridCheck
                             text: "Grid"

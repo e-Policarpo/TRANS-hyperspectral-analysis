@@ -25,6 +25,12 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 from src.widgets._pyqtgraph_ports.mpl_apply import apply_pyqtgraph_ticks
+from src.widgets._pyqtgraph_ports.viewbox import (
+    MOUSE_MODE_PAN,
+    MOUSE_MODE_RECT,
+    ViewBoxState,
+    ViewRect,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -116,28 +122,20 @@ class QMLGraphCanvas(QQuickPaintedItem):
         # Display options
         self._show_grid: bool = True
         self._show_legend: bool = True
-        self._auto_scale: bool = True
-        self._x_min: float = 0
-        self._x_max: float = 1
-        self._y_min: float = 0
-        self._y_max: float = 1
+
+        # All view-range / interaction / scale-history state lives in
+        # the ported pyqtgraph ViewBoxState. The canvas exposes thin
+        # property shims (``_x_min`` / ``_x_max`` / ``_y_min`` /
+        # ``_y_max`` / ``_auto_scale``) so the existing matplotlib
+        # render code keeps reading and writing the same attribute
+        # names, but the source of truth is ``self._viewbox``.
+        self._viewbox = ViewBoxState()
+        self._viewbox.set_dirty_callback(self._markViewboxDirty)
 
         # Cursor state
         self._cursor_x: Optional[float] = None
         self._cursor_y: Optional[float] = None
         self._show_cursor: bool = False
-
-        # Selection / drag-zoom state
-        self._is_selecting: bool = False
-        self._selection_start: Optional[Tuple[float, float]] = None
-        self._selection_end: Optional[Tuple[float, float]] = None
-
-        # Pan state (right-drag, tracked in pixel space for log-scale correctness)
-        self._is_panning: bool = False
-        self._pan_last_px: Optional[Tuple[float, float]] = None
-
-        # Zoom state
-        self._zoom_level: float = 1.0
 
         # Render cache
         self._cached_image: Optional[QImage] = None
@@ -150,8 +148,77 @@ class QMLGraphCanvas(QQuickPaintedItem):
         self._resize_timer.setInterval(150)  # ms
         self._resize_timer.timeout.connect(self._onResizeFinished)
 
-        # Coordinate transform
+        # Coordinate transform (still backed by matplotlib's transData
+        # in Phase 2; Phase 3 swaps it for a QTransform).
         self._data_bounds: Optional[Dict] = None
+
+    # =====================================================================
+    # ViewBox shims — keep the existing render-side writes
+    # (``self._x_min = ...``, ``self._auto_scale = False``) flowing
+    # without churning ~30 attribute references. The shims forward
+    # to the viewbox; the renderer never knows the difference.
+    # =====================================================================
+
+    @property
+    def _x_min(self) -> float:
+        return self._viewbox.view_range().x_min
+
+    @_x_min.setter
+    def _x_min(self, value: float) -> None:
+        r = self._viewbox.view_range()
+        self._viewbox.set_view_range(
+            float(value), r.x_max, r.y_min, r.y_max,
+            push_history=False, disable_auto=False,
+        )
+
+    @property
+    def _x_max(self) -> float:
+        return self._viewbox.view_range().x_max
+
+    @_x_max.setter
+    def _x_max(self, value: float) -> None:
+        r = self._viewbox.view_range()
+        self._viewbox.set_view_range(
+            r.x_min, float(value), r.y_min, r.y_max,
+            push_history=False, disable_auto=False,
+        )
+
+    @property
+    def _y_min(self) -> float:
+        return self._viewbox.view_range().y_min
+
+    @_y_min.setter
+    def _y_min(self, value: float) -> None:
+        r = self._viewbox.view_range()
+        self._viewbox.set_view_range(
+            r.x_min, r.x_max, float(value), r.y_max,
+            push_history=False, disable_auto=False,
+        )
+
+    @property
+    def _y_max(self) -> float:
+        return self._viewbox.view_range().y_max
+
+    @_y_max.setter
+    def _y_max(self, value: float) -> None:
+        r = self._viewbox.view_range()
+        self._viewbox.set_view_range(
+            r.x_min, r.x_max, r.y_min, float(value),
+            push_history=False, disable_auto=False,
+        )
+
+    @property
+    def _auto_scale(self) -> bool:
+        return self._viewbox.auto_range_enabled()
+
+    @_auto_scale.setter
+    def _auto_scale(self, value: bool) -> None:
+        self._viewbox.set_auto_range_enabled(bool(value))
+
+    def _markViewboxDirty(self) -> None:
+        """Dirty callback the viewbox calls after any state mutation."""
+        self._needs_redraw = True
+        self.update()
 
     def componentComplete(self):
         """Called when QML component is fully constructed"""
@@ -557,53 +624,76 @@ class QMLGraphCanvas(QQuickPaintedItem):
 
     @Slot()
     def resetView(self):
-        """Reset to auto-scale view"""
-        self._auto_scale = True
-        self._zoom_level = 1.0
-        self._needs_redraw = True
-        self.update()
+        """Re-enable auto-range and snap to the current data extent.
+
+        Defers to the viewbox: if curves have been added the renderer
+        already registered the data extent via ``_calculateAutoBounds``;
+        otherwise the next render will register it and trigger.
+        """
+        self._viewbox.set_auto_range_enabled(True)
+        self._viewbox.trigger_auto_range()
+        self.scaleChanged.emit()
 
     @Slot(float, float, float, float)
     def setViewRange(self, x_min: float, x_max: float, y_min: float, y_max: float):
-        """Set explicit view range"""
-        self._auto_scale = False
-        self._x_min = x_min
-        self._x_max = x_max
-        self._y_min = y_min
-        self._y_max = y_max
-        self._needs_redraw = True
+        """Set explicit view range (drops auto-range; pushes history)."""
+        self._viewbox.set_view_range(x_min, x_max, y_min, y_max)
         self.scaleChanged.emit()
-        self.update()
 
     @Slot(float)
     def zoomIn(self, factor: float = 1.2):
-        """Zoom in by factor, centered on viewport (works with log scale)"""
+        """Zoom in by ``factor``, centred on the viewport. Uses the
+        viewbox's wheel-zoom helper at the axes centre point so log
+        scales stay correct via the registered pixel↔data adapter.
+        """
         d = self._data_bounds
         if not d:
             return
-
-        ax_w = d['ax_right'] - d['ax_left']
-        ax_h = d['ax_bottom'] - d['ax_top']
-        if ax_w <= 0 or ax_h <= 0:
-            return
-
-        shrink = 1.0 / factor
-        cx = d['ax_left'] + ax_w / 2
-        cy = d['ax_top'] + ax_h / 2
-
-        new_left = cx - ax_w * shrink / 2
-        new_right = cx + ax_w * shrink / 2
-        new_top = cy - ax_h * shrink / 2
-        new_bottom = cy + ax_h * shrink / 2
-
-        xmin, ymax = self._pixelToData(new_left, new_top)
-        xmax, ymin = self._pixelToData(new_right, new_bottom)
-        self.setViewRange(xmin, xmax, ymin, ymax)
+        cx = d['ax_left'] + (d['ax_right'] - d['ax_left']) / 2
+        cy = d['ax_top'] + (d['ax_bottom'] - d['ax_top']) / 2
+        # Map the user-facing ``factor`` (>1 = zoom in) onto
+        # ``handle_wheel``'s ``zoom_step`` (<1 = shrink) and use a
+        # positive delta to take the "zoom in" branch.
+        self._viewbox.handle_wheel(
+            (cx, cy), delta_y=120.0, zoom_step=1.0 / float(factor),
+        )
+        self.scaleChanged.emit()
 
     @Slot(float)
     def zoomOut(self, factor: float = 1.2):
-        """Zoom out by factor"""
-        self.zoomIn(1.0 / factor)
+        """Zoom out by ``factor``, centred on the viewport."""
+        d = self._data_bounds
+        if not d:
+            return
+        cx = d['ax_left'] + (d['ax_right'] - d['ax_left']) / 2
+        cy = d['ax_top'] + (d['ax_bottom'] - d['ax_top']) / 2
+        self._viewbox.handle_wheel(
+            (cx, cy), delta_y=-120.0, zoom_step=1.0 / float(factor),
+        )
+        self.scaleChanged.emit()
+
+    @Slot()
+    def undoZoom(self):
+        """Pop the most recent prior view off the viewbox history."""
+        if self._viewbox.undo_view():
+            self.scaleChanged.emit()
+
+    # mouseMode property — "pan" (default) or "rect" (drag = zoom-rect).
+    mouseModeChanged = Signal(str)
+
+    def _get_mouse_mode(self) -> str:
+        return self._viewbox.mouse_mode()
+
+    def _set_mouse_mode(self, value: str) -> None:
+        current = self._viewbox.mouse_mode()
+        new = value if value in (MOUSE_MODE_PAN, MOUSE_MODE_RECT) else current
+        if new != current:
+            self._viewbox.set_mouse_mode(new)
+            self.mouseModeChanged.emit(new)
+
+    mouseMode = Property(
+        str, _get_mouse_mode, _set_mouse_mode, notify=mouseModeChanged,
+    )
 
     @Slot(str, str)
     def setLabels(self, x_label: str, y_label: str):
@@ -778,7 +868,14 @@ class QMLGraphCanvas(QQuickPaintedItem):
             self._y_max += y_margin
 
     def _updateDataBounds(self):
-        """Update pixel-to-data coordinate mapping"""
+        """Refresh the pixel-to-data mapping after each render.
+
+        Also registers the transform adapters and the axes pixel rect
+        with the viewbox so its interaction handlers can do their own
+        pixel↔data math without referencing the canvas directly.
+        Phase 3 will swap the matplotlib-backed adapter for a
+        ``QTransform``-backed one without changing this call site.
+        """
         bbox = self.axes.get_position()
         fig_w, fig_h = self.canvas.get_width_height()
 
@@ -795,6 +892,26 @@ class QMLGraphCanvas(QQuickPaintedItem):
             'y_min': ylim[0],
             'y_max': ylim[1]
         }
+
+        # Plug the viewbox transform + axes rect for interaction math.
+        self._viewbox.set_transforms(self._pixelToData, self._dataToPixel)
+        self._viewbox.set_axes_pixel_rect((
+            self._data_bounds['ax_left'],
+            self._data_bounds['ax_top'],
+            self._data_bounds['ax_right'],
+            self._data_bounds['ax_bottom'],
+        ))
+        # Register the data extent so ``trigger_auto_range`` (used by
+        # ``resetView`` and double-click) has something to snap to.
+        # ``_calculateAutoBounds`` already wrote the current data
+        # extent into ``_x_min/_x_max/_y_min/_y_max`` before
+        # ``set_xlim``/``set_ylim`` were called.
+        self._viewbox.set_auto_range_data(ViewRect(
+            self._x_min, self._x_max, self._y_min, self._y_max,
+        ))
+        # ``_calculateAutoBounds`` already applies a 5 % margin to the
+        # data extent, so leave the viewbox's auto-range margin at 0.
+        self._viewbox.set_auto_range_margin(0.0)
 
     def _dataToPixel(self, x: float, y: float) -> Tuple[float, float]:
         """Convert data coordinates to pixel coordinates (handles log scale)"""
@@ -836,14 +953,16 @@ class QMLGraphCanvas(QQuickPaintedItem):
             if self._cursor_y is not None and d['ax_top'] <= cpy <= d['ax_bottom']:
                 painter.drawLine(int(d['ax_left']), int(cpy), int(d['ax_right']), int(cpy))
 
-        # Draw selection rectangle
-        if self._selection_start is not None and self._selection_end is not None:
-            px1, py1 = self._dataToPixel(self._selection_start[0], self._selection_start[1])
-            px2, py2 = self._dataToPixel(self._selection_end[0], self._selection_end[1])
-
-            rect = QRectF(min(px1, px2), min(py1, py2),
-                         abs(px2 - px1), abs(py2 - py1))
-
+        # Draw the rubber-band selection rectangle from the viewbox.
+        sel = self._viewbox.selection_box_data()
+        if sel is not None:
+            x_min, y_min, x_max, y_max = sel
+            px1, py1 = self._dataToPixel(x_min, y_min)
+            px2, py2 = self._dataToPixel(x_max, y_max)
+            rect = QRectF(
+                min(px1, px2), min(py1, py2),
+                abs(px2 - px1), abs(py2 - py1),
+            )
             pen = QPen(QColor(100, 200, 255, 180))
             pen.setWidth(1)
             painter.setPen(pen)
@@ -855,14 +974,16 @@ class QMLGraphCanvas(QQuickPaintedItem):
     # =========================================================================
 
     def mousePressEvent(self, event):
-        """Handle mouse press — left: select/zoom-rect, right: pan"""
+        """Left → ``pointClicked`` + curve-pick + start drag-zoom rect.
+        Right → start pan. All interaction state lives on the
+        viewbox; this method just dispatches and emits the canvas's
+        signals (curve clicks, point clicks)."""
         pos = event.position()
-        x, y = self._pixelToData(pos.x(), pos.y())
+        pos_px = (pos.x(), pos.y())
 
         if event.button() == Qt.LeftButton:
+            x, y = self._pixelToData(*pos_px)
             self.pointClicked.emit(x, y)
-
-            # Check for curve click (simple proximity check)
             clicked_curve = self._findNearestCurve(x, y)
             if clicked_curve is not None:
                 self._selected_curve_id = clicked_curve
@@ -870,111 +991,52 @@ class QMLGraphCanvas(QQuickPaintedItem):
                 self.curveSelected.emit(clicked_curve)
                 self._needs_redraw = True
                 self.update()
-
-            # Start drag-zoom selection
-            self._is_selecting = True
-            self._selection_start = (x, y)
-            self._selection_end = (x, y)
+            self._viewbox.handle_press_left(pos_px)
 
         elif event.button() == Qt.RightButton:
-            # Start panning (track in pixel space for log-scale correctness)
-            self._is_panning = True
-            self._pan_last_px = (pos.x(), pos.y())
+            self._viewbox.handle_press_right(pos_px)
 
     def mouseMoveEvent(self, event):
-        """Handle mouse move — drag-zoom rect or pan"""
+        """Update cursor read-out + delegate the active pan / rubber-
+        band-zoom interaction to the viewbox."""
         pos = event.position()
-        x, y = self._pixelToData(pos.x(), pos.y())
-
+        pos_px = (pos.x(), pos.y())
+        x, y = self._pixelToData(*pos_px)
         self._cursor_x = x
         self._cursor_y = y
         self._show_cursor = True
         self.cursorMoved.emit(x, y)
-
-        if self._is_selecting:
-            self._selection_end = (x, y)
-            self.update()
-        elif self._is_panning and self._pan_last_px is not None:
-            # Pan in pixel space — works correctly for both linear and log scale
-            dx_px = pos.x() - self._pan_last_px[0]
-            dy_px = pos.y() - self._pan_last_px[1]
-
-            d = self._data_bounds
-            if d:
-                ax_w = d['ax_right'] - d['ax_left']
-                ax_h = d['ax_bottom'] - d['ax_top']
-                if ax_w > 0 and ax_h > 0:
-                    # Convert viewport corners shifted by pixel delta back to data coords
-                    new_xmin, _ = self._pixelToData(d['ax_left'] - dx_px, d['ax_top'])
-                    new_xmax, _ = self._pixelToData(d['ax_right'] - dx_px, d['ax_top'])
-                    _, new_ymin = self._pixelToData(d['ax_left'], d['ax_bottom'] - dy_px)
-                    _, new_ymax = self._pixelToData(d['ax_left'], d['ax_top'] - dy_px)
-
-                    self.setViewRange(new_xmin, new_xmax, new_ymin, new_ymax)
-                    self._pan_last_px = (pos.x(), pos.y())
+        self._viewbox.handle_move(pos_px)
 
     def mouseReleaseEvent(self, event):
-        """Handle mouse release — drag-zoom to selected rectangle"""
-        if event.button() == Qt.LeftButton and self._is_selecting:
-            if self._selection_start and self._selection_end:
-                x1, y1 = self._selection_start
-                x2, y2 = self._selection_end
-
-                # Check pixel distance to distinguish click from drag
-                px1, py1 = self._dataToPixel(x1, y1)
-                px2, py2 = self._dataToPixel(x2, y2)
-                if abs(px2 - px1) > 5 and abs(py2 - py1) > 5:
-                    xlo, xhi = min(x1, x2), max(x1, x2)
-                    ylo, yhi = min(y1, y2), max(y1, y2)
-                    self.setViewRange(xlo, xhi, ylo, yhi)
-                    self.rangeSelected.emit(xlo, ylo, xhi, yhi)
-
-            self._is_selecting = False
-            self._selection_start = None
-            self._selection_end = None
+        """Finish a left-drag (zoom-rect, may emit ``rangeSelected``)
+        or a right-drag (pan)."""
+        pos = event.position()
+        pos_px = (pos.x(), pos.y())
+        if event.button() == Qt.LeftButton:
+            result = self._viewbox.handle_release_left(pos_px)
+            if result is not None:
+                x_min, y_min, x_max, y_max = result
+                self.scaleChanged.emit()
+                self.rangeSelected.emit(x_min, y_min, x_max, y_max)
             self.update()
-
         elif event.button() == Qt.RightButton:
-            self._is_panning = False
-            self._pan_last_px = None
+            self._viewbox.handle_release_right()
 
     def mouseDoubleClickEvent(self, event):
-        """Double-click to reset view"""
+        """Double-click resets to auto-range via the viewbox."""
         if event.button() == Qt.LeftButton:
-            self.resetView()
+            self._viewbox.handle_double_click()
+            self.scaleChanged.emit()
 
     def wheelEvent(self, event):
-        """Handle scroll wheel for zoom centered on cursor (works with log scale)"""
-        d = self._data_bounds
-        if not d:
-            return
-
+        """Wheel zoom centred on the cursor — viewbox does the math
+        via the registered pixel↔data adapter (so log scale stays
+        correct)."""
         pos = event.position()
-        delta = event.angleDelta().y()
-        shrink = 0.85 if delta > 0 else 1.0 / 0.85  # fraction of current range to keep
-
-        ax_w = d['ax_right'] - d['ax_left']
-        ax_h = d['ax_bottom'] - d['ax_top']
-        if ax_w <= 0 or ax_h <= 0:
-            return
-
-        # Cursor fraction within axes area
-        fx = (pos.x() - d['ax_left']) / ax_w
-        fy = (pos.y() - d['ax_top']) / ax_h
-        fx = max(0.0, min(1.0, fx))
-        fy = max(0.0, min(1.0, fy))
-
-        # New pixel bounds: shrink/expand around cursor pixel
-        new_left = pos.x() - fx * ax_w * shrink
-        new_right = pos.x() + (1 - fx) * ax_w * shrink
-        new_top = pos.y() - fy * ax_h * shrink
-        new_bottom = pos.y() + (1 - fy) * ax_h * shrink
-
-        # Convert back to data coords (handles log scale via matplotlib transform)
-        xmin, ymax = self._pixelToData(new_left, new_top)
-        xmax, ymin = self._pixelToData(new_right, new_bottom)
-
-        self.setViewRange(xmin, xmax, ymin, ymax)
+        delta = float(event.angleDelta().y())
+        if self._viewbox.handle_wheel((pos.x(), pos.y()), delta_y=delta):
+            self.scaleChanged.emit()
 
     def hoverMoveEvent(self, event):
         """Handle hover — emit cursor position but don't repaint (avoids excessive redraws)"""
