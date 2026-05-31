@@ -1945,7 +1945,9 @@ class ToolImplementations:
             base_name = self._extract_clean_base_name(dataset_name)
             file_safe_name = self._sanitize_filename(base_name)
 
-            # Build good dataset (with optional periodic correction)
+            # Build good dataset (with optional periodic correction).
+            # Carry the original spectrum captions across so downstream
+            # processing can still identify each column by name.
             good_name = f"{base_name} - Good Data"
             if good_indices:
                 good_cols = [spectra.columns[i] for i in good_indices]
@@ -1959,12 +1961,12 @@ class ToolImplementations:
                             good_data.append(spectra.iloc[:, idx].values)
                     good_df = pd.DataFrame(
                         np.column_stack(good_data),
-                        columns=[f"Spectrum_{i}" for i in range(len(good_indices))]
+                        columns=good_cols,
                     )
                 else:
                     good_df = pd.DataFrame(
                         spectra[good_cols].values,
-                        columns=[f"Spectrum_{i}" for i in range(len(good_indices))]
+                        columns=good_cols,
                     )
                 good_df.insert(0, spectral_data.independent_var_name, independent_var)
 
@@ -1992,7 +1994,7 @@ class ToolImplementations:
                 bad_cols = [spectra.columns[i] for i in bad_indices]
                 bad_df = pd.DataFrame(
                     spectra[bad_cols].values,
-                    columns=[f"Spectrum_{i}" for i in range(len(bad_indices))]
+                    columns=bad_cols,
                 )
                 bad_df.insert(0, spectral_data.independent_var_name, independent_var)
 

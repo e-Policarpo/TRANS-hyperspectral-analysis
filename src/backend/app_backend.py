@@ -5184,10 +5184,20 @@ class AppBackend(ToolImplementations, QObject):
                 x_name = getattr(dataset, 'independent_var_name', 'x')
                 headers.append(x_name)
 
-                # Add spectrum column headers
+                # Pull the real spectrum captions out of the DataFrame
+                # column names (loaders stamp them there). Fall back to
+                # ``Spectrum N`` only when the column name is missing —
+                # processing/analysis is much easier when the headers
+                # actually identify each spectrum.
                 num_cols = dataset.num_spectra
+                spectra_columns = list(dataset.spectra.columns)
                 for i in range(num_cols):
-                    headers.append(f"Spectrum {i+1}")
+                    name = (
+                        str(spectra_columns[i]).strip()
+                        if i < len(spectra_columns) and spectra_columns[i]
+                        else ""
+                    )
+                    headers.append(name or f"Spectrum {i+1}")
 
                 # Build rows
                 x = dataset.independent_var
