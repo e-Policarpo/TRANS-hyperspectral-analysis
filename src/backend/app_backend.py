@@ -1809,40 +1809,66 @@ class AppBackend(ToolImplementations, QObject):
 
     @staticmethod
     def _pixel_scale_tiff_kwargs(image: "ImageData") -> Dict[str, Any]:
-        """Build tifffile kwargs that encode the image's µm/pixel scale.
+        """Build tifffile kwargs for writing a viewer-friendly TIFF.
 
-        Returns ``{}`` when the image carries no calibration, so the call
-        site can ``**`` the result unconditionally. Metadata only — does
-        not bake a scale bar into pixels.
+        Three things are bundled here so every TIFF we emit is openable
+        by macOS Preview / Adobe / Fiji without modification:
 
-        Canonical ImageJ-style encoding: ``XResolution`` / ``YResolution``
-        as pixels-per-unit (TIFF rationals), ``ResolutionUnit = NONE`` (1),
-        and a free-form ``ImageDescription`` carrying ``unit=…`` so Fiji /
-        ImageJ pick up the physical scale.
+        1. **Pixel-scale tags** (when the image carries calibration):
+           ``XResolution`` / ``YResolution`` as pixels-per-unit, with
+           ``ResolutionUnit=NONE`` and an ImageJ-style ``description``
+           carrying ``unit=…`` so Fiji picks up the physical scale.
+           The rational is encoded with a fixed denominator (1e6) so we
+           don't saturate the uint32 numerator on small pixel sizes
+           (~0.12 µm/px would otherwise blow up to 4 294 967 295 / N
+           and trip strict TIFF parsers).
+        2. **Multi-strip layout** (``rowsperstrip=64``): single-strip
+           TIFFs covering tens of megabytes break macOS Preview, which
+           tries to read the whole strip into memory in one go.
+        3. **``metadata=None``** suppresses tifffile's auto
+           ``{"shape": [...]}`` tag — that tag duplicates
+           ``ImageDescription`` (resulting in two tag-270 entries),
+           which is non-standard and confuses some viewers.
+
+        Returns the kwargs dict; safe to ``**``-splat into
+        ``tifffile.imwrite``.
         """
+        kwargs: Dict[str, Any] = {
+            "metadata": None,
+            "rowsperstrip": 64,
+        }
         meta = getattr(image, "metadata", None)
         ai = getattr(meta, "additional_info", None) or {}
         ps = ai.get("pixel_size")
         if not isinstance(ps, dict):
-            return {}
+            return kwargs
         try:
             dx = float(ps.get("dx") or 0.0)
             dy = float(ps.get("dy") or 0.0)
         except (TypeError, ValueError):
-            return {}
+            return kwargs
         if dx <= 0 or dy <= 0:
-            return {}
+            return kwargs
         unit = str(ps.get("unit") or "µm").strip()
         ij_unit = {
             "µm": "micron", "um": "micron", "micron": "micron",
             "microns": "micron",
             "nm": "nm", "mm": "mm", "cm": "cm", "m": "meter",
         }.get(unit, unit)
-        return {
-            "resolution": (1.0 / dx, 1.0 / dy),
+
+        # Fixed-denominator rational keeps the encoding readable on any
+        # parser (and avoids tifffile's saturation behaviour on tiny
+        # pixel sizes).
+        denom = 1_000_000
+        x_num = int(round((1.0 / dx) * denom))
+        y_num = int(round((1.0 / dy) * denom))
+
+        kwargs.update({
+            "resolution": ((x_num, denom), (y_num, denom)),
             "resolutionunit": "NONE",
             "description": f"ImageJ=1.54p\nunit={ij_unit}\n",
-        }
+        })
+        return kwargs
 
     def _save_image_to_tiff(self, image: "ImageData") -> Optional[str]:
         """Persist ``image`` as a TIFF on disk and return its absolute path.
