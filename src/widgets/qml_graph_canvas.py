@@ -34,6 +34,13 @@ from src.widgets._pyqtgraph_ports.curve_path import (
     array_to_qpainterpath,
     prepare_curve_xy,
 )
+from src.widgets._pyqtgraph_ports.items.linear_region import (
+    HIT_BODY as LR_HIT_BODY,
+    HIT_HANDLE_HI as LR_HIT_HANDLE_HI,
+    HIT_HANDLE_LO as LR_HIT_HANDLE_LO,
+    HIT_NONE as LR_HIT_NONE,
+    LinearRegionItem,
+)
 from src.widgets._pyqtgraph_ports.legend import (
     HIT_BODY,
     HIT_EYE,
@@ -124,6 +131,17 @@ class QMLGraphCanvas(QQuickPaintedItem):
     curvesChanged = Signal()
     scaleChanged = Signal()
 
+    # Phase 6 — interactive overlay items. ``regionId`` is whatever
+    # string identifier the caller passed to ``addLinearRegion``.
+    overlayRegionChanged = Signal(
+        str, float, float,
+        arguments=['regionId', 'xLow', 'xHigh'],
+    )
+    overlayRegionChangeFinished = Signal(
+        str, float, float,
+        arguments=['regionId', 'xLow', 'xHigh'],
+    )
+
     # Color palette for auto-assignment
     DEFAULT_COLORS = [
         '#5BCEFA', '#F5A9B8', '#66ff66', '#FFD700', '#FF6B6B',
@@ -213,6 +231,14 @@ class QMLGraphCanvas(QQuickPaintedItem):
         self._legend = LegendBox()
         self._legend_drag_active: bool = False
         self._legend_drag_last_px: Optional[Tuple[float, float]] = None
+
+        # Phase 6 — interactive overlay items (LinearRegionItem
+        # first; InfiniteLine / TargetItem / RectROI in subsequent
+        # sub-commits). Ordering matters: drawn in list order on top
+        # of curves, hit-tested in reverse so a newer overlay can
+        # cover an older one.
+        self._overlay_items: list[LinearRegionItem] = []
+        self._overlay_drag: Optional[Dict[str, Any]] = None
 
     # =====================================================================
     # ViewBox shims — keep the existing render-side writes
@@ -1115,7 +1141,153 @@ class QMLGraphCanvas(QQuickPaintedItem):
             ]
             self._legend.set_hidden_curves(hidden_ids)
             self._native_draw_legend(painter, ax_rect)
+        if self._overlay_items:
+            self._render_overlay_items(painter, ax_rect)
         self._drawOverlays(painter)
+
+    # =========================================================================
+    # Phase 6 — interactive overlay items
+    # =========================================================================
+
+    def _overlay_data_to_pixel_x(self):
+        """Build a 1-D ``data_to_pixel_x`` callable from the canvas's
+        full ``_dataToPixel``. The y-coordinate is unused for vertical
+        overlay items but the helper needs a numeric to feed through."""
+        y_anchor = self._y_min
+        return lambda x: self._dataToPixel(x, y_anchor)[0]
+
+    def _render_overlay_items(
+        self,
+        painter: QPainter,
+        ax_rect: QRectF,
+    ) -> None:
+        data_to_pixel_x = self._overlay_data_to_pixel_x()
+        active_id = (
+            self._overlay_drag["region_id"]
+            if self._overlay_drag is not None else None
+        )
+        for item in self._overlay_items:
+            hover = (item.region_id == active_id)
+            item.render(
+                painter, ax_rect, data_to_pixel_x, hover=hover,
+            )
+
+    def _find_overlay_at(
+        self,
+        x_pixel: float,
+        ax_rect: QRectF,
+    ) -> Optional[Tuple[LinearRegionItem, str]]:
+        """Return the topmost overlay (last-drawn) that claims a press
+        at ``x_pixel``, paired with its hit type."""
+        if not self._overlay_items:
+            return None
+        data_to_pixel_x = self._overlay_data_to_pixel_x()
+        for item in reversed(self._overlay_items):
+            hit = item.hit_test(
+                x_pixel,
+                data_to_pixel_x=data_to_pixel_x,
+                ax_rect=ax_rect,
+            )
+            if hit != LR_HIT_NONE:
+                return item, hit
+        return None
+
+    def _emit_overlay_change(
+        self,
+        item: LinearRegionItem,
+        finished: bool,
+    ) -> None:
+        lo, hi = item.region()
+        rid = str(item.region_id)
+        if finished:
+            self.overlayRegionChangeFinished.emit(rid, lo, hi)
+        else:
+            self.overlayRegionChanged.emit(rid, lo, hi)
+
+    # --- QML-facing slots ----------------------------------------------------
+
+    @Slot(str, float, float)
+    def addLinearRegion(
+        self,
+        regionId: str,
+        xLow: float,
+        xHigh: float,
+    ) -> None:
+        """Add a vertical-band overlay between ``xLow`` and ``xHigh``.
+        Replaces any existing region with the same id."""
+        self.addLinearRegionWithOptions(regionId, xLow, xHigh, "", "")
+
+    @Slot(str, float, float, str, str)
+    def addLinearRegionWithOptions(
+        self,
+        regionId: str,
+        xLow: float,
+        xHigh: float,
+        color: str,
+        label: str,
+    ) -> None:
+        """Variant accepting ``color`` (hex string, empty = default)
+        and ``label`` (empty = none)."""
+        if not regionId:
+            return
+        self.removeOverlay(regionId)
+        item = LinearRegionItem(
+            region_id=regionId,
+            values=(float(xLow), float(xHigh)),
+            pen_color=color or "#5BCEFA",
+            brush_color=color or "#5BCEFA",
+            label=label or "",
+        )
+        self._overlay_items.append(item)
+        self._needs_redraw = True
+        self.update()
+
+    @Slot(str)
+    def removeOverlay(self, regionId: str) -> None:
+        """Remove the overlay with this id (no-op if not found)."""
+        before = len(self._overlay_items)
+        self._overlay_items = [
+            it for it in self._overlay_items
+            if str(it.region_id) != regionId
+        ]
+        if (
+            self._overlay_drag is not None
+            and self._overlay_drag.get("region_id") == regionId
+        ):
+            self._overlay_drag = None
+        if len(self._overlay_items) != before:
+            self._needs_redraw = True
+            self.update()
+
+    @Slot()
+    def clearOverlays(self) -> None:
+        if not self._overlay_items:
+            return
+        self._overlay_items.clear()
+        self._overlay_drag = None
+        self._needs_redraw = True
+        self.update()
+
+    @Slot(str, result='QVariantList')
+    def getOverlayRegion(self, regionId: str):
+        """Return ``[xLow, xHigh]`` for the named region, or an empty
+        list if the region is missing."""
+        for item in self._overlay_items:
+            if str(item.region_id) == regionId:
+                lo, hi = item.region()
+                return [float(lo), float(hi)]
+        return []
+
+    @Slot(str, float, float)
+    def setOverlayRegion(
+        self, regionId: str, xLow: float, xHigh: float,
+    ) -> None:
+        for item in self._overlay_items:
+            if str(item.region_id) == regionId:
+                if item.set_region(float(xLow), float(xHigh)):
+                    self._needs_redraw = True
+                    self.update()
+                return
 
     @staticmethod
     def _native_log_safe(
@@ -1591,6 +1763,32 @@ class QMLGraphCanvas(QQuickPaintedItem):
                     self._legend_drag_last_px = pos_px
                     return
 
+            # Overlay items (LinearRegionItem etc.) come next: if the
+            # press lands on a handle or band, take it for that item
+            # and short-circuit the viewbox so a region drag doesn't
+            # also begin a zoom-rect.
+            if self._use_fast_render and self._overlay_items and self._data_bounds:
+                d = self._data_bounds
+                ax_rect = QRectF(
+                    d['ax_left'], d['ax_top'],
+                    d['ax_right'] - d['ax_left'],
+                    d['ax_bottom'] - d['ax_top'],
+                )
+                hit_result = self._find_overlay_at(pos_px[0], ax_rect)
+                if hit_result is not None:
+                    item, lr_hit = hit_result
+                    x_data, _ = self._pixelToData(*pos_px)
+                    press_state = item.begin_drag(x_data, lr_hit)
+                    self._overlay_drag = {
+                        "region_id": item.region_id,
+                        "item": item,
+                        "press": press_state,
+                    }
+                    self._emit_overlay_change(item, finished=False)
+                    self._needs_redraw = True
+                    self.update()
+                    return
+
             x, y = self._pixelToData(*pos_px)
             self.pointClicked.emit(x, y)
             clicked_curve = self._findNearestCurve(x, y)
@@ -1649,6 +1847,16 @@ class QMLGraphCanvas(QQuickPaintedItem):
                     self.update()
             return
 
+        if self._overlay_drag is not None:
+            item = self._overlay_drag["item"]
+            press = self._overlay_drag["press"]
+            x_data, _ = self._pixelToData(*pos_px)
+            if item.update_drag(x_data, press):
+                self._emit_overlay_change(item, finished=False)
+                self._needs_redraw = True
+                self.update()
+            return
+
         self._viewbox.handle_move(pos_px)
 
     def mouseReleaseEvent(self, event):
@@ -1660,6 +1868,13 @@ class QMLGraphCanvas(QQuickPaintedItem):
             if self._legend_drag_active:
                 self._legend_drag_active = False
                 self._legend_drag_last_px = None
+                self.update()
+                return
+            if self._overlay_drag is not None:
+                item = self._overlay_drag["item"]
+                self._emit_overlay_change(item, finished=True)
+                self._overlay_drag = None
+                self._needs_redraw = True
                 self.update()
                 return
             result = self._viewbox.handle_release_left(pos_px)
