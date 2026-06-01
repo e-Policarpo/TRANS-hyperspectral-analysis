@@ -28,6 +28,14 @@ from .linear_region import (  # noqa: F401
     LinearRegionItem,
     LinearRegionState,
 )
+from .target_item import (  # noqa: F401
+    HIT_TARGET,
+    HIT_NONE as TARGET_HIT_NONE,
+    SYMBOL_CIRCLE,
+    SYMBOL_CROSSHAIR,
+    TargetItem,
+    TargetItemState,
+)
 
 __all__ = [
     "HIT_BODY",
@@ -35,6 +43,7 @@ __all__ = [
     "HIT_HANDLE_LO",
     "HIT_LINE",
     "HIT_NONE",
+    "HIT_TARGET",
     "INFLINE_HIT_NONE",
     "InfiniteLine",
     "InfiniteLineState",
@@ -42,4 +51,9 @@ __all__ = [
     "LinearRegionState",
     "ORIENT_HORIZONTAL",
     "ORIENT_VERTICAL",
+    "SYMBOL_CIRCLE",
+    "SYMBOL_CROSSHAIR",
+    "TARGET_HIT_NONE",
+    "TargetItem",
+    "TargetItemState",
 ]

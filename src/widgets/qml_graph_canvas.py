@@ -48,6 +48,13 @@ from src.widgets._pyqtgraph_ports.items.linear_region import (
     HIT_NONE as LR_HIT_NONE,
     LinearRegionItem,
 )
+from src.widgets._pyqtgraph_ports.items.target_item import (
+    HIT_NONE as TI_HIT_NONE,
+    HIT_TARGET as TI_HIT_TARGET,
+    SYMBOL_CROSSHAIR as TI_SYMBOL_CROSSHAIR,
+    SYMBOL_CIRCLE as TI_SYMBOL_CIRCLE,
+    TargetItem,
+)
 from src.widgets._pyqtgraph_ports.legend import (
     HIT_BODY,
     HIT_EYE,
@@ -154,6 +161,14 @@ class QMLGraphCanvas(QQuickPaintedItem):
     overlayLineChangeFinished = Signal(
         str, float, arguments=['lineId', 'value'],
     )
+    overlayTargetChanged = Signal(
+        str, float, float,
+        arguments=['targetId', 'x', 'y'],
+    )
+    overlayTargetChangeFinished = Signal(
+        str, float, float,
+        arguments=['targetId', 'x', 'y'],
+    )
 
     # Color palette for auto-assignment
     DEFAULT_COLORS = [
@@ -252,6 +267,7 @@ class QMLGraphCanvas(QQuickPaintedItem):
         # cover an older one.
         self._overlay_items: list[LinearRegionItem] = []
         self._infinite_lines: list[InfiniteLine] = []
+        self._target_items: list[TargetItem] = []
         self._overlay_drag: Optional[Dict[str, Any]] = None
 
     # =====================================================================
@@ -1159,6 +1175,8 @@ class QMLGraphCanvas(QQuickPaintedItem):
             self._render_overlay_items(painter, ax_rect)
         if self._infinite_lines:
             self._render_infinite_lines(painter, ax_rect)
+        if self._target_items:
+            self._render_target_items(painter, ax_rect)
         self._drawOverlays(painter)
 
     # =========================================================================
@@ -1441,6 +1459,151 @@ class QMLGraphCanvas(QQuickPaintedItem):
         for line in self._infinite_lines:
             if str(line.line_id) == lineId:
                 if line.set_value(float(value)):
+                    self._needs_redraw = True
+                    self.update()
+                return
+
+    # --- TargetItem helpers + slots -----------------------------------------
+
+    def _render_target_items(
+        self,
+        painter: QPainter,
+        ax_rect: QRectF,
+    ) -> None:
+        active_id = (
+            self._overlay_drag["region_id"]
+            if (
+                self._overlay_drag is not None
+                and self._overlay_drag.get("kind") == "target"
+            )
+            else None
+        )
+        for tgt in self._target_items:
+            hover = (tgt.target_id == active_id)
+            tgt.render(
+                painter, ax_rect, self._dataToPixel, hover=hover,
+            )
+
+    def _find_target_at(
+        self,
+        x_pixel: float,
+        y_pixel: float,
+        ax_rect: QRectF,
+    ) -> Optional[Tuple[TargetItem, str]]:
+        if not self._target_items:
+            return None
+        for tgt in reversed(self._target_items):
+            hit = tgt.hit_test(
+                x_pixel, y_pixel,
+                data_to_pixel=self._dataToPixel,
+                ax_rect=ax_rect,
+            )
+            if hit != TI_HIT_NONE:
+                return tgt, hit
+        return None
+
+    def _emit_target_change(
+        self,
+        tgt: TargetItem,
+        finished: bool,
+    ) -> None:
+        tid = str(tgt.target_id)
+        x, y = tgt.position()
+        if finished:
+            self.overlayTargetChangeFinished.emit(tid, x, y)
+        else:
+            self.overlayTargetChanged.emit(tid, x, y)
+
+    @Slot(str, float, float)
+    def addTarget(
+        self,
+        targetId: str,
+        x: float,
+        y: float,
+    ) -> None:
+        """Add a crosshair marker at ``(x, y)``. Replaces any existing
+        target with the same id."""
+        self.addTargetWithOptions(
+            targetId, x, y, "", "", TI_SYMBOL_CROSSHAIR,
+        )
+
+    @Slot(str, float, float, str, str, str)
+    def addTargetWithOptions(
+        self,
+        targetId: str,
+        x: float,
+        y: float,
+        color: str,
+        label: str,
+        symbol: str,
+    ) -> None:
+        if not targetId:
+            return
+        if symbol and symbol not in (TI_SYMBOL_CROSSHAIR, TI_SYMBOL_CIRCLE):
+            logger.warning(
+                "Ignoring addTarget: bad symbol %r", symbol,
+            )
+            return
+        self.removeTarget(targetId)
+        tgt = TargetItem(
+            target_id=targetId,
+            position=(float(x), float(y)),
+            pen_color=color or "#FFD700",
+            brush_color=color or "#5BCEFA",
+            label=label or "",
+            symbol=symbol or TI_SYMBOL_CROSSHAIR,
+        )
+        self._target_items.append(tgt)
+        self._needs_redraw = True
+        self.update()
+
+    @Slot(str)
+    def removeTarget(self, targetId: str) -> None:
+        before = len(self._target_items)
+        self._target_items = [
+            t for t in self._target_items
+            if str(t.target_id) != targetId
+        ]
+        if (
+            self._overlay_drag is not None
+            and self._overlay_drag.get("kind") == "target"
+            and self._overlay_drag.get("region_id") == targetId
+        ):
+            self._overlay_drag = None
+        if len(self._target_items) != before:
+            self._needs_redraw = True
+            self.update()
+
+    @Slot()
+    def clearTargets(self) -> None:
+        if not self._target_items:
+            return
+        self._target_items.clear()
+        if (
+            self._overlay_drag is not None
+            and self._overlay_drag.get("kind") == "target"
+        ):
+            self._overlay_drag = None
+        self._needs_redraw = True
+        self.update()
+
+    @Slot(str, result='QVariantList')
+    def getTargetPosition(self, targetId: str):
+        """Return ``[x, y]`` for the named target, or an empty list
+        if it's missing."""
+        for tgt in self._target_items:
+            if str(tgt.target_id) == targetId:
+                x, y = tgt.position()
+                return [float(x), float(y)]
+        return []
+
+    @Slot(str, float, float)
+    def setTargetPosition(
+        self, targetId: str, x: float, y: float,
+    ) -> None:
+        for tgt in self._target_items:
+            if str(tgt.target_id) == targetId:
+                if tgt.set_position(float(x), float(y)):
                     self._needs_redraw = True
                     self.update()
                 return
@@ -1925,6 +2088,7 @@ class QMLGraphCanvas(QQuickPaintedItem):
             # also begin a zoom-rect.
             if self._use_fast_render and self._data_bounds and (
                 self._overlay_items or self._infinite_lines
+                or self._target_items
             ):
                 d = self._data_bounds
                 ax_rect = QRectF(
@@ -1961,6 +2125,23 @@ class QMLGraphCanvas(QQuickPaintedItem):
                         "press": press_state,
                     }
                     self._emit_infinite_line_change(line, finished=False)
+                    self._needs_redraw = True
+                    self.update()
+                    return
+                target_result = self._find_target_at(
+                    pos_px[0], pos_px[1], ax_rect,
+                )
+                if target_result is not None:
+                    tgt, _ = target_result
+                    x_data, y_data = self._pixelToData(*pos_px)
+                    press_state = tgt.begin_drag(x_data, y_data)
+                    self._overlay_drag = {
+                        "kind": "target",
+                        "region_id": tgt.target_id,
+                        "item": tgt,
+                        "press": press_state,
+                    }
+                    self._emit_target_change(tgt, finished=False)
                     self._needs_redraw = True
                     self.update()
                     return
@@ -2038,6 +2219,11 @@ class QMLGraphCanvas(QQuickPaintedItem):
                     self._emit_infinite_line_change(item, finished=False)
                     self._needs_redraw = True
                     self.update()
+            elif kind == "target":
+                if item.update_drag(x_data, y_data, press):
+                    self._emit_target_change(item, finished=False)
+                    self._needs_redraw = True
+                    self.update()
             return
 
         self._viewbox.handle_move(pos_px)
@@ -2060,6 +2246,8 @@ class QMLGraphCanvas(QQuickPaintedItem):
                     self._emit_overlay_change(item, finished=True)
                 elif kind == "infinite_line":
                     self._emit_infinite_line_change(item, finished=True)
+                elif kind == "target":
+                    self._emit_target_change(item, finished=True)
                 self._overlay_drag = None
                 self._needs_redraw = True
                 self.update()
