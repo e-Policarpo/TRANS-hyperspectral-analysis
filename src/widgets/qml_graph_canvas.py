@@ -35,7 +35,11 @@ from src.widgets._pyqtgraph_ports.curve_path import (
     prepare_curve_xy,
 )
 from src.widgets._pyqtgraph_ports.mpl_apply import apply_pyqtgraph_ticks
-from src.widgets._pyqtgraph_ports.ticks import tick_strings, tick_values
+from src.widgets._pyqtgraph_ports.ticks import (
+    format_tick_strings,
+    minor_tick_values,
+    tick_values,
+)
 from src.widgets._pyqtgraph_ports.viewbox import (
     MOUSE_MODE_PAN,
     MOUSE_MODE_RECT,
@@ -47,13 +51,19 @@ from src.widgets._pyqtgraph_ports.viewbox import (
 def _fast_render_enabled_default() -> bool:
     """Read ``TRANS_FAST_RENDER`` once at import time.
 
-    Phase 3 ships native rendering off by default — set the env var to
-    ``1``/``true``/``yes`` to opt in. Phase 4 will flip the default
-    after parity is verified on the rest of the canvas (legend, axes,
-    overlays). Removing the toggle entirely is Phase 4's job.
+    Phase 4 flips the default — native rendering is now **on** by
+    default. Set ``TRANS_FAST_RENDER=0`` / ``false`` / ``no`` /
+    ``off`` to opt back into the matplotlib pipeline if a regression
+    is hit. The matplotlib renderer still ships as
+    ``_renderForExport`` (used by ``exportToPNG`` / ``exportToSVG`` /
+    ``exportToPDF`` at high DPI) so flipping the toggle off is a
+    safe fallback — it just re-routes the on-screen paint through
+    the same code path the export uses.
     """
     val = os.environ.get("TRANS_FAST_RENDER", "").strip().lower()
-    return val in ("1", "true", "yes", "on")
+    if val in ("0", "false", "no", "off"):
+        return False
+    return True
 
 logger = logging.getLogger(__name__)
 
@@ -771,7 +781,7 @@ class QMLGraphCanvas(QQuickPaintedItem):
             return
 
         if self._needs_redraw:
-            self._renderMatplotlib()
+            self._renderForExport()
             self._needs_redraw = False
 
         if self._cached_image is not None:
@@ -781,8 +791,16 @@ class QMLGraphCanvas(QQuickPaintedItem):
             # Draw overlays
             self._drawOverlays(painter)
 
-    def _renderMatplotlib(self):
-        """Render matplotlib figure to cached QImage"""
+    def _renderForExport(self):
+        """Render the matplotlib figure to ``_cached_image``.
+
+        Phase 4 renamed this from ``_renderMatplotlib`` — it's no
+        longer the on-screen renderer (``_renderNative`` is), but
+        ``exportToPNG`` / ``exportToSVG`` / ``exportToPDF`` still need
+        a fully-laid-out matplotlib figure to call ``savefig`` against,
+        and the same method services as the fallback paint path when
+        ``TRANS_FAST_RENDER=0`` is set.
+        """
         w, h = int(self.width()), int(self.height())
         if w <= 0 or h <= 0:
             return
@@ -1106,32 +1124,48 @@ class QMLGraphCanvas(QQuickPaintedItem):
         x_log: bool,
         y_log: bool,
     ) -> None:
-        """Border + grid + tick marks + tick labels + axis labels."""
+        """Frame + grid + major ticks + minor ticks + major-tick
+        labels (with shared exponent when the magnitudes warrant) +
+        axis labels.
+
+        Minor ticks are drawn 3 px long with a lighter pen on the
+        outside of the frame; majors are 5 px and the configured
+        ``_NATIVE_TICK_COLOR``. Grid lines stay attached to majors so
+        the plot doesn't get noisy at high tick densities."""
         # Axes pen + frame.
         pen_axis = QPen(self._NATIVE_AXIS_COLOR)
         pen_axis.setWidthF(1.0)
         painter.setPen(pen_axis)
         painter.drawRect(ax_rect)
 
-        # Ticks (Phase 1 port).
+        # All tick levels for each axis (Phase 1 algorithm).
         x_levels = tick_values(x_vmin, x_vmax, ax_rect.width(), log=x_log)
         y_levels = tick_values(y_vmin, y_vmax, ax_rect.height(), log=y_log)
 
-        # First (major) level only — sub-ticks are Phase 4.
+        # Majors (level 0) drive labels + grid.
         x_major_spacing, x_majors = (
             x_levels[0] if x_levels else (1.0, [])
         )
         y_major_spacing, y_majors = (
             y_levels[0] if y_levels else (1.0, [])
         )
-        x_labels = tick_strings(
-            x_majors, scale=1.0, spacing=x_major_spacing, log=x_log,
-        ) if x_majors else []
-        y_labels = tick_strings(
-            y_majors, scale=1.0, spacing=y_major_spacing, log=y_log,
-        ) if y_majors else []
 
-        # Grid.
+        # Minor + sub-minor levels (Phase 4).
+        x_minors = x_levels[1:] if len(x_levels) > 1 else []
+        y_minors = y_levels[1:] if len(y_levels) > 1 else []
+
+        # Shared-exponent label formatting (Phase 4). When the axis
+        # magnitudes spill outside ``[10⁻⁴, 10⁴]`` we factor out a
+        # ``× 10ⁿ`` and render the labels compactly. Log axes
+        # short-circuit to the per-tick formatter.
+        x_labels, x_shared_exp = format_tick_strings(
+            x_majors, spacing=x_major_spacing, log=x_log,
+        ) if x_majors else ([], None)
+        y_labels, y_shared_exp = format_tick_strings(
+            y_majors, spacing=y_major_spacing, log=y_log,
+        ) if y_majors else ([], None)
+
+        # Grid (majors only).
         if self._show_grid:
             grid_pen = QPen(self._NATIVE_GRID_COLOR)
             grid_pen.setWidthF(0.5)
@@ -1151,7 +1185,32 @@ class QMLGraphCanvas(QQuickPaintedItem):
                         QPointF(ax_rect.right(), py),
                     )
 
-        # Tick marks.
+        # Minor tick marks (3 px, lighter pen, no labels).
+        if x_minors or y_minors:
+            minor_color = QColor(self._NATIVE_TICK_COLOR)
+            minor_color.setAlpha(120)
+            minor_pen = QPen(minor_color)
+            minor_pen.setWidthF(0.7)
+            painter.setPen(minor_pen)
+            minor_len = 3.0
+            for _spacing, values in x_minors:
+                for x in values:
+                    px = self._native_data_x_to_pixel(x, x_vmin, x_vmax, ax_rect)
+                    if ax_rect.left() <= px <= ax_rect.right():
+                        painter.drawLine(
+                            QPointF(px, ax_rect.bottom()),
+                            QPointF(px, ax_rect.bottom() + minor_len),
+                        )
+            for _spacing, values in y_minors:
+                for y in values:
+                    py = self._native_data_y_to_pixel(y, y_vmin, y_vmax, ax_rect)
+                    if ax_rect.top() <= py <= ax_rect.bottom():
+                        painter.drawLine(
+                            QPointF(ax_rect.left() - minor_len, py),
+                            QPointF(ax_rect.left(), py),
+                        )
+
+        # Major tick marks (5 px).
         tick_pen = QPen(self._NATIVE_TICK_COLOR)
         tick_pen.setWidthF(1.0)
         painter.setPen(tick_pen)
@@ -1171,7 +1230,7 @@ class QMLGraphCanvas(QQuickPaintedItem):
                     QPointF(ax_rect.left(), py),
                 )
 
-        # Tick labels.
+        # Major tick labels.
         painter.setPen(self._NATIVE_LABEL_COLOR)
         f = painter.font(); f.setPointSize(9); f.setBold(False)
         painter.setFont(f)
@@ -1193,25 +1252,52 @@ class QMLGraphCanvas(QQuickPaintedItem):
                     label,
                 )
 
-        # Axis labels.
-        if self._x_label:
+        # Axis labels (with the shared exponent appended when present).
+        if self._x_label or x_shared_exp is not None:
             painter.setPen(self._NATIVE_LABEL_COLOR)
+            x_label_full = self._format_axis_label(
+                self._x_label, x_shared_exp,
+            )
             painter.drawText(
                 QRectF(ax_rect.left(), ax_rect.bottom() + 22,
                        ax_rect.width(), 20),
-                Qt.AlignHCenter | Qt.AlignTop, self._x_label,
+                Qt.AlignHCenter | Qt.AlignTop, x_label_full,
             )
-        if self._y_label:
+        if self._y_label or y_shared_exp is not None:
             painter.save()
             painter.translate(14.0, ax_rect.top() + ax_rect.height() / 2)
             painter.rotate(-90.0)
             painter.setPen(self._NATIVE_LABEL_COLOR)
+            y_label_full = self._format_axis_label(
+                self._y_label, y_shared_exp,
+            )
             painter.drawText(
                 QRectF(-ax_rect.height() / 2, -10,
                        ax_rect.height(), 20),
-                Qt.AlignHCenter | Qt.AlignVCenter, self._y_label,
+                Qt.AlignHCenter | Qt.AlignVCenter, y_label_full,
             )
             painter.restore()
+
+    @staticmethod
+    def _format_axis_label(
+        label: str, shared_exponent: Optional[int],
+    ) -> str:
+        """Append ``× 10ⁿ`` (in Unicode superscript) to ``label`` when
+        ``shared_exponent`` is set. Used by both axis-label calls in
+        ``_native_draw_axes`` for the shared-exponent display."""
+        if shared_exponent is None:
+            return label
+        # Unicode superscripts (Phase 1 already has the table; reuse
+        # locally so this helper doesn't depend on the ticks module
+        # at runtime).
+        sup_map = str.maketrans({
+            "-": "⁻", "0": "⁰", "1": "¹", "2": "²", "3": "³",
+            "4": "⁴", "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸",
+            "9": "⁹",
+        })
+        exp_str = str(shared_exponent).translate(sup_map)
+        suffix = f"× 10{exp_str}"
+        return f"{label}  ({suffix})" if label else suffix
 
     @staticmethod
     def _native_data_x_to_pixel(
@@ -1578,8 +1664,11 @@ class QMLGraphCanvas(QQuickPaintedItem):
     # =========================================================================
 
     def _ensureRendered(self):
-        """Ensure the figure is rendered with current data before exporting."""
-        self._renderMatplotlib()
+        """Ensure the matplotlib figure is laid out with current data
+        before an export ``savefig`` call. Phase 4 retargeted this
+        from the renamed ``_renderMatplotlib`` to ``_renderForExport``
+        so export-only changes don't touch the on-screen path."""
+        self._renderForExport()
 
     @Slot(str, result=bool)
     def exportToPNG(self, filepath: str) -> bool:

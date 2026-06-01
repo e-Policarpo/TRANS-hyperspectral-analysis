@@ -22,8 +22,10 @@ import numpy as np
 import pytest
 
 from src.widgets._pyqtgraph_ports.ticks import (
+    format_tick_strings,
     log_tick_strings,
     log_tick_values,
+    minor_tick_values,
     tick_spacing,
     tick_strings,
     tick_values,
@@ -232,3 +234,76 @@ def test_tick_strings_log_dispatch():
     direct = log_tick_strings([0.0, 1.0], scale=1.0, spacing=1.0)
     dispatched = tick_strings([0.0, 1.0], scale=1.0, spacing=1.0, log=True)
     assert direct == dispatched
+
+
+# --- minor_tick_values --------------------------------------------------
+
+def test_minor_tick_values_strips_major_level():
+    """The major level is returned by :func:`tick_values` at index 0;
+    the minor helper returns everything after it."""
+    full = tick_values(0.0, 100.0, 600.0)
+    minors = minor_tick_values(0.0, 100.0, 600.0)
+    # Same total minus one level.
+    assert len(minors) == len(full) - 1
+
+
+def test_minor_tick_values_levels_sit_between_majors():
+    """Minor tick values should fall between adjacent major ticks."""
+    full = tick_values(0.0, 10.0, 600.0)
+    minors = minor_tick_values(0.0, 10.0, 600.0)
+    if not minors:
+        pytest.skip("no minor level produced for this range")
+    major_spacing, major_vals = full[0]
+    minor_spacing, minor_vals = minors[0]
+    # The minor spacing must be smaller than the major spacing.
+    assert minor_spacing < major_spacing
+    # No minor value coincides with a major one (the tick_values
+    # algorithm already de-dups at the spacing/100 level).
+    for mv in minor_vals:
+        assert all(abs(mv - mj) > minor_spacing * 0.01 for mj in major_vals)
+
+
+def test_minor_tick_values_with_max_level_one_returns_one_level():
+    """``max_tick_level=1`` keeps only the major + minor → minor
+    helper returns exactly one level."""
+    minors = minor_tick_values(0.0, 100.0, 600.0, max_tick_level=1)
+    assert len(minors) == 1
+
+
+# --- format_tick_strings ------------------------------------------------
+
+def test_format_tick_strings_no_shared_exponent_in_comfort_range():
+    """Magnitudes inside ``[10^-threshold, 10^threshold]`` get
+    per-tick formatting with no shared exponent."""
+    labels, exp = format_tick_strings([1.0, 2.0, 3.0], spacing=1.0)
+    assert exp is None
+    assert labels == ["1", "2", "3"]
+
+
+def test_format_tick_strings_extracts_shared_positive_exponent():
+    """Very large values are scaled by a shared 10ⁿ multiplier."""
+    labels, exp = format_tick_strings(
+        [100_000.0, 200_000.0, 300_000.0], spacing=100_000.0,
+    )
+    assert exp == 5
+    # 100_000 / 10^5 = 1.0, 200_000 / 10^5 = 2.0, etc.
+    assert labels == ["1", "2", "3"]
+
+
+def test_format_tick_strings_extracts_shared_negative_exponent():
+    """Very small values are scaled by a shared 10⁻ⁿ multiplier."""
+    labels, exp = format_tick_strings(
+        [0.00001, 0.00002, 0.00003], spacing=0.00001,
+    )
+    assert exp == -5
+    assert labels == ["1", "2", "3"]
+
+
+def test_format_tick_strings_log_mode_short_circuits():
+    """Log-mode dispatch bypasses the shared-exponent path —
+    :func:`log_tick_strings` already produces compact labels."""
+    labels, exp = format_tick_strings(
+        [0.0, 1.0, 2.0], spacing=1.0, log=True,
+    )
+    assert exp is None
+    assert any("10" in lbl for lbl in labels[1:])  # log labels show 10ⁿ

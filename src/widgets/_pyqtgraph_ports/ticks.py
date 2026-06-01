@@ -32,6 +32,19 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 
+__all__ = [
+    "TickLevel",
+    "SpacingLevel",
+    "tick_spacing",
+    "tick_values",
+    "log_tick_values",
+    "tick_strings",
+    "log_tick_strings",
+    "minor_tick_values",
+    "format_tick_strings",
+]
+
+
 TickLevel = Tuple[float, List[float]]
 SpacingLevel = Tuple[float, float]
 
@@ -279,3 +292,74 @@ def log_tick_strings(
         head = "" if v == "1" else f"{v}·"
         out.append(f"{head}10{sign}{pot}")
     return out
+
+
+def minor_tick_values(
+    min_val: float,
+    max_val: float,
+    size: float,
+    *,
+    scale: float = 1.0,
+    log: bool = False,
+    tick_density: float = 1.0,
+    max_tick_level: int = 2,
+) -> List[TickLevel]:
+    """Return the *minor* and *sub-minor* tick levels only.
+
+    Thin wrapper around :func:`tick_values` that strips the first
+    (major) level. Use this on top of the major levels in the native
+    renderer so minor ticks can be drawn shorter and lighter without
+    duplicating the algorithm.
+    """
+    levels = tick_values(
+        min_val, max_val, size,
+        scale=scale, log=log, tick_density=tick_density,
+        max_tick_level=max_tick_level,
+    )
+    return levels[1:] if len(levels) > 1 else []
+
+
+def format_tick_strings(
+    values: List[float],
+    spacing: float,
+    *,
+    scale: float = 1.0,
+    log: bool = False,
+    shared_exponent_threshold: int = 4,
+) -> Tuple[List[str], Optional[int]]:
+    """Format tick labels with an optional shared decimal exponent.
+
+    Returns ``(labels, exponent)``. When all formatted values are
+    >= ``10**threshold`` in magnitude (or all < ``10**-threshold``),
+    each label is divided by the common power of ten and the
+    returned ``exponent`` is the shared multiplier the renderer can
+    show once next to the axis (``× 10ⁿ``). Otherwise the per-value
+    labels are produced by :func:`tick_strings` and ``exponent`` is
+    ``None``.
+
+    The shared-exponent shortcut keeps axis labels readable when
+    a Raman intensity axis runs 0 → 200_000 counts — instead of
+    ``200000`` / ``180000`` / ``…`` on every tick we render
+    ``2.0`` / ``1.8`` / ``…`` and the renderer overlays a single
+    ``× 10⁵`` near the axis title.
+    """
+    if log or not values:
+        return tick_strings(values, scale, spacing, log=log), None
+
+    abs_max = max((abs(v * scale) for v in values), default=0.0)
+    if abs_max == 0.0:
+        return tick_strings(values, scale, spacing, log=False), None
+
+    exponent = int(np.floor(np.log10(abs_max)))
+    if abs(exponent) < shared_exponent_threshold:
+        # Magnitudes are in the comfortable range — let per-tick
+        # formatting handle it.
+        return tick_strings(values, scale, spacing, log=False), None
+
+    divisor = 10.0 ** exponent
+    scaled_values = [v * scale / divisor for v in values]
+    scaled_spacing = spacing * scale / divisor
+    labels = tick_strings(
+        scaled_values, scale=1.0, spacing=scaled_spacing, log=False,
+    )
+    return labels, exponent
