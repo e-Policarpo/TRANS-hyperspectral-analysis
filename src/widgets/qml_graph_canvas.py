@@ -34,6 +34,13 @@ from src.widgets._pyqtgraph_ports.curve_path import (
     array_to_qpainterpath,
     prepare_curve_xy,
 )
+from src.widgets._pyqtgraph_ports.items.infinite_line import (
+    HIT_LINE as IL_HIT_LINE,
+    HIT_NONE as IL_HIT_NONE,
+    ORIENT_HORIZONTAL as IL_ORIENT_H,
+    ORIENT_VERTICAL as IL_ORIENT_V,
+    InfiniteLine,
+)
 from src.widgets._pyqtgraph_ports.items.linear_region import (
     HIT_BODY as LR_HIT_BODY,
     HIT_HANDLE_HI as LR_HIT_HANDLE_HI,
@@ -141,6 +148,12 @@ class QMLGraphCanvas(QQuickPaintedItem):
         str, float, float,
         arguments=['regionId', 'xLow', 'xHigh'],
     )
+    overlayLineChanged = Signal(
+        str, float, arguments=['lineId', 'value'],
+    )
+    overlayLineChangeFinished = Signal(
+        str, float, arguments=['lineId', 'value'],
+    )
 
     # Color palette for auto-assignment
     DEFAULT_COLORS = [
@@ -238,6 +251,7 @@ class QMLGraphCanvas(QQuickPaintedItem):
         # of curves, hit-tested in reverse so a newer overlay can
         # cover an older one.
         self._overlay_items: list[LinearRegionItem] = []
+        self._infinite_lines: list[InfiniteLine] = []
         self._overlay_drag: Optional[Dict[str, Any]] = None
 
     # =====================================================================
@@ -1143,6 +1157,8 @@ class QMLGraphCanvas(QQuickPaintedItem):
             self._native_draw_legend(painter, ax_rect)
         if self._overlay_items:
             self._render_overlay_items(painter, ax_rect)
+        if self._infinite_lines:
+            self._render_infinite_lines(painter, ax_rect)
         self._drawOverlays(painter)
 
     # =========================================================================
@@ -1285,6 +1301,146 @@ class QMLGraphCanvas(QQuickPaintedItem):
         for item in self._overlay_items:
             if str(item.region_id) == regionId:
                 if item.set_region(float(xLow), float(xHigh)):
+                    self._needs_redraw = True
+                    self.update()
+                return
+
+    # --- InfiniteLine helpers + slots ---------------------------------------
+
+    def _render_infinite_lines(
+        self,
+        painter: QPainter,
+        ax_rect: QRectF,
+    ) -> None:
+        active_id = (
+            self._overlay_drag["region_id"]
+            if (
+                self._overlay_drag is not None
+                and self._overlay_drag.get("kind") == "infinite_line"
+            )
+            else None
+        )
+        for line in self._infinite_lines:
+            hover = (line.line_id == active_id)
+            line.render(
+                painter, ax_rect, self._dataToPixel, hover=hover,
+            )
+
+    def _find_infinite_line_at(
+        self,
+        x_pixel: float,
+        y_pixel: float,
+        ax_rect: QRectF,
+    ) -> Optional[Tuple[InfiniteLine, str]]:
+        if not self._infinite_lines:
+            return None
+        for line in reversed(self._infinite_lines):
+            hit = line.hit_test(
+                x_pixel, y_pixel,
+                data_to_pixel=self._dataToPixel,
+                ax_rect=ax_rect,
+            )
+            if hit != IL_HIT_NONE:
+                return line, hit
+        return None
+
+    def _emit_infinite_line_change(
+        self,
+        line: InfiniteLine,
+        finished: bool,
+    ) -> None:
+        lid = str(line.line_id)
+        v = line.value()
+        if finished:
+            self.overlayLineChangeFinished.emit(lid, v)
+        else:
+            self.overlayLineChanged.emit(lid, v)
+
+    @Slot(str, str, float)
+    def addInfiniteLine(
+        self,
+        lineId: str,
+        orientation: str,
+        value: float,
+    ) -> None:
+        """Add a vertical (``orientation='vertical'``) or horizontal
+        (``orientation='horizontal'``) line at the given data value.
+        Replaces any existing line with the same id."""
+        self.addInfiniteLineWithOptions(
+            lineId, orientation, value, "", "",
+        )
+
+    @Slot(str, str, float, str, str)
+    def addInfiniteLineWithOptions(
+        self,
+        lineId: str,
+        orientation: str,
+        value: float,
+        color: str,
+        label: str,
+    ) -> None:
+        if not lineId:
+            return
+        if orientation not in (IL_ORIENT_V, IL_ORIENT_H):
+            logger.warning(
+                "Ignoring addInfiniteLine: bad orientation %r", orientation,
+            )
+            return
+        self.removeInfiniteLine(lineId)
+        line = InfiniteLine(
+            line_id=lineId,
+            orientation=orientation,
+            value=float(value),
+            pen_color=color or "#FFD700",
+            label=label or "",
+        )
+        self._infinite_lines.append(line)
+        self._needs_redraw = True
+        self.update()
+
+    @Slot(str)
+    def removeInfiniteLine(self, lineId: str) -> None:
+        before = len(self._infinite_lines)
+        self._infinite_lines = [
+            ln for ln in self._infinite_lines
+            if str(ln.line_id) != lineId
+        ]
+        if (
+            self._overlay_drag is not None
+            and self._overlay_drag.get("kind") == "infinite_line"
+            and self._overlay_drag.get("region_id") == lineId
+        ):
+            self._overlay_drag = None
+        if len(self._infinite_lines) != before:
+            self._needs_redraw = True
+            self.update()
+
+    @Slot()
+    def clearInfiniteLines(self) -> None:
+        if not self._infinite_lines:
+            return
+        self._infinite_lines.clear()
+        if (
+            self._overlay_drag is not None
+            and self._overlay_drag.get("kind") == "infinite_line"
+        ):
+            self._overlay_drag = None
+        self._needs_redraw = True
+        self.update()
+
+    @Slot(str, result=float)
+    def getInfiniteLineValue(self, lineId: str) -> float:
+        """Return the line's current data value. ``NaN`` if absent."""
+        for line in self._infinite_lines:
+            if str(line.line_id) == lineId:
+                return float(line.value())
+        return float("nan")
+
+    @Slot(str, float)
+    def setInfiniteLineValue(self, lineId: str, value: float) -> None:
+        for line in self._infinite_lines:
+            if str(line.line_id) == lineId:
+                if line.set_value(float(value)):
                     self._needs_redraw = True
                     self.update()
                 return
@@ -1767,7 +1923,9 @@ class QMLGraphCanvas(QQuickPaintedItem):
             # press lands on a handle or band, take it for that item
             # and short-circuit the viewbox so a region drag doesn't
             # also begin a zoom-rect.
-            if self._use_fast_render and self._overlay_items and self._data_bounds:
+            if self._use_fast_render and self._data_bounds and (
+                self._overlay_items or self._infinite_lines
+            ):
                 d = self._data_bounds
                 ax_rect = QRectF(
                     d['ax_left'], d['ax_top'],
@@ -1780,11 +1938,29 @@ class QMLGraphCanvas(QQuickPaintedItem):
                     x_data, _ = self._pixelToData(*pos_px)
                     press_state = item.begin_drag(x_data, lr_hit)
                     self._overlay_drag = {
+                        "kind": "linear_region",
                         "region_id": item.region_id,
                         "item": item,
                         "press": press_state,
                     }
                     self._emit_overlay_change(item, finished=False)
+                    self._needs_redraw = True
+                    self.update()
+                    return
+                line_result = self._find_infinite_line_at(
+                    pos_px[0], pos_px[1], ax_rect,
+                )
+                if line_result is not None:
+                    line, _ = line_result
+                    x_data, y_data = self._pixelToData(*pos_px)
+                    press_state = line.begin_drag(x_data, y_data)
+                    self._overlay_drag = {
+                        "kind": "infinite_line",
+                        "region_id": line.line_id,
+                        "item": line,
+                        "press": press_state,
+                    }
+                    self._emit_infinite_line_change(line, finished=False)
                     self._needs_redraw = True
                     self.update()
                     return
@@ -1848,13 +2024,20 @@ class QMLGraphCanvas(QQuickPaintedItem):
             return
 
         if self._overlay_drag is not None:
+            kind = self._overlay_drag.get("kind", "linear_region")
             item = self._overlay_drag["item"]
             press = self._overlay_drag["press"]
-            x_data, _ = self._pixelToData(*pos_px)
-            if item.update_drag(x_data, press):
-                self._emit_overlay_change(item, finished=False)
-                self._needs_redraw = True
-                self.update()
+            x_data, y_data = self._pixelToData(*pos_px)
+            if kind == "linear_region":
+                if item.update_drag(x_data, press):
+                    self._emit_overlay_change(item, finished=False)
+                    self._needs_redraw = True
+                    self.update()
+            elif kind == "infinite_line":
+                if item.update_drag(x_data, y_data, press):
+                    self._emit_infinite_line_change(item, finished=False)
+                    self._needs_redraw = True
+                    self.update()
             return
 
         self._viewbox.handle_move(pos_px)
@@ -1871,8 +2054,12 @@ class QMLGraphCanvas(QQuickPaintedItem):
                 self.update()
                 return
             if self._overlay_drag is not None:
+                kind = self._overlay_drag.get("kind", "linear_region")
                 item = self._overlay_drag["item"]
-                self._emit_overlay_change(item, finished=True)
+                if kind == "linear_region":
+                    self._emit_overlay_change(item, finished=True)
+                elif kind == "infinite_line":
+                    self._emit_infinite_line_change(item, finished=True)
                 self._overlay_drag = None
                 self._needs_redraw = True
                 self.update()

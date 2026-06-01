@@ -12,6 +12,14 @@ Upstream sources live under ``pyqtgraph/graphicsItems/`` at commit
 ``LICENSE`` at ``src/widgets/_pyqtgraph_ports/LICENSE``.
 """
 
+from .infinite_line import (  # noqa: F401
+    HIT_LINE,
+    HIT_NONE as INFLINE_HIT_NONE,
+    InfiniteLine,
+    InfiniteLineState,
+    ORIENT_HORIZONTAL,
+    ORIENT_VERTICAL,
+)
 from .linear_region import (  # noqa: F401
     HIT_BODY,
     HIT_HANDLE_HI,
@@ -25,7 +33,13 @@ __all__ = [
     "HIT_BODY",
     "HIT_HANDLE_HI",
     "HIT_HANDLE_LO",
+    "HIT_LINE",
     "HIT_NONE",
+    "INFLINE_HIT_NONE",
+    "InfiniteLine",
+    "InfiniteLineState",
     "LinearRegionItem",
     "LinearRegionState",
+    "ORIENT_HORIZONTAL",
+    "ORIENT_VERTICAL",
 ]
