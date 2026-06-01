@@ -23,6 +23,10 @@ from PySide6.QtQuick import QQuickPaintedItem
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 
+from src.widgets._pyqtgraph_ports.items.rect_roi import (
+    HIT_NONE as ROI_HIT_NONE,
+    RectROI,
+)
 from src.widgets._pyqtgraph_ports.mpl_apply import apply_pyqtgraph_ticks
 import matplotlib.pyplot as plt
 
@@ -71,6 +75,18 @@ class QMLMapCanvas(QQuickPaintedItem):
     # Block selection signals (TRANS_v3 style)
     blockSelected = Signal(int, int, float, bool, arguments=['blockRow', 'blockCol', 'value', 'isSelected'])
     blockSelectionChanged = Signal(arguments=[])  # Emitted when selection set changes
+
+    # Phase 6.4 — RectROI overlay change signals. ``rect`` is
+    # ``(col0, row0, col1, row1)`` in grid-index space, matching the
+    # axis convention used by ``addRectROI``.
+    roiChanged = Signal(
+        str, float, float, float, float,
+        arguments=['roiId', 'col0', 'row0', 'col1', 'row1'],
+    )
+    roiChangeFinished = Signal(
+        str, float, float, float, float,
+        arguments=['roiId', 'col0', 'row0', 'col1', 'row1'],
+    )
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -143,6 +159,14 @@ class QMLMapCanvas(QQuickPaintedItem):
         self._spectral_cube: Optional[np.ndarray] = None  # Shape: (n_spectral_pts, rows, cols)
         self._independent_var: Optional[np.ndarray] = None  # Wavenumber/voltage axis
         self._independent_var_name: str = "x"
+
+        # Phase 6.4 — ``RectROI`` overlay items. These live alongside
+        # the existing RECT_SELECT / BLOCK_SELECT tools rather than
+        # replacing them: this iteration adds the ROI as an
+        # independently-controllable item the QML side can opt in to
+        # via ``addRectROI``, so the existing tools keep working.
+        self._rect_rois: List[RectROI] = []
+        self._roi_drag: Optional[Dict[str, Any]] = None
 
     @Slot()
     def cleanup(self):
@@ -310,6 +334,181 @@ class QMLMapCanvas(QQuickPaintedItem):
             value = self.getValueAt(row, col)
             result.append({'row': row, 'col': col, 'value': value})
         return result
+
+    # =========================================================================
+    # Phase 6.4 — RectROI overlay items
+    # =========================================================================
+
+    def _roi_data_to_pixel(self):
+        """Return a ``(col, row) -> (pixel_x, pixel_y)`` callable.
+
+        The ``RectROI`` port speaks generic ``(x, y)`` data coords; the
+        map canvas's natural data space is ``(col, row)``. This adapter
+        bridges the two so the ROI corners and the existing
+        block-grid live on the same axes.
+        """
+        d = self._data_to_pixel
+        if d is None:
+            return lambda x, y: (0.0, 0.0)
+        ax_left = d['ax_left']; ax_top = d['ax_top']
+        ax_w = d['ax_right'] - ax_left
+        ax_h = d['ax_bottom'] - ax_top
+        rows = d['data_rows']; cols = d['data_cols']
+        return lambda x, y: (
+            ax_left + (float(x) / cols) * ax_w,
+            ax_top + (float(y) / rows) * ax_h,
+        )
+
+    def _roi_pixel_to_data(
+        self, px: float, py: float,
+    ) -> Tuple[float, float]:
+        """Inverse of ``_roi_data_to_pixel``. Returns ``(col, row)``
+        in **float** units so partial-cell ROI corners survive."""
+        d = self._data_to_pixel
+        if d is None:
+            return 0.0, 0.0
+        ax_w = d['ax_right'] - d['ax_left']
+        ax_h = d['ax_bottom'] - d['ax_top']
+        col = (px - d['ax_left']) / ax_w * d['data_cols']
+        row = (py - d['ax_top']) / ax_h * d['data_rows']
+        return float(col), float(row)
+
+    def _find_roi_at(
+        self,
+        x_pixel: float, y_pixel: float,
+        ax_rect: QRectF,
+    ) -> Optional[Tuple[RectROI, str]]:
+        if not self._rect_rois:
+            return None
+        data_to_pixel = self._roi_data_to_pixel()
+        for roi in reversed(self._rect_rois):
+            hit = roi.hit_test(
+                x_pixel, y_pixel,
+                data_to_pixel=data_to_pixel,
+                ax_rect=ax_rect,
+            )
+            if hit != ROI_HIT_NONE:
+                return roi, hit
+        return None
+
+    def _emit_roi_change(
+        self, roi: RectROI, finished: bool,
+    ) -> None:
+        rid = str(roi.roi_id)
+        x0, y0, x1, y1 = roi.rect()
+        if finished:
+            self.roiChangeFinished.emit(rid, x0, y0, x1, y1)
+        else:
+            self.roiChanged.emit(rid, x0, y0, x1, y1)
+
+    def _current_roi_snap_step(
+        self,
+    ) -> Optional[Tuple[Optional[float], Optional[float]]]:
+        """Snap step in ``(col, row)`` units when the grid overlay is
+        active and at least one axis has a non-trivial block size.
+        ``None`` when the grid overlay is off — every freshly added
+        ROI starts free-form."""
+        if not self._show_grid_overlay:
+            return None
+        if self._grid_block_h <= 1 and self._grid_block_v <= 1:
+            return None
+        sx = float(self._grid_block_h) if self._grid_block_h > 1 else None
+        sy = float(self._grid_block_v) if self._grid_block_v > 1 else None
+        return (sx, sy)
+
+    @Slot(str, float, float, float, float)
+    def addRectROI(
+        self,
+        roiId: str,
+        col0: float, row0: float,
+        col1: float, row1: float,
+    ) -> None:
+        """Add an axis-aligned ROI between ``(col0, row0)`` and
+        ``(col1, row1)``. When the discretization grid overlay is
+        active the ROI auto-snaps to the block grid; otherwise it's
+        free-form. Replaces any existing ROI with the same id."""
+        self.addRectROIWithOptions(
+            roiId, col0, row0, col1, row1, "", "",
+        )
+
+    @Slot(str, float, float, float, float, str, str)
+    def addRectROIWithOptions(
+        self,
+        roiId: str,
+        col0: float, row0: float,
+        col1: float, row1: float,
+        color: str,
+        label: str,
+    ) -> None:
+        if not roiId:
+            return
+        self.removeRectROI(roiId)
+        d = self._data_to_pixel
+        bounds_x = bounds_y = None
+        if d is not None:
+            bounds_x = (0.0, float(d['data_cols']))
+            bounds_y = (0.0, float(d['data_rows']))
+        roi = RectROI(
+            roi_id=roiId,
+            rect=(float(col0), float(row0), float(col1), float(row1)),
+            bounds_x=bounds_x,
+            bounds_y=bounds_y,
+            snap_step=self._current_roi_snap_step(),
+            pen_color=color or "#5BCEFA",
+            brush_color=color or "#5BCEFA",
+            label=label or "",
+        )
+        self._rect_rois.append(roi)
+        self.update()
+
+    @Slot(str)
+    def removeRectROI(self, roiId: str) -> None:
+        before = len(self._rect_rois)
+        self._rect_rois = [
+            r for r in self._rect_rois
+            if str(r.roi_id) != roiId
+        ]
+        if (
+            self._roi_drag is not None
+            and str(self._roi_drag.get("roi_id")) == roiId
+        ):
+            self._roi_drag = None
+        if len(self._rect_rois) != before:
+            self.update()
+
+    @Slot()
+    def clearRectROIs(self) -> None:
+        if not self._rect_rois:
+            return
+        self._rect_rois.clear()
+        self._roi_drag = None
+        self.update()
+
+    @Slot(str, result='QVariantList')
+    def getRectROI(self, roiId: str):
+        """Return ``[col0, row0, col1, row1]`` for the named ROI, or
+        an empty list if absent."""
+        for roi in self._rect_rois:
+            if str(roi.roi_id) == roiId:
+                x0, y0, x1, y1 = roi.rect()
+                return [float(x0), float(y0), float(x1), float(y1)]
+        return []
+
+    @Slot(str, float, float, float, float)
+    def setRectROI(
+        self,
+        roiId: str,
+        col0: float, row0: float,
+        col1: float, row1: float,
+    ) -> None:
+        for roi in self._rect_rois:
+            if str(roi.roi_id) == roiId:
+                if roi.set_rect(
+                    float(col0), float(row0),
+                    float(col1), float(row1),
+                ):
+                    self.update()
+                return
 
     def getSelectionMask(self) -> np.ndarray:
         """
@@ -820,6 +1019,25 @@ class QMLMapCanvas(QQuickPaintedItem):
             painter.setBrush(QBrush(QColor(100, 200, 255, 50)))
             painter.drawRect(self._selection_rect)
 
+        # Phase 6.4 — RectROI overlay items.
+        if self._rect_rois and self._data_to_pixel is not None:
+            d = self._data_to_pixel
+            ax_rect = QRectF(
+                d['ax_left'], d['ax_top'],
+                d['ax_right'] - d['ax_left'],
+                d['ax_bottom'] - d['ax_top'],
+            )
+            data_to_pixel = self._roi_data_to_pixel()
+            active_id = (
+                self._roi_drag["roi_id"]
+                if self._roi_drag is not None else None
+            )
+            for roi in self._rect_rois:
+                hover = (roi.roi_id == active_id)
+                roi.render(
+                    painter, ax_rect, data_to_pixel, hover=hover,
+                )
+
         # Draw drag preview for current tool
         if self._is_dragging and self._drag_start and self._drag_current:
             if self._current_tool == MapTool.LINE_PROFILE:
@@ -861,6 +1079,33 @@ class QMLMapCanvas(QQuickPaintedItem):
             return
 
         pos = event.position()
+        # Phase 6.4 — RectROI overlays take priority over the
+        # tool-driven dispatch below. A press on the body or any
+        # corner handle captures the drag; anywhere else falls
+        # through to the existing tool.
+        if self._rect_rois and self._data_to_pixel is not None:
+            d = self._data_to_pixel
+            ax_rect = QRectF(
+                d['ax_left'], d['ax_top'],
+                d['ax_right'] - d['ax_left'],
+                d['ax_bottom'] - d['ax_top'],
+            )
+            hit_result = self._find_roi_at(pos.x(), pos.y(), ax_rect)
+            if hit_result is not None:
+                roi, hit = hit_result
+                col_data, row_data = self._roi_pixel_to_data(
+                    pos.x(), pos.y(),
+                )
+                press_state = roi.begin_drag(col_data, row_data, hit)
+                self._roi_drag = {
+                    "roi_id": roi.roi_id,
+                    "item": roi,
+                    "press": press_state,
+                }
+                self._emit_roi_change(roi, finished=False)
+                self.update()
+                return
+
         self._drag_start = pos
         self._is_dragging = True
 
@@ -901,6 +1146,20 @@ class QMLMapCanvas(QQuickPaintedItem):
             return
 
         pos = event.position()
+
+        # Phase 6.4 — ROI drag short-circuits the tool-driven move
+        # path (no cursor read-out, no drag-preview update).
+        if self._roi_drag is not None:
+            roi = self._roi_drag["item"]
+            press = self._roi_drag["press"]
+            col_data, row_data = self._roi_pixel_to_data(
+                pos.x(), pos.y(),
+            )
+            if roi.update_drag(col_data, row_data, press):
+                self._emit_roi_change(roi, finished=False)
+                self.update()
+            return
+
         row, col = self._pixelToData(pos.x(), pos.y())
         value = self.getValueAt(row, col)
 
@@ -918,6 +1177,16 @@ class QMLMapCanvas(QQuickPaintedItem):
 
     def mouseReleaseEvent(self, event):
         """Handle mouse release events"""
+        # Phase 6.4 — ROI drag finalisation. Done before the existing
+        # ``_is_dragging`` check because an ROI press doesn't flip
+        # ``_is_dragging`` true.
+        if self._roi_drag is not None:
+            roi = self._roi_drag["item"]
+            self._emit_roi_change(roi, finished=True)
+            self._roi_drag = None
+            self.update()
+            return
+
         if not self._is_dragging or self._drag_start is None:
             return
 
