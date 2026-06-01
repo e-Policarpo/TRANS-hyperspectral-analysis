@@ -36,6 +36,9 @@ logger = logging.getLogger(__name__)
 # implementation (no cache poisoning on matplotlib failures).
 # ---------------------------------------------------------------------------
 
+from src.widgets._pyqtgraph_ports.image_render import (
+    apply_levels_and_lut,
+)
 from src.widgets.lut import get_lut as _get_lut  # noqa: F401
 
 
@@ -381,30 +384,29 @@ class QMLImageCanvas(QQuickPaintedItem):
             ).copy()
             return qimg
 
-        # Single-channel — compute the uint8 brightness array from the
-        # display range, then either ship it straight as ``Format_Grayscale8``
-        # (clean, native, no LUT) or apply a colormap LUT for fancy display.
-        data = arr.astype(np.float32, copy=False)
+        # Single-channel — levels + LUT pipeline routes through the
+        # shared ``apply_levels_and_lut`` port. The grayscale path
+        # still uses ``Format_Grayscale8`` directly because the LUT
+        # round-trip there would be pure overhead (the indices ARE
+        # the grayscale values).
         lo = float(self._display_min)
         hi = float(self._display_max)
-        if hi <= lo:
-            hi = lo + 1.0
-        normalized = np.clip((data - lo) / (hi - lo), 0.0, 1.0)
-        idx = np.ascontiguousarray((normalized * 255.0).astype(np.uint8))
+        levels = (lo, hi) if hi > lo else (lo, lo + 1.0)
         cmap = (self._colormap or "original").lower()
 
         if cmap in ("original", "gray", "grey"):
-            # Native single-channel format — bytesPerLine = width, no row
-            # padding, no LUT round-trip. Cleanest possible pipeline.
+            # Build a grayscale uint8 buffer directly — skip the
+            # 3-channel LUT result we'd otherwise discard.
+            gray_lut = _get_lut("gray")
+            idx = apply_levels_and_lut(arr, levels, gray_lut)[..., 0]
+            idx = np.ascontiguousarray(idx)
             qimg = QImage(
                 idx.data, idx.shape[1], idx.shape[0],
                 idx.shape[1], QImage.Format_Grayscale8,
             ).copy()
             return qimg
 
-        # Colormap path: 8-bit index → 3-channel RGB via lookup table.
-        lut = _get_lut(cmap)
-        rgb = np.ascontiguousarray(lut[idx])  # H×W×3 uint8
+        rgb = apply_levels_and_lut(arr, levels, _get_lut(cmap))
         qimg = QImage(
             rgb.data, rgb.shape[1], rgb.shape[0],
             rgb.shape[1] * 3, QImage.Format_RGB888,
