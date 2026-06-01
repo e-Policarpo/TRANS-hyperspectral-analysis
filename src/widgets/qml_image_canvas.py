@@ -31,44 +31,12 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Colormap LUT cache
+# Colormap LUT cache — now lives in ``src/widgets/lut.py`` so the
+# image provider and image canvas share a single, properly behaved
+# implementation (no cache poisoning on matplotlib failures).
 # ---------------------------------------------------------------------------
 
-_LUT_CACHE: dict = {}
-
-
-def _get_lut(name: str) -> np.ndarray:
-    """Return a cached 256×3 uint8 lookup table for ``name``.
-
-    ``"original"`` and ``"gray"`` produce a plain grayscale ramp. Other
-    names go through matplotlib. Unknown names fall back to gray so the
-    canvas always paints something.
-    """
-    key = (name or "original").lower()
-    if key in _LUT_CACHE:
-        return _LUT_CACHE[key]
-    if key in ("original", "gray", "grey"):
-        ramp = np.tile(np.arange(256, dtype=np.uint8)[:, None], (1, 3))
-        _LUT_CACHE[key] = ramp
-        return ramp
-    try:
-        import matplotlib
-        # matplotlib 3.7+ moved to ``matplotlib.colormaps``; older versions
-        # still expose ``cm.get_cmap``. Try both for safety.
-        try:
-            cmap = matplotlib.colormaps.get_cmap(key)
-        except (AttributeError, ValueError, KeyError):
-            from matplotlib import cm
-            cmap = cm.get_cmap(key)
-    except Exception as e:
-        logger.warning("Could not load colormap %s: %s — using gray", key, e)
-        ramp = np.tile(np.arange(256, dtype=np.uint8)[:, None], (1, 3))
-        _LUT_CACHE[key] = ramp
-        return ramp
-    samples = cmap(np.linspace(0, 1, 256))[:, :3]  # drop alpha
-    lut = (samples * 255).astype(np.uint8)
-    _LUT_CACHE[key] = lut
-    return lut
+from src.widgets.lut import get_lut as _get_lut  # noqa: F401
 
 
 # ---------------------------------------------------------------------------

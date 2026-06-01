@@ -40,33 +40,10 @@ from src.models.image_data import ImageData, ImageMode
 logger = logging.getLogger(__name__)
 
 
-# Matplotlib LUT cache keyed by colormap name.
-_LUT_CACHE: dict = {}
-
-
-def _lut(name: str) -> np.ndarray:
-    """Return a cached 256×3 uint8 LUT. ``original`` / ``gray`` is identity."""
-    key = (name or "original").lower()
-    if key in _LUT_CACHE:
-        return _LUT_CACHE[key]
-    if key in ("original", "gray", "grey"):
-        ramp = np.tile(np.arange(256, dtype=np.uint8)[:, None], (1, 3))
-        _LUT_CACHE[key] = ramp
-        return ramp
-    try:
-        import matplotlib
-        try:
-            cmap = matplotlib.colormaps.get_cmap(key)
-        except (AttributeError, ValueError, KeyError):
-            from matplotlib import cm
-            cmap = cm.get_cmap(key)
-        samples = cmap(np.linspace(0, 1, 256))[:, :3]
-        lut = (samples * 255).astype(np.uint8)
-    except Exception as e:
-        logger.warning("Colormap %r unavailable (%s); falling back to gray", key, e)
-        lut = np.tile(np.arange(256, dtype=np.uint8)[:, None], (1, 3))
-    _LUT_CACHE[key] = lut
-    return lut
+# Colormap LUT cache lives in ``src/widgets/lut.py`` so this provider
+# and the image canvas share a single cache (and the same cache-
+# poisoning fix on matplotlib failures).
+from src.widgets.lut import get_lut as _lut  # noqa: F401
 
 
 def imagedata_to_qimage(
