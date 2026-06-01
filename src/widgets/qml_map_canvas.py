@@ -10,6 +10,7 @@ License: GPL
 """
 
 import numpy as np
+import os
 from typing import Optional, Tuple, Dict, Any, List
 from enum import Enum
 import logging
@@ -17,20 +18,43 @@ import logging
 from PySide6.QtCore import (
     Qt, Signal, Slot, Property, QPointF, QRectF, QObject, QTimer
 )
-from PySide6.QtGui import QImage, QPainter, QColor, QPen, QBrush, QCursor
+from PySide6.QtGui import QImage, QPainter, QColor, QPen, QBrush, QCursor, QFontMetricsF
 from PySide6.QtQuick import QQuickPaintedItem
 
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 
+from src.widgets._pyqtgraph_ports.image_render import (
+    apply_levels_and_lut,
+    downsample_image,
+)
 from src.widgets._pyqtgraph_ports.items.rect_roi import (
     HIT_NONE as ROI_HIT_NONE,
     RectROI,
 )
 from src.widgets._pyqtgraph_ports.mpl_apply import apply_pyqtgraph_ticks
+from src.widgets._pyqtgraph_ports.ticks import (
+    format_tick_strings,
+    tick_values,
+)
+from src.widgets.lut import get_lut
 import matplotlib.pyplot as plt
 
 logger = logging.getLogger(__name__)
+
+
+def _fast_map_render_enabled_default() -> bool:
+    """``TRANS_FAST_MAP_RENDER`` toggle. Default ``True`` — set the
+    env var to ``0`` / ``false`` / ``no`` / ``off`` to fall back to
+    the matplotlib pipeline if a regression is found. The matplotlib
+    code path is still alive: ``_renderMatplotlib`` keeps driving
+    ``exportToPNG`` / ``exportToSVG`` / ``exportToPDF`` so the export
+    output stays high-DPI even when interactive rendering goes
+    native."""
+    val = os.environ.get("TRANS_FAST_MAP_RENDER", "").strip().lower()
+    if val in ("0", "false", "no", "off"):
+        return False
+    return True
 
 
 class MapTool(Enum):
@@ -87,6 +111,18 @@ class QMLMapCanvas(QQuickPaintedItem):
         str, float, float, float, float,
         arguments=['roiId', 'col0', 'row0', 'col1', 'row1'],
     )
+
+    # Phase 7.4 — native render constants. Margins are slightly
+    # tighter than the graph canvas's because the map has no axis
+    # labels — just integer pixel-index ticks.
+    _NATIVE_AX_MARGIN_LEFT = 40
+    _NATIVE_AX_MARGIN_RIGHT = 16
+    _NATIVE_AX_MARGIN_TOP = 12
+    _NATIVE_AX_MARGIN_BOTTOM = 30
+    _NATIVE_BG_COLOR = QColor("#1a1a1a")
+    _NATIVE_AXIS_COLOR = QColor("#444444")
+    _NATIVE_TICK_COLOR = QColor("#888888")
+    _NATIVE_LABEL_COLOR = QColor("#cccccc")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -167,6 +203,13 @@ class QMLMapCanvas(QQuickPaintedItem):
         # via ``addRectROI``, so the existing tools keep working.
         self._rect_rois: List[RectROI] = []
         self._roi_drag: Optional[Dict[str, Any]] = None
+
+        # Phase 7.4 — native (matplotlib-free) interactive renderer.
+        # ``_renderForExport`` keeps matplotlib alive for high-DPI
+        # ``exportTo*`` slots; on-screen ``paint`` goes through
+        # ``_renderNative`` when the toggle is on (default).
+        self._use_fast_render: bool = _fast_map_render_enabled_default()
+        self._native_qimage: Optional[QImage] = None  # cached colourised map
 
     @Slot()
     def cleanup(self):
@@ -749,18 +792,203 @@ class QMLMapCanvas(QQuickPaintedItem):
     # =========================================================================
 
     def paint(self, painter: QPainter):
-        """Render matplotlib figure and overlays to QML"""
+        """Phase 7.4 dispatch: native QPainter path by default; opt
+        back into matplotlib via ``TRANS_FAST_MAP_RENDER=0``."""
+        if self._use_fast_render:
+            self._renderNative(painter)
+            return
+
         if self._needs_redraw:
             self._renderMatplotlib()
             self._needs_redraw = False
 
         if self._cached_image is not None:
-            # Draw the matplotlib image
             target_rect = QRectF(0, 0, self.width(), self.height())
             painter.drawImage(target_rect, self._cached_image)
-
-            # Draw overlays on top
             self._drawOverlays(painter)
+
+    # =====================================================================
+    # Phase 7.4 — native (matplotlib-free) interactive renderer
+    # =====================================================================
+
+    def _renderNative(self, painter: QPainter) -> None:
+        """Paint the map with QPainter primitives.
+
+        Pipeline:
+
+        1. Background fill + axes-rect from margin constants.
+        2. vmin/vmax from explicit ``_vmin`` / ``_vmax`` or the
+           percentile clip.
+        3. (Optional) ``downsample_image`` when the source map is
+           much larger than the on-screen rect — keeps the LUT
+           lookup off the critical path on 4k+ maps.
+        4. ``apply_levels_and_lut`` → uint8 RGB → QImage →
+           ``painter.drawImage`` filling the axes rect.
+        5. QPainter axes frame + tick marks + tick labels via the
+           Phase 1 / Phase 4 tick algorithm.
+        6. ``_data_to_pixel`` is populated so existing overlays
+           (crosshair, profile line, grid overlay, selected blocks,
+           ROIs) still render correctly via ``_drawOverlays``.
+        """
+        w, h = int(self.width()), int(self.height())
+        if w <= 0 or h <= 0:
+            return
+
+        painter.fillRect(QRectF(0, 0, w, h), self._NATIVE_BG_COLOR)
+        if self._map_data is None:
+            return
+
+        ax_left = self._NATIVE_AX_MARGIN_LEFT
+        ax_top = self._NATIVE_AX_MARGIN_TOP
+        ax_right = w - self._NATIVE_AX_MARGIN_RIGHT
+        ax_bottom = h - self._NATIVE_AX_MARGIN_BOTTOM
+        if ax_right <= ax_left or ax_bottom <= ax_top:
+            return
+        ax_rect = QRectF(
+            ax_left, ax_top, ax_right - ax_left, ax_bottom - ax_top,
+        )
+
+        # Levels: explicit takes priority, else percentile clip.
+        if self._vmin is not None and self._vmax is not None:
+            lo, hi = float(self._vmin), float(self._vmax)
+        else:
+            data = self._map_data
+            lo = float(np.nanpercentile(data, self._percentile_clip[0]))
+            hi = float(np.nanpercentile(data, self._percentile_clip[1]))
+        if hi <= lo:
+            hi = lo + 1.0
+
+        # Downsample large maps so the LUT lookup runs over the on-
+        # screen pixel budget, not the full source array. The factor
+        # 2× headroom keeps Qt's bilinear smoothing meaningful when
+        # the user zooms in slightly past the native axes rect.
+        src = self._map_data
+        target = (
+            max(1, int(ax_rect.width()) * 2),
+            max(1, int(ax_rect.height()) * 2),
+        )
+        if src.shape[0] > target[1] * 2 or src.shape[1] > target[0] * 2:
+            src = downsample_image(src, target_size=target, mode="mean")
+
+        # Levels + LUT.
+        cmap = (self._colormap or "viridis").lower()
+        rgb = apply_levels_and_lut(
+            np.asarray(src), levels=(lo, hi), lut=get_lut(cmap),
+        )
+        qimg = QImage(
+            rgb.data, rgb.shape[1], rgb.shape[0],
+            rgb.shape[1] * 3, QImage.Format_RGB888,
+        ).copy()
+
+        painter.save()
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.setClipRect(ax_rect)
+        painter.drawImage(ax_rect, qimg)
+        painter.restore()
+
+        # Axes frame + ticks. Map axes are pixel indices, linear.
+        self._native_draw_axes(painter, ax_rect)
+
+        # Update the transform cache used by every existing overlay.
+        self._data_to_pixel = {
+            'ax_left': ax_left,
+            'ax_right': ax_right,
+            'ax_top': ax_top,
+            'ax_bottom': ax_bottom,
+            'data_rows': self._map_data.shape[0],
+            'data_cols': self._map_data.shape[1],
+        }
+
+        # Existing overlays — selected blocks, profile lines, ROIs,
+        # the rubber-band, crosshair, etc.
+        self._drawOverlays(painter)
+
+    def _native_draw_axes(
+        self,
+        painter: QPainter,
+        ax_rect: QRectF,
+    ) -> None:
+        """Frame + major / minor ticks + tick labels.
+
+        Pixel indices, so no log mode and no axis labels — the map
+        canvas has never carried explicit ``xLabel`` / ``yLabel``
+        text. Tick label is integer column / row index.
+        """
+        if self._map_data is None:
+            return
+        rows, cols = self._map_data.shape
+
+        pen_axis = QPen(self._NATIVE_AXIS_COLOR)
+        pen_axis.setWidthF(1.0)
+        painter.setPen(pen_axis)
+        painter.drawRect(ax_rect)
+
+        x_levels = tick_values(0.0, float(cols), ax_rect.width())
+        y_levels = tick_values(0.0, float(rows), ax_rect.height())
+
+        x_major_spacing, x_majors = (
+            x_levels[0] if x_levels else (1.0, [])
+        )
+        y_major_spacing, y_majors = (
+            y_levels[0] if y_levels else (1.0, [])
+        )
+
+        x_labels, _ = (
+            format_tick_strings(x_majors, spacing=x_major_spacing, log=False)
+            if x_majors else ([], None)
+        )
+        y_labels, _ = (
+            format_tick_strings(y_majors, spacing=y_major_spacing, log=False)
+            if y_majors else ([], None)
+        )
+
+        tick_pen = QPen(self._NATIVE_TICK_COLOR)
+        tick_pen.setWidthF(1.0)
+        painter.setPen(tick_pen)
+        tick_len = 4.0
+        ax_w = ax_rect.width()
+        ax_h = ax_rect.height()
+        for x in x_majors:
+            if 0.0 <= x <= cols:
+                px = ax_rect.left() + (x / cols) * ax_w
+                painter.drawLine(
+                    QPointF(px, ax_rect.bottom()),
+                    QPointF(px, ax_rect.bottom() + tick_len),
+                )
+        for y in y_majors:
+            if 0.0 <= y <= rows:
+                py = ax_rect.top() + (y / rows) * ax_h
+                painter.drawLine(
+                    QPointF(ax_rect.left() - tick_len, py),
+                    QPointF(ax_rect.left(), py),
+                )
+
+        painter.setPen(self._NATIVE_LABEL_COLOR)
+        f = painter.font(); f.setPointSize(8); f.setBold(False)
+        painter.setFont(f)
+        fm = QFontMetricsF(painter.font())
+        for x, label in zip(x_majors, x_labels):
+            if 0.0 <= x <= cols:
+                px = ax_rect.left() + (x / cols) * ax_w
+                tw = fm.horizontalAdvance(label)
+                painter.drawText(
+                    QPointF(
+                        px - tw / 2,
+                        ax_rect.bottom() + tick_len + fm.ascent() + 2,
+                    ),
+                    label,
+                )
+        for y, label in zip(y_majors, y_labels):
+            if 0.0 <= y <= rows:
+                py = ax_rect.top() + (y / rows) * ax_h
+                tw = fm.horizontalAdvance(label)
+                painter.drawText(
+                    QPointF(
+                        ax_rect.left() - tick_len - tw - 4,
+                        py + fm.ascent() / 2 - 1,
+                    ),
+                    label,
+                )
 
     def _renderMatplotlib(self):
         """Render matplotlib figure to cached QImage"""
