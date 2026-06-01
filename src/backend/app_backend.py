@@ -2058,6 +2058,32 @@ class AppBackend(ToolImplementations, QObject):
             return []
         return [int(c) for c in counts]
 
+    @Slot(str, int, result='QVariantMap')
+    def getImageHistogramFull(self, image_id: str, bins: int = 64):
+        """Phase 7.4b — richer histogram payload used by the
+        interactive level-handle widget.
+
+        Returns ``{counts, dataMin, dataMax}`` so the QML widget can
+        map handle pixel positions back to data values. ``counts`` is
+        a list of length ``bins``; ``dataMin`` / ``dataMax`` are the
+        histogram window. Empty payload when the image isn't found.
+        """
+        image = self._images.get(image_id)
+        if image is None:
+            return {}
+        try:
+            counts, edges = image.histogram(bins=int(bins))
+        except Exception as e:
+            logger.warning(
+                "getImageHistogramFull failed for %s: %s", image_id, e,
+            )
+            return {}
+        return {
+            "counts": [int(c) for c in counts],
+            "dataMin": float(edges[0]) if len(edges) else 0.0,
+            "dataMax": float(edges[-1]) if len(edges) else 1.0,
+        }
+
     @Slot(str, result='QVariantMap')
     def getImageInfo(self, image_id: str):
         """Return image-info record used by the side-panel readout.

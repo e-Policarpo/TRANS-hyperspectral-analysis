@@ -363,9 +363,20 @@ Item {
     function refreshHistogram() {
         if (!backend || !imageId) {
             histogramView.counts = []
+            histogramView.dataMin = 0
+            histogramView.dataMax = 1
             return
         }
-        histogramView.counts = backend.getImageHistogram(imageId, 64)
+        // Phase 7.4b — switched to the richer slot so the level
+        // handles know where they sit on the histogram x-axis.
+        var payload = backend.getImageHistogramFull(imageId, 64)
+        if (payload && payload.counts) {
+            histogramView.counts = payload.counts
+            histogramView.dataMin = payload.dataMin
+            histogramView.dataMax = payload.dataMax
+        } else {
+            histogramView.counts = []
+        }
     }
 
     function applyEdits() { img.source = buildSourceUrl() }
@@ -1091,7 +1102,7 @@ Item {
                     }
                     Rectangle {
                         Layout.fillWidth: true
-                        Layout.preferredHeight: 64
+                        Layout.preferredHeight: 72
                         color: bgDarker
                         border.color: borderColor
                         border.width: 1
@@ -1099,23 +1110,147 @@ Item {
                             id: histogramView
                             anchors.fill: parent
                             anchors.margins: 2
+
+                            // Phase 7.4b — interactive histogram.
+                            // ``counts`` + ``dataMin`` / ``dataMax``
+                            // arrive from ``backend.getImageHistogramFull``.
+                            // The two vertical handles drive the
+                            // ``displayMin`` / ``displayMax`` properties
+                            // on the parent window (which in turn
+                            // rebuild the ``image://trans/<id>`` URL
+                            // through ``applyEdits``).
                             property var counts: []
+                            property real dataMin: 0
+                            property real dataMax: 1
                             property real maxCount: {
                                 var m = 1
                                 for (var i = 0; i < counts.length; i++)
                                     if (counts[i] > m) m = counts[i]
                                 return m
                             }
+                            // Only show handles on single-channel
+                            // images; RGB ignores ``displayMin/Max``.
+                            property bool handlesVisible: isSingleChannel
+
+                            function valueToPixel(v) {
+                                var span = dataMax - dataMin
+                                if (span <= 0) return 0
+                                var px = (v - dataMin) / span * width
+                                if (px < 0) px = 0
+                                if (px > width) px = width
+                                return px
+                            }
+                            function pixelToValue(p) {
+                                var span = dataMax - dataMin
+                                var clamped = Math.max(0, Math.min(p, width))
+                                return dataMin + (clamped / Math.max(width, 1)) * span
+                            }
+
                             Repeater {
                                 model: histogramView.counts.length
                                 Rectangle {
                                     width: histogramView.width / Math.max(histogramView.counts.length, 1)
                                     x: index * width
                                     color: accentBlue
-                                    opacity: 0.7
+                                    opacity: 0.55
                                     height: histogramView.height *
                                             (histogramView.counts[index] / histogramView.maxCount)
                                     anchors.bottom: parent.bottom
+                                }
+                            }
+
+                            // In-window shaded overlay between the
+                            // two handles. Helps the eye read which
+                            // bars actually map to the visible LUT
+                            // range.
+                            Rectangle {
+                                id: inRangeBand
+                                visible: histogramView.handlesVisible
+                                anchors.top: parent.top
+                                anchors.bottom: parent.bottom
+                                x: histogramView.valueToPixel(displayMin)
+                                width: Math.max(
+                                    0,
+                                    histogramView.valueToPixel(displayMax) - x,
+                                )
+                                color: accentBlue
+                                opacity: 0.18
+                            }
+
+                            // Min handle.
+                            Rectangle {
+                                id: minHandle
+                                visible: histogramView.handlesVisible
+                                anchors.top: parent.top
+                                anchors.bottom: parent.bottom
+                                x: histogramView.valueToPixel(displayMin) - 1
+                                width: 2
+                                color: "#5BCEFA"
+                            }
+                            MouseArea {
+                                id: minHandleArea
+                                visible: histogramView.handlesVisible
+                                anchors.top: parent.top
+                                anchors.bottom: parent.bottom
+                                x: minHandle.x - 5
+                                width: 12
+                                cursorShape: Qt.SizeHorCursor
+                                acceptedButtons: Qt.LeftButton
+                                property bool dragging: false
+                                onPressed: dragging = true
+                                onReleased: {
+                                    dragging = false
+                                    applyEdits()
+                                    refreshHistogram()
+                                }
+                                onPositionChanged: {
+                                    if (!dragging) return
+                                    var hostX = mapToItem(
+                                        histogramView, mouse.x, 0,
+                                    ).x
+                                    var v = histogramView.pixelToValue(hostX)
+                                    // Don't cross max.
+                                    if (v < displayMax) {
+                                        displayMin = v
+                                    }
+                                }
+                            }
+
+                            // Max handle.
+                            Rectangle {
+                                id: maxHandle
+                                visible: histogramView.handlesVisible
+                                anchors.top: parent.top
+                                anchors.bottom: parent.bottom
+                                x: histogramView.valueToPixel(displayMax) - 1
+                                width: 2
+                                color: "#F5A9B8"
+                            }
+                            MouseArea {
+                                id: maxHandleArea
+                                visible: histogramView.handlesVisible
+                                anchors.top: parent.top
+                                anchors.bottom: parent.bottom
+                                x: maxHandle.x - 5
+                                width: 12
+                                cursorShape: Qt.SizeHorCursor
+                                acceptedButtons: Qt.LeftButton
+                                property bool dragging: false
+                                onPressed: dragging = true
+                                onReleased: {
+                                    dragging = false
+                                    applyEdits()
+                                    refreshHistogram()
+                                }
+                                onPositionChanged: {
+                                    if (!dragging) return
+                                    var hostX = mapToItem(
+                                        histogramView, mouse.x, 0,
+                                    ).x
+                                    var v = histogramView.pixelToValue(hostX)
+                                    if (v > displayMin) {
+                                        displayMax = v
+                                    }
                                 }
                             }
                         }
