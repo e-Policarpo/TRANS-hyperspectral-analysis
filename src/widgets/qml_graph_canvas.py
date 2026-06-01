@@ -34,6 +34,13 @@ from src.widgets._pyqtgraph_ports.curve_path import (
     array_to_qpainterpath,
     prepare_curve_xy,
 )
+from src.widgets._pyqtgraph_ports.legend import (
+    HIT_BODY,
+    HIT_EYE,
+    HIT_NONE,
+    LegendBox,
+    LegendEntry,
+)
 from src.widgets._pyqtgraph_ports.mpl_apply import apply_pyqtgraph_ticks
 from src.widgets._pyqtgraph_ports.ticks import (
     format_tick_strings,
@@ -196,6 +203,16 @@ class QMLGraphCanvas(QQuickPaintedItem):
         self._dirty_curve_ids: set[int] = set()
         self._native_transform: Optional[QTransform] = None
         self._native_inv_transform: Optional[QTransform] = None
+
+        # Phase 5 — self-laid-out legend. Owns its own anchor +
+        # offset + per-curve visibility set; serialises through
+        # ``legendState`` so the graph window save/restore picks it
+        # up. Drag state lives on the canvas (legend is just laid
+        # out per render); mouse handlers update it via
+        # ``shift_offset``.
+        self._legend = LegendBox()
+        self._legend_drag_active: bool = False
+        self._legend_drag_last_px: Optional[Tuple[float, float]] = None
 
     # =====================================================================
     # ViewBox shims — keep the existing render-side writes
@@ -756,6 +773,45 @@ class QMLGraphCanvas(QQuickPaintedItem):
         str, _get_mouse_mode, _set_mouse_mode, notify=mouseModeChanged,
     )
 
+    # legendState — round-trips the legend's anchor + offset + hidden
+    # curve list through the project file. Exposed as a QML Property
+    # so the graph window's saveState() can include it transparently
+    # alongside curve list / scale settings, and loadState() can hand
+    # it back on reopen.
+    legendStateChanged = Signal()
+
+    @Slot(result="QVariantMap")
+    def getLegendState(self):
+        """Snapshot the legend state — used by the graph-window save
+        path. Always includes anchor + offset_px; hidden_curves is
+        included for completeness even though it's derived from
+        ``curve.visible`` at render time."""
+        return self._legend.get_state()
+
+    @Slot("QVariantMap")
+    def setLegendState(self, state):
+        """Restore from :meth:`getLegendState`. Tolerant of missing
+        keys / unknown anchors / malformed values (the underlying
+        ``LegendBox.apply_state`` ignores them)."""
+        if state is None:
+            return
+        self._legend.apply_state(dict(state))
+        self._needs_redraw = True
+        self.update()
+        self.legendStateChanged.emit()
+
+    @Slot(int, bool)
+    def setCurveLegendVisible(self, curve_id: int, visible: bool):
+        """Toggle a single curve's visibility from QML — equivalent
+        to clicking its eye in the legend."""
+        curve = self._curves.get(int(curve_id))
+        if curve is None:
+            return
+        if curve.visible != bool(visible):
+            curve.visible = bool(visible)
+            self._needs_redraw = True
+            self.update()
+
     @Slot(str, str)
     def setLabels(self, x_label: str, y_label: str):
         """Set axis labels"""
@@ -1050,8 +1106,14 @@ class QMLGraphCanvas(QQuickPaintedItem):
         ))
         self._viewbox.set_auto_range_margin(0.0)
 
-        # Legend + overlays.
+        # Legend + overlays. Sync the legend's "hidden" set from
+        # ``curve.visible`` so the eye toggles render correctly.
         if self._show_legend and self._curves:
+            hidden_ids = [
+                cid for cid, curve in self._curves.items()
+                if not curve.visible
+            ]
+            self._legend.set_hidden_curves(hidden_ids)
             self._native_draw_legend(painter, ax_rect)
         self._drawOverlays(painter)
 
@@ -1318,48 +1380,34 @@ class QMLGraphCanvas(QQuickPaintedItem):
     def _native_draw_legend(
         self, painter: QPainter, ax_rect: QRectF,
     ) -> None:
-        """Top-right legend with pen samples — small replacement for
-        matplotlib's legend that gets a richer Phase 5 port later."""
-        visible = [c for c in self._curves.values() if c.visible]
-        if not visible:
+        """Phase 5 — render via the ported ``LegendBox``.
+
+        Builds a fresh :class:`LegendEntry` list from the current
+        curve catalogue (label, pen colour, width, style), forwards
+        the anchor / offset / hidden-curves state from ``self._legend``,
+        and lets the legend lay itself out + paint. The geometry it
+        produces is cached on the legend for the mouse handlers to
+        hit-test against.
+        """
+        entries: List[LegendEntry] = [
+            LegendEntry(
+                curve_id=cid,
+                label=curve.label,
+                color=curve.color,
+                linewidth=float(curve.linewidth),
+                linestyle=curve.linestyle or "-",
+            )
+            for cid, curve in self._curves.items()
+        ]
+        if not entries:
             return
-        painter.setRenderHint(QPainter.Antialiasing, True)
         f = painter.font(); f.setPointSize(9); f.setBold(False)
-        painter.setFont(f)
-        fm = QFontMetricsF(painter.font())
-        sample_w = 24.0
-        sample_gap = 6.0
-        row_h = max(fm.height(), 14.0)
-        pad_x = 8.0
-        pad_y = 6.0
-        max_label_w = max(fm.horizontalAdvance(c.label) for c in visible)
-        box_w = sample_w + sample_gap + max_label_w + pad_x * 2
-        box_h = row_h * len(visible) + pad_y * 2
-        box_x = ax_rect.right() - box_w - 6.0
-        box_y = ax_rect.top() + 6.0
-        box = QRectF(box_x, box_y, box_w, box_h)
-
-        painter.setPen(QPen(self._NATIVE_LEGEND_BORDER))
-        painter.setBrush(QBrush(self._NATIVE_LEGEND_BG))
-        painter.drawRoundedRect(box, 3.0, 3.0)
-
-        for i, curve in enumerate(visible):
-            y_centre = box_y + pad_y + row_h * (i + 0.5)
-            sample_left = box_x + pad_x
-            sample_right = sample_left + sample_w
-            pen = QPen(QColor(curve.color))
-            pen.setWidthF(float(curve.linewidth))
-            painter.setPen(pen)
-            painter.drawLine(
-                QPointF(sample_left, y_centre),
-                QPointF(sample_right, y_centre),
-            )
-            painter.setPen(self._NATIVE_LABEL_COLOR)
-            painter.drawText(
-                QPointF(sample_right + sample_gap,
-                        y_centre + fm.ascent() / 2 - 1),
-                curve.label,
-            )
+        self._legend.render(
+            painter, f, ax_rect, entries,
+            bg_color=self._NATIVE_LEGEND_BG,
+            border_color=self._NATIVE_LEGEND_BORDER,
+            text_color=self._NATIVE_LABEL_COLOR,
+        )
 
     def _calculateAutoBounds(self):
         """Calculate auto-scale bounds from all curves"""
@@ -1524,14 +1572,25 @@ class QMLGraphCanvas(QQuickPaintedItem):
     # =========================================================================
 
     def mousePressEvent(self, event):
-        """Left → ``pointClicked`` + curve-pick + start drag-zoom rect.
-        Right → start pan. All interaction state lives on the
-        viewbox; this method just dispatches and emits the canvas's
-        signals (curve clicks, point clicks)."""
+        """Left → legend hit-test (eye toggle / drag-to-move) →
+        ``pointClicked`` + curve-pick + viewbox drag-zoom rect.
+        Right → start pan."""
         pos = event.position()
         pos_px = (pos.x(), pos.y())
 
         if event.button() == Qt.LeftButton:
+            # Legend takes priority — clicks inside the legend
+            # bounding rect don't reach the viewbox.
+            if self._use_fast_render:
+                hit, hit_cid = self._legend.hit_test(QPointF(*pos_px))
+                if hit == HIT_EYE and hit_cid is not None:
+                    self._toggle_curve_visibility(hit_cid)
+                    return
+                if hit == HIT_BODY:
+                    self._legend_drag_active = True
+                    self._legend_drag_last_px = pos_px
+                    return
+
             x, y = self._pixelToData(*pos_px)
             self.pointClicked.emit(x, y)
             clicked_curve = self._findNearestCurve(x, y)
@@ -1546,9 +1605,21 @@ class QMLGraphCanvas(QQuickPaintedItem):
         elif event.button() == Qt.RightButton:
             self._viewbox.handle_press_right(pos_px)
 
+    def _toggle_curve_visibility(self, curve_id: int) -> None:
+        """Eye-click handler — flips ``curve.visible`` and triggers
+        a repaint. Identical to ``updateCurveProperty(cid, 'visible',
+        'false')`` but auto-derives the new value from the old."""
+        curve = self._curves.get(curve_id)
+        if curve is None:
+            return
+        curve.visible = not curve.visible
+        self._needs_redraw = True
+        self.update()
+
     def mouseMoveEvent(self, event):
         """Update cursor read-out + delegate the active pan / rubber-
-        band-zoom interaction to the viewbox."""
+        band-zoom interaction to the viewbox. Legend drag short-
+        circuits viewbox motion."""
         pos = event.position()
         pos_px = (pos.x(), pos.y())
         x, y = self._pixelToData(*pos_px)
@@ -1556,14 +1627,41 @@ class QMLGraphCanvas(QQuickPaintedItem):
         self._cursor_y = y
         self._show_cursor = True
         self.cursorMoved.emit(x, y)
+
+        if self._legend_drag_active and self._legend_drag_last_px is not None:
+            last = self._legend_drag_last_px
+            dx = pos_px[0] - last[0]
+            dy = pos_px[1] - last[1]
+            self._legend_drag_last_px = pos_px
+            geom = self._legend.geometry()
+            if geom is not None:
+                # Use the current axes rect as the soft bound for
+                # the offset clamp inside ``shift_offset``.
+                d = self._data_bounds
+                if d:
+                    ax_rect = QRectF(
+                        d['ax_left'], d['ax_top'],
+                        d['ax_right'] - d['ax_left'],
+                        d['ax_bottom'] - d['ax_top'],
+                    )
+                    self._legend.shift_offset(dx, dy, ax_rect)
+                    self._needs_redraw = True
+                    self.update()
+            return
+
         self._viewbox.handle_move(pos_px)
 
     def mouseReleaseEvent(self, event):
-        """Finish a left-drag (zoom-rect, may emit ``rangeSelected``)
-        or a right-drag (pan)."""
+        """Finish a left-drag (zoom-rect, may emit ``rangeSelected``,
+        or end a legend drag) or a right-drag (pan)."""
         pos = event.position()
         pos_px = (pos.x(), pos.y())
         if event.button() == Qt.LeftButton:
+            if self._legend_drag_active:
+                self._legend_drag_active = False
+                self._legend_drag_last_px = None
+                self.update()
+                return
             result = self._viewbox.handle_release_left(pos_px)
             if result is not None:
                 x_min, y_min, x_max, y_max = result

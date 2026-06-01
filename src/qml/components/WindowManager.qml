@@ -640,6 +640,19 @@ Item {
                     state.curves = content.curves || []
                     state.xLabel = content.xLabel || ""
                     state.yLabel = content.yLabel || ""
+                    // Persist the legend's anchor / offset / hidden-
+                    // curves payload so the next session opens with
+                    // the user's positioning intact. Falls back to
+                    // ``null`` when the canvas isn't reachable yet
+                    // (window mid-construction) — the loader will
+                    // default to the LegendBox constructor anchor.
+                    if (content.graphCanvas
+                            && content.graphCanvas.getLegendState) {
+                        state.legendState = content.graphCanvas.getLegendState()
+                    } else if (content.canvas
+                            && content.canvas.getLegendState) {
+                        state.legendState = content.canvas.getLegendState()
+                    }
                 } else if (w.type === "table") {
                     // The TableWindowContent owns a TableDataModel (Python
                     // object); pull cells + column names through its slots so
