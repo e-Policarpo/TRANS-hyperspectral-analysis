@@ -385,22 +385,27 @@ class ViewBoxState:
     def handle_press_left(
         self, pos_px: Tuple[float, float],
     ) -> bool:
-        """Left-button press starts either a drag-zoom rect (default
-        in rect mode, *and* in pan mode for parity with the old TRANS
-        behaviour where the left button drag-zoomed) or, in pan mode
-        with the rect-zoom disabled, nothing."""
-        x, y = self._pixel_to_data(*pos_px)
+        """Left-button press. The interaction it starts depends on the
+        active mouse mode (driven by the graph toolbar's pan/zoom
+        toggle):
+
+        * ``MOUSE_MODE_RECT`` → begin a rubber-band zoom rectangle.
+        * ``MOUSE_MODE_PAN``  → begin a left-drag pan.
+
+        Previously the left button always started a zoom-rect
+        regardless of mode, so the toolbar toggle had no effect — the
+        pan/zoom switch is what this respects now.
+        """
         if self._mouse_mode == MOUSE_MODE_RECT:
+            x, y = self._pixel_to_data(*pos_px)
             self._is_selecting = True
             self._selection_start_data = (x, y)
             self._selection_end_data = (x, y)
             return True
-        # Pan mode: left-drag still does the legacy "drag to zoom-rect"
-        # behaviour that the old TRANS code shipped with — preserved
-        # so this phase isn't a behaviour change.
-        self._is_selecting = True
-        self._selection_start_data = (x, y)
-        self._selection_end_data = (x, y)
+        # Pan mode: left-drag pans, tracked in pixel space (same path
+        # as a right-button pan) so log-scale axes behave correctly.
+        self._is_panning = True
+        self._pan_last_px = pos_px
         return True
 
     def handle_press_right(
@@ -463,6 +468,13 @@ class ViewBoxState:
         when the drag was long enough to count as a zoom-rect; returns
         ``None`` otherwise (so the canvas can fall through to its
         single-click behaviour)."""
+        # In pan mode the left button drives a pan, not a selection —
+        # end it here (mirrors ``handle_release_right``).
+        if self._is_panning:
+            self._is_panning = False
+            self._pan_last_px = None
+            self._mark_dirty()
+            return None
         result: Optional[Tuple[float, float, float, float]] = None
         if self._is_selecting and self._selection_start_data is not None:
             x, y = self._pixel_to_data(*pos_px)

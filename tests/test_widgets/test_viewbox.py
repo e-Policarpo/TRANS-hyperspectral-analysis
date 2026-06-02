@@ -188,10 +188,31 @@ def test_set_mouse_mode_rejects_unknown():
 def test_set_mouse_mode_cancels_in_flight_interaction():
     vb = ViewBoxState()
     _identity_transforms(vb)
+    vb.set_mouse_mode(MOUSE_MODE_RECT)
     vb.handle_press_left((10.0, 10.0))
     assert vb.is_selecting() is True
-    vb.set_mouse_mode(MOUSE_MODE_RECT)
+    vb.set_mouse_mode(MOUSE_MODE_PAN)
     assert vb.is_selecting() is False
+
+
+def test_left_drag_pans_in_pan_mode():
+    """Default (pan) mode: left-drag pans, like a right-drag. This is
+    what the toolbar pan/zoom toggle controls."""
+    vb = ViewBoxState()
+    _identity_transforms(vb)
+    vb.set_view_range(0, 100, 0, 100, push_history=False)
+    assert vb.mouse_mode() == MOUSE_MODE_PAN
+    vb.handle_press_left((50.0, 50.0))
+    assert vb.is_panning() is True
+    assert vb.is_selecting() is False
+    changed = vb.handle_move((40.0, 60.0))  # 10 px left, 10 px down
+    assert changed is True
+    r = vb.view_range()
+    assert r.x_min == pytest.approx(10.0)
+    assert r.x_max == pytest.approx(110.0)
+    # Releasing a left-pan returns no zoom-rect.
+    assert vb.handle_release_left((40.0, 60.0)) is None
+    assert vb.is_panning() is False
 
 
 def test_right_drag_pans_view_in_pixel_space():
@@ -213,6 +234,7 @@ def test_right_drag_pans_view_in_pixel_space():
 def test_left_drag_zoom_rect_succeeds_when_long_enough():
     vb = ViewBoxState()
     _identity_transforms(vb)
+    vb.set_mouse_mode(MOUSE_MODE_RECT)
     vb.set_view_range(0, 100, 0, 100, push_history=False)
     vb.handle_press_left((10.0, 10.0))
     vb.handle_move((90.0, 90.0))
@@ -226,6 +248,7 @@ def test_left_drag_zoom_rect_succeeds_when_long_enough():
 def test_left_drag_zoom_rect_below_threshold_is_click():
     vb = ViewBoxState()
     _identity_transforms(vb)
+    vb.set_mouse_mode(MOUSE_MODE_RECT)
     vb.handle_press_left((10.0, 10.0))
     # Move only 2 px — below the 5 px drag threshold.
     result = vb.handle_release_left((12.0, 12.0))
