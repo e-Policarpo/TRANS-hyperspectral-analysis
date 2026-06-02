@@ -193,3 +193,82 @@ def test_reset_crop_clears(canvas):
     canvas.resetCrop()
     assert canvas.cropRect == {}
     assert canvas.cropActive is False
+
+
+# =============================================================================
+# Wheel zoom: sensitivity + zoom-out floor
+# =============================================================================
+
+def _zoomable_canvas(canvas, img_w=400, img_h=400, view_w=200, view_h=200):
+    """Canvas with a known image + widget geometry so ``_fit_scale`` is
+    deterministic. Default: 400px image in a 200px view → fit_scale 0.5."""
+    img = ImageData.from_array(np.zeros((img_h, img_w), dtype=np.uint8))
+    canvas.setImageData(img)
+    canvas.setWidth(view_w)
+    canvas.setHeight(view_h)
+    return canvas
+
+
+def test_fit_scale_matches_geometry(canvas):
+    _zoomable_canvas(canvas)  # 400px image in 200px view
+    assert canvas._fit_scale() == pytest.approx(0.5)
+
+
+def test_one_full_notch_is_a_single_1_1x_step(canvas):
+    _zoomable_canvas(canvas)
+    canvas._fit_to_window = False
+    canvas._zoom = 1.0
+    canvas._zoom_by_delta(120)  # one mouse notch
+    assert canvas._zoom == pytest.approx(1.1)
+
+
+def test_subnotch_trackpad_delta_zooms_proportionally_less(canvas):
+    """A 10-unit trackpad delta must move far less than a full 120 notch —
+    the old code applied a full 1.1× per event regardless."""
+    _zoomable_canvas(canvas)
+    canvas._fit_to_window = False
+    canvas._zoom = 1.0
+    canvas._zoom_by_delta(10)
+    assert 1.0 < canvas._zoom < 1.02
+
+
+def test_zoom_out_cannot_go_below_fit_scale(canvas):
+    _zoomable_canvas(canvas)  # fit_scale 0.5
+    canvas._fit_to_window = False
+    canvas._zoom = 0.5
+    for _ in range(20):
+        canvas._zoom_by_delta(-120)
+    assert canvas._zoom == pytest.approx(0.5)
+
+
+def test_leaving_fit_to_window_starts_from_fit_scale(canvas):
+    """First wheel step out of fit-to-window must be continuous (seed
+    ``_zoom`` from the fitted scale, not the stale 1.0)."""
+    _zoomable_canvas(canvas)  # fit_scale 0.5
+    canvas._fit_to_window = True
+    canvas._zoom = 1.0  # stale value while fit-to-window
+    canvas._zoom_by_delta(-120)  # try to zoom out
+    # Seeded to 0.5 then clamped at the 0.5 floor — no jump up to ~0.9.
+    assert canvas._zoom == pytest.approx(0.5)
+    assert canvas._fit_to_window is False
+
+
+def test_small_image_floor_is_one_to_one(canvas):
+    """Image smaller than the view (fit_scale > 1): zoom-out floor is 1:1,
+    not the >1 fit scale."""
+    _zoomable_canvas(canvas, img_w=100, img_h=100, view_w=400, view_h=400)
+    assert canvas._fit_scale() == pytest.approx(4.0)
+    canvas._fit_to_window = False
+    canvas._zoom = 1.0
+    for _ in range(20):
+        canvas._zoom_by_delta(-120)
+    assert canvas._zoom == pytest.approx(1.0)
+
+
+def test_zoom_in_capped_at_max(canvas):
+    _zoomable_canvas(canvas)
+    canvas._fit_to_window = False
+    canvas._zoom = 1.0
+    for _ in range(200):
+        canvas._zoom_by_delta(120)
+    assert canvas._zoom == pytest.approx(canvas._MAX_ZOOM)

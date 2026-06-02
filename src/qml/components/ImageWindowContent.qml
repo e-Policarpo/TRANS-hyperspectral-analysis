@@ -594,10 +594,16 @@ Item {
                     spacing: 2
                     visible: overlayPool.length > 0 || zoomRegionNames.length > 0
                     Repeater {
-                        model: overlayPool
+                        // Only selected spectra appear in the legend.
+                        // Previously this iterated the full ``overlayPool``
+                        // and merely dimmed deselected entries, so
+                        // unchecking a spectrum left a "ghost" legend row
+                        // behind. Driving off ``selectedOverlays()`` removes
+                        // the row in lock-step with the on-image crosshair
+                        // (which already uses the same model).
+                        model: selectedOverlays()
                         delegate: Row {
                             spacing: 6
-                            opacity: overlaySelected[overlayKeyOf(modelData)] ? 1.0 : 0.35
                             Rectangle {
                                 width: 10; height: 10
                                 color: overlaySpectrumColors[overlayKeyOf(modelData)] || accentBlue

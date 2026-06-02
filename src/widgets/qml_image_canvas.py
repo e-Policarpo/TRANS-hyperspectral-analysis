@@ -526,16 +526,57 @@ class QMLImageCanvas(QQuickPaintedItem):
         if self._panning:
             self._panning = False
 
+    def _fit_scale(self) -> float:
+        """Scale at which the image exactly fits the widget (the size it
+        opens at in fit-to-window mode). Returns 1.0 when geometry isn't
+        known yet."""
+        w, h = self.width(), self.height()
+        if self._image is None or w <= 0 or h <= 0:
+            return 1.0
+        iw, ih = self._image.width, self._image.height
+        if iw <= 0 or ih <= 0:
+            return 1.0
+        return min(w / iw, h / ih)
+
+    # Hard ceiling on zoom-in (40×). The floor is dynamic — see
+    # ``_zoom_by_delta``.
+    _MAX_ZOOM = 40.0
+
+    def _zoom_by_delta(self, delta: float) -> None:
+        """Apply a wheel-zoom step for an angle-delta of ``delta`` units.
+
+        Pure state update (no repaint) so it can be unit-tested without a
+        ``QWheelEvent``. ``wheelEvent`` wraps it.
+        """
+        if self._image is None or delta == 0:
+            return
+
+        # Zoom proportionally to the wheel delta rather than a fixed step
+        # per event. A full mouse notch is 120 units → one 1.1× step; the
+        # many sub-notch deltas a trackpad emits now scale down instead of
+        # each applying a full 1.1× (which made zoom wildly oversensitive).
+        factor = 1.1 ** (delta / 120.0)
+
+        fit_scale = self._fit_scale()
+        # When leaving fit-to-window, seed ``_zoom`` from the actual fitted
+        # scale so the first wheel step is continuous (no jump).
+        if self._fit_to_window:
+            self._zoom = fit_scale
+
+        # Don't allow zooming out past the original/fitted size: the floor
+        # is the fit scale, but never above 1:1 (so small images can still
+        # shrink to their natural size).
+        min_zoom = min(fit_scale, 1.0)
+        self._zoom = max(min_zoom, min(self._MAX_ZOOM, self._zoom * factor))
+        self._fit_to_window = False
+
     def wheelEvent(self, event):
         if self._image is None:
             return
         delta = event.angleDelta().y()
         if delta == 0:
             return
-        factor = 1.1 if delta > 0 else 1.0 / 1.1
-        new_zoom = max(0.05, min(40.0, self._zoom * factor))
-        self._zoom = new_zoom
-        self._fit_to_window = False
+        self._zoom_by_delta(delta)
         self.update()
 
     # --------------------------------------------------------------- resize
