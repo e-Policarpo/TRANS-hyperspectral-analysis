@@ -32,10 +32,16 @@ estiver no `Unified-UI` (e cole o hash do commit ao lado).
   que estão fora do `ax_rect`.
 - [ ] **Area select para zoom mapeia coordenadas erradas.** O zoom
   resultante sai deslocado em relação ao retângulo selecionado.
-- [ ] **Panning.** Adicionar pan dedicado nos gráficos.
+- [x] **Panning.** Adicionar pan dedicado nos gráficos.
   *Nota: o ViewBox da Phase 2 já tem `MOUSE_MODE_PAN`; verificar
   se a toolbar do `GraphWindowContent.qml` está expondo o toggle
   corretamente.*
+  *Fix: a toolbar já expunha o toggle corretamente
+  (`graphCanvas.mouseMode = checked ? "rect" : "pan"`), mas
+  `ViewBoxState.handle_press_left` ignorava o modo e sempre
+  iniciava zoom-rect. Agora, em modo pan, o left-drag faz pan
+  (`viewbox.py`); right-drag continua sempre fazendo pan. Testes
+  em test_viewbox.py atualizados + novo `test_left_drag_pans_in_pan_mode`.*
 - [ ] **Tabela ↔ spectral data.** Adicionar funcionalidade de
   converter uma tabela em spectral data (ou unificar os dois no
   backend mantendo separação organizacional no project browser).
@@ -44,9 +50,26 @@ estiver no `Unified-UI` (e cole o hash do commit ao lado).
   `Opened dataset … - Smoothed in embedded windows` mas o gráfico
   não é alterado. O backend processa, mas o resultado não chega
   ao canvas.
-- [ ] **Toggle zoom/pan não funciona.** Pan continua em botão
+  *Investigação: há DOIS caminhos. (a) Botões da toolbar do
+  gráfico (`GraphWindowContent.qml` → `graphCanvas.applyCurveOperation`)
+  adicionam uma nova curva ao canvas e funcionam. (b) Ferramentas
+  a nível de dataset chamam `_do_open_dataset_in_plot` (origem do
+  log "in embedded windows"), que emite `openDatasetEmbedded` →
+  QML abre uma JANELA NOVA em vez de atualizar o canvas aberto.
+  Fix correto: detectar janela existente para o dataset e
+  atualizar suas curvas (ou rotear o resultado da ferramenta para
+  o canvas ativo). Não feito ainda — requer plumbing de
+  identidade janela↔dataset.*
+- [x] **Toggle zoom/pan não funciona.** Pan continua em botão
   direito e zoom em botão esquerdo independentemente da seleção
   na toolbar; ambos mapeiam coordenadas erradas.
+  *Fix (parte do toggle): `handle_press_left` agora respeita
+  `mouseMode` — modo "pan" faz pan no botão esquerdo, modo "rect"
+  faz zoom-rect. Ver fix de Panning acima. NOTA: a parte
+  "mapeiam coordenadas erradas" (deslocamento do retângulo, item
+  separado abaixo) não foi investigada nesta sessão — o
+  round-trip `_dataToPixel`/`_pixelToData` parece consistente;
+  suspeitar de device-pixel-ratio (Retina) se persistir.*
 - [ ] **Posição inicial dos gráficos.** Deveria auto-centralizar /
   auto-fit os dados (todos os pontos visíveis) ao abrir uma nova
   janela.
@@ -61,15 +84,37 @@ estiver no `Unified-UI` (e cole o hash do commit ao lado).
 
 ## Sistema de Imagens
 
-- [ ] **Sensibilidade do scroll de zoom muito alta.** Diminuir o
+- [x] **Sensibilidade do scroll de zoom muito alta.** Diminuir o
   passo por wheel-tick.
-- [ ] **Limite de zoom-out.** Não permitir reduzir abaixo do
+  *Fix: `wheelEvent` aplicava `1.1×` fixo POR EVENTO; em trackpad
+  macOS chegam muitos eventos sub-notch → zoom dispara. Agora o
+  fator é proporcional ao delta: `1.1 ** (delta/120)` (uma notch
+  de mouse = 120 = um passo 1.1×). Lógica extraída p/
+  `_zoom_by_delta` (testável). Ver `qml_image_canvas.py`.*
+- [x] **Limite de zoom-out.** Não permitir reduzir abaixo do
   tamanho original da imagem.
+  *Fix: piso de zoom era 0.05 (encolhia muito). Agora o piso é
+  `min(fit_scale, 1.0)` — não dá p/ reduzir abaixo do tamanho
+  ajustado à janela (ou 1:1 p/ imagens menores que a janela). Ao
+  sair do fit-to-window, `_zoom` é semeado com `fit_scale` p/
+  evitar salto no primeiro passo. Testes em
+  test_qml_image_canvas.py.*
 - [ ] **Overlays de espectros duplicados.** Espectros estão sendo
   desenhados mais de uma vez no overlay; causa raiz não-óbvia.
-- [ ] **Legenda fantasma no overlay.** Quando o usuário
+  *Investigação: com `showLaserFocus`/`showCrosshair` off (default),
+  só o Repeater `selectedOverlays()` desenha — uma "+" por
+  spectrum. Duplicação ⇒ `getDatasetOverlaysForImage` retorna o
+  mesmo spectrum físico sob dois `dataset_name` (datasets que
+  compartilham `wip_source_stem` + mesma posição). Causa raiz é o
+  merge/identidade do WITec loader (bug #2 da seção WITec) — o fix
+  pertence ao loader, não ao overlay. Dedupe no overlay mascararia
+  o bug real.*
+- [x] **Legenda fantasma no overlay.** Quando o usuário
   desseleciona um espectro na lista, a entrada correspondente
   fica na legenda.
+  *Fix: a legenda iterava `overlayPool` (todos) e só esmaecia os
+  desmarcados (opacity 0.35). Agora usa `selectedOverlays()`, em
+  lock-step com a crosshair na imagem. `ImageWindowContent.qml`.*
 
 ## Aba de análise Hiperespectral
 
@@ -113,11 +158,27 @@ estiver no `Unified-UI` (e cole o hash do commit ao lado).
 - [ ] **Trocar de fonte não funciona.** Preview só muda ao
   escolher Helvetica; nada mais. A UI não é atualizada e a
   configuração não persiste.
+  *Parcial: causa-raiz resolvida — `applyCurrentScheme()`
+  recarregava o preset imutável e descartava as edições. Agora
+  empurra a cópia editada via `setCurrentSchemeData()` e o backend
+  persiste colors+font em preferences.json (`current_scheme_data`).
+  A família de fonte é aplicada como fonte padrão do QApplication
+  no startup (main.py), valendo p/ todo widget que não fixa
+  `font.family`. FALTA p/ update ao vivo: a maioria dos `Text`
+  fixa `font.pixelSize`/`font.family` literais — varrer e ligar
+  esses aos props de tema (`fontFamily`/`fontSize*`).*
 - [ ] **Tamanho de texto.** Muda o preview, não altera a UI, não
   persiste.
+  *Parcial: agora persiste e atinge os props raiz `fontSize*`.
+  Widgets que fixam `font.pixelSize: N` literal ainda não escalam
+  — mesma varredura do item acima.*
 - [ ] **Cores hard-coded no QML.** Trocar cores individuais nas
   preferências não tem efeito; as cores estão fixas nos
   ``Rectangle.color`` / ``Material.accent`` / etc.
+  *Parcial: edições do `ColorEditor` agora persistem e disparam
+  `colorSchemeChanged` → `applyColorScheme()` atualiza os props
+  raiz (bgDark, accentPink, …). Widgets ligados aos props mudam;
+  cores literais ("transparent", hex fixos) ainda não.*
 
 ## Funcionalidades básicas
 
@@ -125,8 +186,21 @@ estiver no `Unified-UI` (e cole o hash do commit ao lado).
   explicitamente utilizadas (o que nem é destrutivo). Deletar
   itens e outras operações destrutivas não entram no undo
   stack.
-- [ ] **Fechar durante operação trava o programa.** Quando o
+  *Parcial: delete de dataset/rename já tinham undo; agora
+  `deleteImage` e `deleteNote` (entidades em memória) também
+  empilham undo (app_backend.py). FALTA: deletes baseados em
+  arquivo (`deleteMap`/`deleteTable`/`deleteGraph`/`deleteOutput`)
+  fazem `unlink()` no disco e não emitem sinal "added", então
+  desfazê-los exige (a) mover p/ lixeira de sessão e (b) plumbing
+  de refresh do project browser. Deixado como follow-up.*
+- [x] **Fechar durante operação trava o programa.** Quando o
   usuário tenta fechar o programa enquanto está salvando ou
   rodando qualquer worker, o programa trava porque o workflow
   editor nunca fecha. Avisar (modal) que há trabalho em
   andamento e aguardar / cancelar.
+  *Fix: `onClosing` em Main.qml intercepta o close quando
+  `backend.isBusy`, abre `busyCloseDialog` (modal) com opções
+  "Keep Working" / "Cancel & Quit". Confirmar cancela o worker
+  (`backend.cancelAllOperations()` → `worker_manager.cancel_all` +
+  `cancel_current`) e re-emite o close, que fecha as janelas de
+  workflow normalmente.*
