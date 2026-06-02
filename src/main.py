@@ -99,6 +99,26 @@ def main():
     # Create backend
     backend = AppBackend()
 
+    # Apply the saved font family/size as the Qt application default so that
+    # the preference takes effect across every widget that doesn't override
+    # font.family explicitly (most of the UI). Live in-session changes are
+    # handled by the QML theme properties; this covers the startup baseline.
+    try:
+        from PySide6.QtGui import QFont
+        prefs = backend.preferencesManager
+        scheme = prefs.getCurrentScheme()
+        font_cfg = (scheme or {}).get('font', {}) if isinstance(scheme, dict) else {}
+        family = font_cfg.get('family') or ""
+        if family and family not in ("system-ui", ".AppleSystemUIFont"):
+            app_font = QFont(family)
+            size_pt = font_cfg.get('sizeMedium')
+            if isinstance(size_pt, (int, float)) and size_pt > 0:
+                app_font.setPointSize(int(size_pt))
+            app.setFont(app_font)
+            logger.info(f"Application default font set to {family}")
+    except Exception as e:
+        logger.warning(f"Could not apply saved application font: {e}")
+
     # Expose backend to QML
     engine.rootContext().setContextProperty("backend", backend)
 

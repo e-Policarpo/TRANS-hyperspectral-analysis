@@ -1620,6 +1620,19 @@ class AppBackend(ToolImplementations, QObject):
         else:
             logger.info("No operation to cancel")
 
+    @Slot()
+    def cancelAllOperations(self):
+        """Cancel the running operation and discard any queued ones.
+
+        Used by the close-while-busy flow so the app can quit without
+        waiting for the full queue to drain.
+        """
+        self.worker_manager.cancel_all()
+        if self.worker_manager.cancel_current():
+            logger.info("All operations cancelled by user")
+        else:
+            logger.info("No running operation; pending queue cleared")
+
     @Slot(result=str)
     def getCurrentOperation(self):
         """Get the name of the currently running operation."""
@@ -2027,9 +2040,30 @@ class AppBackend(ToolImplementations, QObject):
     def deleteImage(self, image_id: str):
         """Remove an image entity from the project."""
         if image_id in self._images:
+            deleted_image = self._images[image_id]
             del self._images[image_id]
             self.imageDeleted.emit(image_id)
             logger.info("Deleted image %s", image_id)
+
+            # Register undo command (image entities live in memory).
+            if not self._suppress_undo:
+                def undo_delete():
+                    self._images[image_id] = deleted_image
+                    self.imageAdded.emit(image_id, deleted_image.name)
+                    self.projectModifiedChanged.emit(True)
+
+                def redo_delete():
+                    self._suppress_undo = True
+                    try:
+                        self.deleteImage(image_id)
+                    finally:
+                        self._suppress_undo = False
+
+                self._undo_manager.push(UndoCommand(
+                    description=f"Delete image '{deleted_image.name}'",
+                    undo_fn=undo_delete,
+                    redo_fn=redo_delete,
+                ))
 
     @Slot(str, str)
     def renameImage(self, image_id: str, new_name: str):
@@ -2678,8 +2712,29 @@ class AppBackend(ToolImplementations, QObject):
     def deleteNote(self, note_id: str):
         """Remove a note entity."""
         if note_id in self._notes:
+            deleted_note = self._notes[note_id]
             del self._notes[note_id]
             self.noteDeleted.emit(note_id)
+
+            # Register undo command (note entities live in memory).
+            if not self._suppress_undo:
+                def undo_delete():
+                    self._notes[note_id] = deleted_note
+                    self.noteAdded.emit(note_id, deleted_note.get('name', 'Note'))
+                    self.projectModifiedChanged.emit(True)
+
+                def redo_delete():
+                    self._suppress_undo = True
+                    try:
+                        self.deleteNote(note_id)
+                    finally:
+                        self._suppress_undo = False
+
+                self._undo_manager.push(UndoCommand(
+                    description=f"Delete note '{deleted_note.get('name', 'Note')}'",
+                    undo_fn=undo_delete,
+                    redo_fn=redo_delete,
+                ))
 
     @Slot(str, str)
     def renameNote(self, note_id: str, new_name: str):

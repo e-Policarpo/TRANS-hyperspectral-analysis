@@ -760,6 +760,12 @@ class PreferencesManager(QObject):
                     elif scheme_name in self._custom_schemes:
                         self._current_scheme = self._custom_schemes[scheme_name]
 
+                    # Restore any user customisation saved on top of the
+                    # preset/custom base (edited colours, font family, sizes).
+                    saved_scheme = data.get('current_scheme_data')
+                    if saved_scheme and saved_scheme.get('colors'):
+                        self._current_scheme = ColorScheme.from_dict(saved_scheme)
+
                     self.preferencesLoaded.emit()
                     logger.info(f"Loaded preferences, current scheme: {scheme_name}")
         except Exception as e:
@@ -770,6 +776,11 @@ class PreferencesManager(QObject):
         try:
             data = {
                 'current_scheme': self._current_scheme_name,
+                # Full snapshot of the active scheme (colors + font) so that
+                # edits the user made to a preset's colours or font survive a
+                # restart. Without this, only the preset *name* was stored and
+                # any customisation was lost on reload.
+                'current_scheme_data': self._current_scheme.to_dict(),
                 'version': '1.0',
                 'autosave_enabled': self._autosave_enabled,
                 'autosave_interval_minutes': self._autosave_interval_minutes,
@@ -869,7 +880,36 @@ class PreferencesManager(QObject):
         """Set a specific color in the current scheme."""
         if color_key in self._current_scheme.colors:
             self._current_scheme.colors[color_key] = color_value
+            self._save_preferences()
             self.colorSchemeChanged.emit(self._current_scheme_name)
+
+    @Slot('QVariant')
+    def setCurrentSchemeData(self, scheme_data: Dict):
+        """Apply a full edited scheme (colors + font) coming from the UI.
+
+        The preferences dialog keeps a local working copy of the scheme while
+        the user tweaks colours, font family and sizes. This persists that copy
+        as the active scheme and notifies the UI so the changes take effect
+        immediately and survive a restart.
+        """
+        if not scheme_data:
+            return
+        try:
+            colors = scheme_data.get('colors')
+            if colors:
+                self._current_scheme.colors.update(colors)
+            font = scheme_data.get('font')
+            if font:
+                self._current_scheme.font.update(font)
+            name = scheme_data.get('name')
+            if name:
+                self._current_scheme.name = name
+            self._save_preferences()
+            self.colorSchemeChanged.emit(self._current_scheme_name)
+            self.fontChanged.emit()
+            logger.info("Applied edited scheme data from preferences dialog")
+        except Exception as e:
+            logger.error(f"Error applying scheme data: {e}")
 
     @Slot(str, result=str)
     def getColor(self, color_key: str) -> str:
@@ -880,6 +920,7 @@ class PreferencesManager(QObject):
     def setFontProperty(self, prop_name: str, value: Any):
         """Set a font property."""
         self._current_scheme.font[prop_name] = value
+        self._save_preferences()
         self.fontChanged.emit()
 
     @Slot(str, result='QVariant')

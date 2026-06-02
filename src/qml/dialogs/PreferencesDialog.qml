@@ -1154,8 +1154,27 @@ Dialog {
     }
 
     function applyCurrentScheme() {
-        if (preferencesManager && currentSchemeName) {
+        if (!preferencesManager)
+            return
+
+        // First switch the active scheme to the selected preset/custom base
+        // (this resets colours/font to that scheme's defaults in the backend).
+        if (currentSchemeName)
             preferencesManager.setScheme(currentSchemeName)
+
+        // Then push the user's working copy (edited colours + font controls)
+        // on top so customisations actually take effect and persist. Without
+        // this the preset would override every tweak the user just made.
+        if (currentScheme && currentScheme.colors) {
+            // Make sure the font block reflects the live controls.
+            if (!currentScheme.font)
+                currentScheme.font = {}
+            currentScheme.font.family = fontFamilyCombo.currentText
+            currentScheme.font.sizeSmall = smallSizeSpinner.value
+            currentScheme.font.sizeMedium = mediumSizeSpinner.value
+            currentScheme.font.sizeLarge = largeSizeSpinner.value
+            currentScheme.font.sizeHeader = headerSizeSpinner.value
+            preferencesManager.setCurrentSchemeData(currentScheme)
         }
     }
 

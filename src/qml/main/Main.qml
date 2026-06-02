@@ -21,8 +21,20 @@ ApplicationWindow {
     height: 900
     title: backend.projectReady ? "TRANS-QML - " + backend.projectName : "TRANS-QML - Hyperspectral Data Analysis"
 
+    // Set to true once the user has confirmed they want to quit despite a
+    // running operation. Lets the second onClosing pass through.
+    property bool _forceClose: false
+
     // Close all child windows when main window closes
     onClosing: function(close) {
+        // If a background worker is still running (e.g. a project save or a
+        // long tool), closing immediately can hang the app or lose work.
+        // Intercept and ask the user instead of accepting the close.
+        if (backend.isBusy && !_forceClose) {
+            close.accepted = false
+            busyCloseDialog.open()
+            return
+        }
         closeAllWorkflowWindows()
         backend.closeAllWindows()
         close.accepted = true
@@ -230,6 +242,11 @@ ApplicationWindow {
 
         function onPreferencesLoaded() {
             console.log("Preferences loaded, applying color scheme")
+            applyColorScheme()
+        }
+
+        function onFontChanged() {
+            console.log("Font changed signal received")
             applyColorScheme()
         }
     }
@@ -1342,6 +1359,45 @@ ApplicationWindow {
         Label {
             text: "TRANS-QML\nHyperspectral Data Analysis Platform\n\nVersion 1.0\n\nResearch Software"
             horizontalAlignment: Text.AlignHCenter
+        }
+    }
+
+    // Shown when the user tries to close the app while a background worker
+    // (project save, long-running tool, etc.) is still active.
+    Dialog {
+        id: busyCloseDialog
+        title: "Operation in progress"
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        width: 440
+        closePolicy: Popup.NoAutoClose
+
+        Label {
+            width: parent.width
+            wrapMode: Text.Wrap
+            text: "TRANS is still working on \"" + (backend ? backend.getCurrentOperation() : "") +
+                  "\".\n\nQuitting now will cancel it and any unsaved work may be lost. " +
+                  "You can keep working and try again once it finishes."
+        }
+
+        footer: DialogButtonBox {
+            Button {
+                text: "Keep Working"
+                DialogButtonBox.buttonRole: DialogButtonBox.RejectRole
+            }
+            Button {
+                text: "Cancel & Quit"
+                DialogButtonBox.buttonRole: DialogButtonBox.AcceptRole
+            }
+        }
+
+        onRejected: close()
+        onAccepted: {
+            // Cancel the worker, mark force-close, then re-issue the close.
+            backend.cancelAllOperations()
+            mainWindow._forceClose = true
+            close()
+            Qt.callLater(function() { mainWindow.close() })
         }
     }
 
