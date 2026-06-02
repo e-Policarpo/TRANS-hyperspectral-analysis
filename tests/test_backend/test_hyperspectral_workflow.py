@@ -244,6 +244,29 @@ class TestMapEditorBackendDiscretization:
 
         assert 'MismatchData' not in backend._linked_datasets
 
+    def test_average_uses_block_when_only_block_v_gt_1(self, backend):
+        """Regression: a 1×N (tall) grid block must average all N spectra in
+        the block. The old guard only checked grid_block_h, so a block_h==1,
+        block_v==3 grid fell through to the single-pixel branch and averaged
+        just one spectrum (wrong block_count)."""
+        # 4 cols × 6 rows = 24 spectra.
+        data = create_test_spectral_data(dim_h=4, dim_v=6)
+        backend._linked_datasets = {'ds': data}
+        backend._active_dataset = 'ds'
+
+        canvas = Mock()
+        canvas._show_grid_overlay = True
+        canvas._grid_block_h = 1
+        canvas._grid_block_v = 3
+        canvas._map_data = np.zeros((6, 4))   # rows=dim_v, cols=dim_h
+        canvas._selected_blocks = {(0, 0)}    # one grid block, rows 0..3, col 0
+        backend._canvas = canvas
+
+        result = backend.getAverageSpectrumForSelectedBlocks()
+        assert 'error' not in result
+        # Block covers pixel rows 0,1,2 at col 0 -> idx 0,4,8 -> 3 spectra.
+        assert result['block_count'] == 3
+
     def test_discretization_ready_signal(self, backend):
         """setDiscretizationGrid should emit discretizationReady signal."""
         from src.models.map_channel import MultiChannelMap, ChannelType

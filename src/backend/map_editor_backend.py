@@ -724,8 +724,13 @@ class MapEditorBackend(QObject):
         rows = self._canvas._map_data.shape[0]
         cols = self._canvas._map_data.shape[1]
 
-        # If grid overlay is active, use grid block coordinates
-        if self._canvas._show_grid_overlay and self._canvas._grid_block_h > 1:
+        # If grid overlay is active, use grid block coordinates. Must match
+        # the canvas's own block/pixel decision (block_h > 1 OR block_v > 1) —
+        # checking only block_h treated a 1×N (tall) grid as pixel coords and
+        # inverted the wrong set.
+        if self._canvas._show_grid_overlay and (
+            self._canvas._grid_block_h > 1 or self._canvas._grid_block_v > 1
+        ):
             import math
             grid_rows = math.ceil(rows / self._canvas._grid_block_v)
             grid_cols = math.ceil(cols / self._canvas._grid_block_h)
@@ -762,8 +767,14 @@ class MapEditorBackend(QObject):
 
         for row, col in selected:
             # If grid overlay active, translate grid block to original pixel
-            # For grid blocks, we average all spectra within the block
-            if self._canvas._show_grid_overlay and self._canvas._grid_block_h > 1:
+            # For grid blocks, we average all spectra within the block.
+            # Guard must match the canvas (block_h > 1 OR block_v > 1): with a
+            # 1×N grid the canvas stores grid-block coords, so the old
+            # block_h-only check mis-read them as pixel coords and averaged
+            # the wrong (and wrong number of) spectra.
+            if self._canvas._show_grid_overlay and (
+                self._canvas._grid_block_h > 1 or self._canvas._grid_block_v > 1
+            ):
                 block_h = self._canvas._grid_block_h
                 block_v = self._canvas._grid_block_v
                 orig_rows = self._canvas._map_data.shape[0] if self._canvas._map_data is not None else 0

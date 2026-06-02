@@ -135,9 +135,18 @@ estiver no `Unified-UI` (e cole o hash do commit ao lado).
   gráficos.
 - [ ] **Grid 1x1 aplica tamanho errado.** Quando o usuário coloca
   grid 1×1 explicitamente, o código aplica outro tamanho.
-- [ ] **Average spectrum lê número errado de blocos.** Adicionar
+- [x] **Average spectrum lê número errado de blocos.** Adicionar
   limpeza de cache ao trocar o tamanho do grid e reprocessar a
   média.
+  *Investigação: a seleção JÁ é limpa ao trocar o grid
+  (`setGridBlockSize` faz `_selected_blocks.clear()`). O bug real
+  era inconsistência de guard: o canvas decide bloco-vs-pixel com
+  `block_h > 1 OR block_v > 1`, mas o backend
+  (`getAverageSpectrumForSelectedBlocks` e `invertSelection`) só
+  checava `block_h > 1`. Num grid 1×N (blocos altos) o canvas
+  guarda coords de bloco, mas o backend as lia como pixel →
+  média de 1 spectrum em vez de N (block_count errado). Guards
+  alinhados. Teste de regressão em test_hyperspectral_workflow.py.*
 - [ ] **Suporte a espectros espacialmente resolvidos não-mapas.**
   Espectros pontuais e em linha (line scans) precisam ser
   reconhecidos além de mapas em área.
