@@ -23,6 +23,48 @@ Rectangle {
     property string selectedDataset: ""
     property string selectedCategory: ""
 
+    // Sort state for browser items (right-click a category header to change).
+    // "name" or "type"; applied when (re)populating the per-category models.
+    property string sortKey: "name"
+    property bool sortAsc: true
+
+    // Comparator over item dicts ({name/title, type}). When sorting by type,
+    // ties fall back to name so the order is stable.
+    function itemComparator(a, b) {
+        var av, bv
+        if (browserRoot.sortKey === "type") {
+            av = (a.type || "").toLowerCase()
+            bv = (b.type || "").toLowerCase()
+            if (av !== bv)
+                return browserRoot.sortAsc ? (av < bv ? -1 : 1) : (av < bv ? 1 : -1)
+        }
+        av = (a.name || a.title || "").toLowerCase()
+        bv = (b.name || b.title || "").toLowerCase()
+        if (av < bv) return browserRoot.sortAsc ? -1 : 1
+        if (av > bv) return browserRoot.sortAsc ? 1 : -1
+        return 0
+    }
+
+    // Sort an array of item dicts then (re)fill a ListModel from it.
+    function populateSorted(model, items) {
+        var arr = items.slice()
+        arr.sort(browserRoot.itemComparator)
+        model.clear()
+        for (var i = 0; i < arr.length; i++)
+            model.append(arr[i])
+    }
+
+    // Change sort and re-apply across categories.
+    function setSort(key) {
+        if (browserRoot.sortKey === key)
+            browserRoot.sortAsc = !browserRoot.sortAsc
+        else {
+            browserRoot.sortKey = key
+            browserRoot.sortAsc = true
+        }
+        refreshBrowser()
+    }
+
     // Theme colors - reactive bindings to main window
     property var mainWin: ApplicationWindow.window
     property color bgDark: mainWin ? mainWin.bgDark : "#1a1a2e"
@@ -178,8 +220,30 @@ Rectangle {
                                 id: categoryMouseArea
                                 anchors.fill: parent
                                 hoverEnabled: true
-                                onClicked: {
-                                    categoryModel.setProperty(index, "expanded", !model.expanded)
+                                acceptedButtons: Qt.LeftButton | Qt.RightButton
+                                onClicked: (mouse) => {
+                                    if (mouse.button === Qt.RightButton) {
+                                        sortMenu.popup()
+                                    } else {
+                                        categoryModel.setProperty(index, "expanded", !model.expanded)
+                                    }
+                                }
+                            }
+
+                            // Right-click a category header to sort all items.
+                            Menu {
+                                id: sortMenu
+                                MenuItem {
+                                    text: "Sort by Name" +
+                                          (browserRoot.sortKey === "name"
+                                              ? (browserRoot.sortAsc ? "  ↑" : "  ↓") : "")
+                                    onTriggered: browserRoot.setSort("name")
+                                }
+                                MenuItem {
+                                    text: "Sort by Type" +
+                                          (browserRoot.sortKey === "type"
+                                              ? (browserRoot.sortAsc ? "  ↑" : "  ↓") : "")
+                                    onTriggered: browserRoot.setSort("type")
                                 }
                             }
                         }
@@ -838,12 +902,16 @@ Rectangle {
             return
         }
 
-        // Refresh datasets
+        // Each category is collected into an array, then sorted + appended via
+        // populateSorted() so the current sort (name/type) applies uniformly.
+        var i
+
+        // Datasets
         var datasets = backend.getDatasetList()
-        datasetsModel.clear()
-        for (var i = 0; i < datasets.length; i++) {
+        var datasetItems = []
+        for (i = 0; i < datasets.length; i++) {
             var datasetInfo = backend.getDatasetInfo(datasets[i])
-            datasetsModel.append({
+            datasetItems.push({
                 name: datasets[i],
                 icon: "",
                 type: datasetInfo.type || "Unknown",
@@ -851,16 +919,17 @@ Rectangle {
                 numSpectra: datasetInfo.num_spectra || 0
             })
         }
+        populateSorted(datasetsModel, datasetItems)
 
         // Tables and graphs are now embedded windows managed by WindowManager
         tablesModel.clear()
         graphsModel.clear()
 
-        // Refresh maps
+        // Maps
         var maps = backend.getMapList()
-        mapsModel.clear()
+        var mapItems = []
         for (i = 0; i < maps.length; i++) {
-            mapsModel.append({
+            mapItems.push({
                 id: maps[i].id,
                 title: maps[i].title,
                 name: maps[i].title,
@@ -869,12 +938,13 @@ Rectangle {
                 type: "Map"
             })
         }
+        populateSorted(mapsModel, mapItems)
 
-        // Refresh images (RGB previews, optical/video frames, raw map channels)
+        // Images (RGB previews, optical/video frames, raw map channels)
         var images = backend.getImageList ? backend.getImageList() : []
-        imagesModel.clear()
+        var imageItems = []
         for (i = 0; i < images.length; i++) {
-            imagesModel.append({
+            imageItems.push({
                 id: images[i].id,
                 title: images[i].name,
                 name: images[i].name,
@@ -882,12 +952,13 @@ Rectangle {
                 type: images[i].mode || "Image"
             })
         }
+        populateSorted(imagesModel, imageItems)
 
-        // Refresh notes (text annotations from measurement files + user notes)
+        // Notes (text annotations from measurement files + user notes)
         var notes = backend.getNotesList ? backend.getNotesList() : []
-        notesModel.clear()
+        var noteItems = []
         for (i = 0; i < notes.length; i++) {
-            notesModel.append({
+            noteItems.push({
                 id: notes[i].id,
                 title: notes[i].name,
                 name: notes[i].name,
@@ -895,12 +966,13 @@ Rectangle {
                 type: notes[i].source || "Note"
             })
         }
+        populateSorted(notesModel, noteItems)
 
-        // Refresh outputs
+        // Outputs
         var outputs = backend.getOutputList()
-        outputsModel.clear()
+        var outputItems = []
         for (i = 0; i < outputs.length; i++) {
-            outputsModel.append({
+            outputItems.push({
                 id: outputs[i].id,
                 title: outputs[i].filename,
                 name: outputs[i].filename,
@@ -908,10 +980,26 @@ Rectangle {
                 type: outputs[i].tool
             })
         }
+        populateSorted(outputsModel, outputItems)
     }
 
+    // Per-type icon for browser items so types are visually distinguishable.
+    // PLACEHOLDERS for now — short text tokens per type; replace these with the
+    // real icon assets when provided (single spot to swap). The delegate uses
+    // ``model.icon || getDefaultIcon(category)`` so an explicit per-item icon
+    // still wins. Reused by the unified-tree delegate.
     function getDefaultIcon(categoryName) {
-        return ""
+        switch (categoryName) {
+            case "Datasets": return "[DS]"
+            case "Tables":   return "[TBL]"
+            case "Graphs":   return "[GR]"
+            case "Maps":     return "[MAP]"
+            case "Images":   return "[IMG]"
+            case "Notes":    return "[TXT]"
+            case "Outputs":  return "[OUT]"
+            case "Folder":   return "[DIR]"
+            default:          return "[?]"
+        }
     }
 
     function updateMetadata() {
