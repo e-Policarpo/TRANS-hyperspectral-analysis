@@ -118,6 +118,7 @@ class ProjectManager:
                 'images': self._serialize_images(project_data.get('images', {})),
                 'notes': self._serialize_notes(project_data.get('notes', {})),
                 'naming_convention': project_data.get('naming_convention'),
+                'browser_tree': project_data.get('browser_tree', {}),
             }
 
             # Save to file (compressed)
@@ -201,6 +202,7 @@ class ProjectManager:
                 'images': images,
                 'notes': notes,
                 'naming_convention': project_json.get('naming_convention'),
+                'browser_tree': project_json.get('browser_tree', {}),
             }
 
             self.current_project_path = project_path

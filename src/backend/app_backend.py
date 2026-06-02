@@ -98,6 +98,7 @@ class AppBackend(ToolImplementations, QObject):
     noteAdded = Signal(str, str)  # note_id, name
     noteDeleted = Signal(str)  # note_id
     noteRenamed = Signal(str, str)  # note_id, new_name
+    browserTreeChanged = Signal()  # folder tree / item placements changed
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -220,6 +221,14 @@ class AppBackend(ToolImplementations, QObject):
         self.open_map_windows = []  # List of {'window': MapWindow, 'title': str, 'id': str, 'path': str}
         self._table_models = []  # Keep references to prevent GC
         self._window_id_counter = 0
+
+        # Project-browser organization: a unified folder tree that can hold any
+        # item type (dataset/map/image/note/output) mixed together. Folders are
+        # flat records with a parent link; ``placements`` maps an item ref
+        # (``"<type>:<id>"``) to the folder it lives in. Items with no entry
+        # render at the tree root. Persisted in the .hrt project file.
+        self._browser_tree = {"folders": [], "placements": {}}
+        self._folder_counter = 0
 
         # Track maps and output files from tools
         self.maps = []  # List of {'id': str, 'title': str, 'path': str, 'timestamp': str}
@@ -876,6 +885,25 @@ class AppBackend(ToolImplementations, QObject):
             naming = project_data.get('naming_convention')
             if naming:
                 self._naming_convention = naming
+
+            # Restore browser folder tree (unified organization).
+            tree = project_data.get('browser_tree') or {}
+            self._browser_tree = {
+                "folders": list(tree.get("folders", []) or []),
+                "placements": dict(tree.get("placements", {}) or {}),
+            }
+            # Keep the folder-id counter ahead of any restored ids so new
+            # folders don't collide with loaded ones.
+            max_n = 0
+            for f in self._browser_tree["folders"]:
+                fid = str(f.get("id", ""))
+                if fid.startswith("folder_"):
+                    try:
+                        max_n = max(max_n, int(fid.split("_", 1)[1]))
+                    except (ValueError, IndexError):
+                        pass
+            self._folder_counter = max_n
+            self.browserTreeChanged.emit()
 
             # Restore maps and output files
             loaded_maps = project_data.get('maps', [])
@@ -3730,6 +3758,7 @@ class AppBackend(ToolImplementations, QObject):
             'notes': self._notes,
             'naming_convention': self._naming_convention,
             'map_editor': map_editor_state,
+            'browser_tree': self._browser_tree,
         }
 
         success = self.project_manager.save_project(project_path, project_data)
@@ -3889,6 +3918,98 @@ class AppBackend(ToolImplementations, QObject):
             ))
 
         return dataset_name
+
+    # ========================================================================
+    # Project-browser folder tree (unified organization)
+    # ========================================================================
+
+    @Slot(result='QVariant')
+    def getBrowserTree(self):
+        """Return the browser organization: ``{folders, placements}``.
+
+        ``folders`` is a list of ``{id, name, parent}`` (parent is "" for
+        top-level); ``placements`` maps ``"<type>:<id>"`` → folder id. The
+        QML browser composes the visible tree by combining this with the
+        existing item lists (datasets/maps/images/notes/outputs); items with
+        no placement (or a placement to a missing folder) render at the root.
+        """
+        return {
+            "folders": [dict(f) for f in self._browser_tree.get("folders", [])],
+            "placements": dict(self._browser_tree.get("placements", {})),
+        }
+
+    def _folder_exists(self, folder_id: str) -> bool:
+        return any(f["id"] == folder_id for f in self._browser_tree["folders"])
+
+    @Slot(str, str, result=str)
+    def createFolder(self, name: str, parent_id: str = "") -> str:
+        """Create a folder under ``parent_id`` ("" = top level). Returns its id."""
+        name = (name or "New Folder").strip() or "New Folder"
+        if parent_id and not self._folder_exists(parent_id):
+            parent_id = ""
+        self._folder_counter += 1
+        folder_id = f"folder_{self._folder_counter}"
+        self._browser_tree["folders"].append(
+            {"id": folder_id, "name": name, "parent": parent_id}
+        )
+        self.projectModifiedChanged.emit(True)
+        self.browserTreeChanged.emit()
+        logger.info("Created browser folder '%s' (%s) under '%s'", name, folder_id, parent_id or "root")
+        return folder_id
+
+    @Slot(str, str, result=bool)
+    def renameFolder(self, folder_id: str, new_name: str) -> bool:
+        new_name = (new_name or "").strip()
+        if not new_name:
+            return False
+        for f in self._browser_tree["folders"]:
+            if f["id"] == folder_id:
+                f["name"] = new_name
+                self.projectModifiedChanged.emit(True)
+                self.browserTreeChanged.emit()
+                return True
+        return False
+
+    @Slot(str, result=bool)
+    def deleteFolder(self, folder_id: str) -> bool:
+        """Delete a folder. Child folders and any items placed in it are
+        reparented to the deleted folder's parent (items aren't destroyed)."""
+        target = next((f for f in self._browser_tree["folders"] if f["id"] == folder_id), None)
+        if target is None:
+            return False
+        parent = target.get("parent", "")
+        # Reparent child folders.
+        for f in self._browser_tree["folders"]:
+            if f.get("parent") == folder_id:
+                f["parent"] = parent
+        # Reparent placed items.
+        for ref, fid in list(self._browser_tree["placements"].items()):
+            if fid == folder_id:
+                if parent:
+                    self._browser_tree["placements"][ref] = parent
+                else:
+                    del self._browser_tree["placements"][ref]
+        self._browser_tree["folders"] = [
+            f for f in self._browser_tree["folders"] if f["id"] != folder_id
+        ]
+        self.projectModifiedChanged.emit(True)
+        self.browserTreeChanged.emit()
+        logger.info("Deleted browser folder %s (children reparented to '%s')", folder_id, parent or "root")
+        return True
+
+    @Slot(str, str)
+    def moveItem(self, item_ref: str, folder_id: str):
+        """Place ``item_ref`` ("<type>:<id>") into ``folder_id`` ("" = root)."""
+        if not item_ref:
+            return
+        if folder_id and not self._folder_exists(folder_id):
+            return
+        if folder_id:
+            self._browser_tree["placements"][item_ref] = folder_id
+        else:
+            self._browser_tree["placements"].pop(item_ref, None)
+        self.projectModifiedChanged.emit(True)
+        self.browserTreeChanged.emit()
 
     @Slot(str)
     def openWorkflow(self, workflow_name: str):
