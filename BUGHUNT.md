@@ -76,9 +76,18 @@ estiver no `Unified-UI` (e cole o hash do commit ao lado).
 
 ## Sistema de Widgets
 
-- [ ] **Zona de captura do mouse na janela inteira.** Hoje só a
+- [x] **Zona de captura do mouse na janela inteira.** Hoje só a
   barra superior reage ao foco; o mouse dentro do conteúdo da
   janela não direciona os comandos para essa janela específica.
+  *Causa: havia um MouseArea "click anywhere to bring to front"
+  em `EmbeddedWindow.qml`, mas com `z: -1` (atrás do conteúdo). No
+  Qt Quick o press vai pro item de cima primeiro; o conteúdo
+  (canvas/botões) consome o press e ele nunca cai pro MouseArea
+  atrás. Pôr na frente roubaria todos os cliques do conteúdo.
+  Fix: trocado por um `TapHandler` (passive grab) que vê o press
+  em qualquer lugar — inclusive sobre conteúdo interativo — sem
+  roubá-lo; `gesturePolicy: DragThreshold` cede em drag (pan/zoom
+  do canvas seguem funcionando).*
 - [ ] **Ctrl+C / Ctrl+V** (mensagem cortada — copiar para tabelas?
   para gráficos? Confirmar escopo).
 

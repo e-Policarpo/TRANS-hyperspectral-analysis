@@ -556,14 +556,18 @@ Item {
         }
     }
 
-    // Click anywhere to bring to front
-    MouseArea {
-        anchors.fill: parent
-        z: -1
-        onPressed: function(mouse) {
-            embeddedWindow.bringToFront()
-            mouse.accepted = false
-        }
+    // Bring the window to front on any press inside it — including over
+    // interactive content (canvas, buttons, table). A TapHandler takes only
+    // a *passive* grab, so it observes the press without stealing it from
+    // the content's own MouseAreas. The previous approach was a covering
+    // MouseArea at z:-1, which sat behind the content and therefore never
+    // saw presses the content consumed — so only the title bar raised the
+    // window. DragThreshold keeps the handler passive (it yields on drag),
+    // so canvas pan/zoom and buttons keep working.
+    TapHandler {
+        acceptedButtons: Qt.AllButtons
+        gesturePolicy: TapHandler.DragThreshold
+        onPressedChanged: if (pressed) embeddedWindow.bringToFront()
     }
 
     Component.onCompleted: {
