@@ -239,14 +239,45 @@ Rectangle {
                                             renderType: Text.NativeRendering
                                         }
 
-                                        Text {
-                                            text: model.title || model.name || ""
-                                            font.pixelSize: 12
-                                            font.bold: false
-                                            color: "#e0e0e0"
-                                            renderType: Text.NativeRendering
+                                        // Item name. When the name is too
+                                        // long it elides with "…"; on hover,
+                                        // if it actually overflows, it scrolls
+                                        // (marquee) so the full name is
+                                        // readable without resizing the panel.
+                                        Item {
+                                            id: nameClip
                                             Layout.fillWidth: true
-                                            elide: Text.ElideRight
+                                            Layout.preferredHeight: nameText.implicitHeight
+                                            clip: true
+
+                                            readonly property bool overflowing: nameText.implicitWidth > width
+                                            readonly property bool scrolling: itemMouseArea.containsMouse && overflowing
+
+                                            Text {
+                                                id: nameText
+                                                text: model.title || model.name || ""
+                                                font.pixelSize: 12
+                                                font.bold: false
+                                                color: "#e0e0e0"
+                                                renderType: Text.NativeRendering
+                                                // Full width while scrolling so nothing is elided;
+                                                // otherwise constrained + elided to the container.
+                                                width: nameClip.scrolling ? implicitWidth : nameClip.width
+                                                elide: nameClip.scrolling ? Text.ElideNone : Text.ElideRight
+
+                                                SequentialAnimation on x {
+                                                    running: nameClip.scrolling
+                                                    loops: Animation.Infinite
+                                                    onRunningChanged: if (!running) nameText.x = 0
+                                                    PauseAnimation { duration: 600 }
+                                                    NumberAnimation {
+                                                        to: Math.min(0, nameClip.width - nameText.implicitWidth)
+                                                        duration: Math.max(800, (nameText.implicitWidth - nameClip.width) * 25)
+                                                    }
+                                                    PauseAnimation { duration: 600 }
+                                                    NumberAnimation { to: 0; duration: 300 }
+                                                }
+                                            }
                                         }
 
                                         Text {

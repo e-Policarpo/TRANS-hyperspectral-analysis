@@ -181,8 +181,13 @@ estiver no `Unified-UI` (e cole o hash do commit ao lado).
 
 ## Project Browser
 
-- [ ] **Rolling text para legibilidade.** Quando o nome do
+- [x] **Rolling text para legibilidade.** Quando o nome do
   dataset trunca, fazer rolar no hover.
+  *Fix: o nome do item no `ProjectBrowser.qml` agora fica dentro
+  de um `Item { clip: true }`; quando o texto realmente transborda
+  e o mouse está em cima, um `SequentialAnimation on x` faz
+  marquee (pausa → rola até o fim → pausa → volta, em loop). Sem
+  hover/overflow continua elidido com "…". Reset de x ao sair.*
 - [ ] **Estrutura em árvore com pastas.** Permitir criar pastas
   para organizar datasets, com drag-and-drop.
 
