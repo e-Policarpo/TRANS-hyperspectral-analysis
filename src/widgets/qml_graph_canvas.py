@@ -138,6 +138,7 @@ class QMLGraphCanvas(QQuickPaintedItem):
     # Signals to QML
     curveClicked = Signal(int, arguments=['curveId'])
     curveSelected = Signal(int, arguments=['curveId'])
+    selectedCurveIdChanged = Signal(int, arguments=['curveId'])
     cursorMoved = Signal(float, float, arguments=['x', 'y'])
     pointClicked = Signal(float, float, arguments=['x', 'y'])
     rangeSelected = Signal(float, float, float, float, arguments=['x1', 'y1', 'x2', 'y2'])
@@ -488,9 +489,29 @@ class QMLGraphCanvas(QQuickPaintedItem):
             self._needs_redraw = True
             self.update()
 
-    @Property(int)
-    def selectedCurveId(self) -> int:
+    def _get_selected_curve_id(self) -> int:
         return self._selected_curve_id if self._selected_curve_id is not None else -1
+
+    def _set_selected_curve_id(self, value: int) -> None:
+        """Writable so QML can assign it (e.g. ``onCurveSelected`` handlers)
+        without crashing — previously this was read-only with no setter, so
+        a QML write triggered a 'NoneType is not callable' metacall error.
+        Also notifyable so ``enabled: canvas.selectedCurveId >= 0`` bindings
+        actually re-evaluate when the selection changes."""
+        new = None if value is None or int(value) < 0 else int(value)
+        if new is not None and new not in self._curves:
+            new = None
+        if new == self._selected_curve_id:
+            return
+        self._selected_curve_id = new
+        self._needs_redraw = True
+        self.update()
+        self.selectedCurveIdChanged.emit(self._get_selected_curve_id())
+
+    selectedCurveId = Property(
+        int, _get_selected_curve_id, _set_selected_curve_id,
+        notify=selectedCurveIdChanged,
+    )
 
     @Property(int)
     def curveCount(self) -> int:
@@ -574,6 +595,7 @@ class QMLGraphCanvas(QQuickPaintedItem):
             if self._selected_curve_id == curve_id:
                 self._selected_curve_id = None
                 self.curveSelected.emit(-1)
+                self.selectedCurveIdChanged.emit(-1)
 
             self._needs_redraw = True
             self.curvesChanged.emit()
@@ -583,6 +605,7 @@ class QMLGraphCanvas(QQuickPaintedItem):
     @Slot()
     def clearCurves(self):
         """Remove all curves"""
+        had_selection = self._selected_curve_id is not None
         self._curves.clear()
         self._invalidate_all_curve_paths()
         self._selected_curve_id = None
@@ -590,6 +613,8 @@ class QMLGraphCanvas(QQuickPaintedItem):
         self._needs_redraw = True
         self.curvesChanged.emit()
         self.curveSelected.emit(-1)
+        if had_selection:
+            self.selectedCurveIdChanged.emit(-1)
         self.update()
 
     @Slot(int, str, str)
@@ -626,6 +651,7 @@ class QMLGraphCanvas(QQuickPaintedItem):
         if curve_id in self._curves or curve_id == -1:
             self._selected_curve_id = curve_id if curve_id != -1 else None
             self.curveSelected.emit(curve_id)
+            self.selectedCurveIdChanged.emit(self._get_selected_curve_id())
             self._needs_redraw = True
             self.update()
 
@@ -2149,10 +2175,11 @@ class QMLGraphCanvas(QQuickPaintedItem):
             x, y = self._pixelToData(*pos_px)
             self.pointClicked.emit(x, y)
             clicked_curve = self._findNearestCurve(x, y)
-            if clicked_curve is not None:
+            if clicked_curve is not None and clicked_curve != self._selected_curve_id:
                 self._selected_curve_id = clicked_curve
                 self.curveClicked.emit(clicked_curve)
                 self.curveSelected.emit(clicked_curve)
+                self.selectedCurveIdChanged.emit(clicked_curve)
                 self._needs_redraw = True
                 self.update()
             self._viewbox.handle_press_left(pos_px)

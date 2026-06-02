@@ -394,8 +394,10 @@ Item {
                             }
 
                             onCurveSelected: function(curveId) {
-                                selectedCurveId = curveId
-                                // Update curves list selection
+                                // graphCanvas.selectedCurveId is already set by
+                                // the canvas itself; just sync the list view.
+                                // (Assigning selectedCurveId here used to crash:
+                                // it resolved to the canvas's read-only property.)
                                 curvesList.currentIndex = getCurveIndex(curveId)
                             }
 
@@ -884,9 +886,6 @@ Item {
     ListModel {
         id: curvesModel
     }
-
-    // Track selected curve
-    property int selectedCurveId: -1
 
     // Helper functions
     function updateCurvesList() {

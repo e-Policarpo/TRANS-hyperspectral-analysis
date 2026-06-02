@@ -139,12 +139,23 @@ estiver no `Unified-UI` (e cole o hash do commit ao lado).
   crosshair, o cursor desaparece dentro do canvas.
 - [ ] **Line profile.** Não lê a distância correta no eixo X e
   aceita perfis que saem da área da imagem.
-- [ ] **NoneType ao abrir gráfico sem ponto associado.**
+- [x] **NoneType ao abrir gráfico sem ponto associado.**
   ```
   An error occurred executing the property metacall WriteProperty
   on property "selectedCurveId" of QMLGraphCanvas(0x…)
   TypeError: 'NoneType' object is not callable
   ```
+  *Fix: `selectedCurveId` no `QMLGraphCanvas` era `@Property(int)`
+  só-leitura (sem setter, sem notify). O handler `onCurveSelected`
+  em `GraphWindowContent.qml` fazia `selectedCurveId = curveId` —
+  nome não-qualificado que resolvia p/ a property só-leitura do
+  canvas → metacall WriteProperty chamava setter inexistente
+  (None). Agora é Property read/write com notify
+  (`selectedCurveIdChanged`); o write não quebra e os bindings
+  `enabled: canvas.selectedCurveId >= 0` da toolbar ficam reativos
+  (antes nunca atualizavam). Removido o `property selectedCurveId`
+  local morto e o write redundante. Testes em
+  test_qml_graph_canvas.py (novo).*
 
 ## Project Browser
 
