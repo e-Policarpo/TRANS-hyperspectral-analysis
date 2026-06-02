@@ -306,6 +306,30 @@ class QMLMapCanvas(QQuickPaintedItem):
         self._needs_redraw = True
         self.update()
 
+    def _compute_display_levels(self) -> Tuple[float, float]:
+        """Resolve the (lo, hi) colour levels for the current map.
+
+        Explicit ``_vmin``/``_vmax`` win; otherwise percentile-clip the
+        data. Guards against the degenerate cases that otherwise paint the
+        whole map white: a map with no linked spectra is all-NaN (or
+        empty), and ``np.nanpercentile`` returns NaN there — NaN levels
+        feed the LUT as ``(data - NaN) / NaN`` → all-NaN → white. We fall
+        back to a safe unit range and ensure ``hi > lo`` with finite ends.
+        """
+        if self._vmin is not None and self._vmax is not None:
+            lo, hi = float(self._vmin), float(self._vmax)
+        elif self._map_data is not None and np.isfinite(self._map_data).any():
+            lo = float(np.nanpercentile(self._map_data, self._percentile_clip[0]))
+            hi = float(np.nanpercentile(self._map_data, self._percentile_clip[1]))
+        else:
+            # No data / all-NaN / empty — nothing meaningful to scale to.
+            lo, hi = 0.0, 1.0
+        if not (np.isfinite(lo) and np.isfinite(hi)):
+            lo, hi = 0.0, 1.0
+        if hi <= lo:
+            hi = lo + 1.0
+        return lo, hi
+
     @Slot()
     def clearOverlays(self):
         """Clear all overlay elements"""
@@ -319,12 +343,8 @@ class QMLMapCanvas(QQuickPaintedItem):
         """Get current value range [min, max]"""
         if self._map_data is None:
             return [0.0, 1.0]
-        if self._vmin is not None and self._vmax is not None:
-            return [self._vmin, self._vmax]
-        return [
-            float(np.nanpercentile(self._map_data, self._percentile_clip[0])),
-            float(np.nanpercentile(self._map_data, self._percentile_clip[1]))
-        ]
+        lo, hi = self._compute_display_levels()
+        return [lo, hi]
 
     # =========================================================================
     # Block selection methods (TRANS_v3 style)
@@ -849,14 +869,7 @@ class QMLMapCanvas(QQuickPaintedItem):
         )
 
         # Levels: explicit takes priority, else percentile clip.
-        if self._vmin is not None and self._vmax is not None:
-            lo, hi = float(self._vmin), float(self._vmax)
-        else:
-            data = self._map_data
-            lo = float(np.nanpercentile(data, self._percentile_clip[0]))
-            hi = float(np.nanpercentile(data, self._percentile_clip[1]))
-        if hi <= lo:
-            hi = lo + 1.0
+        lo, hi = self._compute_display_levels()
 
         # Downsample large maps so the LUT lookup runs over the on-
         # screen pixel budget, not the full source array. The factor
@@ -1211,8 +1224,15 @@ class QMLMapCanvas(QQuickPaintedItem):
                     rect_y = d['ax_top'] + row * cell_h
                     painter.drawRect(QRectF(rect_x, rect_y, cell_w, cell_h))
 
-        # Draw crosshair
-        if self._show_crosshair and self._crosshair_pos is not None:
+        # Draw crosshair. Show it whenever the crosshair tool is active
+        # (it tracks the hover position in hoverMoveEvent) — not only when
+        # the explicit ``_show_crosshair`` flag is set. Without this, the
+        # CROSSHAIR tool blanked the OS cursor (Qt.BlankCursor) but never
+        # drew its replacement, so the cursor just vanished.
+        if (
+            (self._show_crosshair or self._current_tool == MapTool.CROSSHAIR)
+            and self._crosshair_pos is not None
+        ):
             row, col = self._crosshair_pos
             x, y = self._dataToPixel(row, col)
 

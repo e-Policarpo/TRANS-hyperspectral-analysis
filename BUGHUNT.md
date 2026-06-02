@@ -118,10 +118,17 @@ estiver no `Unified-UI` (e cole o hash do commit ao lado).
 
 ## Aba de análise Hiperespectral
 
-- [ ] **Mapas sem espectros associados ficam brancos ao ativar
+- [x] **Mapas sem espectros associados ficam brancos ao ativar
   grid overlay.** Provavelmente um divide-by-zero ou um
   `imshow` com array vazio quando o map data ainda não tem
   espectros vinculados.
+  *Fix: confirmado divide-by-NaN. Map sem espectros vinculados é
+  all-NaN; `np.nanpercentile` retorna NaN → níveis (lo,hi)=NaN →
+  LUT faz `(data-NaN)/NaN` → tudo NaN → branco. O guard `hi<=lo`
+  não pegava (comparação com NaN é False). Extraído
+  `_compute_display_levels()` que trata all-NaN/vazio/constante e
+  garante lo/hi finitos com hi>lo (fallback 0..1). `getValueRange`
+  também usa o helper. Testes em test_qml_map_canvas.py.*
 - [ ] **Overlays não aparecem nesta aba.** Os overlays de
   espectros (que funcionam no modo Spectral) não são herdados
   pela aba hiperespectral. Average spectrum também não puxa os
@@ -135,8 +142,14 @@ estiver no `Unified-UI` (e cole o hash do commit ao lado).
   Espectros pontuais e em linha (line scans) precisam ser
   reconhecidos além de mapas em área.
 - [ ] **Zoom não funciona** nesta aba.
-- [ ] **Crosshair invisível.** Selecionando a ferramenta
+- [x] **Crosshair invisível.** Selecionando a ferramenta
   crosshair, o cursor desaparece dentro do canvas.
+  *Fix: a ferramenta CROSSHAIR seta `Qt.BlankCursor` (esconde o
+  cursor do OS) p/ desenhar uma cruz custom no lugar. `hoverMoveEvent`
+  já atualizava `_crosshair_pos`, MAS o desenho exigia também
+  `_show_crosshair` (flag separada que a ferramenta nunca liga) →
+  cursor sumia sem substituto. Agora desenha quando
+  `_current_tool == CROSSHAIR` também. `qml_map_canvas.py`.*
 - [ ] **Line profile.** Não lê a distância correta no eixo X e
   aceita perfis que saem da área da imagem.
 - [x] **NoneType ao abrir gráfico sem ponto associado.**

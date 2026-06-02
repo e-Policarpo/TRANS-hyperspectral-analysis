@@ -304,3 +304,48 @@ class TestAppBackendImageImport:
         assert mock_backend._imported_map_data is None
         assert mock_backend._imported_map_name == ""
         assert mock_backend._imported_map_path == ""
+
+
+class TestQMLMapCanvasDisplayLevels:
+    """Colour-level resolution, incl. the degenerate cases that used to
+    paint the whole map white (all-NaN / empty / constant maps)."""
+
+    def _canvas(self):
+        from src.widgets.qml_map_canvas import QMLMapCanvas
+        return QMLMapCanvas()
+
+    def test_normal_data_gives_finite_increasing_levels(self):
+        canvas = self._canvas()
+        canvas.setMapData(np.linspace(0, 100, 100).reshape(10, 10))
+        lo, hi = canvas._compute_display_levels()
+        assert np.isfinite(lo) and np.isfinite(hi)
+        assert hi > lo
+
+    def test_all_nan_map_falls_back_to_unit_range(self):
+        """A map with no linked spectra is all-NaN; nanpercentile returns
+        NaN there. Must NOT propagate NaN into the LUT (white map)."""
+        canvas = self._canvas()
+        canvas.setMapData(np.full((8, 8), np.nan))
+        lo, hi = canvas._compute_display_levels()
+        assert np.isfinite(lo) and np.isfinite(hi)
+        assert hi > lo
+        assert (lo, hi) == (0.0, 1.0)
+
+    def test_constant_map_has_nonzero_span(self):
+        canvas = self._canvas()
+        canvas.setMapData(np.full((8, 8), 5.0))
+        lo, hi = canvas._compute_display_levels()
+        assert hi > lo
+
+    def test_explicit_range_is_respected(self):
+        canvas = self._canvas()
+        canvas.setMapData(np.linspace(0, 100, 64).reshape(8, 8))
+        canvas.setValueRange(10.0, 20.0)
+        assert canvas._compute_display_levels() == (10.0, 20.0)
+
+    def test_get_value_range_finite_for_all_nan(self):
+        canvas = self._canvas()
+        canvas.setMapData(np.full((8, 8), np.nan))
+        rng = canvas.getValueRange()
+        assert all(np.isfinite(v) for v in rng)
+        assert rng[1] > rng[0]
