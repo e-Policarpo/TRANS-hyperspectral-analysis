@@ -3803,6 +3803,93 @@ class AppBackend(ToolImplementations, QObject):
         self._table_models.append(model)
         self.openTableEmbedded.emit(title, model)
 
+    @Slot('QObject', str, result=str)
+    def createDatasetFromTable(self, table_model, name: str = "") -> str:
+        """Promote a table (``TableDataModel``) into a ``SpectralData`` dataset.
+
+        Tables and datasets share the same DataFrame structure; this lets the
+        user run the dataset tools (smoothing, FFT, …) on hand-built/edited
+        table data. The first column becomes the independent variable (X axis);
+        the rest become spectra. ``SpectralData.validate_data`` enforces the
+        ≥2-column / numeric-first-column rules — failures surface via
+        ``errorOccurred``. Returns the registered dataset name, or ``""``.
+        """
+        if table_model is None:
+            return ""
+        try:
+            df = table_model.to_dataframe()
+        except Exception as e:
+            logger.error("createDatasetFromTable: could not read table: %s", e)
+            self.errorOccurred.emit("Convert to Dataset", f"Could not read table data: {e}")
+            return ""
+
+        if df is None or df.empty or len(df.columns) < 2:
+            self.errorOccurred.emit(
+                "Convert to Dataset",
+                "A dataset needs at least two columns: an X axis plus one or more spectra.",
+            )
+            return ""
+
+        # Coerce to numeric — the X axis must be numeric and the tools expect
+        # numeric spectra. Non-numeric cells become NaN.
+        df = df.apply(pd.to_numeric, errors="coerce")
+        if not pd.api.types.is_numeric_dtype(df.iloc[:, 0]) or df.iloc[:, 0].isna().all():
+            self.errorOccurred.emit(
+                "Convert to Dataset",
+                "The first column is used as the X axis and must contain numbers.",
+            )
+            return ""
+
+        # Unique dataset name.
+        base = (name or "").strip() or "Table dataset"
+        dataset_name = base
+        counter = 1
+        while dataset_name in self._datasets:
+            dataset_name = f"{base} ({counter})"
+            counter += 1
+
+        try:
+            meta = SpectralMetadata(
+                source_type="table",
+                dimensions=(len(df.columns) - 1, 1),
+                scan_mode="manual",
+                units={"x": str(df.columns[0]), "independent": str(df.columns[0])},
+                additional_info={"created_from": "table"},
+            )
+            sd = SpectralData(df, meta)
+        except (ValueError, TypeError) as e:
+            self.errorOccurred.emit("Convert to Dataset", str(e))
+            return ""
+
+        self._datasets[dataset_name] = sd
+        self._active_dataset = dataset_name
+        self.dataLoaded.emit(dataset_name)
+        self.projectModifiedChanged.emit(True)
+        logger.info("Created dataset '%s' from table (%d columns)", dataset_name, len(df.columns))
+
+        # Undo: removing the promoted dataset (mirrors deleteDataset).
+        if not self._suppress_undo:
+            def undo_create():
+                self._datasets.pop(dataset_name, None)
+                if self._active_dataset == dataset_name:
+                    self._active_dataset = None
+                self.datasetDeleted.emit(dataset_name)
+                self.projectModifiedChanged.emit(True)
+
+            def redo_create():
+                self._datasets[dataset_name] = sd
+                self._active_dataset = dataset_name
+                self.dataLoaded.emit(dataset_name)
+                self.projectModifiedChanged.emit(True)
+
+            self._undo_manager.push(UndoCommand(
+                description=f"Create dataset '{dataset_name}' from table",
+                undo_fn=undo_create,
+                redo_fn=redo_create,
+            ))
+
+        return dataset_name
+
     @Slot(str)
     def openWorkflow(self, workflow_name: str):
         """Open a workflow editor window."""

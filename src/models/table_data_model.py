@@ -1094,6 +1094,30 @@ class TableDataModel(QAbstractTableModel):
     def isEmpty(self) -> bool:
         return self._data.empty
 
+    def to_dataframe(self) -> pd.DataFrame:
+        """Return a copy of the table contents as a DataFrame, with column
+        names taken from the (possibly renamed) column metadata rather than
+        the raw ``_data.columns``. Used to promote a table into a
+        ``SpectralData`` dataset."""
+        df = self._data.copy()
+        if not df.empty and self._column_metadata:
+            names = [m.name for m in self._column_metadata]
+            if len(names) == len(df.columns):
+                df.columns = names
+        return df
+
+    @Slot(result=bool)
+    def canBeDataset(self) -> bool:
+        """True when this table can become a SpectralData dataset: at least
+        two columns and a numeric first column (which becomes the X axis).
+        Drives the enabled state of the 'Add as Dataset' action."""
+        if self._data.empty or len(self._data.columns) < 2:
+            return False
+        try:
+            return bool(pd.api.types.is_numeric_dtype(self._data.iloc[:, 0]))
+        except Exception:
+            return False
+
     @Property(str, notify=displayFormatChanged)
     def displayFormat(self) -> str:
         return self._display_format

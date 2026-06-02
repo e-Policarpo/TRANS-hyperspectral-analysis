@@ -187,6 +187,38 @@ Item {
                     }
                 }
 
+                // Promote this table to a dataset (SpectralData) so the dataset
+                // tools can operate on it. The first column is the X axis.
+                Button {
+                    id: addAsDatasetBtn
+                    text: "Add as Dataset"
+                    Layout.preferredWidth: 110
+                    // dataRevision dependency forces re-evaluation after edits.
+                    enabled: tableModel !== null && dataRevision >= 0 && tableModel.canBeDataset()
+                    ToolTip.visible: hovered
+                    ToolTip.text: enabled
+                        ? "Promote this table to a dataset you can run tools on"
+                        : "Needs at least 2 columns with a numeric first column (X axis)"
+                    onClicked: {
+                        if (backend && tableModel) {
+                            backend.createDatasetFromTable(tableModel, "")
+                        }
+                    }
+
+                    background: Rectangle {
+                        color: !addAsDatasetBtn.enabled ? bgMedium
+                               : (addAsDatasetBtn.hovered ? accentBlue : bgLight)
+                        radius: 3
+                        border.color: accentBlue
+                    }
+                    contentItem: Text {
+                        text: parent.text
+                        color: addAsDatasetBtn.enabled ? textLight : textMuted
+                        font.pixelSize: 10
+                        horizontalAlignment: Text.AlignHCenter
+                    }
+                }
+
                 Button {
                     text: "Export CSV"
                     Layout.preferredWidth: 80
