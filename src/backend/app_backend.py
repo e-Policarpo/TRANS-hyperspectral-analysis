@@ -1396,9 +1396,27 @@ class AppBackend(ToolImplementations, QObject):
         self._datasets.update(result['datasets'])
 
         # Surface images and notes attached by loaders BEFORE the broadcast
-        # signal so the subsequent browser refresh sees them.
+        # signal so the subsequent browser refresh sees them. Snapshot the
+        # image/note registries first so we can tell which ids this import
+        # created and auto-file just those.
+        _images_before = set(self._images.keys())
+        _notes_before = set(self._notes.keys())
         self._absorb_dataset_images(result)
         self._absorb_dataset_notes(result)
+
+        # Auto-file freshly imported measurement data into type folders.
+        # Tables/graphs are never imported, so they are untouched (stay at
+        # root, per the user's choice). Existing placements are respected, so
+        # re-imports and user-moved items don't get yanked back.
+        _filed = False
+        for _name in result.get('datasets', {}):
+            _filed |= self._auto_file(f"dataset:{_name}", "Spectral Data")
+        for _img_id in self._images.keys() - _images_before:
+            _filed |= self._auto_file(f"image:{_img_id}", "Images")
+        for _note_id in self._notes.keys() - _notes_before:
+            _filed |= self._auto_file(f"note:{_note_id}", "Notes")
+        if _filed:
+            self.browserTreeChanged.emit()
 
         # Set active dataset (browser's onDataLoaded will refresh and now
         # find the registered images/notes via getImageList / getNotesList).
@@ -4011,6 +4029,37 @@ class AppBackend(ToolImplementations, QObject):
         self.projectModifiedChanged.emit(True)
         self.browserTreeChanged.emit()
 
+    # ------------------------------------------------------------------ #
+    # Auto-filing of freshly imported/created items into type folders.
+    # Called at registration time (not as a sweep) so items the user later
+    # moves to root are never re-filed. Existing placements are respected.
+    # ------------------------------------------------------------------ #
+    def _ensure_browser_folder(self, name: str) -> str:
+        """Return the id of the top-level folder called ``name``, creating it
+        if absent. Reuses an existing folder so repeated imports share one."""
+        for f in self._browser_tree["folders"]:
+            if (f.get("parent", "") or "") == "" and f.get("name") == name:
+                return f["id"]
+        self._folder_counter += 1
+        folder_id = f"folder_{self._folder_counter}"
+        self._browser_tree["folders"].append(
+            {"id": folder_id, "name": name, "parent": ""}
+        )
+        logger.info("Auto-created browser folder %r (%s)", name, folder_id)
+        return folder_id
+
+    def _auto_file(self, item_ref: str, folder_name: str) -> bool:
+        """File a newly created ``item_ref`` into the top-level folder
+        ``folder_name``. No-op (returns False) if the item already has a
+        placement, so the user's manual organization is never overridden.
+        Does not emit signals — the caller batches one browserTreeChanged."""
+        if not item_ref or not folder_name:
+            return False
+        if item_ref in self._browser_tree["placements"]:
+            return False
+        self._browser_tree["placements"][item_ref] = self._ensure_browser_folder(folder_name)
+        return True
+
     @Slot(str)
     def openWorkflow(self, workflow_name: str):
         """Open a workflow editor window."""
@@ -5008,6 +5057,14 @@ class AppBackend(ToolImplementations, QObject):
             self.outputCreated.emit(output_id, tool_name, output_path)
             logger.info(f"Registered output file: {output_id} from {tool_name}")
 
+            # Auto-file the output into "Output <source data type>" (e.g.
+            # "Output Spectral Data", "Output Maps"). The source type is
+            # inferred from the tool — map-related tools group under Maps,
+            # everything else operates on spectral data.
+            _src = "Maps" if "map" in (tool_name or "").lower() else "Spectral Data"
+            if self._auto_file(f"output:{output_id}", f"Output {_src}"):
+                self.browserTreeChanged.emit()
+
         # Register undo for tool results that created new datasets
         if output_path and not self._suppress_undo:
             # Find any newly created dataset that matches this tool output
@@ -5071,6 +5128,7 @@ class AppBackend(ToolImplementations, QObject):
         # Register each map and open visualization window
         from datetime import datetime
         from pathlib import Path
+        filed = False
         for path in output_paths:
             if path:
                 self._map_id_counter += 1
@@ -5089,10 +5147,13 @@ class AppBackend(ToolImplementations, QObject):
                 self.maps.append(map_info)
                 self.mapCreated.emit(map_id, map_filename)
                 logger.info(f"Registered map: {map_id} - {map_filename}")
+                filed |= self._auto_file(f"map:{map_id}", "Maps")
 
                 # Open visualization window for this map
                 self._open_map_window(path, map_id, map_filename)
 
+        if filed:
+            self.browserTreeChanged.emit()
         self.toolCompleted.emit("Map Generator", f"{num_maps} maps")
 
     @Slot(str, str)

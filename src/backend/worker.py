@@ -11,7 +11,9 @@ License: GPL
 import logging
 from typing import Callable, Any
 from queue import Queue
-from PySide6.QtCore import QThread, Signal, QObject, QMutex, QMutexLocker
+from PySide6.QtCore import (
+    QThread, Signal, QObject, QMutex, QMutexLocker, QCoreApplication, Slot,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,9 @@ class PersistentWorker(QThread):
 
     def __init__(self):
         super().__init__()
+        # Name the thread so any future "QThread destroyed while running"
+        # diagnostics point here instead of an anonymous ''.
+        self.setObjectName("TRANS-PersistentWorker")
         self.task_queue = Queue()
         self._running = True
         self._current_task = None
@@ -133,6 +138,7 @@ class WorkerManager(QObject):
     def __init__(self, max_concurrent=1):  # Only 1 since we have single thread
         super().__init__()
         self.worker = PersistentWorker()
+        self._shutdown_done = False
 
         # Store callbacks to invoke them in main thread
         self._task_callbacks = {}  # task_name -> (on_finished, on_error)
@@ -144,6 +150,18 @@ class WorkerManager(QObject):
 
         # Start the persistent worker
         self.worker.start()
+
+        # Stop the thread on application exit. Connecting here (when the
+        # backend is constructed, before the QML engine is even loaded) means
+        # this fires BEFORE any cleanup wired up later in main.py — so the
+        # worker is always stopped and waited before its QThread is destroyed,
+        # regardless of what the window-teardown path does. Without this the
+        # idle worker outlived shutdown and Qt aborted with
+        # "QThread: Destroyed while thread is still running".
+        _app = QCoreApplication.instance()
+        if _app is not None:
+            _app.aboutToQuit.connect(self.shutdown)
+
         logger.info("WorkerManager initialized with persistent worker")
 
     def submit(self,
@@ -239,8 +257,25 @@ class WorkerManager(QObject):
         """Check if worker is processing a task."""
         return self.worker._current_task_name is not None or not self.worker.task_queue.empty()
 
+    @Slot()
     def shutdown(self):
-        """Shutdown the worker thread."""
-        self.worker.stop()
-        self.worker.wait()  # Wait for thread to finish
-        logger.info("WorkerManager shutdown complete")
+        """Stop the worker thread and wait for it to finish.
+
+        Idempotent and bounded: safe to call from both the aboutToQuit signal
+        and an explicit cleanup, and it never blocks forever (a stuck thread is
+        terminated as a last resort) so the app can always exit cleanly.
+        """
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
+        try:
+            if self.worker.isRunning():
+                logger.info("WorkerManager: stopping worker thread...")
+                self.worker.stop()
+                if not self.worker.wait(3000):
+                    logger.warning("Worker did not stop in 3s; terminating")
+                    self.worker.terminate()
+                    self.worker.wait(1000)
+            logger.info("WorkerManager shutdown complete")
+        except Exception as e:
+            logger.error(f"Error during WorkerManager shutdown: {e}")

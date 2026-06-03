@@ -151,22 +151,14 @@ def main():
                     logger.warning(f"Error closing window: {e}")
             logger.info("All windows closed")
 
-        # Stop worker thread gracefully
-        if hasattr(backend, 'worker_manager') and hasattr(backend.worker_manager, 'worker'):
-            worker = backend.worker_manager.worker
-            if worker.isRunning():
-                logger.info("Stopping worker thread...")
-                worker.stop()
-
-                # Give it time to finish current task
-                if not worker.wait(3000):  # Wait up to 3 seconds
-                    logger.warning("Worker thread did not stop gracefully, terminating...")
-                    worker.terminate()
-                    worker.wait(1000)  # Wait for termination
-
-                logger.info("Worker thread stopped")
-            else:
-                logger.info("Worker thread already stopped")
+        # Stop worker thread gracefully. This is idempotent: WorkerManager also
+        # stops the thread on aboutToQuit (connected earlier, so it usually runs
+        # first); whichever fires first wins and the second call is a no-op.
+        if hasattr(backend, 'worker_manager'):
+            try:
+                backend.worker_manager.shutdown()
+            except Exception as e:
+                logger.warning(f"Error stopping worker manager: {e}")
 
         logger.info("=== Cleanup complete ===")
 

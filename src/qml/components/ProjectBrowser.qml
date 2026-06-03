@@ -41,6 +41,26 @@ Rectangle {
     property string selectedRef: ""
     property string selectedDataset: ""
 
+    // Ref ("<type>:<id>") of the row currently being dragged. Set when a drag
+    // starts; the release hit-test reads it to file the item.
+    property string draggingRef: ""
+
+    // Folder id ("" = root) that a drop at the current drag position would land
+    // in. Recomputed as the drag moves (Finder-style: the folder whose region —
+    // its row OR any of its listed contents — is under the cursor) and used to
+    // highlight that folder row live.
+    property string dropTargetFolder: ""
+
+    // True once a drag has been handled (a move was requested, which rebuilds
+    // the tree and repositions every row). If a drag ends WITHOUT being handled
+    // (released outside the list viewport), nothing rebuilds and the dragged
+    // row is left displaced — so we snap it back.
+    property bool dropHandled: false
+
+    // Row geometry shared by the delegate height and the drop hit-test so the
+    // two can't drift. A row occupies rowHeight plus the ListView spacing.
+    readonly property int rowHeight: 28
+
     // Sort state (Phase C). "name" or "type"; applied to items when the tree
     // is flattened. Folders are always ordered by name for stability.
     property string sortKey: "name"
@@ -192,22 +212,16 @@ Rectangle {
             }
         }
 
-        // Unified tree. The container hosts (bottom→top): a root DropArea that
-        // unfiles items dropped on empty space, a right-click MouseArea for the
-        // background context menu, and the ListView of folders + items.
+        // Unified tree. The container hosts (bottom→top): a right-click
+        // MouseArea for the background context menu and the ListView of
+        // folders + items. There is deliberately no root DropArea — a drag
+        // released anywhere that is not a folder is a no-op and the row snaps
+        // back to where it started (forceLayout in the row's drag handler).
+        // To take an item OUT of a folder, use right-click → "Remove from
+        // Folder".
         Item {
             Layout.fillWidth: true
             Layout.fillHeight: true
-
-            DropArea {
-                id: rootDropArea
-                anchors.fill: parent
-                keys: ["application/x-trans-item"]
-                onDropped: function(drop) {
-                    if (backend && drop.hasText)
-                        backend.moveItem(drop.text, "")  // "" == root (unfile)
-                }
-            }
 
             // Right-click on empty background → new folder / sort.
             MouseArea {
@@ -230,6 +244,9 @@ Rectangle {
                     id: rowItem
                     readonly property bool isFolder: model.isFolder
                     readonly property string itemRef: model.ref || ""
+                    // True while this row's press turned into a drag (vs a click),
+                    // so onReleased only files on an actual drag.
+                    property bool didDrag: false
 
                     // Reconstruct the row dict for selection / open / menus.
                     function rowData() {
@@ -242,11 +259,13 @@ Rectangle {
                     }
 
                     width: treeView.width
-                    height: 28
+                    height: browserRoot.rowHeight
                     radius: 3
                     color: {
                         if (rowItem.isFolder) {
-                            if (folderDrop.containsDrag)
+                            // Highlight the folder a drop would currently land in.
+                            if (browserRoot.draggingRef !== ""
+                                    && browserRoot.dropTargetFolder === model.folderId)
                                 return Qt.rgba(accentBlue.r, accentBlue.g, accentBlue.b, 0.30)
                             if (rowMouseArea.containsMouse)
                                 return bgLight
@@ -332,18 +351,14 @@ Rectangle {
                         }
                     }
 
-                    // Drag support for ALL item rows (folders are drop targets,
-                    // not draggable). Carries the stable "<type>:<id>" ref so
-                    // folder/root DropAreas can re-file it via backend.moveItem.
-                    Drag.active: rowMouseArea.drag.active
-                    Drag.hotSpot.x: 12
-                    Drag.hotSpot.y: 14
-                    Drag.dragType: Drag.Automatic
-                    Drag.mimeData: {
-                        "text/plain": rowItem.itemRef,
-                        "application/x-trans-item": rowItem.itemRef
-                    }
-
+                    // Drag/drop is handled WITHOUT DropAreas: the row follows the
+                    // cursor via MouseArea.drag.target, and on release we hit-test
+                    // the drop position against the flattened tree
+                    // (browserRoot.folderAtContentY). This gives Finder-style
+                    // region drops — drop anywhere within a folder's listed
+                    // contents (not just its row), and the empty/root area is a
+                    // valid target so items can leave folders. Items only;
+                    // folders are drop targets, not draggable.
                     MouseArea {
                         id: rowMouseArea
                         anchors.fill: parent
@@ -351,6 +366,31 @@ Rectangle {
                         acceptedButtons: Qt.LeftButton | Qt.RightButton
                         drag.target: rowItem.isFolder ? undefined : rowItem
                         drag.threshold: 10
+
+                        onPressed: rowItem.didDrag = false
+
+                        drag.onActiveChanged: {
+                            if (rowMouseArea.drag.active) {
+                                rowItem.didDrag = true
+                                browserRoot.draggingRef = rowItem.itemRef
+                                browserRoot.dropHandled = false
+                                browserRoot.dropTargetFolder = ""
+                            } else if (!browserRoot.dropHandled) {
+                                // Released outside the list → nothing moved and the
+                                // tree wasn't rebuilt; snap the displaced row back.
+                                snapBackTimer.restart()
+                                browserRoot.dropTargetFolder = ""
+                            }
+                        }
+
+                        // Live-highlight the folder a drop would land in as the
+                        // row is dragged over the tree.
+                        onPositionChanged: function(mouse) {
+                            if (rowMouseArea.drag.active) {
+                                var cp = rowItem.mapToItem(treeView.contentItem, mouse.x, mouse.y)
+                                browserRoot.dropTargetFolder = browserRoot.folderAtContentY(cp.y)
+                            }
+                        }
 
                         onClicked: function(mouse) {
                             if (mouse.button === Qt.RightButton) {
@@ -375,18 +415,25 @@ Rectangle {
                             else
                                 browserRoot.openItemRow(rowItem.rowData())
                         }
-                    }
 
-                    // Folder rows accept item drops; for non-folder rows this is
-                    // disabled so the drop falls through to the root DropArea.
-                    DropArea {
-                        id: folderDrop
-                        anchors.fill: parent
-                        enabled: rowItem.isFolder
-                        keys: ["application/x-trans-item"]
-                        onDropped: function(drop) {
-                            if (backend && drop.hasText && rowItem.isFolder)
-                                backend.moveItem(drop.text, model.folderId)
+                        // On release of an actual drag, file the item into the
+                        // folder under the cursor (or root). Releases outside the
+                        // list viewport are ignored → drag.onActiveChanged snaps
+                        // the row back.
+                        onReleased: function(mouse) {
+                            if (!rowItem.didDrag || rowItem.isFolder)
+                                return
+                            rowItem.didDrag = false
+                            var vp = rowItem.mapToItem(treeView, mouse.x, mouse.y)
+                            var inView = vp.x >= 0 && vp.x <= treeView.width
+                                         && vp.y >= 0 && vp.y <= treeView.height
+                            if (inView && browserRoot.draggingRef) {
+                                var cp = rowItem.mapToItem(treeView.contentItem, mouse.x, mouse.y)
+                                var target = browserRoot.folderAtContentY(cp.y)
+                                browserRoot.dropHandled = true
+                                browserRoot.requestMove(browserRoot.draggingRef, target)
+                            }
+                            browserRoot.dropTargetFolder = ""
                         }
                     }
                 }
@@ -470,6 +517,64 @@ Rectangle {
         id: treeModel
     }
 
+    // Deferred item move. A drop handler must NOT call backend.moveItem
+    // directly: that rebuilds the tree synchronously and destroys the very
+    // delegate whose MouseArea is still finishing the drop, corrupting the
+    // drag grab (symptom: only the first drag-drop ever worked). Instead the
+    // drop stashes the move here and fires this Timer, which runs on the next
+    // event-loop tick — after the release fully unwinds. The Timer lives on
+    // browserRoot (not the delegate), so it survives the rebuild and ``backend``
+    // resolves cleanly.
+    property string pendingMoveRef: ""
+    property string pendingMoveFolder: ""
+    Timer {
+        id: moveTimer
+        interval: 0
+        repeat: false
+        onTriggered: {
+            if (backend && browserRoot.pendingMoveRef)
+                backend.moveItem(browserRoot.pendingMoveRef, browserRoot.pendingMoveFolder)
+            browserRoot.pendingMoveRef = ""
+            browserRoot.pendingMoveFolder = ""
+        }
+    }
+
+    // Queue a deferred move (see moveTimer above).
+    function requestMove(ref, folderId) {
+        if (!ref) return
+        browserRoot.pendingMoveRef = ref
+        browserRoot.pendingMoveFolder = folderId || ""
+        moveTimer.restart()
+    }
+
+    // Finder-style drop hit-test: given a Y in treeView CONTENT coordinates,
+    // return the folder id ("" = root) a drop there should file into. Every row
+    // carries the id of the folder it belongs to (a folder row carries its own
+    // id, an item row carries its container), so the rule is simply "the folder
+    // owning the row under the cursor". Above the first row or below the last
+    // (the empty area) resolves to root, which is how items leave folders.
+    function folderAtContentY(contentY) {
+        if (contentY < 0)
+            return ""
+        var stride = browserRoot.rowHeight + treeView.spacing
+        var idx = Math.floor(contentY / stride)
+        if (idx < 0 || idx >= treeModel.count)
+            return ""
+        var row = treeModel.get(idx)
+        return row ? (row.folderId || "") : ""
+    }
+
+    // Snap a displaced row back when a drag ended without a folder drop.
+    // rebuildRows() recreates every delegate at its correct position, so the
+    // dragged row returns home. Deferred (next tick) for the same reason as
+    // moveTimer: rebuilding mid-release would destroy the dragging delegate.
+    Timer {
+        id: snapBackTimer
+        interval: 0
+        repeat: false
+        onTriggered: browserRoot.rebuildRows()
+    }
+
     // -- Context menus ------------------------------------------------------
 
     // Per-item actions. Keyed on the item's ``type`` (dataset/map/image/note/
@@ -491,6 +596,20 @@ Rectangle {
                     case "output": backend.openItem(r.path || r.name); break
                     default: break  // tables/graphs are live embedded windows
                 }
+            }
+        }
+
+        // Take the item out of its folder (back to the unfiled root). Only
+        // shown when the item is actually inside a folder. This replaces the
+        // old "drop on empty space to unfile" behaviour — off-folder drops now
+        // snap back instead.
+        MenuItem {
+            text: "Remove from Folder"
+            visible: itemMenu.row && itemMenu.row.folderId
+            height: visible ? implicitHeight : 0
+            onTriggered: {
+                if (backend && itemMenu.row && itemMenu.row.ref)
+                    backend.moveItem(itemMenu.row.ref, "")
             }
         }
 
@@ -1058,6 +1177,9 @@ Rectangle {
             var t
             for (t = 0; t < its.length; t++) {
                 its[t].depth = depth
+                // Carry the container folder so a drop on this item files into
+                // the same folder (root items carry "" → drop unfiles to root).
+                its[t].folderId = parentId
                 browserRoot.appendRow(its[t])
             }
         }
