@@ -60,6 +60,8 @@ class MapEditorBackend(QObject):
     linkedDatasetsChanged = Signal()
     spectrumReady = Signal(str, 'QVariantMap', arguments=['datasetName', 'spectrumData'])
     openPlotWindowRequested = Signal(str, 'QVariantList', arguments=['datasetName', 'spectra'])
+    # Line-scan / point-set viewing (non-area spatially-resolved spectra).
+    lineScanModeChanged = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -79,6 +81,13 @@ class MapEditorBackend(QObject):
         # Reference to the AppBackend (set by QML), used to look up
         # in-memory MultiChannelMap entities by id without disk I/O.
         self._app_backend = None
+
+        # Line-scan / point-set mode: a non-area dataset shown as a 2-D
+        # array where columns are positions (point index). Clicks resolve a
+        # spectrum by column, not by the area-map ``row*cols+col``.
+        self._line_scan_mode: bool = False
+        self._line_scan_dataset: str = ""
+        self._line_scan_view: str = "kymograph"  # "kymograph" | "strip"
 
     def set_app_backend(self, app_backend) -> None:
         """Inject the AppBackend reference (called from QML at startup).
@@ -132,6 +141,24 @@ class MapEditorBackend(QObject):
             return 0
         return self._multi_channel_map.spectral_points
 
+    @Property(bool, notify=lineScanModeChanged)
+    def isLineScanMode(self) -> bool:
+        """True when the tab is showing a line scan / point set (not an area map)."""
+        return self._line_scan_mode
+
+    @Property(str, notify=lineScanModeChanged)
+    def lineScanView(self) -> str:
+        """Current line-scan view: "kymograph" or "strip"."""
+        return self._line_scan_view
+
+    @Property(int, notify=lineScanModeChanged)
+    def lineScanPoints(self) -> int:
+        """Number of positions (spectra) in the active line scan."""
+        if not self._line_scan_mode:
+            return 0
+        data = self._linked_datasets.get(self._line_scan_dataset)
+        return int(data.num_spectra) if data is not None else 0
+
     @Property('QVariantList', notify=linkedDatasetsChanged)
     def linkedDatasetNames(self) -> List[str]:
         """Get list of linked dataset names"""
@@ -164,6 +191,85 @@ class MapEditorBackend(QObject):
 
         self.linkedDatasetsChanged.emit()
         logger.info(f"Linked dataset '{name}' with {spectral_data.num_spectra} spectra")
+
+    # =========================================================================
+    # Line-scan / point-set viewing (non-area spatially-resolved spectra)
+    # =========================================================================
+
+    @staticmethod
+    def _build_line_scan_array(spectral_data, view: str) -> np.ndarray:
+        """Build the 2-D array shown for a line/point dataset.
+
+        - ``"kymograph"``: ``(P points × N positions)`` — column j is
+          spectrum j. This is the ``spectra`` DataFrame as-is.
+        - ``"strip"``: ``(1 × N)`` — a single summary value per position
+          (mean over the spectral axis).
+        """
+        spectra = np.asarray(spectral_data.spectra.values, dtype=float)
+        if view == "strip":
+            with np.errstate(all="ignore"):
+                strip = np.nanmean(spectra, axis=0)
+            return strip.reshape(1, -1)
+        return spectra  # kymograph (P × N)
+
+    @Slot(str, str)
+    def loadDatasetAsLineScan(self, name: str, view: str = "kymograph"):
+        """Show a line-scan / point-set dataset in the tab.
+
+        Builds the chosen 2-D view (kymograph or scalar strip), links the
+        dataset for per-position spectrum inspection, and enters line-scan
+        mode so clicks resolve a spectrum by column (position index).
+        """
+        if self._app_backend is None or not hasattr(self._app_backend, "_datasets"):
+            logger.warning("loadDatasetAsLineScan: AppBackend not available")
+            return
+        spectral_data = self._app_backend._datasets.get(name)
+        if spectral_data is None:
+            logger.warning(f"loadDatasetAsLineScan: dataset not found: {name}")
+            return
+
+        view = view if view in ("kymograph", "strip") else "kymograph"
+        self.linkDataset(name, spectral_data)
+        self._active_dataset = name
+        self._line_scan_mode = True
+        self._line_scan_dataset = name
+        self._line_scan_view = view
+
+        arr = self._build_line_scan_array(spectral_data, view)
+        # Fresh single-channel map (kymograph/strip differ in shape from any
+        # previously-shown map, and MultiChannelMap pins a single shape).
+        self._multi_channel_map = None
+        self.setMapDataFromArray(arr, name)  # emits map/channel signals + sets canvas
+        self.lineScanModeChanged.emit()
+        logger.info(
+            f"Loaded line scan '{name}' as {view}: "
+            f"{spectral_data.num_spectra} positions, "
+            f"{spectral_data.num_points} points"
+        )
+
+    @Slot(str)
+    def setLineScanView(self, view: str):
+        """Toggle the active line scan between "kymograph" and "strip"."""
+        if not self._line_scan_mode or view not in ("kymograph", "strip"):
+            return
+        if view == self._line_scan_view:
+            return
+        spectral_data = self._linked_datasets.get(self._line_scan_dataset)
+        if spectral_data is None:
+            return
+        self._line_scan_view = view
+        arr = self._build_line_scan_array(spectral_data, view)
+        # Kymograph (P×N) and strip (1×N) differ in shape — rebuild the map.
+        self._multi_channel_map = None
+        self.setMapDataFromArray(arr, self._line_scan_dataset)
+        self.lineScanModeChanged.emit()
+
+    def _exit_line_scan_mode(self):
+        """Leave line-scan mode (called when a real area map is loaded)."""
+        if self._line_scan_mode:
+            self._line_scan_mode = False
+            self._line_scan_dataset = ""
+            self.lineScanModeChanged.emit()
 
     @Slot(str)
     def unlinkDataset(self, name: str):
@@ -202,10 +308,15 @@ class MapEditorBackend(QObject):
 
         spectral_data = self._linked_datasets[dataset_name]
         dims = spectral_data.metadata.dimensions
-        num_cols = dims[0]  # horizontal dimension
 
-        # Calculate spectrum index
-        spectrum_idx = row * num_cols + col
+        if self._line_scan_mode and dataset_name == self._line_scan_dataset:
+            # Line scan / point set: the displayed array's columns ARE the
+            # positions (kymograph) or strip cells, so the spectrum is the
+            # column index; ``row`` is the spectral sample and is ignored.
+            spectrum_idx = max(0, min(int(col), spectral_data.num_spectra - 1))
+        else:
+            num_cols = dims[0]  # horizontal dimension
+            spectrum_idx = row * num_cols + col
 
         if spectrum_idx >= spectral_data.num_spectra:
             return {'error': f'Index {spectrum_idx} out of range (max: {spectral_data.num_spectra - 1})'}
@@ -378,6 +489,7 @@ class MapEditorBackend(QObject):
             return
 
         logger.info(f"Loading in-memory map id={map_id}")
+        self._exit_line_scan_mode()
         self._multi_channel_map = mcm
         if self._canvas:
             active = self._multi_channel_map.active_channel
@@ -394,6 +506,7 @@ class MapEditorBackend(QObject):
             path = Path(file_path.replace("file://", ""))
             logger.info(f"Loading map from: {path}")
 
+            self._exit_line_scan_mode()
             # Create new multi-channel map
             self._multi_channel_map = MultiChannelMap()
 
@@ -492,6 +605,7 @@ class MapEditorBackend(QObject):
 
     def setMultiChannelMap(self, mcmap: MultiChannelMap):
         """Set map data programmatically from Python"""
+        self._exit_line_scan_mode()
         self._multi_channel_map = mcmap
 
         # Update canvas

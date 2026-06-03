@@ -599,6 +599,19 @@ Rectangle {
             }
         }
 
+        // Spatially-resolved spectra that aren't area maps (line scans /
+        // point sets) can be inspected in the Hyperspectral tab.
+        MenuItem {
+            text: "Open in Hyperspectral"
+            visible: itemMenu.row && itemMenu.row.type === "dataset" && backend
+                     && ["line", "point"].indexOf(backend.spatialLayout(itemMenu.row.id)) !== -1
+            height: visible ? implicitHeight : 0
+            onTriggered: {
+                if (backend && itemMenu.row && itemMenu.row.id)
+                    backend.openDatasetInHyperspectral(itemMenu.row.id)
+            }
+        }
+
         // Take the item out of its folder (back to the unfiled root). Only
         // shown when the item is actually inside a folder. This replaces the
         // old "drop on empty space to unfile" behaviour — off-folder drops now

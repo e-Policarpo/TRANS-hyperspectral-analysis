@@ -212,9 +212,30 @@ estiver no `Unified-UI` (e cole o hash do commit ao lado).
   guarda coords de bloco, mas o backend as lia como pixel →
   média de 1 spectrum em vez de N (block_count errado). Guards
   alinhados. Teste de regressão em test_hyperspectral_workflow.py.*
-- [ ] **Suporte a espectros espacialmente resolvidos não-mapas.**
+- [x] **Suporte a espectros espacialmente resolvidos não-mapas.**
   Espectros pontuais e em linha (line scans) precisam ser
   reconhecidos além de mapas em área.
+  *Fix: como os loaders só guardam `Point_N` (sem coords x,y reais),
+  line scans e point sets viram uma sequência ordenada 1×N (eixo
+  espacial = índice do ponto). (1) Reconhecimento:
+  `AppBackend.spatialLayout(name) -> area/line/point/none` +
+  `spatial_layout` em `getDatasetListWithInfo`. (2) Entrada: ação
+  "Open in Hyperspectral" no menu de contexto do ProjectBrowser
+  (só p/ datasets line/point) → sinal `openInHyperspectralRequested`
+  → Main.qml troca p/ aba 1 e chama `loadDatasetAsLineScan`. (3)
+  Visualização (toggle no status bar): `map_editor_backend`
+  `loadDatasetAsLineScan(name, view)` constrói **kymograph** (P×N =
+  `spectra.values`, coluna j = espectro j) ou **strip** (1×N = média
+  por coluna) e entra em line-scan mode (reseta o MultiChannelMap
+  pois as shapes diferem). (4) Inspeção: `getSpectrumFromDataset`
+  resolve por COLUNA em line-scan mode (clica qualquer linha → espectro
+  da posição). Sai do modo ao carregar um mapa de área. 14 testes em
+  test_line_scan_support.py.*
+  *Follow-ups (fora do escopo): média sobre posições selecionadas +
+  semântica do line-profile no modo line-scan; eixo-Y do kymograph
+  rotulado com a variável independente real (canvas desenha índices);
+  overlays nesta aba (item separado); abrir o cubo de um dataset de
+  área direto.*
 - [ ] **Zoom não funciona** nesta aba.
 - [x] **Crosshair invisível.** Selecionando a ferramenta
   crosshair, o cursor desaparece dentro do canvas.

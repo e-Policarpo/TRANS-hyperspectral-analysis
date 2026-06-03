@@ -103,6 +103,7 @@ class AppBackend(ToolImplementations, QObject):
     noteDeleted = Signal(str)  # note_id
     noteRenamed = Signal(str, str)  # note_id, new_name
     browserTreeChanged = Signal()  # folder tree / item placements changed
+    openInHyperspectralRequested = Signal(str)  # dataset name — open a line/point dataset in the Hyperspectral tab
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1725,6 +1726,50 @@ class AppBackend(ToolImplementations, QObject):
             return self._datasets[dataset_name]
         return None
 
+    # Scan modes the loaders stamp on point-like (non-area) acquisitions.
+    _POINT_SCAN_MODES = frozenset({"single", "point", "pinpoint"})
+
+    def _spatial_layout(self, data) -> str:
+        """Classify a dataset's spatial layout for the Hyperspectral tab:
+
+        - ``"none"``  — not a real spectral dataset (flat / integrated values,
+          or fewer than 2 points per spectrum).
+        - ``"area"``  — a 2-D area map (both grid dimensions > 1).
+        - ``"point"`` — a single spectrum, or a point/pinpoint/single scan.
+        - ``"line"``  — a 1-D line scan / ordered point set (1×N or N×1).
+        """
+        try:
+            meta = data.metadata
+            if 'intervals' in (meta.additional_info or {}):
+                return "none"
+            if data.num_points < 2 or data.num_spectra < 1:
+                return "none"
+            dims = meta.dimensions or (0, 0)
+            dim_h = dims[0] if len(dims) > 0 else 0
+            dim_v = dims[1] if len(dims) > 1 else 0
+            if min(dim_h, dim_v) > 1:
+                return "area"
+            if data.num_spectra == 1 or meta.scan_mode in self._POINT_SCAN_MODES:
+                return "point"
+            return "line"
+        except Exception:
+            return "none"
+
+    @Slot(str, result=str)
+    def spatialLayout(self, dataset_name: str) -> str:
+        """Spatial layout of a dataset by name ("area"/"line"/"point"/"none")."""
+        data = self._datasets.get(dataset_name)
+        return self._spatial_layout(data) if data is not None else "none"
+
+    @Slot(str)
+    def openDatasetInHyperspectral(self, dataset_name: str):
+        """Ask the UI to open a line/point dataset in the Hyperspectral tab."""
+        if dataset_name not in self._datasets:
+            self.errorOccurred.emit("Not Found", f"Dataset not found: {dataset_name}")
+            return
+        logger.info(f"Open in Hyperspectral requested: {dataset_name}")
+        self.openInHyperspectralRequested.emit(dataset_name)
+
     @Slot(result='QVariantList')
     def getDatasetListWithInfo(self):
         """
@@ -1752,7 +1797,8 @@ class AppBackend(ToolImplementations, QObject):
                 'is_truncated': 'truncated' in name.lower() or 'T_' in name,
                 'is_discretized': is_discretized,
                 'is_integrated': False,  # We've excluded integrated datasets
-                'dimensions': list(data.metadata.dimensions)
+                'dimensions': list(data.metadata.dimensions),
+                'spatial_layout': self._spatial_layout(data),
             }
             dataset_info.append(info)
 

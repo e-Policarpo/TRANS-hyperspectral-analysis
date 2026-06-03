@@ -888,11 +888,32 @@ Item {
                         color: textMuted
                     }
 
+                    // Line-scan view toggle (kymograph vs scalar strip).
+                    Label {
+                        visible: mapBackend.isLineScanMode
+                        text: "View:"
+                        font.pixelSize: 11
+                        color: textMuted
+                    }
+                    ComboBox {
+                        id: lineScanViewCombo
+                        visible: mapBackend.isLineScanMode
+                        model: ["Kymograph", "Strip"]
+                        currentIndex: mapBackend.lineScanView === "strip" ? 1 : 0
+                        implicitHeight: 26
+                        font.pixelSize: 11
+                        onActivated: mapBackend.setLineScanView(
+                            currentIndex === 1 ? "strip" : "kymograph")
+                    }
+
                     Item { Layout.fillWidth: true }
 
                     Label {
-                        text: mapBackend.hasMapData ?
-                              mapBackend.mapRows + " \u00d7 " + mapBackend.mapCols : "No data"
+                        text: mapBackend.isLineScanMode
+                              ? ("Line scan \u00b7 " + mapBackend.lineScanPoints + " pts")
+                              : (mapBackend.hasMapData
+                                 ? mapBackend.mapRows + " \u00d7 " + mapBackend.mapCols
+                                 : "No data")
                         font.pixelSize: 11
                         color: Qt.darker(textMuted, 1.2)
                     }
@@ -1114,6 +1135,14 @@ Item {
     }
 
     // Public API
+    // Open a line scan / point-set dataset as a kymograph (toggle to strip
+    // in the status bar). The map backend looks the dataset up via the
+    // injected AppBackend and links it for per-position spectrum inspection.
+    function loadDatasetAsLineScan(datasetName) {
+        mapBackend.loadDatasetAsLineScan(datasetName, "kymograph")
+        autoScale()
+    }
+
     function loadMap(filePath) {
         mapBackend.loadMapFromFile(filePath)
         // Add to open maps list

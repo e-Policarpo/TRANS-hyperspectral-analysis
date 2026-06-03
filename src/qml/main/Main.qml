@@ -53,6 +53,7 @@ ApplicationWindow {
     // id (signal handlers don't see properties declared on inner items).
     property string _pendingMapLoad: ""
     property string _pendingMapLoadById: ""
+    property string _pendingLineScan: ""
 
     // Show startup dialog on launch and apply saved color scheme
     Component.onCompleted: {
@@ -1158,6 +1159,10 @@ ApplicationWindow {
                             mew.mapEditorBackend.loadMapById(mainWindow._pendingMapLoadById)
                             mainWindow._pendingMapLoadById = ""
                         }
+                        if (mainWindow._pendingLineScan) {
+                            mew.loadDatasetAsLineScan(mainWindow._pendingLineScan)
+                            mainWindow._pendingLineScan = ""
+                        }
 
                         console.log("MapEditorWorkstation lazy-loaded and initialized")
                     }
@@ -1453,6 +1458,20 @@ ApplicationWindow {
                 mew.loadMap(filePath)
             } else {
                 mainWindow._pendingMapLoad = filePath
+            }
+        }
+
+        // Open a line scan / point-set dataset in the Hyperspectral tab.
+        function onOpenInHyperspectralRequested(datasetName) {
+            console.log("Open in Hyperspectral:", datasetName)
+            tabBar.currentIndex = 1
+            currentTabIndex = 1
+            mapEditorLoader.ensureLoaded()
+            var mew = mapEditorLoader.item
+            if (mew) {
+                mew.loadDatasetAsLineScan(datasetName)
+            } else {
+                mainWindow._pendingLineScan = datasetName
             }
         }
 
