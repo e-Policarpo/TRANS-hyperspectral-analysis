@@ -917,6 +917,20 @@ Item {
         return graphCanvas.addCurve(label, xData, yData, color || "", 2.0)
     }
 
+    // Append curves (without clearing existing ones) and re-frame the data.
+    // Used to overlay a tool result onto the source dataset's open window.
+    function addCurvesAndFit(curveList) {
+        if (!curveList) return
+        for (var i = 0; i < curveList.length; i++) {
+            var c = curveList[i]
+            if (c && c.x && c.y && c.x.length > 0 && c.y.length > 0) {
+                graphCanvas.addCurve(c.label || ("Curve " + (i + 1)),
+                                     c.x, c.y, c.color || "", 2.0)
+            }
+        }
+        graphCanvas.resetView()
+    }
+
     function clearCurves() {
         // curvesChanged signal from graphCanvas.clearCurves() triggers updateCurvesList() via Connections
         graphCanvas.clearCurves()

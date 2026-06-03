@@ -78,7 +78,7 @@ estiver no `Unified-UI` (e cole o hash do commit ao lado).
   `SpectralData`, registra em `_datasets`, emite `dataLoaded`, é
   undoable. Botão "Add as Dataset" em `TableWindowContent.qml`.
   10 testes em test_table_to_dataset.py.*
-- [ ] **Operações sobre gráficos não disparam.** Smoothing (e
+- [x] **Operações sobre gráficos não disparam.** Smoothing (e
   provavelmente outros botões) emite o log
   `Opened dataset … - Smoothed in embedded windows` mas o gráfico
   não é alterado. O backend processa, mas o resultado não chega
@@ -86,13 +86,24 @@ estiver no `Unified-UI` (e cole o hash do commit ao lado).
   *Investigação: há DOIS caminhos. (a) Botões da toolbar do
   gráfico (`GraphWindowContent.qml` → `graphCanvas.applyCurveOperation`)
   adicionam uma nova curva ao canvas e funcionam. (b) Ferramentas
-  a nível de dataset chamam `_do_open_dataset_in_plot` (origem do
-  log "in embedded windows"), que emite `openDatasetEmbedded` →
-  QML abre uma JANELA NOVA em vez de atualizar o canvas aberto.
-  Fix correto: detectar janela existente para o dataset e
-  atualizar suas curvas (ou rotear o resultado da ferramenta para
-  o canvas ativo). Não feito ainda — requer plumbing de
-  identidade janela↔dataset.*
+  a nível de dataset criam um dataset derivado (`X - Smoothed`,
+  metadata `original=X`) que só aparecia no browser; ao abrir
+  emitia `openDatasetEmbedded` → JANELA NOVA em vez de tocar o
+  canvas aberto.*
+  *Fix (decisão do usuário: OVERLAY na janela da fonte). Identidade
+  janela↔dataset: o WindowManager guarda `datasetName` por janela
+  (`findGraphWindowByDataset`, `addCurvesToGraphWindow`). No backend,
+  `_on_tool_completed` chama `_route_derived_datasets()` que DIFFA
+  `_datasets` contra `_seen_dataset_keys` (cobre TODA ferramenta
+  espectral que carimba `original` — smoothing, baseline, cosmic-ray,
+  derivada, bg-sub, bandgap/doping, …; ignora map-gen e imports) e
+  emite `displayDerivedDataset(source, result, curves, …)`. QML
+  (`onDisplayDerivedDataset`) acha a janela da fonte e SOBREPÕE a
+  curva (raise; sem 2ª janela); se a fonte não está aberta, abre
+  janela nova p/ o resultado. `_workflow_mode` suprime (resultados
+  intermediários não viram janela). Seed de `_seen_dataset_keys` no
+  load de projeto p/ não floodar no 1º tool. 5 testes em
+  test_derived_dataset_routing.py.*
 - [x] **Toggle zoom/pan não funciona.** Pan continua em botão
   direito e zoom em botão esquerdo independentemente da seleção
   na toolbar; ambos mapeiam coordenadas erradas.

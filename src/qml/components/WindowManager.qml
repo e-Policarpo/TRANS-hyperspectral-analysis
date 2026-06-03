@@ -187,12 +187,15 @@ Item {
             updateContentBounds()
         })
 
-        // Add to registry
+        // Add to registry. ``datasetName`` is the dataset identity a graph
+        // window represents (defaults to the title; overridden for dataset
+        // windows) so tool results can be routed back to the right window.
         windows.push({
             id: windowId,
             window: window,
             type: windowType,
-            title: title
+            title: title,
+            datasetName: title || ""
         })
 
         // Activate the new window
@@ -233,6 +236,15 @@ Item {
         windowConfig.height = windowConfig.height || 450
 
         var windowId = createWindow("graph", title || "Graph", graphContent, windowConfig)
+
+        // Remember which dataset this window represents (for routing tool
+        // results back to it). Defaults to the title when not specified.
+        for (var wi = 0; wi < windows.length; wi++) {
+            if (windows[wi].id === windowId) {
+                windows[wi].datasetName = windowConfig.datasetName || title || ""
+                break
+            }
+        }
 
         // Apply config to the content item (curves, labels, etc.)
         function applyGraphConfig(content) {
@@ -419,7 +431,7 @@ Item {
     // Convenience: open a graph window with curve data directly. When a graph
     // window with the same title already exists, refresh its curves and bring
     // it to the front instead of creating a duplicate.
-    function openGraphWindow(title, curves, xLabel, yLabel) {
+    function openGraphWindow(title, curves, xLabel, yLabel, datasetName) {
         var existing = findWindowByTitle("graph", title)
         if (existing) {
             updateGraphWindow(existing, title, curves, xLabel, yLabel)
@@ -428,8 +440,46 @@ Item {
         return createEnhancedGraphWindow(title, {
             curves: curves,
             xLabel: xLabel || "X",
-            yLabel: yLabel || "Y"
+            yLabel: yLabel || "Y",
+            datasetName: datasetName || title
         })
+    }
+
+    // Find the graph window representing the given dataset (by stable
+    // dataset identity, not just visible title). Returns the window id or "".
+    function findGraphWindowByDataset(datasetName) {
+        if (!datasetName) return ""
+        for (var i = 0; i < windows.length; i++) {
+            var w = windows[i]
+            if (w.type === "graph" && w.window && w.datasetName === datasetName) {
+                return w.id
+            }
+        }
+        return ""
+    }
+
+    // Append curves to an existing graph window (without clearing the
+    // current ones) and frame the data. Used to overlay tool results.
+    function addCurvesToGraphWindow(windowId, curves) {
+        var info = getWindow(windowId)
+        if (!info || !info.window) return false
+        var win = info.window
+
+        function doAdd(content) {
+            if (content && typeof content.addCurvesAndFit === "function") {
+                content.addCurvesAndFit(curves)
+            }
+        }
+
+        if (win.contentItem) {
+            doAdd(win.contentItem)
+        } else {
+            win.contentItemChanged.connect(function() {
+                if (win.contentItem) doAdd(win.contentItem)
+            })
+        }
+        activateWindow(windowId)
+        return true
     }
 
     // Update an existing graph window's curves (for reuse instead of creating new)

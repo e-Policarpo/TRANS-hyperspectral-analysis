@@ -2124,7 +2124,21 @@ ApplicationWindow {
 
         function onOpenDatasetEmbedded(name, curves, xLabel, yLabel) {
             if (currentTabIndex !== 0) tabBar.currentIndex = 0
-            toolWindowManager.openGraphWindow(name, curves, xLabel, yLabel)
+            // The window's stable dataset identity is the dataset name.
+            toolWindowManager.openGraphWindow(name, curves, xLabel, yLabel, name)
+        }
+
+        // A dataset operation produced a derived result: overlay it onto the
+        // source dataset's open graph window, or open a new window if the
+        // source isn't currently shown.
+        function onDisplayDerivedDataset(source, result, curves, xLabel, yLabel) {
+            if (currentTabIndex !== 0) tabBar.currentIndex = 0
+            var wid = toolWindowManager.findGraphWindowByDataset(source)
+            if (wid) {
+                toolWindowManager.addCurvesToGraphWindow(wid, curves)
+            } else {
+                toolWindowManager.openGraphWindow(result, curves, xLabel, yLabel, result)
+            }
         }
 
         function onOpenTableEmbedded(title, tableModel) {

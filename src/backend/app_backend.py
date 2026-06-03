@@ -88,6 +88,10 @@ class AppBackend(ToolImplementations, QObject):
     loadMapInEditorById = Signal(str)  # map_id - request to load an in-memory map by ID
     projectStateRestored = Signal(str)  # stateJson - emitted after loading project to restore tables/graphs/workspace
     openDatasetEmbedded = Signal(str, 'QVariantList', str, str)  # name, curves, xLabel, yLabel
+    # A dataset tool produced a derived dataset (`result`) from `source`. QML
+    # overlays the result curves onto the source's open graph window (or opens
+    # a new window when the source isn't currently shown).
+    displayDerivedDataset = Signal(str, str, 'QVariantList', str, str)  # source, result, curves, xLabel, yLabel
     openTableEmbedded = Signal(str, QObject)  # title, TableDataModel
     openImageEmbedded = Signal(str, str)  # title, image_id (canvas pulls QImage via image:// URL provider)
     openNoteEmbedded = Signal(str, str, str)  # title, body_text, source_label
@@ -122,6 +126,10 @@ class AppBackend(ToolImplementations, QObject):
         self._datasets: Dict[str, SpectralData] = {}
         self._active_dataset: Optional[str] = None
         self._workflow_mode: bool = False  # When True, suppress dataLoaded emission for intermediate results
+        # Dataset keys known before the current tool run — diffed in
+        # ``_on_tool_completed`` to spot newly-created derived datasets so
+        # their result can be overlaid on the source's open graph window.
+        self._seen_dataset_keys: set = set()
 
         # Imported map data (for Map Editor)
         self._imported_map_data: Optional[np.ndarray] = None
@@ -953,6 +961,10 @@ class AppBackend(ToolImplementations, QObject):
             # so that refreshBrowser() sees the complete project state
             if self._datasets:
                 self.dataLoaded.emit(self._active_dataset)
+
+            # Treat everything already in the loaded project as "seen" so the
+            # first tool run doesn't bulk-overlay previously-derived datasets.
+            self._seen_dataset_keys = set(self._datasets)
 
             # Restore map editor state
             map_editor_state = project_data.get('map_editor', {})
@@ -5070,6 +5082,55 @@ class AppBackend(ToolImplementations, QObject):
             # Find any newly created dataset that matches this tool output
             # Tool results typically create datasets with names derived from the tool
             self._register_tool_result_undo(tool_name, output_path)
+
+        # Overlay any newly-created derived dataset onto the source's open
+        # graph window (so dataset-level operations visibly "fire" on the
+        # graph instead of silently spawning a separate window).
+        self._route_derived_datasets()
+
+    def _route_derived_datasets(self):
+        """Display datasets created since the last tool run that carry an
+        ``original`` source in their metadata.
+
+        Diffing against ``_seen_dataset_keys`` (rather than guessing "the
+        last dataset") covers every spectral tool that stamps ``original``
+        — smoothing, baseline, cosmic-ray, derivative, background
+        subtraction, etc. — and ignores tools that add no dataset (map
+        generation) or plain imports (no ``original``)."""
+        if self._workflow_mode:
+            # Intermediate workflow results aren't shown individually.
+            self._seen_dataset_keys = set(self._datasets)
+            return
+        new_keys = [k for k in self._datasets if k not in self._seen_dataset_keys]
+        self._seen_dataset_keys = set(self._datasets)
+        for name in new_keys:
+            data = self._datasets.get(name)
+            info = getattr(getattr(data, "metadata", None), "additional_info", None)
+            source = info.get("original") if isinstance(info, dict) else None
+            if source:
+                self._display_derived_dataset(source, name)
+
+    def _display_derived_dataset(self, source: str, result: str):
+        """Emit ``displayDerivedDataset`` with the result's first-spectrum
+        curve so QML can overlay it on the source's graph window."""
+        dataset = self._datasets.get(result)
+        if dataset is None:
+            return
+        curves = []
+        try:
+            if getattr(dataset, "num_spectra", 0) > 0:
+                x = dataset.independent_var.tolist()
+                y = dataset.spectra.iloc[:, 0].values.tolist()
+                if y:
+                    curves.append({"x": x, "y": y, "label": result})
+        except Exception as e:
+            logger.error(f"Error building derived curves for {result}: {e}")
+            return
+        if not curves:
+            return
+        x_label = getattr(dataset, "independent_var_name", "x")
+        self.displayDerivedDataset.emit(source, result, curves, x_label, "Intensity")
+        logger.info(f"Routing derived dataset {result!r} onto source {source!r}")
 
     def _register_tool_result_undo(self, tool_name: str, output_path: str):
         """Register an undo command for a tool that created a new dataset."""
