@@ -20,7 +20,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 pytest.importorskip("PySide6.QtWidgets")
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtGui import QGuiApplication, QImage, QPainter
 
 from src.widgets.qml_graph_canvas import QMLGraphCanvas
 
@@ -102,3 +102,123 @@ def test_clear_curves_notifies_when_selection_existed(canvas):
     canvas.clearCurves()
     assert canvas.selectedCurveId == -1
     assert seen == [-1]
+
+
+# ---------------------------------------------------------------------------
+# Auto-fit on open — resetView() / _calculateAutoBounds() must frame all data
+# immediately (before the first paint), with an exact 5 % margin.
+# ---------------------------------------------------------------------------
+
+def _sized_canvas(app, w=800, h=600):
+    c = QMLGraphCanvas()
+    c.setWidth(w)
+    c.setHeight(h)
+    return c
+
+
+def _paint_once(canvas):
+    """Drive one native paint so the data→pixel transform registers."""
+    img = QImage(int(canvas.width()), int(canvas.height()),
+                 QImage.Format_ARGB32)
+    p = QPainter(img)
+    canvas._renderNative(p)
+    p.end()
+
+
+def test_reset_view_frames_data_before_any_paint(app):
+    c = _sized_canvas(app)
+    c.addCurve("c", list(np.linspace(100, 2000, 400)),
+               list(np.linspace(-5, 50, 400)))
+    c.resetView()  # no paint has happened yet
+    x0, x1, y0, y1 = c._viewbox.view_range().as_tuple()
+    # data x in [100, 2000], y in [-5, 50] + exact 5 % margin.
+    assert (round(x0, 3), round(x1, 3)) == (5.0, 2095.0)
+    assert (round(y0, 3), round(y1, 3)) == (-7.75, 52.75)
+
+
+def test_auto_bounds_exact_margin_is_stable_first_call(app):
+    """The first auto-bounds call (from the default 0–1 view) must give
+    the same exact margin as steady state — no transient edge swap."""
+    c = _sized_canvas(app)
+    c.addCurve("c", list(np.linspace(100, 2000, 400)),
+               list(np.linspace(-5, 50, 400)))
+    c._calculateAutoBounds()
+    first = tuple(round(v, 3) for v in c._viewbox.view_range().as_tuple())
+    c._calculateAutoBounds()
+    second = tuple(round(v, 3) for v in c._viewbox.view_range().as_tuple())
+    assert first == second == (5.0, 2095.0, -7.75, 52.75)
+
+
+def test_auto_bounds_degenerate_axis_uses_half_unit_fallback(app):
+    c = _sized_canvas(app, 400, 300)
+    c.addCurve("flat", [3.0, 3.0, 3.0], [7.0, 7.0, 7.0])
+    c.resetView()
+    assert tuple(round(v, 3) for v in c._viewbox.view_range().as_tuple()) == (
+        2.5, 3.5, 6.5, 7.5,
+    )
+
+
+def test_reset_view_with_no_curves_is_unit_box(app):
+    c = _sized_canvas(app)
+    c.resetView()
+    assert c._viewbox.view_range().as_tuple() == (0.0, 1.0, 0.0, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# Curve-pick coordinate space — _findNearestCurve must compare the click and
+# the curve samples in the SAME space. In native (default) mode the matplotlib
+# axes is never laid out, so the old transData path could not pick any curve.
+# ---------------------------------------------------------------------------
+
+def test_find_nearest_curve_hits_in_native_mode(app):
+    c = _sized_canvas(app)
+    xs = np.linspace(100.0, 2000.0, 400)
+    ys = np.linspace(-5.0, 50.0, 400)
+    cid = c.addCurve("c", list(xs), list(ys))
+    _paint_once(c)  # registers the native transform
+    # A point exactly on the line, round-tripped through the transform.
+    x_on = 1000.0
+    y_on = float(np.interp(x_on, xs, ys))
+    px, py = c._dataToPixel(x_on, y_on)
+    xd, yd = c._pixelToData(px, py)
+    assert c._findNearestCurve(xd, yd) == cid
+
+
+def test_find_nearest_curve_misses_far_from_line(app):
+    c = _sized_canvas(app)
+    xs = np.linspace(100.0, 2000.0, 400)
+    ys = np.linspace(-5.0, 50.0, 400)
+    c.addCurve("c", list(xs), list(ys))
+    _paint_once(c)
+    # Top-left corner of the axes is well off the rising line.
+    fx, fy = c._pixelToData(70.0, 30.0)
+    assert c._findNearestCurve(fx, fy) is None
+
+
+# ---------------------------------------------------------------------------
+# Area-select (rubber-band) zoom must frame exactly the dragged rectangle:
+# the corner pixels of the resulting view map back to the press/release
+# pixels. Locks in the native-render coordinate round-trip.
+# ---------------------------------------------------------------------------
+
+def test_area_select_zoom_is_pixel_exact(app):
+    c = _sized_canvas(app)
+    c.addCurve("c", list(np.linspace(100.0, 2000.0, 400)),
+               list(np.linspace(-5.0, 50.0, 400)))
+    _paint_once(c)  # register native transform + axes rect
+    c.mouseMode = "rect"
+
+    a = (250.0, 180.0)   # press pixel
+    b = (560.0, 430.0)   # release pixel
+    vb = c._viewbox
+    vb.handle_press_left(a)
+    vb.handle_move(b)
+    res = vb.handle_release_left(b)   # (x_min, y_min, x_max, y_max)
+    assert res is not None
+    x_min, y_min, x_max, y_max = res
+
+    # The new view's corners must land back on the dragged pixels.
+    tl = c._dataToPixel(x_min, y_max)   # top-left
+    br = c._dataToPixel(x_max, y_min)   # bottom-right
+    assert tl == pytest.approx(a, abs=1e-6)
+    assert br == pytest.approx(b, abs=1e-6)

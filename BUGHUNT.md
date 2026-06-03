@@ -4,7 +4,7 @@ Lista corrente de bugs e melhorias encontradas no uso real do TRANS.
 Cada item começa não-resolvido (`- [ ]`); marque `- [x]` quando o fix
 estiver no `Unified-UI` (e cole o hash do commit ao lado).
 
-Última atualização: 2026-06-01.
+Última atualização: 2026-06-03.
 
 ---
 
@@ -23,15 +23,42 @@ estiver no `Unified-UI` (e cole o hash do commit ao lado).
 
 ## Sistema de gráficos e tabelas
 
-- [ ] **Downsampling em gráficos densos.** Para que a UI não trave
+- [x] **Downsampling em gráficos densos.** Para que a UI não trave
   com curvas de >100k pontos.
-  *Nota: o caminho QPainter (Phase 3) já tem `downsample` em
-  `prepare_curve_xy` com `max_points=100_000`. Verificar se está
-  realmente ativo no fluxo da usuária.*
+  *Verificado ATIVO: o render nativo chama `prepare_curve_xy(...,
+  max_points=_MAX_PATH_POINTS, downsample_mode=DOWNSAMPLE_PEAK)` com
+  `_MAX_PATH_POINTS=50_000`. Teste headless: curva de 1.000.000 pts →
+  100.000 elementos no path (50k blocos peak × 2 = min/max por bloco,
+  preserva o envelope). O caminho matplotlib (fallback) também reduz
+  via `step = len // max(2000, w*2)`. (A nota antiga dizia 100k; hoje
+  são 50k blocos.)*
 - [ ] **Culling de dados fora da viewport.** Não desenhar segmentos
   que estão fora do `ax_rect`.
+  *Status: clipping em nível de pixel JÁ ativo — `_renderNative` faz
+  `painter.setClipRect(ax_rect)`, então segmentos fora do eixo não são
+  rasterizados. NÃO há culling em nível de dados (descartar pontos fora
+  do x-range antes de montar o path) — e isso é proposital: o
+  `QPainterPath` é cacheado em coords de DADOS e reusado em zoom/pan
+  sem rebuild; cull por view-range forçaria rebuild a cada zoom/pan e
+  mataria o cache. Com o cap de 50k pts o custo de traversal já é
+  limitado. Recomendação: deixar como está.*
 - [ ] **Area select para zoom mapeia coordenadas erradas.** O zoom
   resultante sai deslocado em relação ao retângulo selecionado.
+  *Investigação: no render nativo (default) o round-trip é
+  PIXEL-EXATO — provado por teste headless (`ViewBoxState` +
+  `_native_build_transform`, offset 0.0) e travado em regressão
+  (`test_area_select_zoom_is_pixel_exact`). Não consegui reproduzir
+  deslocamento no caminho nativo. PORÉM achei e corrigi um bug REAL de
+  coordenadas vizinho — ver abaixo. Se o deslocamento persistir p/ a
+  usuária, é específico de ambiente (device-pixel-ratio/Retina) e
+  preciso de um print/repro p/ atacar.*
+- [x] **Clique em curva não seleciona (modo nativo).** `_findNearestCurve`
+  media o clique com o transform NATIVO (`_dataToPixel`) mas os pontos
+  da curva com `self.axes.transData` (matplotlib) — que no modo nativo
+  nunca é layoutado (limites 0–1 default), então o clique nunca casava:
+  selecionar curva clicando ficava quebrado. *Fix: mapeia ambos via
+  `_dataToPixel` (um só espaço de coords; cobre nativo + fallback +
+  log). Testes `test_find_nearest_curve_hits/misses_in_native_mode`.*
 - [x] **Panning.** Adicionar pan dedicado nos gráficos.
   *Nota: o ViewBox da Phase 2 já tem `MOUSE_MODE_PAN`; verificar
   se a toolbar do `GraphWindowContent.qml` está expondo o toggle
@@ -42,9 +69,15 @@ estiver no `Unified-UI` (e cole o hash do commit ao lado).
   iniciava zoom-rect. Agora, em modo pan, o left-drag faz pan
   (`viewbox.py`); right-drag continua sempre fazendo pan. Testes
   em test_viewbox.py atualizados + novo `test_left_drag_pans_in_pan_mode`.*
-- [ ] **Tabela ↔ spectral data.** Adicionar funcionalidade de
+- [x] **Tabela ↔ spectral data.** Adicionar funcionalidade de
   converter uma tabela em spectral data (ou unificar os dois no
   backend mantendo separação organizacional no project browser).
+  *Fix (Phase A, `f6ccf27`): promoção one-way tabela→dataset.
+  `TableDataModel.to_dataframe()` + `canBeDataset()`;
+  `AppBackend.createDatasetFromTable()` coage p/ numérico, constrói
+  `SpectralData`, registra em `_datasets`, emite `dataLoaded`, é
+  undoable. Botão "Add as Dataset" em `TableWindowContent.qml`.
+  10 testes em test_table_to_dataset.py.*
 - [ ] **Operações sobre gráficos não disparam.** Smoothing (e
   provavelmente outros botões) emite o log
   `Opened dataset … - Smoothed in embedded windows` mas o gráfico
@@ -70,9 +103,21 @@ estiver no `Unified-UI` (e cole o hash do commit ao lado).
   separado abaixo) não foi investigada nesta sessão — o
   round-trip `_dataToPixel`/`_pixelToData` parece consistente;
   suspeitar de device-pixel-ratio (Retina) se persistir.*
-- [ ] **Posição inicial dos gráficos.** Deveria auto-centralizar /
+- [x] **Posição inicial dos gráficos.** Deveria auto-centralizar /
   auto-fit os dados (todos os pontos visíveis) ao abrir uma nova
   janela.
+  *Fix: `resetView()` agora enquadra os dados DIRETO das curvas
+  (`_calculateAutoBounds`), sem depender da extensão registrada num
+  paint anterior — então funciona antes do 1º render. O
+  `GraphWindowContent.qml` chama `graphCanvas.resetView()` logo após
+  carregar as curvas (em `onCurvesChanged` e `Component.onCompleted`),
+  garantindo o auto-fit ao abrir. Bônus: `_calculateAutoBounds` foi
+  reescrito p/ setar o range em UM `set_view_range` (antes ia por 4
+  setters que faziam `sorted()` contra o range default 0–1 →
+  inflava a margem do 1º frame); agora a margem de 5% é exata já na
+  1ª chamada. Testes: `test_reset_view_frames_data_before_any_paint`,
+  `test_auto_bounds_exact_margin_is_stable_first_call`,
+  degenerate/empty + no-curves.*
 
 ## Sistema de Widgets
 
@@ -197,8 +242,16 @@ estiver no `Unified-UI` (e cole o hash do commit ao lado).
   e o mouse está em cima, um `SequentialAnimation on x` faz
   marquee (pausa → rola até o fim → pausa → volta, em loop). Sem
   hover/overflow continua elidido com "…". Reset de x ao sair.*
-- [ ] **Estrutura em árvore com pastas.** Permitir criar pastas
+- [x] **Estrutura em árvore com pastas.** Permitir criar pastas
   para organizar datasets, com drag-and-drop.
+  *Fix (Phases D1/D2, `30adc86` + `a6974ec`): árvore de pastas no
+  backend (`getBrowserTree`/`createFolder`/`renameFolder`/
+  `deleteFolder`/`moveItem`, persistida) + UI achatada em
+  `ProjectBrowser.qml`. Drag-and-drop via hit-test no release
+  (não DropAreas — `Drag.Automatic` segfaulta no PySide6/macOS) com
+  drop por região estilo Finder e root como alvo real. Auto-filing
+  de imports nas pastas por tipo. (Parte do DnD/auto-filing ainda
+  UNCOMMITTED no working tree em 2026-06-03.)*
 
 ## Preferências e estética
 

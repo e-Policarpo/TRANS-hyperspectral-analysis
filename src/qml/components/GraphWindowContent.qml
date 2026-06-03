@@ -977,6 +977,8 @@ Item {
                     )
                 }
             }
+            // Frame all points when the data first lands in the window.
+            graphCanvas.resetView()
             // curvesChanged signal handles updateCurvesList() via Connections
         }
     }
@@ -1016,6 +1018,8 @@ Item {
                     )
                 }
             }
+            // Frame all points when the window opens with data already set.
+            graphCanvas.resetView()
             // curvesChanged signal handles updateCurvesList() via Connections
         }
     }

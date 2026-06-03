@@ -784,14 +784,26 @@ class QMLGraphCanvas(QQuickPaintedItem):
 
     @Slot()
     def resetView(self):
-        """Re-enable auto-range and snap to the current data extent.
+        """Re-enable auto-range and frame the current data extent.
 
-        Defers to the viewbox: if curves have been added the renderer
-        already registered the data extent via ``_calculateAutoBounds``;
-        otherwise the next render will register it and trigger.
+        When curves exist this computes the data bounds directly
+        (``_calculateAutoBounds`` writes the view range with a 5 %
+        margin) instead of waiting for the next paint to register the
+        extent with the viewbox. That makes the toolbar "Reset View"
+        button and the auto-fit-on-open call work immediately, even
+        before the first render. With no curves yet it falls back to the
+        viewbox's registered extent (if any).
         """
         self._viewbox.set_auto_range_enabled(True)
-        self._viewbox.trigger_auto_range()
+        if self._curves:
+            # Writes via the ``_x_min`` … setters keep auto-range on
+            # (disable_auto=False), so the view stays live-fitted until
+            # the user interacts.
+            self._calculateAutoBounds()
+        else:
+            self._viewbox.trigger_auto_range()
+        self._needs_redraw = True
+        self.update()
         self.scaleChanged.emit()
 
     @Slot(float, float, float, float)
@@ -1927,10 +1939,21 @@ class QMLGraphCanvas(QQuickPaintedItem):
         )
 
     def _calculateAutoBounds(self):
-        """Calculate auto-scale bounds from all curves"""
+        """Compute auto-scale bounds from all visible curves and apply
+        them to the viewbox in a single update.
+
+        Setting the four edges through the individual ``_x_min`` …
+        property setters used to route each assignment through
+        ``set_view_range``'s ``sorted()`` against the *previous*
+        (possibly default 0–1) range, which transiently swapped an edge
+        and inflated the first-frame margin. Computing the range locally
+        and pushing it once avoids that and is cheaper (one viewbox
+        mutation instead of six)."""
         if not self._curves:
-            self._x_min, self._x_max = 0, 1
-            self._y_min, self._y_max = 0, 1
+            self._viewbox.set_view_range(
+                0.0, 1.0, 0.0, 1.0,
+                push_history=False, disable_auto=False,
+            )
             return
 
         x_mins, x_maxs = [], []
@@ -1943,25 +1966,21 @@ class QMLGraphCanvas(QQuickPaintedItem):
                 y_mins.append(np.nanmin(curve.y))
                 y_maxs.append(np.nanmax(curve.y))
 
-        if x_mins:
-            self._x_min = min(x_mins)
-            self._x_max = max(x_maxs)
-            self._y_min = min(y_mins)
-            self._y_max = max(y_maxs)
+        if not x_mins:
+            return
 
-            # Add margin
-            x_margin = (self._x_max - self._x_min) * 0.05
-            y_margin = (self._y_max - self._y_min) * 0.05
+        x_min, x_max = float(min(x_mins)), float(max(x_maxs))
+        y_min, y_max = float(min(y_mins)), float(max(y_maxs))
 
-            if x_margin == 0:
-                x_margin = 0.5
-            if y_margin == 0:
-                y_margin = 0.5
+        # 5 % margin; fall back to ±0.5 for a degenerate (zero-width) axis.
+        x_margin = (x_max - x_min) * 0.05 or 0.5
+        y_margin = (y_max - y_min) * 0.05 or 0.5
 
-            self._x_min -= x_margin
-            self._x_max += x_margin
-            self._y_min -= y_margin
-            self._y_max += y_margin
+        self._viewbox.set_view_range(
+            x_min - x_margin, x_max + x_margin,
+            y_min - y_margin, y_max + y_margin,
+            push_history=False, disable_auto=False,
+        )
 
     def _updateDataBounds(self):
         """Refresh the pixel-to-data mapping after each render.
@@ -2318,7 +2337,17 @@ class QMLGraphCanvas(QQuickPaintedItem):
         self.update()
 
     def _findNearestCurve(self, x: float, y: float) -> Optional[int]:
-        """Find curve nearest to click point in pixel space (works with log scale)"""
+        """Find the curve nearest to a click, measured in pixel space.
+
+        Both the click point and the curve samples are mapped through
+        the canvas's own ``_dataToPixel`` (the native ``QTransform`` in
+        fast-render mode), so the distance check lives in a single
+        coordinate space. The old path mapped curve points with
+        ``self.axes.transData`` — but in native mode the matplotlib
+        axes is never laid out (default 0–1 limits), so the comparison
+        was against garbage pixels and clicking a curve never selected
+        it.
+        """
         if not self._curves or not self._data_bounds:
             return None
 
@@ -2332,21 +2361,26 @@ class QMLGraphCanvas(QQuickPaintedItem):
             if not curve.visible or len(curve.x) == 0:
                 continue
 
-            # Downsample for distance check if curve is huge
+            # Downsample for the distance check if the curve is huge.
             cx, cy = curve.x, curve.y
             if len(cx) > 500:
                 step = len(cx) // 500
                 cx, cy = cx[::step], cy[::step]
 
-            # Convert curve points to pixel space
+            # Map each sample with the same transform the canvas renders
+            # with (handles native + matplotlib fallback + log scale).
             try:
-                pts = self.axes.transData.transform(np.column_stack([cx, cy]))
-                fig_h = self.canvas.get_width_height()[1]
-                pts[:, 1] = fig_h - pts[:, 1]
+                pts = np.array(
+                    [self._dataToPixel(float(px), float(py))
+                     for px, py in zip(cx, cy)],
+                    dtype=np.float64,
+                )
             except Exception:
                 continue
+            if pts.size == 0:
+                continue
 
-            dists = np.sqrt((pts[:, 0] - click_px)**2 + (pts[:, 1] - click_py)**2)
+            dists = np.hypot(pts[:, 0] - click_px, pts[:, 1] - click_py)
             min_dist = float(np.min(dists))
 
             if min_dist < best_dist:
