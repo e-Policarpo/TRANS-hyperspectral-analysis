@@ -272,3 +272,45 @@ def test_zoom_in_capped_at_max(canvas):
     for _ in range(200):
         canvas._zoom_by_delta(120)
     assert canvas._zoom == pytest.approx(canvas._MAX_ZOOM)
+
+
+# ----------------------------------------------------------- scale ruler
+
+def test_nice_step_rounds_to_1_2_5():
+    ns = QMLImageCanvas._nice_step
+    assert ns(0.3) == 0.5
+    assert ns(0.7) == 1.0
+    assert ns(3) == 5.0
+    assert ns(7) == 10.0
+    assert ns(23) == 50.0
+    assert ns(90) == 100.0
+    assert ns(0) == 1.0          # degenerate input is safe
+
+
+def test_fmt_tick_decimals_track_step():
+    f = QMLImageCanvas._fmt_tick
+    assert f(100.0, 50.0) == "100"      # integer step → no decimals
+    assert f(0.5, 0.5) == "0.5"          # sub-unit step → one decimal
+    assert f(0.4, 0.2) == "0.4"          # nice steps are only 1/2/5 ×10ⁿ
+
+
+def test_ruler_paints_for_physical_and_pixel_images(canvas):
+    """The border ruler must paint without error for an image that carries a
+    physical pixel size (nm) and for one that does not (falls back to px)."""
+    from PySide6.QtGui import QImage, QPainter
+    from src.models.image_data import ImageMetadata
+
+    arr = np.random.rand(400, 400).astype(np.float32)
+    canvas.setWidth(600); canvas.setHeight(500)
+    target = QImage(600, 500, QImage.Format_ARGB32)
+
+    physical = ImageData.from_array(
+        arr, mode=ImageMode.SINGLE_FLOAT, name="scan",
+        metadata=ImageMetadata(source="omicron_matrix_scan",
+                               pixel_size_nm=(20.0, 20.0)))
+    canvas.setImageData(physical)
+    p = QPainter(target); canvas.paint(p); p.end()
+
+    pixels = ImageData.from_array(arr, mode=ImageMode.SINGLE_FLOAT, name="nopx")
+    canvas.setImageData(pixels)
+    p = QPainter(target); canvas.paint(p); p.end()

@@ -16,13 +16,14 @@ License: GPL
 from __future__ import annotations
 
 import logging
+import math
 from typing import Optional, Tuple
 
 import numpy as np
 from PySide6.QtCore import (
     Property, QObject, QPointF, QRectF, QSize, Qt, QTimer, Signal, Slot,
 )
-from PySide6.QtGui import QColor, QImage, QPainter, QPen
+from PySide6.QtGui import QBrush, QColor, QFont, QImage, QPainter, QPen
 from PySide6.QtQuick import QQuickPaintedItem
 
 from src.models.image_data import ImageData, ImageMode
@@ -460,6 +461,9 @@ class QMLImageCanvas(QQuickPaintedItem):
         painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
         painter.drawImage(rect, self._qimage)
 
+        # Scale ruler along the canvas borders (physical units when known).
+        self._draw_ruler(painter, rect)
+
         # Crop overlay
         if self._crop_rect is not None:
             wrect = self._image_rect_to_widget(self._crop_rect)
@@ -478,6 +482,101 @@ class QMLImageCanvas(QQuickPaintedItem):
             irect.width() * sx,
             irect.height() * sy,
         )
+
+    # --------------------------------------------------------------- ruler
+    @staticmethod
+    def _nice_step(raw: float) -> float:
+        """Round ``raw`` up to the nearest 1 / 2 / 5 × 10ⁿ 'nice' number."""
+        if raw <= 0 or not math.isfinite(raw):
+            return 1.0
+        base = 10.0 ** math.floor(math.log10(raw))
+        for m in (1, 2, 5, 10):
+            if raw <= m * base:
+                return m * base
+        return 10 * base
+
+    @staticmethod
+    def _fmt_tick(v: float, step: float) -> str:
+        if step >= 1:
+            return f"{v:.0f}"
+        decimals = max(0, -int(math.floor(math.log10(step))))
+        return f"{v:.{decimals}f}"
+
+    def _draw_ruler(self, painter: QPainter, rect: QRectF) -> None:
+        """Draw scale ticks along the bottom and left canvas borders.
+
+        Tick values are recomputed from the current pan/zoom each paint, so the
+        scale stays correct as the user zooms. Physical units (nm / µm / mm) are
+        used when the image carries ``pixel_size_nm``; otherwise pixel indices.
+        """
+        if self._image is None:
+            return
+        W, H = self.width(), self.height()
+        iw, ih = self._image.width, self._image.height
+        if rect.width() <= 0 or rect.height() <= 0 or iw <= 0 or ih <= 0:
+            return
+
+        sx = rect.width() / iw   # widget px per image px (x)
+        sy = rect.height() / ih  # widget px per image px (y)
+
+        px_nm = getattr(self._image.metadata, "pixel_size_nm", None)
+        if px_nm and px_nm[0] and px_nm[1]:
+            dy_nm, dx_nm = float(px_nm[0]), float(px_nm[1])  # nm per image px
+            total_nm = max(iw * dx_nm, ih * dy_nm)
+            if total_nm >= 1e6:
+                div, unit = 1e6, "mm"
+            elif total_nm >= 1e3:
+                div, unit = 1e3, "µm"
+            else:
+                div, unit = 1.0, "nm"
+            dxp, dyp = dx_nm / div, dy_nm / div   # display units per image px
+        else:
+            dxp, dyp, unit = 1.0, 1.0, "px"
+
+        band = QColor(0, 0, 0, 120)
+        painter.setBrush(QBrush(band))
+        painter.setPen(Qt.NoPen)
+        painter.drawRect(QRectF(0, H - 18, W, 18))      # bottom band
+        painter.drawRect(QRectF(0, 0, 32, H - 18))      # left band
+
+        font = QFont(painter.font())
+        font.setPixelSize(10)
+        painter.setFont(font)
+        ink = QColor(235, 235, 235, 235)
+        painter.setPen(QPen(ink))
+        target = 90.0  # desired widget px between ticks
+
+        # --- X axis (bottom) ---
+        step = self._nice_step(target * dxp / sx)
+        v_lo = max(0.0, (0 - rect.x()) / sx * dxp)
+        v_hi = min(iw * dxp, (W - rect.x()) / sx * dxp)
+        k = math.ceil(v_lo / step - 1e-9)
+        while k * step <= v_hi + 1e-9:
+            v = k * step
+            wx = rect.x() + (v / dxp) * sx
+            painter.drawLine(int(wx), H - 18, int(wx), H - 12)
+            painter.drawText(QRectF(wx - 32, H - 15, 64, 13),
+                             Qt.AlignCenter, self._fmt_tick(v, step))
+            k += 1
+
+        # --- Y axis (left) ---
+        step = self._nice_step(target * dyp / sy)
+        v_lo = max(0.0, (0 - rect.y()) / sy * dyp)
+        v_hi = min(ih * dyp, (H - rect.y()) / sy * dyp)
+        k = math.ceil(v_lo / step - 1e-9)
+        while k * step <= v_hi + 1e-9:
+            v = k * step
+            wy = rect.y() + (v / dyp) * sy
+            if wy < H - 18:  # don't collide with the bottom band
+                painter.drawLine(0, int(wy), 6, int(wy))
+                painter.drawText(QRectF(2, wy - 7, 30, 13),
+                                 Qt.AlignVCenter | Qt.AlignLeft,
+                                 self._fmt_tick(v, step))
+            k += 1
+
+        # --- unit label (bottom-right) ---
+        painter.drawText(QRectF(W - 42, H - 15, 40, 13),
+                         Qt.AlignRight | Qt.AlignVCenter, unit)
 
     # ----------------------------------------------------------- mouse / wheel
     def mousePressEvent(self, event):

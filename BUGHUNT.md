@@ -32,6 +32,17 @@ estiver no `Unified-UI` (e cole o hash do commit ao lado).
   preserva o envelope). O caminho matplotlib (fallback) também reduz
   via `step = len // max(2000, w*2)`. (A nota antiga dizia 100k; hoje
   são 50k blocos.)*
+- [ ] **Réguas/ticks do gráfico dessincronizando com os dados.**
+  Reportado 2026-06-29: os ticks dos eixos não casariam com a
+  curva ("sempre, ao abrir"). NÃO REPRODUZIDO até agora: render
+  headless (nativo *e* fallback matplotlib) com dados realistas
+  (I(V) Omicron, y~1e-9, NaN nas pontas) mostra alinhamento
+  pixel-perfeito (tick x=0 e curva V=0 ambos em px 420.0;
+  `_native_data_x_to_pixel` == `_native_build_transform`, Δ=0 em
+  zoom/resize/log). FALTA: screenshot do estado quebrado +
+  confirmar `TRANS_FAST_RENDER` e se é HiDPI/Retina ou um dataset
+  específico. Ver `qml_graph_canvas.py` (`_renderNative` /
+  `_native_draw_axes`).
 - [ ] **Culling de dados fora da viewport.** Não desenhar segmentos
   que estão fora do `ax_rect`.
   *Status: clipping em nível de pixel JÁ ativo — `_renderNative` faz
@@ -180,8 +191,14 @@ estiver no `Unified-UI` (e cole o hash do commit ao lado).
   *Fix: a legenda iterava `overlayPool` (todos) e só esmaecia os
   desmarcados (opacity 0.35). Agora usa `selectedOverlays()`, em
   lock-step com a crosshair na imagem. `ImageWindowContent.qml`.*
-
-## Aba de análise Hiperespectral
+- [ ] **"WITec probe offset" aparece p/ imagens não-WITec.** O
+  visualizador de imagens (`ImageWindowContent.qml`) mostra a seção
+  "WITec probe offset" (ΔX/ΔY, "Show video centre") mesmo para
+  imagens Omicron MATRIX (ex.: scan `…112539 5_1 I`), onde não se
+  aplica. O probe offset (laser − centro do vídeo) só faz sentido
+  p/ dados WITec. FALTA: condicionar a seção à fonte WITec
+  (ex.: `image.metadata.source` / `additional_info`) — esconder p/
+  Omicron e demais. Reportado 2026-06-29; ver para depois.
 
 - [x] **Mapas sem espectros associados ficam brancos ao ativar
   grid overlay.** Provavelmente um divide-by-zero ou um

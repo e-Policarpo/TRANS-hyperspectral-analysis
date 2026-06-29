@@ -294,6 +294,22 @@ class AppBackend(ToolImplementations, QObject):
 
         return output_path
 
+    def _autosave_imported_dataset(self, name: str, dataset) -> None:
+        """Write a freshly imported dataset to the project's ``imported``
+        output folder as CSV, mirroring how tool outputs are persisted to
+        disk. No-op if no project is open or the dataset can't be saved."""
+        if self._output_base_dir is None:
+            return
+        if not hasattr(dataset, 'save'):
+            return
+        try:
+            safe = self._sanitize_filename(name)
+            output_path = self._ensure_output_dir('imported') / f"{safe}.csv"
+            dataset.save(str(output_path))
+            logger.info(f"Auto-saved imported dataset to {output_path}")
+        except Exception as e:
+            logger.warning(f"Could not auto-save imported dataset {name!r} as CSV: {e}")
+
     def _sanitize_filename(self, name: str) -> str:
         """
         Sanitize a string for use as a filename.
@@ -1128,39 +1144,62 @@ class AppBackend(ToolImplementations, QObject):
         return result
 
     def _do_smart_load_matrix(self, filepath: Path, progress_callback=None):
-        """Smart load for Omicron Matrix files — uses header FERB enumeration."""
+        """Smart load for Omicron Matrix sessions.
+
+        Builds, per acquisition session: a folder named after the session, an
+        overview dataset overlaying every spectrum, and one per-point dataset
+        per STS location (each holding that point's repetitions). Scan images
+        (.Z_mtrx/.I_mtrx) are carried as ``matrix_maps`` (geometry-aware, tagged
+        with the spectrum locations) for the main thread to register, and as
+        browsable pictures via the overview dataset's ``images`` payload.
+        """
         if not self.omicron_sts_loader:
             raise RuntimeError("Omicron STS loader not available")
 
-        spectral_data, topography = self.omicron_sts_loader.smart_load_from_file(
+        spectral_data, _topography = self.omicron_sts_loader.smart_load_from_file(
             filepath, progress_callback=progress_callback
         )
+        return self._matrix_result_from_spectral(spectral_data)
 
-        result = {'datasets': {}, 'active_dataset': None}
-        folder_name = filepath.parent.name
+    def _matrix_result_from_spectral(self, spectral_data) -> dict:
+        """Expand a loaded Omicron primary into the rich import result.
 
-        sweep_channels = spectral_data.metadata.additional_info.get('sweep_channels', {})
-        if sweep_channels:
-            base_name = self._apply_naming_convention(folder_name, 'IV')
-            for sweep_name, sweep_df in sweep_channels.items():
-                dataset_name = f"{base_name}_{sweep_name}"
-                channel_metadata = self.omicron_sts_loader.create_metadata(
-                    dimensions=spectral_data.metadata.dimensions,
-                    scan_mode=spectral_data.metadata.scan_mode,
-                    units=spectral_data.metadata.units,
-                    source_directory=str(filepath.parent),
-                    instrument="Omicron Matrix",
-                    sweep_direction=sweep_name
-                )
-                channel_data = SpectralData(sweep_df, channel_metadata)
-                result['datasets'][dataset_name] = channel_data
-                logger.info(f"Smart-loaded Omicron {sweep_name}: {dataset_name}")
+        Shared by smart import (one session) and folder import (all sessions in
+        a directory): builds, per session, an overview dataset + one per-point
+        dataset, plus the scan maps (``matrix_maps``) and per-session folder
+        placements (``matrix_folders``). Scan pictures ride on the overview's
+        ``images`` payload for the standard image-absorb path.
+        """
+        loader = self.omicron_sts_loader
+        sessions = spectral_data.metadata.additional_info.get('sessions', [])
+        result = {
+            'datasets': {}, 'active_dataset': None,
+            'matrix_maps': [], 'matrix_folders': {},
+        }
+        for session in sessions:
+            label = session['label']
+            overview_name = f"{label} · overview"
+            overview = loader.build_overview_dataset(session, overview_name)
+            # Attach this session's scan pictures for the standard image-absorb
+            # path; only on the overview so they register once per session.
+            overview.metadata.additional_info['images'] = session.get('images', [])
+            result['datasets'][overview_name] = overview
+            result['matrix_folders'][f"dataset:{overview_name}"] = label
+            if result['active_dataset'] is None:
+                result['active_dataset'] = overview_name
 
-            result['active_dataset'] = f"{base_name}_Mixed"
-        else:
-            dataset_name = self._apply_naming_convention(folder_name, 'IV')
-            result['datasets'][dataset_name] = spectral_data
-            result['active_dataset'] = dataset_name
+            for batch in session['batches']:
+                px = batch.get('location_px')
+                loc = f" ({px[0]},{px[1]})" if px else ""
+                pt_name = f"{label} · pt{batch['point_index']}{loc}"
+                result['datasets'][pt_name] = loader.build_point_dataset(
+                    session, batch, pt_name)
+                result['matrix_folders'][f"dataset:{pt_name}"] = label
+
+            for m in session['maps']:
+                entry = dict(m)
+                entry['session_label'] = label
+                result['matrix_maps'].append(entry)
 
         return result
 
@@ -1408,26 +1447,56 @@ class AppBackend(ToolImplementations, QObject):
         # Add datasets to application state
         self._datasets.update(result['datasets'])
 
+        # Persist each imported dataset to disk as CSV, mirroring how tool
+        # outputs are written into the project's output structure.
+        for _ds_name, _ds in result['datasets'].items():
+            self._autosave_imported_dataset(_ds_name, _ds)
+
         # Surface images and notes attached by loaders BEFORE the broadcast
         # signal so the subsequent browser refresh sees them. Snapshot the
         # image/note registries first so we can tell which ids this import
         # created and auto-file just those.
         _images_before = set(self._images.keys())
         _notes_before = set(self._notes.keys())
+        _maps_before = {m['id'] for m in self.maps}
         self._absorb_dataset_images(result)
         self._absorb_dataset_notes(result)
+        self._absorb_matrix_maps(result)
 
         # Auto-file freshly imported measurement data into type folders.
         # Tables/graphs are never imported, so they are untouched (stay at
         # root, per the user's choice). Existing placements are respected, so
-        # re-imports and user-moved items don't get yanked back.
+        # re-imports and user-moved items don't get yanked back. Matrix
+        # datasets are filed into a per-session subfolder under Spectral Data.
+        _matrix_folders = result.get('matrix_folders', {})
         _filed = False
         for _name in result.get('datasets', {}):
-            _filed |= self._auto_file(f"dataset:{_name}", "Spectral Data")
+            _ref = f"dataset:{_name}"
+            _sub = _matrix_folders.get(_ref)
+            if _sub:
+                _filed |= self._auto_file_sub(_ref, "Spectral Data", _sub)
+            else:
+                _filed |= self._auto_file(_ref, "Spectral Data")
+        # Images and maps from a Matrix session carry a ``session_label`` so
+        # they nest under Images/<session> and Maps/<session>, mirroring the
+        # per-session Spectral Data subfolders. Other imports stay flat.
         for _img_id in self._images.keys() - _images_before:
-            _filed |= self._auto_file(f"image:{_img_id}", "Images")
+            _img = self._images.get(_img_id)
+            _sub = (getattr(_img, 'metadata', None)
+                    and (_img.metadata.additional_info or {}).get('session_label'))
+            if _sub:
+                _filed |= self._auto_file_sub(f"image:{_img_id}", "Images", _sub)
+            else:
+                _filed |= self._auto_file(f"image:{_img_id}", "Images")
         for _note_id in self._notes.keys() - _notes_before:
             _filed |= self._auto_file(f"note:{_note_id}", "Notes")
+        for _m in self.maps:
+            if _m['id'] not in _maps_before:
+                _sub = _m.get('session_label')
+                if _sub:
+                    _filed |= self._auto_file_sub(f"map:{_m['id']}", "Maps", _sub)
+                else:
+                    _filed |= self._auto_file(f"map:{_m['id']}", "Maps")
         if _filed:
             self.browserTreeChanged.emit()
 
@@ -1558,49 +1627,18 @@ class AppBackend(ToolImplementations, QObject):
             first_key = list(spectral_data_dict.keys())[0]
             result['active_dataset'] = f"{dirpath.name}_{first_key}"
 
-        elif iv_mtrx_files:
-            # Omicron Matrix I(V) files
+        elif iv_mtrx_files or list(dirpath.glob("*_0001.mtrx")):
+            # Omicron Matrix session(s): same rich session/batch/image handling
+            # as smart import — overview + per-point datasets, scan maps with
+            # spectrum-location overlays, and browsable scan pictures.
             if not self.omicron_sts_loader:
                 raise RuntimeError("Omicron STS loader not available")
 
-            spectral_data, topography = self.omicron_sts_loader.load_from_directory(
+            spectral_data, _topography = self.omicron_sts_loader.load_from_directory(
                 dirpath,
                 progress_callback=progress_callback
             )
-
-            # Create three separate datasets from sweep channels (Forward, Backward, Mixed)
-            base_name = self._apply_naming_convention(dirpath.name, 'IV')
-
-            sweep_channels = spectral_data.metadata.additional_info.get('sweep_channels', {})
-
-            if sweep_channels:
-                # Create individual datasets for each sweep direction
-                for sweep_name, sweep_df in sweep_channels.items():
-                    dataset_name = f"{base_name}_{sweep_name}"
-                    # Create new SpectralData for each channel
-                    channel_metadata = self.omicron_sts_loader.create_metadata(
-                        dimensions=spectral_data.metadata.dimensions,
-                        scan_mode=spectral_data.metadata.scan_mode,
-                        units=spectral_data.metadata.units,
-                        source_directory=str(dirpath),
-                        instrument="Omicron Matrix",
-                        sweep_direction=sweep_name,
-                        n_files=spectral_data.metadata.additional_info.get('n_files', 0)
-                    )
-                    channel_data = SpectralData(
-                        sweep_df, channel_metadata,
-                        topography.data if topography else None
-                    )
-                    result['datasets'][dataset_name] = channel_data
-                    logger.info(f"Loaded Omicron I(V) {sweep_name} dataset: {dataset_name}")
-
-                # Set Mixed as active by default
-                result['active_dataset'] = f"{base_name}_Mixed"
-            else:
-                # Fallback: no sweep channels, use original data
-                result['datasets'][base_name] = spectral_data
-                result['active_dataset'] = base_name
-                logger.info(f"Loaded Omicron I(V) dataset: {base_name}")
+            result = self._matrix_result_from_spectral(spectral_data)
 
         elif flat_files:
             # Omicron Matrix flat (image) files
@@ -1625,8 +1663,20 @@ class AppBackend(ToolImplementations, QObject):
 
     def _on_folder_loaded(self, result: dict):
         """Handle folder loading completion in main thread."""
+        # Omicron session imports carry maps / per-session folders / scan
+        # pictures — route them through the full import handler so those are
+        # absorbed (images, in-memory maps, nested folders) exactly like smart
+        # import. Other folder formats keep the lightweight handling below.
+        if 'matrix_maps' in result:
+            self._on_file_loaded(result)
+            return
+
         # Add datasets to application state
         self._datasets.update(result['datasets'])
+
+        # Persist each imported dataset to disk as CSV, mirroring tool outputs.
+        for _ds_name, _ds in result['datasets'].items():
+            self._autosave_imported_dataset(_ds_name, _ds)
 
         # Set active dataset
         if result['active_dataset']:
@@ -4118,6 +4168,100 @@ class AppBackend(ToolImplementations, QObject):
         self._browser_tree["placements"][item_ref] = self._ensure_browser_folder(folder_name)
         return True
 
+    def _ensure_browser_subfolder(self, name: str, parent_id: str) -> str:
+        """Return the id of the subfolder ``name`` under ``parent_id``,
+        creating it if absent. Reuses an existing one so repeated imports of
+        the same session share a single folder."""
+        for f in self._browser_tree["folders"]:
+            if (f.get("parent", "") or "") == parent_id and f.get("name") == name:
+                return f["id"]
+        self._folder_counter += 1
+        folder_id = f"folder_{self._folder_counter}"
+        self._browser_tree["folders"].append(
+            {"id": folder_id, "name": name, "parent": parent_id}
+        )
+        logger.info("Auto-created browser subfolder %r (%s) under %s",
+                    name, folder_id, parent_id)
+        return folder_id
+
+    def _auto_file_sub(self, item_ref: str, parent_name: str, sub_name: str) -> bool:
+        """File ``item_ref`` into ``parent_name``/``sub_name`` (nested folder).
+        No-op if the item already has a placement (respects user organization)."""
+        if not item_ref or not parent_name or not sub_name:
+            return False
+        if item_ref in self._browser_tree["placements"]:
+            return False
+        parent_id = self._ensure_browser_folder(parent_name)
+        self._browser_tree["placements"][item_ref] = \
+            self._ensure_browser_subfolder(sub_name, parent_id)
+        return True
+
+    def _absorb_matrix_maps(self, result: dict):
+        """Register Omicron scan images carried in ``result['matrix_maps']`` as
+        in-memory multi-channel maps.
+
+        Each map keeps its physical geometry and the STS locations of the
+        spectra taken on it (``metadata.extra['sts_locations']``) so the map
+        editor can overlay where spectra were measured. Runs on the main thread
+        (emits signals); auto-filing into the Maps folder is left to the caller.
+        """
+        entries = result.get('matrix_maps') or []
+        if not entries:
+            return
+        from src.models.map_channel import (
+            MultiChannelMap, MapMetadata, ChannelType,
+        )
+        from datetime import datetime
+        for m in entries:
+            try:
+                channels = m.get('channels') or {}
+                if not channels:
+                    continue
+                units = m.get('channel_units') or {}
+                mcm = MultiChannelMap()
+                for cname, arr in channels.items():
+                    ctype = (ChannelType.HEIGHT if cname.upper().startswith('Z')
+                             else ChannelType.CUSTOM)
+                    mcm.add_channel(cname, np.asarray(arr, dtype=np.float64),
+                                    channel_type=ctype,
+                                    units=units.get(cname, 'a.u.'))
+                active = m.get('active_channel')
+                if active in mcm.channels:
+                    mcm.set_active_channel(active)
+                mcm.metadata = MapMetadata(
+                    dimensions=mcm.shape,
+                    physical_size=(m.get('height_m'), m.get('width_m')),
+                    physical_units='m',
+                    instrument='Omicron Matrix',
+                    source_file=", ".join(m.get('source_files', [])) or None,
+                    creation_date=m.get('timestamp'),
+                    extra={
+                        'sts_locations': m.get('locations', []),
+                        'offset_m': (m.get('x_offset_m'), m.get('y_offset_m')),
+                        'angle': m.get('angle', 0.0),
+                        'session_label': m.get('session_label', ''),
+                    },
+                )
+                self._map_id_counter += 1
+                map_id = f"map_{self._map_id_counter}"
+                self._maps_inmem[map_id] = mcm
+                self.maps.append({
+                    'id': map_id,
+                    'title': m.get('title', map_id),
+                    'path': '',
+                    'timestamp': m.get('timestamp')
+                    or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    'sts_locations': m.get('locations', []),
+                    'session_label': m.get('session_label'),
+                })
+                self.mapCreated.emit(map_id, m.get('title', map_id))
+                logger.info("Registered Omicron map %s (%r) with %d channel(s), "
+                            "%d STS location(s)", map_id, m.get('title'),
+                            len(channels), len(m.get('locations', [])))
+            except Exception as exc:
+                logger.warning("Could not register Omicron map %r: %s",
+                               m.get('title'), exc)
+
     @Slot(str)
     def openWorkflow(self, workflow_name: str):
         """Open a workflow editor window."""
@@ -4745,6 +4889,18 @@ class AppBackend(ToolImplementations, QObject):
             poly_order=poly_order,
             smoothing_type=smoothing_type,
             on_finished=lambda path: self._on_tool_completed("Curve Smoothing", path)
+        )
+
+    @Slot(str)
+    def averageCurves(self, dataset_name: str):
+        """QML wrapper for averaging all spectra into a single mean curve."""
+        logger.info(f"Submitting curve averaging for {dataset_name} to worker")
+        self.status = f"Averaging curves for {dataset_name}..."
+        self.worker_manager.submit(
+            name=f"Average Curves {dataset_name}",
+            operation=self.average_curves,
+            dataset_name=dataset_name,
+            on_finished=lambda path: self._on_tool_completed("Average Curves", path)
         )
 
     @Slot('QStringList', str)

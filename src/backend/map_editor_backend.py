@@ -495,9 +495,37 @@ class MapEditorBackend(QObject):
             active = self._multi_channel_map.active_channel
             if active:
                 self._canvas.setMapData(active.data)
+            self._push_sts_markers(mcm)
         self.mapDataChanged.emit()
         self.channelListChanged.emit()
         self.activeChannelChanged.emit(self.activeChannelName)
+
+    def _push_sts_markers(self, mcm):
+        """Show, on the canvas, where spectra were taken on this scan image.
+
+        Reads the STS locations carried on Omicron maps
+        (``metadata.extra['sts_locations']``) and converts each to a data-grid
+        marker (col = STS pixel x, row = STS pixel y). Clears any prior markers
+        when the map has none.
+        """
+        if self._canvas is None:
+            return
+        locs = []
+        try:
+            extra = getattr(mcm.metadata, 'extra', None) or {}
+            locs = extra.get('sts_locations', []) or []
+        except Exception:
+            locs = []
+        markers = []
+        for L in locs:
+            px = L.get('px')
+            if not px:
+                continue
+            markers.append({
+                'col': int(px[0]), 'row': int(px[1]),
+                'label': str(L.get('point_index', '')),
+            })
+        self._canvas.setStsMarkers(markers)
 
     @Slot(str)
     def loadMapFromFile(self, file_path: str):

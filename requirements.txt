@@ -28,6 +28,7 @@ Pillow>=10.0.0                    # Image generation and manipulation (PIL)
 # File I/O
 # ============================================================================
 h5py>=3.0.0                       # HDF5 file format for .hrt project files
+access2theMatrix>=0.4.4           # Omicron/Scienta MATRIX result-file parsing engine (STS curves + scan images)
 # NSFopen - now vendored in src/data_loaders/nsfopen/ (MIT licensed, by Nanosurf AG)
 
 # ============================================================================

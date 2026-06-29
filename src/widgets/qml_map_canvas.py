@@ -191,6 +191,12 @@ class QMLMapCanvas(QQuickPaintedItem):
         # STS grid region overlay (topography with spectral grid position)
         self._sts_region_rect: Optional[Tuple[float, float, float, float]] = None  # (x0, y0, x1, y1) in fractional coords
 
+        # STS point markers — where spectra were taken on this scan image.
+        # Each marker is {'row': int, 'col': int, 'label': str}; row/col are in
+        # the map data grid (col = STS pixel x, row = STS pixel y).
+        self._sts_markers: list = []
+        self._show_sts_markers: bool = True
+
         # Spectral cube link for reconstruction
         self._spectral_cube: Optional[np.ndarray] = None  # Shape: (n_spectral_pts, rows, cols)
         self._independent_var: Optional[np.ndarray] = None  # Wavenumber/voltage axis
@@ -643,6 +649,38 @@ class QMLMapCanvas(QQuickPaintedItem):
     def clearStsRegionRect(self):
         """Remove the STS grid region rectangle overlay."""
         self._sts_region_rect = None
+        self.update()
+
+    @Slot("QVariantList")
+    def setStsMarkers(self, markers):
+        """Set the STS point markers (where spectra were taken on this scan).
+
+        ``markers`` is a list of dicts with integer ``row``/``col`` (in the map
+        data grid) and a ``label`` string. Pass an empty list to clear.
+        """
+        cleaned = []
+        for m in markers or []:
+            try:
+                cleaned.append({
+                    'row': int(m['row']), 'col': int(m['col']),
+                    'label': str(m.get('label', '')),
+                })
+            except (KeyError, TypeError, ValueError):
+                continue
+        self._sts_markers = cleaned
+        self._needs_redraw = True
+        self.update()
+
+    @Slot()
+    def clearStsMarkers(self):
+        """Remove all STS point markers."""
+        self._sts_markers = []
+        self.update()
+
+    @Slot(bool)
+    def setShowStsMarkers(self, show: bool):
+        """Toggle visibility of the STS point markers."""
+        self._show_sts_markers = bool(show)
         self.update()
 
     @Slot()
@@ -1157,6 +1195,21 @@ class QMLMapCanvas(QQuickPaintedItem):
                 int(px_left), int(px_top),
                 int(px_right - px_left), int(px_bottom - px_top)
             )
+
+        # Draw STS point markers — where spectra were taken on this scan image.
+        if (self._show_sts_markers and self._sts_markers
+                and self._data_to_pixel is not None):
+            ring = QPen(QColor(255, 255, 0, 230))   # yellow ring
+            ring.setWidth(2)
+            for mk in self._sts_markers:
+                x, y = self._dataToPixel(mk['row'], mk['col'])
+                painter.setPen(ring)
+                painter.setBrush(QBrush(QColor(255, 0, 0, 160)))  # red dot
+                painter.drawEllipse(QRectF(x - 5, y - 5, 10, 10))
+                label = mk.get('label', '')
+                if label:
+                    painter.setPen(QPen(QColor(255, 255, 0, 255)))
+                    painter.drawText(int(x + 7), int(y - 7), label)
 
         # Draw grid overlay for discretization
         if self._show_grid_overlay and self._data_to_pixel is not None and self._map_data is not None:
