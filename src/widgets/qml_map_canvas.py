@@ -129,6 +129,15 @@ class QMLMapCanvas(QQuickPaintedItem):
         self.setAcceptedMouseButtons(Qt.AllButtons)
         self.setAcceptHoverEvents(True)
         self.setFlag(QQuickPaintedItem.ItemHasContents, True)
+        # Render via a GPU framebuffer so the painter is device-pixel-ratio
+        # scaled on HiDPI/Retina. With the default Image target the paint
+        # painter is not DPR-scaled on macOS, which drew the map into the
+        # top-left quarter of the item while clicks/overlays used full logical
+        # coords (matches the QMLImageCanvas / QMLGraphCanvas fix).
+        try:
+            self.setRenderTarget(QQuickPaintedItem.FramebufferObject)
+        except Exception:
+            pass  # Software-only Qt builds don't support FBO targets
 
         # Matplotlib setup
         self._dpi = 100

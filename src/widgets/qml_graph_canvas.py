@@ -182,6 +182,17 @@ class QMLGraphCanvas(QQuickPaintedItem):
         self.setAcceptedMouseButtons(Qt.AllButtons)
         self.setAcceptHoverEvents(True)
         self.setFlag(QQuickPaintedItem.ItemHasContents, True)
+        # Render through a GPU framebuffer so the painter is scaled by the
+        # device pixel ratio (Retina). With the default Image target the paint
+        # painter is NOT DPR-scaled on macOS HiDPI, so drawing at logical
+        # coordinates landed the whole plot in the top-left quarter of the item
+        # while the interaction math used full logical coords — the plot looked
+        # "stuck to the top-left" and the cursor/pan didn't track the data. The
+        # FBO target gives a logical-coordinate painter (matches QMLImageCanvas).
+        try:
+            self.setRenderTarget(QQuickPaintedItem.FramebufferObject)
+        except Exception:
+            pass  # Software-only Qt builds don't support FBO targets
 
         # Matplotlib setup
         self._dpi = 100
@@ -1155,6 +1166,13 @@ class QMLGraphCanvas(QQuickPaintedItem):
         painter.save()
         painter.setClipRect(ax_rect)
         painter.setRenderHint(QPainter.Antialiasing, True)
+        # The painter already carries Qt's device-pixel-ratio scale (e.g. 2×
+        # on Retina). The data→pixel ``transform`` must be COMPOSED with it,
+        # not replace it — otherwise the DPR scale is wiped and curves render
+        # at logical size in the top-left quarter while the DPR-scaled ticks /
+        # frame fill the full item. ``transform * base_xform`` applies the data
+        # transform first, then the painter's existing (DPR) transform.
+        base_xform = painter.transform()
         for cid, curve in self._curves.items():
             if not curve.visible:
                 continue
@@ -1166,6 +1184,12 @@ class QMLGraphCanvas(QQuickPaintedItem):
             if cid == self._selected_curve_id:
                 width += 1.0
             pen.setWidthF(width)
+            # The path is stroked while the data→pixel ``transform`` is active,
+            # so a non-cosmetic pen has its width scaled by the transform. With
+            # small-magnitude data (e.g. STM currents ~1e-6) that scale is huge
+            # and a 1.5px line floods the whole plot. A cosmetic pen keeps the
+            # width in device pixels regardless of the transform.
+            pen.setCosmetic(True)
             ls = (curve.linestyle or "-").strip()
             if ls in ("--", "dashed"):
                 pen.setStyle(Qt.DashLine)
@@ -1176,9 +1200,9 @@ class QMLGraphCanvas(QQuickPaintedItem):
             else:
                 pen.setStyle(Qt.SolidLine)
             painter.setPen(pen)
-            painter.setTransform(transform, combine=False)
+            painter.setTransform(transform * base_xform)
             painter.drawPath(path)
-        painter.setTransform(QTransform())
+        painter.setTransform(base_xform)
         painter.restore()
 
         # Store transforms for interaction (viewbox + ``_pixelToData``).

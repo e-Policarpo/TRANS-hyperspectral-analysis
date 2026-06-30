@@ -324,7 +324,13 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
             sample_name = sample_name or curve.get('sample_name', '')
             dataset_name = dataset_name or curve.get('dataset_name', '')
             run, scan = _parse_run_scan(f.name)
-            key = curve['location_px'] if curve['location_px'] else ('run', run)
+            # A "point" = one spectroscopy experiment = one run cycle. Key on
+            # (run, location) NOT location alone: revisiting an already-measured
+            # spot in a later run is a distinct experiment/point and must not be
+            # merged (location alone collapses revisits and loses points). The
+            # location is included so a rare single-run multi-point line scan
+            # still splits per position.
+            key = (run, curve['location_px'])
             batch = batches.get(key)
             if batch is None:
                 batch = {
