@@ -95,6 +95,9 @@ class QMLMapCanvas(QQuickPaintedItem):
     toolChanged = Signal(str, arguments=['toolName'])
     mapUpdated = Signal()
     spectralDataRequested = Signal(int, int, arguments=['row', 'col'])
+    # Emitted when a click lands on an STS marker dot (the index into the map's
+    # sts_locations list), so the backend can plot that point's spectrum.
+    stsMarkerClicked = Signal(int, arguments=['index'])
 
     # Block selection signals (TRANS_v3 style)
     blockSelected = Signal(int, int, float, bool, arguments=['blockRow', 'blockCol', 'value', 'isSelected'])
@@ -673,6 +676,7 @@ class QMLMapCanvas(QQuickPaintedItem):
                 cleaned.append({
                     'row': int(m['row']), 'col': int(m['col']),
                     'label': str(m.get('label', '')),
+                    'index': int(m.get('index', -1)),
                 })
             except (KeyError, TypeError, ValueError):
                 continue
@@ -1415,6 +1419,16 @@ class QMLMapCanvas(QQuickPaintedItem):
                 self._emit_roi_change(roi, finished=False)
                 self.update()
                 return
+
+        # STS marker dots take priority over the tool dispatch: a click within
+        # a few px of a dot plots that point's spectrum (any tool).
+        if (self._show_sts_markers and self._sts_markers
+                and self._data_to_pixel is not None):
+            for mk in self._sts_markers:
+                mx, my = self._dataToPixel(mk['row'], mk['col'])
+                if abs(pos.x() - mx) <= 7.0 and abs(pos.y() - my) <= 7.0:
+                    self.stsMarkerClicked.emit(int(mk.get('index', -1)))
+                    return
 
         self._drag_start = pos
         self._is_dragging = True

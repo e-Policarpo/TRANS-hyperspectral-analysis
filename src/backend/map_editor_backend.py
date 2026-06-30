@@ -464,6 +464,7 @@ class MapEditorBackend(QObject):
             # Connect canvas signals
             canvas.spectralDataRequested.connect(self._onSpectrumRequested)
             canvas.blockSelectionChanged.connect(self._onBlockSelectionChanged)
+            canvas.stsMarkerClicked.connect(self._on_sts_marker_clicked)
 
     # =========================================================================
     # Data Loading
@@ -517,15 +518,43 @@ class MapEditorBackend(QObject):
         except Exception:
             locs = []
         markers = []
-        for L in locs:
+        for i, L in enumerate(locs):
             px = L.get('px')
             if not px:
                 continue
+            # ``index`` is the position in sts_locations, so a click on the dot
+            # maps back to this location (and its avg_spectrum) in
+            # _on_sts_marker_clicked.
             markers.append({
                 'col': int(px[0]), 'row': int(px[1]),
-                'label': str(L.get('point_index', '')),
+                'label': str(L.get('point_index', '')), 'index': i,
             })
         self._canvas.setStsMarkers(markers)
+
+    @Slot(int)
+    def _on_sts_marker_clicked(self, index: int):
+        """Plot the average spectrum of the STS point whose dot was clicked."""
+        mcm = self._multi_channel_map
+        if mcm is None:
+            return
+        try:
+            locs = (getattr(mcm.metadata, 'extra', None) or {}).get(
+                'sts_locations', []) or []
+        except Exception:
+            return
+        if not (0 <= index < len(locs)):
+            return
+        loc = locs[index]
+        avg = loc.get('avg_spectrum')
+        if not avg or not avg.get('y'):
+            logger.info("STS dot %s has no stored spectrum to plot", index)
+            return
+        title = f"Point {loc.get('point_index', index)}"
+        spectrum = {
+            'x': avg['V'], 'y': avg['y'], 'title': title,
+            'x_name': 'V', 'y_name': 'Current',
+        }
+        self.openPlotWindowRequested.emit(title, [spectrum])
 
     @Slot(str)
     def loadMapFromFile(self, file_path: str):

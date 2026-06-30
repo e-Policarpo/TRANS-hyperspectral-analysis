@@ -784,3 +784,49 @@ class TestStatePersistence:
         # Restore
         backend_with_map.restoreState(state)
         assert backend_with_map.activeDataset == 'Dataset2'
+
+
+# =============================================================================
+# STS marker (dot) click → plot average spectrum
+# =============================================================================
+
+class TestStsMarkerClick:
+    """Clicking a 'where spectra were taken' dot plots that point's average."""
+
+    @staticmethod
+    def _map_with_locations():
+        mcm = MultiChannelMap()
+        mcm.add_channel("Z", np.zeros((10, 10)), ChannelType.HEIGHT, "m")
+        V = [-1.0, 0.0, 1.0]
+        mcm.metadata.extra = {'sts_locations': [
+            {'point_index': 3, 'px': [5, 5],
+             'avg_spectrum': {'V': V, 'y': [0.1, 0.2, 0.3]}},
+            {'point_index': 7, 'px': [8, 2],
+             'avg_spectrum': {'V': V, 'y': [1.0, 2.0, 3.0]}},
+        ]}
+        return mcm, V
+
+    def test_clicking_dot_plots_its_average_spectrum(self, backend):
+        mcm, V = self._map_with_locations()
+        backend._multi_channel_map = mcm
+        captured = {}
+        backend.openPlotWindowRequested.connect(
+            lambda name, spectra: captured.update(name=name, spectra=spectra))
+        backend._on_sts_marker_clicked(1)
+        assert 'name' in captured and 'Point 7' in captured['name']
+        sp = captured['spectra'][0]
+        assert sp['x'] == V and sp['y'] == [1.0, 2.0, 3.0]
+
+    def test_marker_click_is_safe_without_spectrum_or_out_of_range(self, backend):
+        mcm = MultiChannelMap()
+        mcm.add_channel("Z", np.zeros((4, 4)), ChannelType.HEIGHT, "m")
+        mcm.metadata.extra = {'sts_locations': [
+            {'point_index': 1, 'px': [0, 0], 'avg_spectrum': None}]}
+        backend._multi_channel_map = mcm
+        fired = []
+        backend.openPlotWindowRequested.connect(lambda n, s: fired.append(1))
+        backend._on_sts_marker_clicked(0)    # no spectrum → no plot
+        backend._on_sts_marker_clicked(99)   # out of range → safe
+        backend._multi_channel_map = None
+        backend._on_sts_marker_clicked(0)    # no map → safe
+        assert fired == []
