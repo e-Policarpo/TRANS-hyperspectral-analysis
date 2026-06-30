@@ -1164,11 +1164,13 @@ class AppBackend(ToolImplementations, QObject):
     def _matrix_result_from_spectral(self, spectral_data) -> dict:
         """Expand a loaded Omicron primary into the rich import result.
 
-        Shared by smart import (one session) and folder import (all sessions in
-        a directory): builds, per session, an overview dataset + one per-point
-        dataset, plus the scan maps (``matrix_maps``) and per-session folder
-        placements (``matrix_folders``). Scan pictures ride on the overview's
-        ``images`` payload for the standard image-absorb path.
+        Per session: each detected **line scan** becomes a single dataset (its
+        ordered positions, each = the average over that position's reps; opens
+        in the Hyperspectral tab, exportable as one CSV); each **isolated**
+        point becomes a per-point dataset (its reps). Sessions with no line
+        scans keep the overview + per-point layout. Scan images ride along as
+        ``matrix_maps`` + the first dataset's ``images`` payload; everything is
+        filed into the per-session folder via ``matrix_folders``.
         """
         loader = self.omicron_sts_loader
         sessions = spectral_data.metadata.additional_info.get('sessions', [])
@@ -1176,25 +1178,60 @@ class AppBackend(ToolImplementations, QObject):
             'datasets': {}, 'active_dataset': None,
             'matrix_maps': [], 'matrix_folders': {},
         }
+
+        def _add(name, ds, label):
+            result['datasets'][name] = ds
+            result['matrix_folders'][f"dataset:{name}"] = label
+            if result['active_dataset'] is None:
+                result['active_dataset'] = name
+            return ds
+
         for session in sessions:
             label = session['label']
-            overview_name = f"{label} · overview"
-            overview = loader.build_overview_dataset(session, overview_name)
-            # Attach this session's scan pictures for the standard image-absorb
-            # path; only on the overview so they register once per session.
-            overview.metadata.additional_info['images'] = session.get('images', [])
-            result['datasets'][overview_name] = overview
-            result['matrix_folders'][f"dataset:{overview_name}"] = label
-            if result['active_dataset'] is None:
-                result['active_dataset'] = overview_name
+            line_scans = session.get('line_scans', []) or []
+            in_line = {pi for ls in line_scans for pi in ls['point_indices']}
+            first_ds = None
 
-            for batch in session['batches']:
+            # One dataset per detected line scan (positions × per-position mean).
+            for ls in line_scans:
+                ls_name = (f"{label} · line{ls['id']} "
+                           f"({ls['n_points']}pts ×{ls['reps']})")
+                ds = _add(ls_name,
+                          loader.build_line_scan_dataset(session, ls, ls_name),
+                          label)
+                first_ds = first_ds or ds
+
+            # Isolated points (not part of any line scan) → per-point datasets.
+            isolated = [b for b in session['batches']
+                        if b['point_index'] not in in_line]
+            for batch in isolated:
                 px = batch.get('location_px')
                 loc = f" ({px[0]},{px[1]})" if px else ""
                 pt_name = f"{label} · pt{batch['point_index']}{loc}"
-                result['datasets'][pt_name] = loader.build_point_dataset(
-                    session, batch, pt_name)
-                result['matrix_folders'][f"dataset:{pt_name}"] = label
+                ds = _add(pt_name,
+                          loader.build_point_dataset(session, batch, pt_name),
+                          label)
+                first_ds = first_ds or ds
+
+            # No line scans → also add the all-spectra overview (the line-scan
+            # datasets already serve that role when lines are present, and the
+            # overview would be redundant + heavy for a big grid/line session).
+            if not line_scans:
+                overview_name = f"{label} · overview"
+                ds = _add(overview_name,
+                          loader.build_overview_dataset(session, overview_name),
+                          label)
+                first_ds = first_ds or ds
+
+            # Fallback so a session never yields zero datasets.
+            if first_ds is None:
+                overview_name = f"{label} · overview"
+                first_ds = _add(
+                    overview_name,
+                    loader.build_overview_dataset(session, overview_name), label)
+
+            # Scan pictures ride on the first dataset for the image-absorb path.
+            first_ds.metadata.additional_info['images'] = session.get('images', [])
 
             for m in session['maps']:
                 entry = dict(m)

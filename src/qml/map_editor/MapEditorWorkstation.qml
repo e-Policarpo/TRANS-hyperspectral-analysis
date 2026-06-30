@@ -771,10 +771,18 @@ Item {
                         pointInspector.setPoint(row, col, value, mapBackend.activeChannelName)
                         root.spectrumRequested(row, col)
 
-                        // Plot spectra from all selected datasets
-                        var selectedNames = getSelectedDatasetNames()
-                        if (selectedNames.length > 0) {
-                            mapBackend.requestPlotFromMultipleDatasets(selectedNames, row, col)
+                        if (mapBackend.isLineScanMode && mapBackend.activeDataset) {
+                            // Line scan: clicking a position plots that point's
+                            // spectrum (the rep-average column) from the active
+                            // line-scan dataset.
+                            mapBackend.requestPlotFromDataset(
+                                mapBackend.activeDataset, row, col)
+                        } else {
+                            // Area map: plot spectra from all selected datasets.
+                            var selectedNames = getSelectedDatasetNames()
+                            if (selectedNames.length > 0) {
+                                mapBackend.requestPlotFromMultipleDatasets(selectedNames, row, col)
+                            }
                         }
                     }
 

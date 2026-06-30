@@ -668,6 +668,118 @@ class TestOmicronSessionBuilders:
 # Real-data session tests (skipped when the data directory is absent)
 # =============================================================================
 
+# =============================================================================
+# Line-scan detection (synthetic points, no real data needed)
+# =============================================================================
+
+class TestOmicronLineScanDetection:
+    """Tests for _detect_line_scans / _is_line."""
+
+    @staticmethod
+    def _pt(idx, px, reps, m=None):
+        return {'point_index': idx, 'location_px': px,
+                'location_m': m or [px[0] * 1e-9, px[1] * 1e-9],
+                'mixed': [None] * reps}
+
+    def test_detects_straight_even_line(self, sts_loader):
+        pts = [self._pt(i + 1, (10 + i * 5, 20), 3) for i in range(6)]
+        ls = sts_loader._detect_line_scans(pts)
+        assert len(ls) == 1
+        assert ls[0]['n_points'] == 6 and ls[0]['reps'] == 3
+        assert ls[0]['px_start'] == [10, 20] and ls[0]['px_end'] == [35, 20]
+        assert all(p['line_scan_id'] == 1 for p in pts)
+        assert [p['line_pos'] for p in pts] == [0, 1, 2, 3, 4, 5]
+
+    def test_ignores_scattered_points(self, sts_loader):
+        pts = [self._pt(i + 1, p, 3) for i, p in enumerate(
+            [(10, 20), (300, 5), (150, 200), (50, 180), (280, 90)])]
+        ls = sts_loader._detect_line_scans(pts)
+        assert ls == []
+        assert all(p['line_scan_id'] is None for p in pts)
+
+    def test_short_runs_below_threshold_not_a_line(self, sts_loader):
+        # 3 collinear points < _LINE_MIN_POINTS (4) → not flagged
+        pts = [self._pt(i + 1, (10 + i * 5, 20), 3) for i in range(3)]
+        assert sts_loader._detect_line_scans(pts) == []
+
+    def test_same_spot_repeats_are_not_a_line(self, sts_loader):
+        pts = [self._pt(i + 1, (42, 65), 10) for i in range(5)]
+        assert sts_loader._detect_line_scans(pts) == []  # zero-length steps
+
+    def test_interleaved_parallel_lines_split_by_rep_count(self, sts_loader):
+        # A 63-rep line and a 1-rep pre-sweep interleave point-for-point in
+        # acquisition order (the dia 30-06 pattern); detection per rep-count
+        # must recover both as separate lines.
+        pts = []
+        idx = 1
+        for i in range(5):
+            pts.append(self._pt(idx, (100 - i * 3, 50), 63)); idx += 1
+            pts.append(self._pt(idx, (98 - i * 3, 50), 1)); idx += 1
+        ls = sts_loader._detect_line_scans(pts)
+        assert len(ls) == 2
+        assert {l['reps'] for l in ls} == {1, 63}
+        assert all(l['n_points'] == 5 for l in ls)
+
+    def test_grid_splits_into_one_line_per_row(self, sts_loader):
+        # Two parallel rows (a tiny grid) become two separate line scans.
+        pts = []
+        idx = 1
+        for y in (20, 60):
+            for x in range(0, 50, 5):
+                pts.append(self._pt(idx, (x, y), 4)); idx += 1
+        ls = sts_loader._detect_line_scans(pts)
+        assert len(ls) == 2
+        assert all(l['n_points'] == 10 for l in ls)
+
+
+class TestOmicronLineScanDataset:
+    """Tests for build_line_scan_dataset (one column per position = rep mean)."""
+
+    def test_columns_are_per_position_rep_averages(self, sts_loader):
+        V = np.linspace(-1.0, 1.0, 8)
+
+        def pt(pi, px, mixeds, pos):
+            return {'point_index': pi, 'location_px': px, 'location_m': [0, 0],
+                    'V': V, 'forward': mixeds, 'backward': mixeds,
+                    'mixed': mixeds, 'rep_V': [V] * len(mixeds),
+                    'first_timestamp': None, 'line_pos': pos}
+
+        batches = [
+            pt(1, (0, 0), [np.full(8, 2.0), np.full(8, 4.0)], 0),    # mean 3
+            pt(2, (5, 0), [np.full(8, 10.0), np.full(8, 20.0)], 1),  # mean 15
+            pt(3, (10, 0), [np.full(8, 1.0), np.full(8, 3.0)], 2),   # mean 2
+        ]
+        session = {'batches': batches, 'source_dir': '/d', 'sample_name': 'S',
+                   'dataset_name': 'D', 'label': 'L'}
+        ls = {'id': 1, 'reps': 2, 'n_points': 3, 'point_indices': [1, 2, 3]}
+        ds = sts_loader.build_line_scan_dataset(session, ls, 'line')
+        assert list(ds.data.columns) == ['V', 'P1', 'P2', 'P3']  # one col / position
+        assert np.allclose(ds.data['P1'], 3.0)
+        assert np.allclose(ds.data['P2'], 15.0)
+        assert np.allclose(ds.data['P3'], 2.0)
+        ai = ds.metadata.additional_info
+        assert ai['matrix_kind'] == 'line_scan'
+        assert ai['averaged_over_reps'] is True
+        assert ai['spectrum_meta'][1]['point_index'] == 2
+
+    def test_nan_reps_are_ignored_in_average(self, sts_loader):
+        V = np.linspace(-1.0, 1.0, 5)
+        a = np.array([1.0, np.nan, 3.0, np.nan, 5.0])
+        b = np.array([3.0, 2.0, np.nan, np.nan, 7.0])
+        pt = {'point_index': 1, 'location_px': (0, 0), 'location_m': [0, 0],
+              'V': V, 'forward': [a, b], 'backward': [a, b], 'mixed': [a, b],
+              'rep_V': [V, V], 'first_timestamp': None, 'line_pos': 0}
+        pt2 = dict(pt); pt2['point_index'] = 2; pt2['location_px'] = (5, 0)
+        pt2['line_pos'] = 1
+        session = {'batches': [pt, pt2], 'source_dir': '/d', 'sample_name': '',
+                   'dataset_name': '', 'label': 'L'}
+        ls = {'id': 1, 'reps': 2, 'n_points': 2, 'point_indices': [1, 2]}
+        ds = sts_loader.build_line_scan_dataset(session, ls, 'line')
+        # NaN-aware mean: [mean(1,3)=2, 2, 3, nan, mean(5,7)=6]
+        np.testing.assert_allclose(ds.data['P1'].values,
+                                   [2.0, 2.0, 3.0, np.nan, 6.0])
+
+
 # A complete real MATRIX session (header + spectra + scan images). Smart import
 # needs the whole session (access2theMatrix reads the _0001.mtrx header chain),
 # so these run against a real on-disk session rather than synthetic fixtures.

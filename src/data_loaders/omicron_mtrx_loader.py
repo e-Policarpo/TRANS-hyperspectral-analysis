@@ -383,6 +383,10 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
             b['first_timestamp'] = next(
                 (t for t in b['rep_timestamps'] if t is not None), None)
 
+        # Detect line scans (contiguous straight, evenly-spaced runs of
+        # same-rep points) and tag each batch with line_scan_id / line_pos.
+        line_scans = self._detect_line_scans(ordered)
+
         # Scan images -> maps + pictures; tag each map with the spectra on it.
         maps, images = self._build_images(md, image_files, label, ordered)
 
@@ -400,9 +404,105 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
             'channels_present': sorted(present),
             'spatial_layout': spatial_layout,
             'batches': ordered,
+            'line_scans': line_scans,
             'maps': maps,
             'images': images,
         }
+
+    # ------------------------------------------------------------------
+    # Line-scan detection
+    # ------------------------------------------------------------------
+
+    # Tunables. A line scan is a run of >= _LINE_MIN_POINTS same-rep points
+    # whose pixel locations lie on a straight (perpendicular deviation
+    # < _LINE_PERP_TOL_PX), monotone, roughly evenly-spaced (largest/smallest
+    # step < _LINE_EVEN_RATIO) line.
+    _LINE_MIN_POINTS = 4
+    _LINE_PERP_TOL_PX = 6.0
+    _LINE_EVEN_RATIO = 3.0
+
+    def _detect_line_scans(self, batches: List[dict]) -> List[dict]:
+        """Identify line scans among the session's points.
+
+        A line scan is acquired continuously along a line with the same number
+        of repetitions at every point. Because a parallel single-sweep can
+        interleave point-for-point with the multi-rep scan (and other
+        acquisitions sit between unrelated points), detection runs WITHIN each
+        rep-count group, in acquisition order, so each line pops out cleanly.
+
+        Tags each batch with ``line_scan_id`` (or None) and ``line_pos`` (index
+        along the line), and returns a list of line-scan descriptors.
+        """
+        from collections import defaultdict
+        for b in batches:
+            b['line_scan_id'] = None
+            b['line_pos'] = None
+
+        groups: Dict[int, List[dict]] = defaultdict(list)
+        for b in batches:
+            if b.get('location_px') is not None:
+                groups[len(b['mixed'])].append(b)
+
+        line_scans: List[dict] = []
+        next_id = 1
+        for reps, group in groups.items():
+            group.sort(key=lambda b: b['point_index'])
+            i, n = 0, len(group)
+            while i < n:
+                run = [group[i]]
+                while i + len(run) < n:
+                    cand = group[i + len(run)]
+                    if self._is_line([b['location_px'] for b in run]
+                                     + [cand['location_px']]):
+                        run.append(cand)
+                    else:
+                        break
+                if len(run) >= self._LINE_MIN_POINTS:
+                    lid = next_id
+                    next_id += 1
+                    for pos, b in enumerate(run):
+                        b['line_scan_id'] = lid
+                        b['line_pos'] = pos
+                    line_scans.append({
+                        'id': lid,
+                        'reps': reps,
+                        'n_points': len(run),
+                        'point_indices': [b['point_index'] for b in run],
+                        'px_start': list(run[0]['location_px']),
+                        'px_end': list(run[-1]['location_px']),
+                        'm_start': list(run[0]['location_m']) if run[0]['location_m'] else None,
+                        'm_end': list(run[-1]['location_m']) if run[-1]['location_m'] else None,
+                    })
+                    i += len(run)
+                else:
+                    i += 1
+
+        line_scans.sort(key=lambda d: d['point_indices'][0])
+        return line_scans
+
+    def _is_line(self, pxs: List) -> bool:
+        """True if pixel locations ``pxs`` form a straight, monotone,
+        roughly-evenly-spaced line. Runs of < 3 points are trivially
+        collinear (so a candidate run can grow before the test bites)."""
+        if len(pxs) < 3:
+            return True
+        P = np.asarray(pxs, dtype=float)
+        d = P[-1] - P[0]
+        L = float(np.hypot(d[0], d[1]))
+        if L < 1.0:
+            return False
+        d = d / L
+        rel = P - P[0]
+        proj = rel @ d
+        perp = np.abs(rel[:, 0] * d[1] - rel[:, 1] * d[0])
+        if perp.max() > self._LINE_PERP_TOL_PX:
+            return False
+        steps = np.diff(proj)
+        if np.any(steps <= 0):                       # must advance monotonically
+            return False
+        if steps.max() / max(steps.min(), 1e-6) > self._LINE_EVEN_RATIO:
+            return False
+        return True
 
     def _ext_channel(self, f: Path) -> str:
         """Channel token for a spectroscopy file, e.g. 'I(V)' or 'Aux2(V)'."""
@@ -807,6 +907,73 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
             rep_timestamps=[t.isoformat() if t else None
                             for t in batch['rep_timestamps']],
             rep_files=list(batch['rep_files']),
+            sweep_channels=sweep_channels,
+        )
+        return SpectralData(df, metadata)
+
+    def build_line_scan_dataset(self, session: dict, line_scan: dict,
+                                name: str) -> SpectralData:
+        """One dataset for a detected line scan: one column per line position,
+        each column = the **average** spectrum over that position's repetitions
+        (NaN-aware mean).
+
+        This is the kymograph the Hyperspectral tab shows (a dot per position),
+        so a click on a position returns that column = its average. It's a
+        single, exportable CSV (V + one averaged spectrum per position).
+        """
+        by_idx = {b['point_index']: b for b in session['batches']}
+        pts = [by_idx[pi] for pi in line_scan['point_indices'] if pi in by_idx]
+        pts.sort(key=lambda b: b.get('line_pos') or 0)
+
+        lengths = [len(b['V']) for b in pts]
+        modal = max(set(lengths), key=lengths.count)
+        pts = [b for b in pts if len(b['V']) == modal]
+        V = pts[0]['V']
+
+        def _avg(specs):
+            good = [s for s in specs if len(s) == modal]
+            if not good:
+                return np.full(modal, np.nan)
+            with np.errstate(invalid='ignore'):
+                return np.nanmean(np.column_stack(good), axis=1)
+
+        mix_cols: Dict[str, np.ndarray] = {}
+        fwd_cols: Dict[str, np.ndarray] = {}
+        bwd_cols: Dict[str, np.ndarray] = {}
+        spectrum_meta: List[dict] = []
+        for pos, b in enumerate(pts):
+            col = f"P{pos + 1}"
+            mix_cols[col] = _avg(b['mixed'])
+            fwd_cols[col] = _avg(b['forward'])
+            bwd_cols[col] = _avg(b['backward'])
+            ts = b.get('first_timestamp')
+            spectrum_meta.append({
+                'column': col, 'point_index': b['point_index'], 'line_pos': pos,
+                'location_px': list(b['location_px']) if b['location_px'] else None,
+                'location_m': list(b['location_m']) if b['location_m'] else None,
+                'n_reps': len(b['mixed']),
+                'timestamp': ts.isoformat() if ts else None,
+            })
+        df = self._sweep_df(V, mix_cols)
+        sweep_channels = {
+            'Forward': self._sweep_df(V, fwd_cols),
+            'Backward': self._sweep_df(V, bwd_cols),
+            'Mixed': self._sweep_df(V, mix_cols),
+        }
+        metadata = self.create_metadata(
+            dimensions=(len(mix_cols), 1),
+            scan_mode='line',
+            units=dict(self._UNITS),
+            source_directory=session['source_dir'],
+            instrument='Omicron Matrix',
+            sample_name=session['sample_name'],
+            dataset_name=session['dataset_name'],
+            session_label=session['label'],
+            matrix_kind='line_scan',
+            line_scan_id=line_scan['id'],
+            line_scan_reps=line_scan['reps'],
+            averaged_over_reps=True,
+            spectrum_meta=spectrum_meta,
             sweep_channels=sweep_channels,
         )
         return SpectralData(df, metadata)
