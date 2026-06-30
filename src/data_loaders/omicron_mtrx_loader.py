@@ -59,8 +59,8 @@ except Exception:  # pragma: no cover
 # Module helpers
 # ---------------------------------------------------------------------------
 
-def _read_tlkb_seconds(path: Path) -> Optional[datetime]:
-    """Read the acquisition timestamp from a MATRIX result file.
+def _tlkb_seconds_from_bytes(raw: bytes) -> Optional[datetime]:
+    """Acquisition timestamp from already-read result-file bytes.
 
     Every ONTMATRX result file opens with a ``TLKB`` block whose first 8 bytes
     (after the 8-byte tag+size) are the acquisition time as Unix seconds
@@ -68,14 +68,19 @@ def _read_tlkb_seconds(path: Path) -> Optional[datetime]:
     value, so we read it straight from the bytes to get a real ``datetime``.
     """
     try:
-        raw = path.read_bytes()
         idx = raw.find(b'TLKB')
         if idx < 0:
             return None
         secs = unpack_from('<Q', raw, idx + 8)[0]
-        if not secs:
-            return None
-        return datetime.fromtimestamp(secs)
+        return datetime.fromtimestamp(secs) if secs else None
+    except Exception:
+        return None
+
+
+def _read_tlkb_seconds(path: Path) -> Optional[datetime]:
+    """Acquisition timestamp from a MATRIX result file on disk."""
+    try:
+        return _tlkb_seconds_from_bytes(path.read_bytes())
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("Could not read TLKB timestamp from %s: %s", path, exc)
         return None
@@ -305,20 +310,35 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
             (c for c in self._PRIMARY_PRIORITY if c in present),
             next(iter(present), None))
 
+        primary_files = sorted(
+            (f for f in spec_files if self._ext_channel(f) == primary_channel),
+            key=lambda p: _parse_run_scan(p.name))
+
+        # Parse the session header ONCE and scan it forward per file. a2m's
+        # open() re-reads + re-parses the whole header on every call (O(N) per
+        # file → O(N²) per session: a 16 MB / 16k-file session took *hours*).
+        # The incremental cursor makes it O(N); any file not reached in header
+        # order falls back to a from-scratch open().
         md = self._new_md()
+        raw_param = self._read_header_chain(header)
+        header_ok = raw_param[:len(self.MAGIC_NUMBER)] == self.MAGIC_NUMBER
+        if header_ok:
+            md.raw_param = raw_param
+            md.param = {'BREF': ''}
+            md.channel_id = {}
+        cursor = [12]
+
         sample_name = dataset_name = ''
-        # batches keyed by STS pixel location (fallback: run index)
         batches: Dict[Any, dict] = {}
-        total = len([f for f in spec_files
-                     if self._ext_channel(f) == primary_channel])
-        done = 0
-        for f in sorted(spec_files, key=lambda p: _parse_run_scan(p.name)):
-            if self._ext_channel(f) != primary_channel:
-                continue
-            if progress_callback:
+        total = len(primary_files)
+        for done, f in enumerate(primary_files):
+            if progress_callback and (done % 64 == 0):
                 progress_callback(done, total, f"Reading {f.name}")
-            done += 1
-            curve = self._curve_via_a2m(md, f)
+            curve = None
+            if header_ok:
+                curve = self._curve_incremental(md, raw_param, cursor, f)
+            if curve is None:
+                curve = self._curve_via_a2m(self._new_md(), f)
             if curve is None:
                 continue
             sample_name = sample_name or curve.get('sample_name', '')
@@ -393,14 +413,90 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
     # Curve extraction (access2theMatrix)
     # ------------------------------------------------------------------
 
+    def _read_header_chain(self, header: Path) -> bytes:
+        """Read the session header chain (``_0001.mtrx`` + any ``_0002…``) once.
+
+        Mirrors access2theMatrix's chaining: the magic prefix is stripped from
+        every link after the first. Reading this 16 MB+ blob once and scanning
+        it forward (see :meth:`_curve_incremental`) replaces a2m's per-file
+        re-read+re-parse, turning a session import from O(N²) into O(N)."""
+        base = str(header)[:-len('_0001.mtrx')]
+        raw = b''
+        i = 1
+        while True:
+            link = Path(f"{base}_{i:04d}.mtrx")
+            if not link.exists():
+                break
+            data = link.read_bytes()
+            raw += data if i == 1 else data[len(self.MAGIC_NUMBER):]
+            i += 1
+        return raw
+
+    def _curve_incremental(self, md, raw_param: bytes, cursor: list,
+                           filepath: Path) -> Optional[dict]:
+        """Extract a curve by advancing the shared header-parse cursor to this
+        file's entry — no per-file header re-read/re-parse.
+
+        ``md`` keeps the running parser state; ``cursor`` is a 1-element list
+        holding the parse offset. Files must be visited in header order (the
+        loader sorts by (run, scan), which is acquisition order). Returns None
+        if the file isn't reached going forward, so the caller can fall back to
+        a from-scratch :meth:`_curve_via_a2m`.
+        """
+        fn = filepath.name
+        n = len(raw_param)
+        dp = cursor[0]
+        while dp < n and md.param.get('BREF') != fn:
+            dp = md._scan_raw_param(dp, raw_param)
+        cursor[0] = dp
+        if md.param.get('BREF') != fn:
+            return None
+        try:
+            md.raw_data = filepath.read_bytes()
+        except Exception:
+            return None
+        if md.raw_data[:len(self.MAGIC_NUMBER)] != self.MAGIC_NUMBER:
+            return None
+        md.data = np.array([])
+        md.data_item_count = 0
+        md.bricklet_size = 0
+        try:
+            md._scan_raw_data(len(self.MAGIC_NUMBER), md.raw_data)
+        except Exception:
+            return None
+        md.channel_name = self._ext_channel(filepath)
+        md.result_data_file = str(filepath)
+        md.axis = None
+        try:
+            scan = md._cu_data()
+        except Exception:
+            return None
+        if md.object_type != 'curve':
+            return None
+        md.scan = scan
+        md.traces = (['trace', 'retrace']
+                     if getattr(scan, 'ndim', 0) == 2 and scan.shape[0] == 3
+                     else ['trace'])
+        return self._extract_curve(md, filepath)
+
     def _curve_via_a2m(self, md, filepath: Path) -> Optional[dict]:
-        """Extract one spectroscopy curve (+ metadata) via access2theMatrix."""
+        """Fallback: open one spectroscopy file from scratch (re-reads the
+        header). Used when the fast incremental pass can't reach the file in
+        header order."""
         try:
             traces, _msg = md.open(str(filepath))
         except Exception as exc:
             logger.warning("a2m could not open %s: %s", filepath.name, exc)
             return None
         if not traces or md.object_type != 'curve':
+            return None
+        return self._extract_curve(md, filepath)
+
+    def _extract_curve(self, md, filepath: Path) -> Optional[dict]:
+        """Build the curve dict from an ``MtrxData`` whose header+data are
+        already parsed for ``filepath`` (``md.scan``/``traces``/``param`` set)."""
+        traces = md.traces
+        if not traces:
             return None
         try:
             cu_f, _ = md.select_curve(traces[0])
@@ -453,7 +549,7 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
             'backward': bwd,
             'mixed': mixed,
             'n_points': xp,
-            'timestamp': _read_tlkb_seconds(filepath),
+            'timestamp': _tlkb_seconds_from_bytes(getattr(md, 'raw_data', b'')),
             'location_px': location_px,
             'location_m': location_m,
             'parent_image': parent_image,
