@@ -799,42 +799,47 @@ class TestStsMarkerClick:
         mcm.add_channel("Z", np.zeros((10, 10)), ChannelType.HEIGHT, "m")
         V = [-1.0, 0.0, 1.0]
         mcm.metadata.extra = {'sts_locations': [
-            {'point_index': 3, 'px': [5, 5],
-             'avg_spectrum': {'V': V, 'y': [0.1, 0.2, 0.3]}},
-            {'point_index': 7, 'px': [8, 2],
-             'avg_spectrum': {'V': V, 'y': [1.0, 2.0, 3.0]}},
+            {'point_index': 3, 'px': [5, 5], 'avg_spectra': {
+                'V': V, 'Mixed': [0.1, 0.2, 0.3],
+                'Forward': [0.4, 0.5, 0.6], 'Backward': [0.7, 0.8, 0.9]}},
+            {'point_index': 7, 'px': [8, 2], 'avg_spectra': {
+                'V': V, 'Mixed': [1.0, 2.0, 3.0],
+                'Forward': [4.0, 5.0, 6.0], 'Backward': [7.0, 8.0, 9.0]}},
         ]}
         return mcm, V
 
-    def test_clicking_dot_plots_its_average_spectrum(self, backend):
+    def test_clicking_dot_plots_all_three_sweeps_in_own_windows(self, backend):
         mcm, V = self._map_with_locations()
         backend._multi_channel_map = mcm
-        captured = {}
+        by_name = {}
         backend.openPlotWindowRequested.connect(
-            lambda name, spectra: captured.update(name=name, spectra=spectra))
-        backend._on_sts_marker_clicked(1)
-        assert len(captured['spectra']) == 1
-        sp = captured['spectra'][0]
-        assert sp['title'] == "Point 7"
-        assert sp['x'] == V and sp['y'] == [1.0, 2.0, 3.0]
+            lambda name, spectra: by_name.__setitem__(name, spectra))
+        backend._on_sts_marker_clicked(1)          # point 7
+        assert set(by_name) == {"STS points · Mixed", "STS points · Forward",
+                                "STS points · Backward"}
+        assert by_name["STS points · Mixed"][0]['y'] == [1.0, 2.0, 3.0]
+        assert by_name["STS points · Forward"][0]['y'] == [4.0, 5.0, 6.0]
+        assert by_name["STS points · Backward"][0]['y'] == [7.0, 8.0, 9.0]
+        assert by_name["STS points · Mixed"][0]['title'] == "Point 7"
 
     def test_clicking_dots_overlays_then_toggles_off(self, backend):
         mcm, _ = self._map_with_locations()
         backend._multi_channel_map = mcm
-        events = []
+        mixed = []
         backend.openPlotWindowRequested.connect(
-            lambda name, spectra: events.append([s['title'] for s in spectra]))
+            lambda name, spectra: mixed.append([s['title'] for s in spectra])
+            if name == "STS points · Mixed" else None)
         backend._on_sts_marker_clicked(0)          # Point 3
         backend._on_sts_marker_clicked(1)          # + Point 7 (overlay)
-        assert events[-1] == ["Point 3", "Point 7"]
+        assert mixed[-1] == ["Point 3", "Point 7"]
         backend._on_sts_marker_clicked(0)          # toggle Point 3 off
-        assert events[-1] == ["Point 7"]
+        assert mixed[-1] == ["Point 7"]
 
     def test_marker_click_is_safe_without_spectrum_or_out_of_range(self, backend):
         mcm = MultiChannelMap()
         mcm.add_channel("Z", np.zeros((4, 4)), ChannelType.HEIGHT, "m")
         mcm.metadata.extra = {'sts_locations': [
-            {'point_index': 1, 'px': [0, 0], 'avg_spectrum': None}]}
+            {'point_index': 1, 'px': [0, 0], 'avg_spectra': None}]}
         backend._multi_channel_map = mcm
         fired = []
         backend.openPlotWindowRequested.connect(lambda n, s: fired.append(1))

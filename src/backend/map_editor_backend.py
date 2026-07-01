@@ -551,9 +551,9 @@ class MapEditorBackend(QObject):
         if not (0 <= index < len(locs)):
             return
         loc = locs[index]
-        avg = loc.get('avg_spectrum')
-        if not avg or not avg.get('y'):
-            logger.info("STS dot %s has no stored spectrum to plot", index)
+        avg = loc.get('avg_spectra')
+        if not avg or not avg.get('Mixed'):
+            logger.info("STS dot %s has no stored spectra to plot", index)
             return
 
         pi = loc.get('point_index', index)
@@ -564,14 +564,23 @@ class MapEditorBackend(QObject):
         if pi in sel:
             del sel[pi]                       # toggle off
         else:
-            sel[pi] = {
-                'x': avg['V'], 'y': avg['y'], 'title': f"Point {pi}",
-                'x_name': 'V', 'y_name': 'Current',
-            }
+            sel[pi] = avg                     # {'V', 'Mixed', 'Forward', 'Backward'}
 
-        spectra = list(sel.values())
-        if spectra:
-            self.openPlotWindowRequested.emit("STS points", spectra)
+        # One plot window per sweep direction, each overlaying every selected
+        # point's average for that direction (Forward / Backward / Mixed).
+        for sweep in ('Mixed', 'Forward', 'Backward'):
+            spectra = []
+            for p_i, a in sel.items():
+                y = a.get(sweep)
+                if y is None:
+                    continue
+                spectra.append({
+                    'x': a.get('V'), 'y': y, 'title': f"Point {p_i}",
+                    'x_name': 'V', 'y_name': 'Current',
+                })
+            if spectra:
+                self.openPlotWindowRequested.emit(f"STS points · {sweep}", spectra)
+
         # Highlight the selected dots on the canvas (instant click feedback).
         if self._canvas is not None:
             selected_idx = [i for i, L in enumerate(locs)

@@ -609,7 +609,10 @@ class TestInMemoryMapPersistence:
             instrument='Omicron Matrix',
             extra={'session_label': 'S', 'sts_locations': [
                 {'point_index': 1, 'px': [2, 1], 'reps': 5,
-                 'avg_spectrum': {'V': [-1.0, 0.0, 1.0], 'y': [0.5, np.nan, 1.5]}},
+                 'avg_spectra': {'V': [-1.0, 0.0, 1.0],
+                                 'Mixed': [0.5, np.nan, 1.5],
+                                 'Forward': [0.1, 0.2, 0.3],
+                                 'Backward': [0.9, 0.8, 0.7]}},
             ]})
         return mcm
 
@@ -631,8 +634,9 @@ class TestInMemoryMapPersistence:
         assert g.metadata.physical_size == (3e-6, 4e-6)
         loc = g.metadata.extra['sts_locations'][0]
         assert loc['point_index'] == 1 and loc['px'] == [2, 1]
-        np.testing.assert_allclose(loc['avg_spectrum']['y'], [0.5, np.nan, 1.5],
+        np.testing.assert_allclose(loc['avg_spectra']['Mixed'], [0.5, np.nan, 1.5],
                                    equal_nan=True)
+        np.testing.assert_allclose(loc['avg_spectra']['Forward'], [0.1, 0.2, 0.3])
 
     def test_no_maps_is_safe(self, tmp_path):
         pm = ProjectManager()

@@ -716,22 +716,34 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
                 if b['point_index'] in seen:
                     continue
                 seen.add(b['point_index'])
-                # Average spectrum at this point (NaN-aware mean over reps), so
-                # clicking the dot on the scan plots that point's spectrum.
-                stack = [s for s in b['mixed'] if len(s) == len(b['V'])]
-                if stack:
+                # Average spectrum at this point (NaN-aware mean over reps) for
+                # each sweep, so clicking the dot plots that point's Forward /
+                # Backward / Mixed spectra (each into its own window).
+                n = len(b['V'])
+
+                def _avg(specs):
+                    good = [s for s in specs if len(s) == n]
+                    if not good:
+                        return None
                     with warnings.catch_warnings():
                         warnings.simplefilter('ignore', category=RuntimeWarning)
-                        avg = np.nanmean(np.column_stack(stack), axis=1)
-                    avg_spectrum = {'V': b['V'].tolist(), 'y': avg.tolist()}
-                else:
-                    avg_spectrum = None
+                        return np.nanmean(np.column_stack(good), axis=1).tolist()
+
+                mix = _avg(b['mixed'])
+                avg_spectra = None
+                if mix is not None:
+                    avg_spectra = {
+                        'V': b['V'].tolist(),
+                        'Mixed': mix,
+                        'Forward': _avg(b['forward']),
+                        'Backward': _avg(b['backward']),
+                    }
                 locations.append({
                     'point_index': b['point_index'],
                     'px': list(b['location_px']) if b['location_px'] else None,
                     'm': list(b['location_m']) if b['location_m'] else None,
                     'reps': len(b['mixed']),
-                    'avg_spectrum': avg_spectrum,
+                    'avg_spectra': avg_spectra,
                 })
             locations.sort(key=lambda d: d['point_index'])
 

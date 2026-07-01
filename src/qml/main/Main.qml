@@ -1133,13 +1133,20 @@ ApplicationWindow {
                             var xl = spectra[0].x_name || "X"
                             var yl = spectra[0].y_name || "Intensity"
 
-                            if (!forceNewWindow && mainSpectrumWindowId
-                                    && toolWindowManager.hasWindow(mainSpectrumWindowId)) {
+                            // Key the reused window by datasetName so distinct
+                            // sources (e.g. "STS points · Forward/Backward/Mixed")
+                            // each get their own window instead of clobbering one.
+                            var ids = mainWindow.spectrumWindowIds
+                            var wid = ids[datasetName]
+                            if (!forceNewWindow && wid
+                                    && toolWindowManager.hasWindow(wid)) {
                                 toolWindowManager.updateGraphWindow(
-                                    mainSpectrumWindowId, title, curves, xl, yl)
+                                    wid, title, curves, xl, yl)
                             } else {
-                                mainSpectrumWindowId = toolWindowManager.openGraphWindow(
+                                wid = toolWindowManager.openGraphWindow(
                                     title, curves, xl, yl)
+                                ids[datasetName] = wid
+                                mainWindow.spectrumWindowIds = ids
                             }
                         })
                         mew.openMultiDatasetSpectraRequested.connect(function(datasetSpectraList, forceNewWindow) {
@@ -1639,6 +1646,9 @@ ApplicationWindow {
 
     // Track the main spectrum plot window ID (reused for click-to-plot)
     property string mainSpectrumWindowId: ""
+    // Per-source spectrum windows (datasetName → windowId), so e.g. the STS
+    // dots' Forward / Backward / Mixed each reuse their own window.
+    property var spectrumWindowIds: ({})
 
     // Expose the WindowManager so embedded table contents can create graph windows
     function getToolWindowManager() { return toolWindowManager }
