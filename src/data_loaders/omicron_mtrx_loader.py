@@ -32,6 +32,7 @@ images lives in ``SpectralData.metadata.additional_info`` under the keys
 
 import logging
 import re
+import warnings
 from datetime import datetime
 from pathlib import Path
 from struct import unpack_from
@@ -719,7 +720,8 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
                 # clicking the dot on the scan plots that point's spectrum.
                 stack = [s for s in b['mixed'] if len(s) == len(b['V'])]
                 if stack:
-                    with np.errstate(invalid='ignore'):
+                    with warnings.catch_warnings():
+                        warnings.simplefilter('ignore', category=RuntimeWarning)
                         avg = np.nanmean(np.column_stack(stack), axis=1)
                     avg_spectrum = {'V': b['V'].tolist(), 'y': avg.tolist()}
                 else:
@@ -921,16 +923,21 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
         )
         return SpectralData(df, metadata)
 
+    # Sweep name → batch key.
+    _SWEEPS = {'Forward': 'forward', 'Backward': 'backward', 'Mixed': 'mixed'}
+
     def build_line_scan_dataset(self, session: dict, line_scan: dict,
-                                name: str) -> SpectralData:
-        """One dataset for a detected line scan: one column per line position,
-        each column = the **average** spectrum over that position's repetitions
-        (NaN-aware mean).
+                                name: str, sweep: str = 'Mixed') -> SpectralData:
+        """One dataset for a detected line scan, for the given ``sweep``
+        ('Forward' / 'Backward' / 'Mixed'): one column per line position, each
+        column = the **average** of that position's repetitions (NaN-aware mean)
+        for that sweep direction.
 
         This is the kymograph the Hyperspectral tab shows (a dot per position),
         so a click on a position returns that column = its average. It's a
         single, exportable CSV (V + one averaged spectrum per position).
         """
+        key = self._SWEEPS.get(sweep, 'mixed')
         by_idx = {b['point_index']: b for b in session['batches']}
         pts = [by_idx[pi] for pi in line_scan['point_indices'] if pi in by_idx]
         pts.sort(key=lambda b: b.get('line_pos') or 0)
@@ -944,18 +951,15 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
             good = [s for s in specs if len(s) == modal]
             if not good:
                 return np.full(modal, np.nan)
-            with np.errstate(invalid='ignore'):
+            with warnings.catch_warnings():  # quiet all-NaN (railed) positions
+                warnings.simplefilter('ignore', category=RuntimeWarning)
                 return np.nanmean(np.column_stack(good), axis=1)
 
-        mix_cols: Dict[str, np.ndarray] = {}
-        fwd_cols: Dict[str, np.ndarray] = {}
-        bwd_cols: Dict[str, np.ndarray] = {}
+        cols: Dict[str, np.ndarray] = {}
         spectrum_meta: List[dict] = []
         for pos, b in enumerate(pts):
             col = f"P{pos + 1}"
-            mix_cols[col] = _avg(b['mixed'])
-            fwd_cols[col] = _avg(b['forward'])
-            bwd_cols[col] = _avg(b['backward'])
+            cols[col] = _avg(b[key])
             ts = b.get('first_timestamp')
             spectrum_meta.append({
                 'column': col, 'point_index': b['point_index'], 'line_pos': pos,
@@ -964,14 +968,9 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
                 'n_reps': len(b['mixed']),
                 'timestamp': ts.isoformat() if ts else None,
             })
-        df = self._sweep_df(V, mix_cols)
-        sweep_channels = {
-            'Forward': self._sweep_df(V, fwd_cols),
-            'Backward': self._sweep_df(V, bwd_cols),
-            'Mixed': self._sweep_df(V, mix_cols),
-        }
+        df = self._sweep_df(V, cols)
         metadata = self.create_metadata(
-            dimensions=(len(mix_cols), 1),
+            dimensions=(len(cols), 1),
             scan_mode='line',
             units=dict(self._UNITS),
             source_directory=session['source_dir'],
@@ -982,9 +981,9 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
             matrix_kind='line_scan',
             line_scan_id=line_scan['id'],
             line_scan_reps=line_scan['reps'],
+            sweep_direction=sweep,
             averaged_over_reps=True,
             spectrum_meta=spectrum_meta,
-            sweep_channels=sweep_channels,
         )
         return SpectralData(df, metadata)
 

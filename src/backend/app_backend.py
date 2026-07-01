@@ -1192,14 +1192,18 @@ class AppBackend(ToolImplementations, QObject):
             in_line = {pi for ls in line_scans for pi in ls['point_indices']}
             first_ds = None
 
-            # One dataset per detected line scan (positions × per-position mean).
+            # Per detected line scan, one dataset per sweep direction
+            # (positions × per-position rep-mean). Mixed first so it's active.
             for ls in line_scans:
-                ls_name = (f"{label} · line{ls['id']} "
-                           f"({ls['n_points']}pts ×{ls['reps']})")
-                ds = _add(ls_name,
-                          loader.build_line_scan_dataset(session, ls, ls_name),
-                          label)
-                first_ds = first_ds or ds
+                base = (f"{label} · line{ls['id']} "
+                        f"({ls['n_points']}pts ×{ls['reps']})")
+                for sweep in ('Mixed', 'Forward', 'Backward'):
+                    ls_name = f"{base} · {sweep}"
+                    ds = _add(ls_name,
+                              loader.build_line_scan_dataset(
+                                  session, ls, ls_name, sweep),
+                              label)
+                    first_ds = first_ds or ds
 
             # Isolated points (not part of any line scan) → per-point datasets.
             isolated = [b for b in session['batches']

@@ -762,6 +762,28 @@ class TestOmicronLineScanDataset:
         assert ai['averaged_over_reps'] is True
         assert ai['spectrum_meta'][1]['point_index'] == 2
 
+    def test_sweep_selects_forward_backward_mixed(self, sts_loader):
+        V = np.linspace(-1.0, 1.0, 4)
+        fwd = [np.full(4, 1.0), np.full(4, 3.0)]     # mean 2
+        bwd = [np.full(4, 10.0), np.full(4, 20.0)]   # mean 15
+        mix = [np.full(4, 5.0), np.full(4, 7.0)]     # mean 6
+        pt = {'point_index': 1, 'location_px': (0, 0), 'location_m': [0, 0],
+              'V': V, 'forward': fwd, 'backward': bwd, 'mixed': mix,
+              'rep_V': [V, V], 'first_timestamp': None, 'line_pos': 0}
+        pt2 = dict(pt); pt2['point_index'] = 2; pt2['location_px'] = (5, 0)
+        pt2['line_pos'] = 1
+        session = {'batches': [pt, pt2], 'source_dir': '/d', 'sample_name': '',
+                   'dataset_name': '', 'label': 'L'}
+        ls = {'id': 1, 'reps': 2, 'n_points': 2, 'point_indices': [1, 2]}
+        dF = sts_loader.build_line_scan_dataset(session, ls, 'F', 'Forward')
+        dB = sts_loader.build_line_scan_dataset(session, ls, 'B', 'Backward')
+        dM = sts_loader.build_line_scan_dataset(session, ls, 'M', 'Mixed')
+        assert np.allclose(dF.data['P1'], 2.0)
+        assert np.allclose(dB.data['P1'], 15.0)
+        assert np.allclose(dM.data['P1'], 6.0)
+        assert dF.metadata.additional_info['sweep_direction'] == 'Forward'
+        assert dB.metadata.additional_info['sweep_direction'] == 'Backward'
+
     def test_nan_reps_are_ignored_in_average(self, sts_loader):
         V = np.linspace(-1.0, 1.0, 5)
         a = np.array([1.0, np.nan, 3.0, np.nan, 5.0])
