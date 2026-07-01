@@ -511,6 +511,7 @@ class MapEditorBackend(QObject):
         """
         if self._canvas is None:
             return
+        self._sts_selected = {}   # new map → clear the point selection
         locs = []
         try:
             extra = getattr(mcm.metadata, 'extra', None) or {}
@@ -533,7 +534,12 @@ class MapEditorBackend(QObject):
 
     @Slot(int)
     def _on_sts_marker_clicked(self, index: int):
-        """Plot the average spectrum of the STS point whose dot was clicked."""
+        """Toggle the clicked STS point in the plot.
+
+        Clicking a dot adds its average spectrum to the plot (and highlights the
+        dot); clicking it again removes it. All currently-selected points are
+        overlaid in one graph window, so several points can be compared.
+        """
         mcm = self._multi_channel_map
         if mcm is None:
             return
@@ -549,12 +555,28 @@ class MapEditorBackend(QObject):
         if not avg or not avg.get('y'):
             logger.info("STS dot %s has no stored spectrum to plot", index)
             return
-        title = f"Point {loc.get('point_index', index)}"
-        spectrum = {
-            'x': avg['V'], 'y': avg['y'], 'title': title,
-            'x_name': 'V', 'y_name': 'Current',
-        }
-        self.openPlotWindowRequested.emit(title, [spectrum])
+
+        pi = loc.get('point_index', index)
+        sel = getattr(self, '_sts_selected', None)
+        if sel is None:
+            sel = {}
+            self._sts_selected = sel
+        if pi in sel:
+            del sel[pi]                       # toggle off
+        else:
+            sel[pi] = {
+                'x': avg['V'], 'y': avg['y'], 'title': f"Point {pi}",
+                'x_name': 'V', 'y_name': 'Current',
+            }
+
+        spectra = list(sel.values())
+        if spectra:
+            self.openPlotWindowRequested.emit("STS points", spectra)
+        # Highlight the selected dots on the canvas (instant click feedback).
+        if self._canvas is not None:
+            selected_idx = [i for i, L in enumerate(locs)
+                            if L.get('point_index', i) in sel]
+            self._canvas.setSelectedStsMarkers(selected_idx)
 
     @Slot(str)
     def loadMapFromFile(self, file_path: str):

@@ -208,6 +208,8 @@ class QMLMapCanvas(QQuickPaintedItem):
         # the map data grid (col = STS pixel x, row = STS pixel y).
         self._sts_markers: list = []
         self._show_sts_markers: bool = True
+        # Indices of currently-selected STS markers (their spectra are plotted).
+        self._sts_selected: set = set()
 
         # Spectral cube link for reconstruction
         self._spectral_cube: Optional[np.ndarray] = None  # Shape: (n_spectral_pts, rows, cols)
@@ -681,7 +683,20 @@ class QMLMapCanvas(QQuickPaintedItem):
             except (KeyError, TypeError, ValueError):
                 continue
         self._sts_markers = cleaned
+        self._sts_selected = set()   # fresh markers → clear selection
         self._needs_redraw = True
+        self.update()
+
+    @Slot("QVariantList")
+    def setSelectedStsMarkers(self, indices):
+        """Highlight the given STS marker indices as selected (spectra plotted)."""
+        sel = set()
+        for i in indices or []:
+            try:
+                sel.add(int(i))
+            except (TypeError, ValueError):
+                continue
+        self._sts_selected = sel
         self.update()
 
     @Slot()
@@ -1210,19 +1225,26 @@ class QMLMapCanvas(QQuickPaintedItem):
             )
 
         # Draw STS point markers — where spectra were taken on this scan image.
+        # Selected dots (whose spectrum is on the plot) are drawn bigger with a
+        # white ring + cyan fill so the click clearly registered.
         if (self._show_sts_markers and self._sts_markers
                 and self._data_to_pixel is not None):
-            ring = QPen(QColor(255, 255, 0, 230))   # yellow ring
+            ring = QPen(QColor(255, 255, 0, 230))       # yellow ring (idle)
             ring.setWidth(2)
+            sel_ring = QPen(QColor(255, 255, 255, 255))  # white ring (selected)
+            sel_ring.setWidth(3)
             for mk in self._sts_markers:
                 x, y = self._dataToPixel(mk['row'], mk['col'])
-                painter.setPen(ring)
-                painter.setBrush(QBrush(QColor(255, 0, 0, 160)))  # red dot
-                painter.drawEllipse(QRectF(x - 5, y - 5, 10, 10))
+                selected = mk.get('index', -1) in self._sts_selected
+                r = 7.0 if selected else 5.0
+                painter.setPen(sel_ring if selected else ring)
+                painter.setBrush(QBrush(QColor(0, 200, 255, 210) if selected
+                                        else QColor(255, 0, 0, 160)))
+                painter.drawEllipse(QRectF(x - r, y - r, 2 * r, 2 * r))
                 label = mk.get('label', '')
                 if label:
                     painter.setPen(QPen(QColor(255, 255, 0, 255)))
-                    painter.drawText(int(x + 7), int(y - 7), label)
+                    painter.drawText(int(x + r + 2), int(y - r - 2), label)
 
         # Draw grid overlay for discretization
         if self._show_grid_overlay and self._data_to_pixel is not None and self._map_data is not None:

@@ -813,9 +813,22 @@ class TestStsMarkerClick:
         backend.openPlotWindowRequested.connect(
             lambda name, spectra: captured.update(name=name, spectra=spectra))
         backend._on_sts_marker_clicked(1)
-        assert 'name' in captured and 'Point 7' in captured['name']
+        assert len(captured['spectra']) == 1
         sp = captured['spectra'][0]
+        assert sp['title'] == "Point 7"
         assert sp['x'] == V and sp['y'] == [1.0, 2.0, 3.0]
+
+    def test_clicking_dots_overlays_then_toggles_off(self, backend):
+        mcm, _ = self._map_with_locations()
+        backend._multi_channel_map = mcm
+        events = []
+        backend.openPlotWindowRequested.connect(
+            lambda name, spectra: events.append([s['title'] for s in spectra]))
+        backend._on_sts_marker_clicked(0)          # Point 3
+        backend._on_sts_marker_clicked(1)          # + Point 7 (overlay)
+        assert events[-1] == ["Point 3", "Point 7"]
+        backend._on_sts_marker_clicked(0)          # toggle Point 3 off
+        assert events[-1] == ["Point 7"]
 
     def test_marker_click_is_safe_without_spectrum_or_out_of_range(self, backend):
         mcm = MultiChannelMap()
