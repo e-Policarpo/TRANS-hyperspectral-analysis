@@ -115,6 +115,8 @@ class ProjectManager:
                 'workspace': project_data.get('workspace', {}),
                 'output_files': project_data.get('output_files', []),
                 'maps': project_data.get('maps', []),
+                'maps_inmem': self._serialize_maps_inmem(
+                    project_data.get('maps_inmem', {})),
                 'images': self._serialize_images(project_data.get('images', {})),
                 'notes': self._serialize_notes(project_data.get('notes', {})),
                 'naming_convention': project_data.get('naming_convention'),
@@ -199,6 +201,8 @@ class ProjectManager:
                 'workspace': project_json.get('workspace', {}),
                 'output_files': project_json.get('output_files', []),
                 'maps': project_json.get('maps', []),
+                'maps_inmem': self._deserialize_maps_inmem(
+                    project_json.get('maps_inmem', [])),
                 'images': images,
                 'notes': notes,
                 'naming_convention': project_json.get('naming_convention'),
@@ -369,6 +373,84 @@ class ProjectManager:
                     "Could not deserialize image %s: %s",
                     payload.get("id", "?"), e, exc_info=True,
                 )
+        return out
+
+    def _serialize_maps_inmem(self, maps_inmem: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Serialize in-memory :class:`MultiChannelMap` objects for the project.
+
+        These maps (e.g. Omicron scan images) have no on-disk file, so their
+        channel arrays (base64 float32) and metadata — including the STS
+        locations + per-point average spectra used for the click-to-plot dots —
+        are embedded in the .hrt so the Hyperspectral tab restores on reopen.
+        """
+        if not maps_inmem:
+            return []
+        out: List[Dict[str, Any]] = []
+        for map_id, mcm in maps_inmem.items():
+            try:
+                channels = {}
+                for name, ch in mcm.channels.items():
+                    arr = np.ascontiguousarray(ch.data, dtype=np.float32)
+                    ctype = getattr(getattr(ch.metadata, 'channel_type', None),
+                                    'value', 'custom')
+                    channels[name] = {
+                        'shape': list(arr.shape),
+                        'b64': base64.b64encode(arr.tobytes()).decode('ascii'),
+                        'units': getattr(ch.metadata, 'units', 'a.u.'),
+                        'channel_type': ctype,
+                    }
+                meta = mcm.metadata
+                out.append({
+                    'id': map_id,
+                    'active_channel': mcm.active_channel_name,
+                    'channels': channels,
+                    'metadata': {
+                        'dimensions': list(meta.dimensions) if meta and meta.dimensions else None,
+                        'physical_size': list(meta.physical_size) if meta and meta.physical_size else None,
+                        'physical_units': getattr(meta, 'physical_units', 'um') if meta else 'um',
+                        'instrument': getattr(meta, 'instrument', '') if meta else '',
+                        'extra': (getattr(meta, 'extra', {}) or {}) if meta else {},
+                    },
+                })
+            except Exception as e:
+                logger.warning("Could not serialize map %s: %s", map_id, e)
+        return out
+
+    def _deserialize_maps_inmem(self, payloads: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Reconstruct in-memory :class:`MultiChannelMap` objects from payloads."""
+        out: Dict[str, Any] = {}
+        if not payloads:
+            return out
+        from src.models.map_channel import (
+            MultiChannelMap, MapMetadata, ChannelType,
+        )
+        for p in payloads:
+            try:
+                mcm = MultiChannelMap()
+                for name, cd in p.get('channels', {}).items():
+                    arr = np.frombuffer(
+                        base64.b64decode(cd['b64']), dtype=np.float32,
+                    ).reshape(cd['shape']).astype(np.float64)
+                    ctype = (ChannelType.HEIGHT if name.upper().startswith('Z')
+                             else ChannelType.CUSTOM)
+                    mcm.add_channel(name, arr, channel_type=ctype,
+                                    units=cd.get('units', 'a.u.'))
+                active = p.get('active_channel')
+                if active in mcm.channels:
+                    mcm.set_active_channel(active)
+                md = p.get('metadata', {}) or {}
+                mcm.metadata = MapMetadata(
+                    dimensions=tuple(md['dimensions']) if md.get('dimensions')
+                    else (mcm.shape or (0, 0)),
+                    physical_size=tuple(md['physical_size']) if md.get('physical_size') else None,
+                    physical_units=md.get('physical_units', 'um'),
+                    instrument=md.get('instrument', ''),
+                    extra=md.get('extra', {}) or {},
+                )
+                out[p['id']] = mcm
+            except Exception as e:
+                logger.warning("Could not deserialize map %s: %s",
+                               p.get('id', '?'), e)
         return out
 
     def _make_json_serializable(self, obj):

@@ -591,3 +591,53 @@ class TestModifiedFlag:
         # Load should reset
         pm.load_project(tmp_path / "test.hrt")
         assert pm.is_modified() is False
+
+
+class TestInMemoryMapPersistence:
+    """In-memory maps (Omicron scans) survive save/load, incl. STS dot spectra."""
+
+    def _map(self):
+        from src.models.map_channel import MultiChannelMap, MapMetadata, ChannelType
+        mcm = MultiChannelMap()
+        z = np.arange(12, dtype=float).reshape(3, 4)
+        z[0, 0] = np.nan                      # railed sample
+        mcm.add_channel("Z", z, ChannelType.HEIGHT, "m")
+        mcm.add_channel("I", z * 2, ChannelType.CUSTOM, "A")
+        mcm.set_active_channel("Z")
+        mcm.metadata = MapMetadata(
+            dimensions=(3, 4), physical_size=(3e-6, 4e-6), physical_units='m',
+            instrument='Omicron Matrix',
+            extra={'session_label': 'S', 'sts_locations': [
+                {'point_index': 1, 'px': [2, 1], 'reps': 5,
+                 'avg_spectrum': {'V': [-1.0, 0.0, 1.0], 'y': [0.5, np.nan, 1.5]}},
+            ]})
+        return mcm
+
+    def test_map_round_trips_through_hrt(self, tmp_path):
+        pm = ProjectManager()
+        mcm = self._map()
+        pm.save_project(tmp_path / "m.hrt", {
+            'metadata': {'name': 'M'}, 'datasets': {}, 'tables': [], 'graphs': [],
+            'workspace': {}, 'maps_inmem': {'map_1': mcm},
+        })
+        loaded = pm.load_project(tmp_path / "m.hrt")
+        restored = loaded['maps_inmem']
+        assert set(restored) == {'map_1'}
+        g = restored['map_1']
+        assert set(g.channel_names) == {'Z', 'I'}
+        assert g.active_channel_name == 'Z'
+        np.testing.assert_allclose(g.channels['Z'].data, mcm.channels['Z'].data,
+                                   equal_nan=True)
+        assert g.metadata.physical_size == (3e-6, 4e-6)
+        loc = g.metadata.extra['sts_locations'][0]
+        assert loc['point_index'] == 1 and loc['px'] == [2, 1]
+        np.testing.assert_allclose(loc['avg_spectrum']['y'], [0.5, np.nan, 1.5],
+                                   equal_nan=True)
+
+    def test_no_maps_is_safe(self, tmp_path):
+        pm = ProjectManager()
+        pm.save_project(tmp_path / "e.hrt", {
+            'metadata': {}, 'datasets': {}, 'tables': [], 'graphs': [],
+            'workspace': {}})
+        loaded = pm.load_project(tmp_path / "e.hrt")
+        assert loaded['maps_inmem'] == {}

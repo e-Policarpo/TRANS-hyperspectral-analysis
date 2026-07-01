@@ -935,6 +935,19 @@ class AppBackend(ToolImplementations, QObject):
             for m in loaded_maps:
                 self.maps.append(m)
 
+            # Restore in-memory maps (Omicron scans etc. with no on-disk file)
+            # so the Hyperspectral tab + click-to-plot dots come back.
+            loaded_inmem = project_data.get('maps_inmem', {}) or {}
+            for map_id, mcm in loaded_inmem.items():
+                self._maps_inmem[map_id] = mcm
+            # Keep the id counter ahead of restored ids to avoid collisions.
+            for m in self.maps:
+                try:
+                    n = int(str(m['id']).rsplit('_', 1)[1])
+                    self._map_id_counter = max(self._map_id_counter, n)
+                except (ValueError, IndexError, KeyError):
+                    pass
+
             loaded_outputs = project_data.get('output_files', [])
             for o in loaded_outputs:
                 self.output_files.append(o)
@@ -1961,13 +1974,18 @@ class AppBackend(ToolImplementations, QObject):
 
         for map_info in self.maps:
             if map_info['id'] == map_id:
-                map_path = Path(map_info['path'])
-                for ext in ['.tiff', '.tif', '.png', '.gsf', '']:
-                    check_path = map_path.with_suffix(ext) if ext else map_path
-                    if check_path.exists():
-                        self.loadMapInEditor.emit(str(check_path))
-                        logger.info(f"Requested map load in editor: {check_path}")
-                        return
+                raw_path = map_info.get('path') or ''
+                if raw_path:
+                    map_path = Path(raw_path)
+                    for ext in ['.tiff', '.tif', '.png', '.gsf', '']:
+                        # ``with_suffix`` raises on an empty-name path (e.g.
+                        # ``Path('')`` == ``PosixPath('.')``), so only call it
+                        # when there is a real path.
+                        check_path = map_path.with_suffix(ext) if ext else map_path
+                        if check_path.exists():
+                            self.loadMapInEditor.emit(str(check_path))
+                            logger.info(f"Requested map load in editor: {check_path}")
+                            return
                 msg = (f"Map '{map_info['title']}' has no on-disk file "
                        f"and no in-memory backing.")
                 logger.warning(msg)
@@ -3921,6 +3939,7 @@ class AppBackend(ToolImplementations, QObject):
             },
             'output_files': self.output_files,
             'maps': self.maps,
+            'maps_inmem': self._maps_inmem,
             'images': self._images,
             'notes': self._notes,
             'naming_convention': self._naming_convention,
