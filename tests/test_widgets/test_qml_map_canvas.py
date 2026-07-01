@@ -349,3 +349,48 @@ class TestQMLMapCanvasDisplayLevels:
         rng = canvas.getValueRange()
         assert all(np.isfinite(v) for v in rng)
         assert rng[1] > rng[0]
+
+
+class TestProfileLineResizeSafe:
+    """The line profile is stored in axes fractions so it tracks the data
+    across window resizes instead of sticking to absolute screen pixels."""
+
+    @staticmethod
+    def _canvas_with_axes(ax):
+        from src.widgets.qml_map_canvas import QMLMapCanvas
+        canvas = QMLMapCanvas()
+        canvas.setMapData(np.zeros((100, 100)))
+        canvas._data_to_pixel = ax
+        return canvas
+
+    def test_axesfrac_roundtrip(self):
+        ax = {'ax_left': 50, 'ax_right': 450, 'ax_top': 20, 'ax_bottom': 420,
+              'data_rows': 100, 'data_cols': 100}
+        canvas = self._canvas_with_axes(ax)
+        nx, ny = canvas._pixel_to_axesfrac(250.0, 220.0)   # centre of axes
+        assert nx == pytest.approx(0.5)
+        assert ny == pytest.approx(0.5)
+        px, py = canvas._axesfrac_to_pixel(nx, ny)
+        assert (px, py) == pytest.approx((250.0, 220.0))
+
+    def test_profile_pixel_follows_axes_on_resize(self):
+        small = {'ax_left': 50, 'ax_right': 250, 'ax_top': 20, 'ax_bottom': 220,
+                 'data_rows': 100, 'data_cols': 100}
+        canvas = self._canvas_with_axes(small)
+        # A point at 25% across / 75% down the axes.
+        frac = canvas._pixel_to_axesfrac(100.0, 170.0)
+        assert frac == pytest.approx((0.25, 0.75))
+        # Window grows: axes rect doubles. Same fraction → new pixel.
+        big = {'ax_left': 100, 'ax_right': 500, 'ax_top': 40, 'ax_bottom': 440,
+               'data_rows': 100, 'data_cols': 100}
+        canvas._data_to_pixel = big
+        px, py = canvas._axesfrac_to_pixel(*frac)
+        assert px == pytest.approx(100 + 0.25 * 400)   # 200
+        assert py == pytest.approx(40 + 0.75 * 400)     # 340
+
+    def test_axesfrac_none_without_axes(self):
+        from src.widgets.qml_map_canvas import QMLMapCanvas
+        canvas = QMLMapCanvas()
+        canvas._data_to_pixel = None
+        assert canvas._pixel_to_axesfrac(1, 2) is None
+        assert canvas._axesfrac_to_pixel(0.5, 0.5) is None

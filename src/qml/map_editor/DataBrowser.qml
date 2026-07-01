@@ -24,6 +24,10 @@ Rectangle {
     property int spectralPoints: 0
     property int mapRows: 0
     property int mapCols: 0
+    // Associated-spectra metadata for the Info section (item 4). Shape from
+    // MapEditorBackend.getMapSpectraInfo(): sts_point_count, sweeps[],
+    // bias_min/max, bias_points, linked_datasets[].
+    property var spectraInfo: ({})
 
     // Signals
     signal channelSelected(string channelName)
@@ -213,7 +217,9 @@ Rectangle {
             }
         }
 
-        // Masks Section
+        // Masks Section — DISABLED (item 3): masks aren't functional yet, so
+        // the whole panel is commented out until create/apply/toggle exists.
+        /*
         GroupBox {
             id: masksGroup
             title: "Masks"
@@ -293,11 +299,12 @@ Rectangle {
                 }
             }
         }
+        */
 
-        // Info Section
+        // Info / Metadata Section
         GroupBox {
             id: infoGroup
-            title: "Info"
+            title: "Metadata"
             Layout.fillWidth: true
             Layout.fillHeight: true
 
@@ -342,6 +349,61 @@ Rectangle {
                     text: channelNames.length + " channel(s)"
                     font.pixelSize: 11
                     color: textMuted
+                }
+
+                // --- Associated spectra (item 4) ------------------------
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 1
+                    color: borderColor
+                    visible: spectraInfo && spectraInfo.sts_point_count > 0
+                }
+
+                Label {
+                    text: "Associated spectra"
+                    font.pixelSize: 10
+                    font.bold: true
+                    color: accentPink
+                    visible: spectraInfo && spectraInfo.sts_point_count > 0
+                }
+
+                Label {
+                    text: (spectraInfo ? spectraInfo.sts_point_count : 0) +
+                          " STS point(s) on scan"
+                    font.pixelSize: 11
+                    color: accentBlue
+                    visible: spectraInfo && spectraInfo.sts_point_count > 0
+                }
+
+                Label {
+                    text: "Bias: " + (spectraInfo.bias_min !== undefined
+                          ? spectraInfo.bias_min.toFixed(2) + " … " +
+                            spectraInfo.bias_max.toFixed(2) + " V"
+                          : "--") +
+                          " (" + (spectraInfo ? spectraInfo.bias_points : 0) + " pts)"
+                    font.pixelSize: 11
+                    color: textMuted
+                    visible: spectraInfo && spectraInfo.bias_points > 0
+                }
+
+                Label {
+                    text: "Sweeps: " + (spectraInfo && spectraInfo.sweeps
+                          ? spectraInfo.sweeps.join(", ") : "--")
+                    font.pixelSize: 11
+                    color: textMuted
+                    wrapMode: Text.WordWrap
+                    Layout.fillWidth: true
+                    visible: !!(spectraInfo && spectraInfo.sweeps
+                             && spectraInfo.sweeps.length > 0)
+                }
+
+                Label {
+                    text: "Datasets: " + (spectraInfo && spectraInfo.linked_datasets
+                          ? spectraInfo.linked_datasets.length : 0)
+                    font.pixelSize: 11
+                    color: textMuted
+                    visible: !!(spectraInfo && spectraInfo.linked_datasets
+                             && spectraInfo.linked_datasets.length > 0)
                 }
 
                 Item { Layout.fillHeight: true }

@@ -10,6 +10,7 @@ import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
+import "Fmt.js" as Fmt
 
 // Statistics Panel for Map Editor
 // Displays statistics for the current channel or selection
@@ -106,7 +107,7 @@ Rectangle {
                     color: textMuted
                 }
                 Label {
-                    text: hasStats && stats.min !== undefined ? stats.min.toFixed(4) : "--"
+                    text: hasStats && stats.min !== undefined ? Fmt.sci(stats.min) : "--"
                     font.pixelSize: 10
                     font.family: monoFont
                     color: textLight
@@ -119,7 +120,7 @@ Rectangle {
                     color: textMuted
                 }
                 Label {
-                    text: hasStats && stats.max !== undefined ? stats.max.toFixed(4) : "--"
+                    text: hasStats && stats.max !== undefined ? Fmt.sci(stats.max) : "--"
                     font.pixelSize: 10
                     font.family: monoFont
                     color: textLight
@@ -133,7 +134,7 @@ Rectangle {
                     color: textMuted
                 }
                 Label {
-                    text: hasStats && stats.mean !== undefined ? stats.mean.toFixed(4) : "--"
+                    text: hasStats && stats.mean !== undefined ? Fmt.sci(stats.mean) : "--"
                     font.pixelSize: 10
                     font.family: monoFont
                     color: accentBlue
@@ -146,7 +147,7 @@ Rectangle {
                     color: textMuted
                 }
                 Label {
-                    text: hasStats && stats.std !== undefined ? stats.std.toFixed(4) : "--"
+                    text: hasStats && stats.std !== undefined ? Fmt.sci(stats.std) : "--"
                     font.pixelSize: 10
                     font.family: monoFont
                     color: textLight
@@ -160,7 +161,7 @@ Rectangle {
                     color: textMuted
                 }
                 Label {
-                    text: hasStats && stats.median !== undefined ? stats.median.toFixed(4) : "--"
+                    text: hasStats && stats.median !== undefined ? Fmt.sci(stats.median) : "--"
                     font.pixelSize: 10
                     font.family: monoFont
                     color: textLight
@@ -173,7 +174,7 @@ Rectangle {
                     color: textMuted
                 }
                 Label {
-                    text: hasStats && stats.rms !== undefined ? stats.rms.toFixed(4) : "--"
+                    text: hasStats && stats.rms !== undefined ? Fmt.sci(stats.rms) : "--"
                     font.pixelSize: 10
                     font.family: monoFont
                     color: textLight
@@ -187,7 +188,7 @@ Rectangle {
                     color: textMuted
                 }
                 Label {
-                    text: hasStats && stats.range !== undefined ? stats.range.toFixed(4) : "--"
+                    text: hasStats && stats.range !== undefined ? Fmt.sci(stats.range) : "--"
                     font.pixelSize: 10
                     font.family: monoFont
                     color: textLight

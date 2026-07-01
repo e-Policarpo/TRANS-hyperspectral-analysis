@@ -10,6 +10,7 @@ import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
+import "Fmt.js" as Fmt
 
 // Point Inspector Panel for Map Editor
 // Displays information about the currently inspected point
@@ -117,7 +118,7 @@ Rectangle {
                     color: textMuted
                 }
                 Label {
-                    text: hasPoint ? currentValue.toFixed(6) : "--"
+                    text: hasPoint ? Fmt.sci(currentValue, 6) : "--"
                     font.pixelSize: 11
                     font.family: monoFont
                     color: hasPoint ? accentBlue : textMuted

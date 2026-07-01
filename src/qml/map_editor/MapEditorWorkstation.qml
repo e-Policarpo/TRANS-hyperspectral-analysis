@@ -12,6 +12,7 @@ import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
 import Qt.labs.platform 1.1 as Platform
 import TransQML 1.0
+import "Fmt.js" as Fmt
 
 // Map Editor Workstation - Gwyddion-style map editing interface
 // Implements TRANS_v3 interactive canvas with spatial-spectral reconstruction
@@ -90,6 +91,7 @@ Item {
             dataBrowser.mapCols = mapBackend.mapCols
             dataBrowser.hasSpectralData = mapBackend.hasSpectralData
             dataBrowser.spectralPoints = mapBackend.spectralPoints
+            dataBrowser.spectraInfo = mapBackend.getMapSpectraInfo()
             // Auto-link datasets with matching spatial dimensions
             mapBackend.autoLinkMatchingDatasets(backend)
         }
@@ -99,6 +101,11 @@ Item {
             root.openSpectrumPlotRequested(datasetName, spectra, false)
         }
 
+        onStsAverageUpdated: function(result) {
+            // Average of the selected STS dots → inline "Average Spectrum" panel.
+            inlineSpectrumViewer.showStsAverage(result)
+        }
+
         onChannelListChanged: {
             dataBrowser.channelNames = mapBackend.channelNames
         }
@@ -106,6 +113,7 @@ Item {
         onSpectralDataChanged: {
             dataBrowser.hasSpectralData = mapBackend.hasSpectralData
             dataBrowser.spectralPoints = mapBackend.spectralPoints
+            dataBrowser.spectraInfo = mapBackend.getMapSpectraInfo()
             pointInspector.setSpectrumAvailable(mapBackend.hasSpectralData)
         }
     }
@@ -767,7 +775,7 @@ Item {
                     anchors.fill: parent
 
                     onPointClicked: function(x, y, row, col, value) {
-                        coordLabel.text = "(" + row + ", " + col + ") = " + value.toFixed(4)
+                        coordLabel.text = "(" + row + ", " + col + ") = " + Fmt.sci(value)
                         pointInspector.setPoint(row, col, value, mapBackend.activeChannelName)
                         root.spectrumRequested(row, col)
 
@@ -787,7 +795,7 @@ Item {
                     }
 
                     onCursorMoved: function(x, y, row, col, value) {
-                        coordLabel.text = "(" + row + ", " + col + ") = " + value.toFixed(4)
+                        coordLabel.text = "(" + row + ", " + col + ") = " + Fmt.sci(value)
                     }
 
                     onSpectralDataRequested: function(row, col) {
@@ -811,12 +819,8 @@ Item {
                         onTriggered: inlineSpectrumViewer.updateSpectrum()
                     }
 
-                    onProfileDrawn: function(x1, y1, x2, y2) {
-                        var startRow = Math.floor(y1 / (height / mapBackend.mapRows))
-                        var startCol = Math.floor(x1 / (width / mapBackend.mapCols))
-                        var endRow = Math.floor(y2 / (height / mapBackend.mapRows))
-                        var endCol = Math.floor(x2 / (width / mapBackend.mapCols))
-
+                    onProfileDrawn: function(startRow, startCol, endRow, endCol) {
+                        // Endpoints already in data coords (axes-rect aware).
                         var profileResult = mapBackend.extractProfile(startRow, startCol, endRow, endCol)
                         if (profileResult && profileResult.distance && profileResult.values) {
                             profileViewer.setProfile(
@@ -952,102 +956,110 @@ Item {
             }
         }
 
-        // Right: Data Browser & Panels
+        // Right: Data Browser & Panels — one scrolling box of collapsible,
+        // drag-resizable sections (item 4).
         Rectangle {
             Layout.preferredWidth: 240
             Layout.fillHeight: true
             color: bgMedium
 
-            ColumnLayout {
+            Flickable {
+                id: rightPanelFlick
                 anchors.fill: parent
-                spacing: 0
+                contentWidth: width
+                contentHeight: rightPanelCol.implicitHeight
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
-                // Data Browser (channels, masks)
-                DataBrowser {
-                    id: dataBrowser
-                    Layout.fillWidth: true
-                    Layout.preferredHeight: 280
+                ColumnLayout {
+                    id: rightPanelCol
+                    width: rightPanelFlick.width
+                    spacing: 2
 
-                    channelNames: mapBackend.channelNames
-                    activeChannel: mapBackend.activeChannelName
-                    hasSpectralData: mapBackend.hasSpectralData
-                    spectralPoints: mapBackend.spectralPoints
-                    mapRows: mapBackend.mapRows
-                    mapCols: mapBackend.mapCols
+                    // Data Browser (channels + map/spectra metadata)
+                    CollapsibleSection {
+                        title: "Data Browser"
+                        bodyHeight: 280
 
-                    onChannelSelected: function(channelName) {
-                        mapBackend.setActiveChannel(channelName)
+                        DataBrowser {
+                            id: dataBrowser
+                            anchors.fill: parent
+
+                            channelNames: mapBackend.channelNames
+                            activeChannel: mapBackend.activeChannelName
+                            hasSpectralData: mapBackend.hasSpectralData
+                            spectralPoints: mapBackend.spectralPoints
+                            mapRows: mapBackend.mapRows
+                            mapCols: mapBackend.mapCols
+
+                            onChannelSelected: function(channelName) {
+                                mapBackend.setActiveChannel(channelName)
+                            }
+
+                            onStatisticsRequested: function(channelName) {
+                                var stats = mapBackend.getChannelStatistics(channelName)
+                                statsPanel.updateStats(stats, channelName, false, 0)
+                            }
+                        }
                     }
 
-                    onStatisticsRequested: function(channelName) {
-                        var stats = mapBackend.getChannelStatistics(channelName)
-                        statsPanel.updateStats(stats, channelName, false, 0)
-                    }
-                }
+                    // Point Inspector
+                    CollapsibleSection {
+                        title: "Point Inspector"
+                        bodyHeight: 150
 
-                // Separator
-                Rectangle {
-                    Layout.fillWidth: true
-                    Layout.preferredHeight: 1
-                    color: borderColor
-                }
+                        PointInspector {
+                            id: pointInspector
+                            anchors.fill: parent
 
-                // Point Inspector
-                PointInspector {
-                    id: pointInspector
-                    Layout.fillWidth: true
+                            hasSpectrum: mapBackend.hasSpectralData
 
-                    hasSpectrum: mapBackend.hasSpectralData
+                            onPlotSpectrumRequested: function(row, col) {
+                                root.spectrumRequested(row, col)
+                            }
 
-                    onPlotSpectrumRequested: function(row, col) {
-                        root.spectrumRequested(row, col)
+                            onAddToComparisonRequested: function(row, col) {
+                                console.log("Add to comparison:", row, col)
+                            }
+                        }
                     }
 
-                    onAddToComparisonRequested: function(row, col) {
-                        console.log("Add to comparison:", row, col)
-                    }
-                }
+                    // Statistics Panel
+                    CollapsibleSection {
+                        title: "Statistics"
+                        bodyHeight: 170
 
-                // Separator
-                Rectangle {
-                    Layout.fillWidth: true
-                    Layout.preferredHeight: 1
-                    color: borderColor
-                }
-
-                // Statistics Panel
-                StatisticsPanel {
-                    id: statsPanel
-                    Layout.fillWidth: true
-                    Layout.preferredHeight: 160
-                }
-
-                // Separator
-                Rectangle {
-                    Layout.fillWidth: true
-                    Layout.preferredHeight: 1
-                    color: borderColor
-                }
-
-                // Hyperspectral Control Panel (replaces Export section)
-                HyperspectralControlPanel {
-                    id: hyperspectralPanel
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    mapBackend: mapBackend
-                    appBackend: backend
-                    mapCanvas: mapCanvas
-
-                    onOpenGraphRequested: {
-                        // Forward to parent for embedded window creation
-                        root.openSpectrumPlotRequested(
-                            mapBackend.activeDataset,
-                            mapBackend.getSelectedSpectraFromDataset(mapBackend.activeDataset),
-                            false)
+                        StatisticsPanel {
+                            id: statsPanel
+                            anchors.fill: parent
+                        }
                     }
 
-                    onOpenTableRequested: {
-                        console.log("Table view requested for", mapBackend.activeDataset)
+                    // Hyperspectral Control Panel (replaces Export section)
+                    CollapsibleSection {
+                        title: "Hyperspectral"
+                        bodyHeight: 340
+
+                        HyperspectralControlPanel {
+                            id: hyperspectralPanel
+                            anchors.fill: parent
+                            mapBackend: mapBackend
+                            appBackend: backend
+                            mapCanvas: mapCanvas
+
+                            onOpenGraphRequested: {
+                                // Forward to parent for embedded window creation
+                                root.openSpectrumPlotRequested(
+                                    mapBackend.activeDataset,
+                                    mapBackend.getSelectedSpectraFromDataset(mapBackend.activeDataset),
+                                    false)
+                            }
+
+                            onOpenTableRequested: {
+                                console.log("Table view requested for", mapBackend.activeDataset)
+                            }
+                        }
                     }
                 }
             }

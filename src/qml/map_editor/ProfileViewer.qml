@@ -11,6 +11,7 @@ import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
 import TransQML 1.0
+import "Fmt.js" as Fmt
 
 // Profile Viewer for Map Editor
 // Displays line profiles extracted from the map
@@ -192,7 +193,7 @@ Rectangle {
 
                 Label {
                     text: "Min: " + (profileData && profileData.stats ?
-                          profileData.stats.min.toFixed(3) : "--")
+                          Fmt.sci(profileData.stats.min) : "--")
                     font.pixelSize: 10
                     font.family: monoFont
                     color: textMuted
@@ -200,7 +201,7 @@ Rectangle {
 
                 Label {
                     text: "Max: " + (profileData && profileData.stats ?
-                          profileData.stats.max.toFixed(3) : "--")
+                          Fmt.sci(profileData.stats.max) : "--")
                     font.pixelSize: 10
                     font.family: monoFont
                     color: textMuted
@@ -208,7 +209,7 @@ Rectangle {
 
                 Label {
                     text: "Mean: " + (profileData && profileData.stats ?
-                          profileData.stats.mean.toFixed(3) : "--")
+                          Fmt.sci(profileData.stats.mean) : "--")
                     font.pixelSize: 10
                     font.family: monoFont
                     color: textMuted

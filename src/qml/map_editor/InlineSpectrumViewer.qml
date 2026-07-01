@@ -21,6 +21,9 @@ Item {
     // State
     property bool expanded: false
     property int blockCount: 0
+    // When the average comes from STS dots (not map blocks) we show a point
+    // count instead of a block count in the header.
+    property int stsPointCount: 0
 
     // Theme colors
     property var mainWin: ApplicationWindow.window
@@ -32,6 +35,9 @@ Item {
     property color textLight: mainWin ? mainWin.textLight : "#ffffff"
     property color textMuted: mainWin ? mainWin.textMuted : "#B0A0B8"
     property color borderColor: mainWin ? mainWin.borderColor : "#7B3F76"
+
+    // True when either block-selection or STS-dot data is displayed.
+    property bool hasData: blockCount > 0 || stsPointCount > 0
 
     Layout.fillWidth: true
     Layout.preferredHeight: expanded ? 228 : 28
@@ -70,7 +76,9 @@ Item {
                     Label {
                         text: (expanded ? "\u25BC " : "\u25B6 ") +
                               "Average Spectrum" +
-                              (blockCount > 0 ? " (" + blockCount + " blocks)" : "")
+                              (stsPointCount > 0
+                               ? " (" + stsPointCount + " STS pt" + (stsPointCount !== 1 ? "s" : "") + ")"
+                               : (blockCount > 0 ? " (" + blockCount + " blocks)" : ""))
                         font.pixelSize: 11
                         font.bold: true
                         color: accentPink
@@ -79,7 +87,7 @@ Item {
                     Item { Layout.fillWidth: true }
 
                     Label {
-                        text: blockCount === 0 ? "No selection" : ""
+                        text: !hasData ? "No selection" : ""
                         font.pixelSize: 9
                         color: textMuted
                         visible: !expanded
@@ -97,10 +105,13 @@ Item {
                 // Empty state
                 Label {
                     anchors.centerIn: parent
-                    text: "Select blocks on map to see average spectrum"
+                    text: "Select blocks or STS points on the map to see average spectrum"
                     font.pixelSize: 11
                     color: textMuted
-                    visible: blockCount === 0
+                    visible: !hasData
+                    horizontalAlignment: Text.AlignHCenter
+                    wrapMode: Text.WordWrap
+                    width: parent.width - 20
                 }
 
                 // GraphCanvas for spectrum display
@@ -108,7 +119,7 @@ Item {
                     id: spectrumGraph
                     anchors.fill: parent
                     anchors.margins: 2
-                    visible: blockCount > 0
+                    visible: hasData
                 }
             }
         }
@@ -122,6 +133,7 @@ Item {
 
         if (result && !result.error && result.x && result.y) {
             blockCount = result.block_count || 0
+            stsPointCount = 0   // block selection overrides any STS-dot average
             spectrumGraph.clearCurves()
             spectrumGraph.addCurve(
                 result.x, result.y,
@@ -143,9 +155,34 @@ Item {
         }
     }
 
+    // Display the average of the currently-selected STS dots (item 2a). An
+    // empty/blank result clears the panel. Independent of block selection.
+    function showStsAverage(result) {
+        if (result && !result.error && result.x && result.y
+                && result.x.length > 0) {
+            blockCount = 0   // STS-dot average overrides any block selection
+            stsPointCount = result.point_count || 0
+            spectrumGraph.clearCurves()
+            spectrumGraph.addCurve(
+                result.x, result.y,
+                result.title || "Average Spectrum",
+                "#5BCEFA"
+            )
+            spectrumGraph.setLabels(
+                result.x_name || "V",
+                result.y_name || "Current"
+            )
+            if (!expanded) expanded = true
+        } else {
+            stsPointCount = 0
+            if (blockCount === 0) spectrumGraph.clearCurves()
+        }
+    }
+
     // Clear the viewer
     function clear() {
         blockCount = 0
+        stsPointCount = 0
         spectrumGraph.clearCurves()
     }
 

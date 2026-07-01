@@ -13,6 +13,7 @@ import numpy as np
 from typing import Optional, Dict, Any, List, Tuple
 from pathlib import Path
 import logging
+import warnings
 
 from PySide6.QtCore import (
     QObject, Signal, Slot, Property, QUrl
@@ -60,6 +61,9 @@ class MapEditorBackend(QObject):
     linkedDatasetsChanged = Signal()
     spectrumReady = Signal(str, 'QVariantMap', arguments=['datasetName', 'spectrumData'])
     openPlotWindowRequested = Signal(str, 'QVariantList', arguments=['datasetName', 'spectra'])
+    # Average (mixed) spectrum of the currently-selected STS dots, pushed to the
+    # inline "Average Spectrum" panel. Empty map ({}) clears it.
+    stsAverageUpdated = Signal('QVariantMap', arguments=['result'])
     # Line-scan / point-set viewing (non-area spatially-resolved spectra).
     lineScanModeChanged = Signal()
 
@@ -168,6 +172,42 @@ class MapEditorBackend(QObject):
     def activeDataset(self) -> str:
         """Get currently active dataset for spectrum viewing"""
         return self._active_dataset or ""
+
+    @Slot(result='QVariantMap')
+    def getMapSpectraInfo(self) -> Dict:
+        """Summary of the spectra associated with the current map (item 4).
+
+        Feeds the map-metadata panel: how many STS points were taken on this
+        scan, the bias sweep (range + points), which sweep directions exist,
+        and the names of any linked spectral datasets.
+        """
+        info = {
+            'sts_point_count': 0,
+            'linked_datasets': list(self._linked_datasets.keys()),
+            'sweeps': [],
+            'bias_points': 0,
+        }
+        mcm = self._multi_channel_map
+        if mcm is None:
+            return info
+        try:
+            extra = getattr(mcm.metadata, 'extra', None) or {}
+            locs = extra.get('sts_locations', []) or []
+        except Exception:
+            locs = []
+        info['sts_point_count'] = len(locs)
+        # Read the bias axis / available sweeps off the first point's average
+        # (tolerant of the legacy single-spectrum schema).
+        avg = (self._loc_avg_spectra(locs[0]) if locs else None) or {}
+        V = avg.get('V')
+        if V is not None and len(V) > 0:
+            varr = np.asarray(V, dtype=float)
+            info['bias_min'] = float(np.nanmin(varr))
+            info['bias_max'] = float(np.nanmax(varr))
+            info['bias_points'] = int(varr.size)
+        info['sweeps'] = [s for s in ('Forward', 'Backward', 'Mixed')
+                          if avg.get(s) is not None]
+        return info
 
     # =========================================================================
     # Dataset Linking for Spectrum Viewing
@@ -531,6 +571,25 @@ class MapEditorBackend(QObject):
                 'label': str(L.get('point_index', '')), 'index': i,
             })
         self._canvas.setStsMarkers(markers)
+        self.stsAverageUpdated.emit({})   # new map → clear the inline panel
+
+    @staticmethod
+    def _loc_avg_spectra(loc: dict):
+        """Per-sweep averages for an STS location, tolerant of the legacy schema.
+
+        New Omicron maps store ``avg_spectra`` = {V, Mixed, Forward, Backward}.
+        Projects saved before the multi-sweep rewrite stored a single
+        ``avg_spectrum`` = {V, y}; upgrade those to a Mixed-only spectrum so old
+        .hrt files still click-to-plot (Forward/Backward simply won't exist).
+        """
+        avg = loc.get('avg_spectra')
+        if avg and avg.get('Mixed'):
+            return avg
+        legacy = loc.get('avg_spectrum')
+        if legacy and legacy.get('y'):
+            return {'V': legacy.get('V'), 'Mixed': legacy.get('y'),
+                    'Forward': None, 'Backward': None}
+        return None
 
     @Slot(int)
     def _on_sts_marker_clicked(self, index: int):
@@ -551,7 +610,7 @@ class MapEditorBackend(QObject):
         if not (0 <= index < len(locs)):
             return
         loc = locs[index]
-        avg = loc.get('avg_spectra')
+        avg = self._loc_avg_spectra(loc)
         if not avg or not avg.get('Mixed'):
             logger.info("STS dot %s has no stored spectra to plot", index)
             return
@@ -586,6 +645,41 @@ class MapEditorBackend(QObject):
             selected_idx = [i for i, L in enumerate(locs)
                             if L.get('point_index', i) in sel]
             self._canvas.setSelectedStsMarkers(selected_idx)
+
+        # Push the average (mixed) of every selected dot to the inline panel.
+        self.stsAverageUpdated.emit(self._sts_average_result(sel))
+
+    def _sts_average_result(self, sel: dict) -> Dict:
+        """Build the inline-panel payload: NaN-aware mean of the selected dots'
+        Mixed spectra. Returns {} when nothing usable is selected."""
+        if not sel:
+            return {}
+        x_ref = None
+        stack = []
+        for a in sel.values():
+            y = a.get('Mixed')
+            v = a.get('V')
+            if y is None or v is None:
+                continue
+            arr = np.asarray(y, dtype=float)
+            if x_ref is None:
+                x_ref = np.asarray(v, dtype=float)
+            # Only stack rows matching the reference length (share the V grid).
+            if arr.shape == x_ref.shape:
+                stack.append(arr)
+        if not stack or x_ref is None:
+            return {}
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            mean_y = np.nanmean(np.vstack(stack), axis=0)
+        n = len(stack)
+        return {
+            'x': x_ref.tolist(),
+            'y': mean_y.tolist(),
+            'title': f"Avg of {n} STS point{'s' if n != 1 else ''} · Mixed",
+            'x_name': 'V', 'y_name': 'Current',
+            'point_count': n,
+        }
 
     @Slot(str)
     def loadMapFromFile(self, file_path: str):

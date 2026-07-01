@@ -80,7 +80,7 @@ class QMLMapCanvas(QQuickPaintedItem):
 
     Signals:
         pointClicked(x, y, row, col, value): Emitted when clicking on map
-        profileDrawn(x1, y1, x2, y2): Emitted after drawing line profile
+        profileDrawn(startRow, startCol, endRow, endCol): line profile in data coords
         regionSelected(x1, y1, x2, y2): Emitted after rect selection
         cursorMoved(x, y, row, col, value): Emitted on cursor movement
         toolChanged(toolName): Emitted when tool changes
@@ -89,7 +89,8 @@ class QMLMapCanvas(QQuickPaintedItem):
 
     # Signals to QML
     pointClicked = Signal(float, float, int, int, float, arguments=['x', 'y', 'row', 'col', 'value'])
-    profileDrawn = Signal(float, float, float, float, arguments=['x1', 'y1', 'x2', 'y2'])
+    profileDrawn = Signal(int, int, int, int,
+                          arguments=['startRow', 'startCol', 'endRow', 'endCol'])
     regionSelected = Signal(float, float, float, float, arguments=['x1', 'y1', 'x2', 'y2'])
     cursorMoved = Signal(float, float, int, int, float, arguments=['x', 'y', 'row', 'col', 'value'])
     toolChanged = Signal(str, arguments=['toolName'])
@@ -171,7 +172,11 @@ class QMLMapCanvas(QQuickPaintedItem):
         # Overlay elements
         self._show_crosshair: bool = False
         self._crosshair_pos: Optional[Tuple[int, int]] = None
-        self._profile_line: Optional[Tuple[QPointF, QPointF]] = None
+        # Profile line stored as axes-fraction endpoints ((nx0,ny0),(nx1,ny1))
+        # — fractions within the image axes rect — so it tracks the data on
+        # resize instead of sticking to absolute screen pixels.
+        self._profile_line: Optional[Tuple[Tuple[float, float],
+                                            Tuple[float, float]]] = None
         self._selection_rect: Optional[QRectF] = None
 
         # Coordinate transform cache
@@ -210,6 +215,9 @@ class QMLMapCanvas(QQuickPaintedItem):
         self._show_sts_markers: bool = True
         # Indices of currently-selected STS markers (their spectra are plotted).
         self._sts_selected: set = set()
+        # ``index`` of the STS marker currently under the cursor (hover popup),
+        # or None. Only tracked with the POINTER tool.
+        self._hover_sts: Optional[int] = None
 
         # Spectral cube link for reconstruction
         self._spectral_cube: Optional[np.ndarray] = None  # Shape: (n_spectral_pts, rows, cols)
@@ -699,10 +707,29 @@ class QMLMapCanvas(QQuickPaintedItem):
         self._sts_selected = sel
         self.update()
 
+    def _sts_marker_at(self, px: float, py: float, tol: float = 7.0):
+        """Return the STS marker whose dot is within ``tol`` px of (px, py).
+
+        Nearest dot wins when several overlap (dense line scans). Returns the
+        marker dict or None. Assumes ``self._data_to_pixel`` is set.
+        """
+        if not (self._sts_markers and self._data_to_pixel is not None):
+            return None
+        best = None
+        best_d2 = tol * tol
+        for mk in self._sts_markers:
+            mx, my = self._dataToPixel(mk['row'], mk['col'])
+            d2 = (px - mx) ** 2 + (py - my) ** 2
+            if d2 <= best_d2:
+                best_d2 = d2
+                best = mk
+        return best
+
     @Slot()
     def clearStsMarkers(self):
         """Remove all STS point markers."""
         self._sts_markers = []
+        self._hover_sts = None
         self.update()
 
     @Slot(bool)
@@ -1197,6 +1224,30 @@ class QMLMapCanvas(QQuickPaintedItem):
 
         return x, y
 
+    def _pixel_to_axesfrac(self, x: float, y: float):
+        """Screen pixel → fraction within the image axes rect.
+
+        Not clamped, so points drawn outside the image keep their true
+        position. Returns None when the axes geometry is unknown.
+        """
+        d = self._data_to_pixel
+        if d is None:
+            return None
+        aw = d['ax_right'] - d['ax_left']
+        ah = d['ax_bottom'] - d['ax_top']
+        if aw == 0 or ah == 0:
+            return None
+        return ((x - d['ax_left']) / aw, (y - d['ax_top']) / ah)
+
+    def _axesfrac_to_pixel(self, nx: float, ny: float):
+        """Axes fraction → screen pixel using the current axes rect."""
+        d = self._data_to_pixel
+        if d is None:
+            return None
+        aw = d['ax_right'] - d['ax_left']
+        ah = d['ax_bottom'] - d['ax_top']
+        return (d['ax_left'] + nx * aw, d['ax_top'] + ny * ah)
+
     def _drawOverlays(self, painter: QPainter):
         """Draw interactive overlay elements"""
         painter.setRenderHint(QPainter.Antialiasing, True)
@@ -1233,18 +1284,50 @@ class QMLMapCanvas(QQuickPaintedItem):
             ring.setWidth(2)
             sel_ring = QPen(QColor(255, 255, 255, 255))  # white ring (selected)
             sel_ring.setWidth(3)
+            hover_pos = None   # (x, y, label) of the dot under the cursor
             for mk in self._sts_markers:
                 x, y = self._dataToPixel(mk['row'], mk['col'])
-                selected = mk.get('index', -1) in self._sts_selected
-                r = 7.0 if selected else 5.0
-                painter.setPen(sel_ring if selected else ring)
+                idx = mk.get('index', -1)
+                selected = idx in self._sts_selected
+                hovered = idx == self._hover_sts
+                r = 8.0 if hovered else (7.0 if selected else 5.0)
+                painter.setPen(sel_ring if (selected or hovered) else ring)
                 painter.setBrush(QBrush(QColor(0, 200, 255, 210) if selected
                                         else QColor(255, 0, 0, 160)))
                 painter.drawEllipse(QRectF(x - r, y - r, 2 * r, 2 * r))
                 label = mk.get('label', '')
-                if label:
+                if hovered:
+                    hover_pos = (x, y, label)
+                elif label:
                     painter.setPen(QPen(QColor(255, 255, 0, 255)))
                     painter.drawText(int(x + r + 2), int(y - r - 2), label)
+
+            # Hover popup drawn last so it sits above every dot: a filled chip
+            # with the point index near the hovered dot.
+            if hover_pos is not None:
+                hx, hy, hlabel = hover_pos
+                text = "#" + (hlabel if hlabel else str(self._hover_sts))
+                font = painter.font()
+                font.setBold(True)
+                font.setPointSize(max(9, font.pointSize()))
+                painter.setFont(font)
+                fm = painter.fontMetrics()
+                tw = fm.horizontalAdvance(text)
+                th = fm.height()
+                pad = 4
+                bx = hx + 10
+                by = hy - th - 10
+                # Keep the chip inside the canvas.
+                if bx + tw + 2 * pad > self.width():
+                    bx = hx - 10 - tw - 2 * pad
+                if by < 0:
+                    by = hy + 12
+                chip = QRectF(bx, by, tw + 2 * pad, th + 2 * pad)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(QColor(20, 20, 30, 235)))
+                painter.drawRoundedRect(chip, 4, 4)
+                painter.setPen(QPen(QColor(91, 206, 250, 255)))  # accent blue
+                painter.drawText(chip, Qt.AlignCenter, text)
 
         # Draw grid overlay for discretization
         if self._show_grid_overlay and self._data_to_pixel is not None and self._map_data is not None:
@@ -1333,18 +1416,24 @@ class QMLMapCanvas(QQuickPaintedItem):
             # Horizontal line
             painter.drawLine(0, int(y), int(self.width()), int(y))
 
-        # Draw profile line
-        if self._profile_line is not None:
-            start, end = self._profile_line
-            pen = QPen(QColor(255, 100, 100, 200))
-            pen.setWidth(2)
-            painter.setPen(pen)
-            painter.drawLine(start, end)
+        # Draw profile line — stored in axes fractions, converted to pixels
+        # against the CURRENT axes rect so it stays glued to the data on resize.
+        if self._profile_line is not None and self._data_to_pixel is not None:
+            (nx0, ny0), (nx1, ny1) = self._profile_line
+            p0 = self._axesfrac_to_pixel(nx0, ny0)
+            p1 = self._axesfrac_to_pixel(nx1, ny1)
+            if p0 is not None and p1 is not None:
+                start = QPointF(*p0)
+                end = QPointF(*p1)
+                pen = QPen(QColor(255, 100, 100, 200))
+                pen.setWidth(2)
+                painter.setPen(pen)
+                painter.drawLine(start, end)
 
-            # Draw endpoints
-            painter.setBrush(QBrush(QColor(255, 100, 100)))
-            painter.drawEllipse(start, 4, 4)
-            painter.drawEllipse(end, 4, 4)
+                # Draw endpoints
+                painter.setBrush(QBrush(QColor(255, 100, 100)))
+                painter.drawEllipse(start, 4, 4)
+                painter.drawEllipse(end, 4, 4)
 
         # Draw selection rectangle
         if self._selection_rect is not None:
@@ -1443,14 +1532,15 @@ class QMLMapCanvas(QQuickPaintedItem):
                 return
 
         # STS marker dots take priority over the tool dispatch: a click within
-        # a few px of a dot plots that point's spectrum (any tool).
-        if (self._show_sts_markers and self._sts_markers
+        # a few px of a dot plots that point's spectrum. Only active with the
+        # POINTER tool so the dots don't intercept line-profile / block / etc.
+        if (self._current_tool == MapTool.POINTER
+                and self._show_sts_markers and self._sts_markers
                 and self._data_to_pixel is not None):
-            for mk in self._sts_markers:
-                mx, my = self._dataToPixel(mk['row'], mk['col'])
-                if abs(pos.x() - mx) <= 7.0 and abs(pos.y() - my) <= 7.0:
-                    self.stsMarkerClicked.emit(int(mk.get('index', -1)))
-                    return
+            hit = self._sts_marker_at(pos.x(), pos.y())
+            if hit is not None:
+                self.stsMarkerClicked.emit(int(hit.get('index', -1)))
+                return
 
         self._drag_start = pos
         self._is_dragging = True
@@ -1540,12 +1630,15 @@ class QMLMapCanvas(QQuickPaintedItem):
         self._is_dragging = False
 
         if self._current_tool == MapTool.LINE_PROFILE:
-            # Store profile line for display
-            self._profile_line = (self._drag_start, pos)
-            self.profileDrawn.emit(
-                self._drag_start.x(), self._drag_start.y(),
-                pos.x(), pos.y()
-            )
+            # Store the line in axes fractions (resize-safe) and emit the
+            # endpoints in DATA coords — computed against the real axes rect,
+            # not the whole widget — so the extracted profile matches the line.
+            f0 = self._pixel_to_axesfrac(self._drag_start.x(), self._drag_start.y())
+            f1 = self._pixel_to_axesfrac(pos.x(), pos.y())
+            self._profile_line = (f0, f1) if (f0 is not None and f1 is not None) else None
+            r0, c0 = self._pixelToData(self._drag_start.x(), self._drag_start.y())
+            r1, c1 = self._pixelToData(pos.x(), pos.y())
+            self.profileDrawn.emit(r0, c0, r1, c1)
 
         elif self._current_tool in (MapTool.RECT_SELECT, MapTool.ZOOM_RECT):
             rect = QRectF(self._drag_start, pos).normalized()
@@ -1569,6 +1662,23 @@ class QMLMapCanvas(QQuickPaintedItem):
         value = self.getValueAt(row, col)
 
         self.cursorMoved.emit(pos.x(), pos.y(), row, col, value)
+
+        # STS-dot hover popup — only with the POINTER tool, matching the click
+        # gate. Shows the dot's point index so the user knows which one they'll
+        # click even in dense line scans.
+        if (self._current_tool == MapTool.POINTER
+                and self._show_sts_markers and self._sts_markers
+                and self._data_to_pixel is not None):
+            hit = self._sts_marker_at(pos.x(), pos.y())
+            new_hover = int(hit['index']) if hit is not None else None
+            if new_hover != self._hover_sts:
+                self._hover_sts = new_hover
+                self.setCursor(QCursor(
+                    Qt.PointingHandCursor if hit is not None else Qt.ArrowCursor))
+                self.update()
+        elif self._hover_sts is not None:
+            self._hover_sts = None
+            self.update()
 
         if self._current_tool == MapTool.CROSSHAIR:
             self._crosshair_pos = (row, col)

@@ -282,6 +282,78 @@ estiver no `Unified-UI` (e cole o hash do commit ao lado).
   local morto e o write redundante. Testes em
   test_qml_graph_canvas.py (novo).*
 
+## Interface Hiperespectral (touch-up) — reportado 2026-07-01
+
+- [x] **Line profile "gruda" em pixel absoluto ao redimensionar.** Ao
+  desenhar um line profile no mapa, a linha desenhada se desloca
+  quando a janela muda de tamanho (windowed ↔ fullscreen): a linha
+  parece fixa numa posição de pixel ABSOLUTA da tela, não nas
+  coordenadas de dados do canvas. Provável: o overlay do line
+  profile (`qml_map_canvas` `_profile_line` / `MapTool.LINE_PROFILE`)
+  guarda/desenha em px de tela em vez de (row,col) de dados, então
+  dessincroniza no resize. Converter start/end p/ coords de dados e
+  redesenhar via `_dataToPixel`.
+  *FIX: `_profile_line` agora guarda frações-de-axes*
+  *(`_pixel_to_axesfrac`/`_axesfrac_to_pixel`), redesenha contra o
+  axes rect atual; `profileDrawn` emite coords de dados via
+  `_pixelToData` (também corrigiu a margem de axes ignorada no QML).*
+- [x] **Dots: média no painel + índice no hover + só no POINTER.**
+  (a) Ao clicar nos dots p/ plotar, a média (mixed) dos dots
+  selecionados deve aparecer TAMBÉM na caixa "Average Spectrum" do
+  próprio analisador hiperespectral (hoje só diz "Select blocks on
+  map to see average spectrum"). (b) Além do highlight atual, mostrar
+  o NÚMERO/índice do dot num popup ao passar o mouse (hover), p/ o
+  usuário saber qual dot vai clicar. (c) Os dots só devem ser
+  interativos quando a ferramenta POINTER está ativa — ao desenhar
+  linhas (ou outra tool) o hit-test dos dots NÃO deve interferir
+  (hoje `mousePressEvent` intercepta em qualquer tool).
+  *FIX: (a) sinal `stsAverageUpdated`→`InlineSpectrumViewer.*
+  *showStsAverage` (média NaN-aware dos dots selecionados). (b) chip*
+  *"#idx" no hover (`_hover_sts`). (c) click+hover gated a*
+  *`MapTool.POINTER` via `_sts_marker_at`.*
+- [x] **Masks não faz nada → remover/comentar por ora.** Comentar no
+  código a seção Masks (não funciona atualmente).
+  *FIX: GroupBox Masks comentado (`/* */`) em `DataBrowser.qml`.*
+- [x] **Channel statistics e value readout mostram só zero.** O
+  readout de valor no point inspector ("(215,632) = −0.0000") e as
+  estatísticas de canal / do line profile ("Min/Max/Mean: −0.000")
+  mostram 0 p/ correntes STM pequenas (~1e-7 A). O plot do line
+  profile mostra os valores certos (~-4.6e-7), então é FORMATAÇÃO:
+  usar notação científica / mais algarismos significativos nesses
+  readouts (não `%.3f`).
+  *FIX: novo `Fmt.js` (`sci(v,sig)`, notação científica p/ |v|<1e-3*
+  *ou ≥1e5) usado em Statistics/Profile/PointInspector/coordLabel.*
+  *Campos editáveis vmin/vmax mantidos com `.toFixed`.*
+- [x] **Redesenho do painel direito.** O painel inteiro do lado
+  direito deve ser UMA caixa rolável (como a seção de discretização
+  já é). Os separadores entre seções devem ser arrastáveis p/
+  redimensionar/esconder cada seção, e ter um botão p/ colapsar a
+  seção quando não usada (além do scroll). Metadata de mapas deve
+  mostrar info sobre os espectros associados.
+  *FIX: novo `CollapsibleSection.qml` (header=separador c/ chevron*
+  *▼/▶ p/ colapsar + handle inferior p/ arrastar-redimensionar);*
+  *painel = `Flickable`+`ColumnLayout` de seções. Metadata via*
+  *`getMapSpectraInfo()` (pts STS, bias, sweeps, datasets).*
+
+## Portabilidade (Windows) — audit 2026-07-01
+
+- [ ] **`file://` stripping quebra no Windows.** ~15 QML fazem
+  `path.substring(7)` / `.replace("file://","")`. macOS
+  `file:///Users/x`→`/Users/x` ✓; Windows `file:///C:/Users/x`→
+  `/C:/Users/x` ✗ (barra antes da letra do drive → path inválido).
+  Quebra TODOS os diálogos de abrir/salvar no Windows (import de
+  mapa/imagem, load/save de projeto, workflow, export). Fix robusto:
+  converter a URL no lado Python via `QUrl(url).toLocalFile()` (trata
+  as duas plataformas) em vez de fatiar string. Afeta:
+  MapEditorWorkstation, ImageWindowContent, HyperspectralControlPanel,
+  IntegrationTool, MapViewerPanel, MapDiscretizerTool,
+  MapProcessingTool, ImageSmoothingTool, NodeParameterEditor,
+  LoadWorkflowDialog, GraphWindowContent, TableWindowContent.
+- [ ] **Sem CI.** Não há `.github/workflows/`. Adicionar job
+  `windows-latest` (+ `macos`) rodando `pytest` headless com
+  `QT_QPA_PLATFORM=offscreen` daria validação Windows automática a
+  cada push (pega import/erros de path; não pega render/interação).
+
 ## Project Browser
 
 - [x] **Rolling text para legibilidade.** Quando o nome do

@@ -848,3 +848,70 @@ class TestStsMarkerClick:
         backend._multi_channel_map = None
         backend._on_sts_marker_clicked(0)    # no map → safe
         assert fired == []
+
+    def test_sts_average_pushed_to_inline_panel(self, backend):
+        mcm, V = self._map_with_locations()
+        backend._multi_channel_map = mcm
+        avg = []
+        backend.stsAverageUpdated.connect(lambda r: avg.append(r))
+        backend._on_sts_marker_clicked(0)          # Point 3 alone
+        assert avg[-1]['point_count'] == 1
+        assert avg[-1]['x'] == V
+        assert avg[-1]['y'] == [0.1, 0.2, 0.3]
+        backend._on_sts_marker_clicked(1)          # + Point 7 → mean of both
+        assert avg[-1]['point_count'] == 2
+        assert avg[-1]['y'] == pytest.approx([0.55, 1.1, 1.65])
+        backend._on_sts_marker_clicked(0)          # toggle Point 3 off
+        assert avg[-1]['point_count'] == 1
+        assert avg[-1]['y'] == [1.0, 2.0, 3.0]
+        backend._on_sts_marker_clicked(1)          # toggle Point 7 off → empty
+        assert avg[-1] == {}
+
+    def test_sts_average_result_empty_when_nothing_selected(self, backend):
+        assert backend._sts_average_result({}) == {}
+
+    def test_get_map_spectra_info(self, backend):
+        mcm, V = self._map_with_locations()
+        backend._multi_channel_map = mcm
+        info = backend.getMapSpectraInfo()
+        assert info['sts_point_count'] == 2
+        assert info['bias_points'] == len(V)
+        assert info['bias_min'] == min(V)
+        assert info['bias_max'] == max(V)
+        assert set(info['sweeps']) == {'Forward', 'Backward', 'Mixed'}
+
+    def test_get_map_spectra_info_no_map(self, backend):
+        backend._multi_channel_map = None
+        info = backend.getMapSpectraInfo()
+        assert info['sts_point_count'] == 0
+        assert info['sweeps'] == []
+
+    def test_legacy_avg_spectrum_schema_still_plots(self, backend):
+        # Projects saved before the multi-sweep rewrite stored a single
+        # 'avg_spectrum' = {V, y}; the reader must upgrade it to Mixed-only.
+        mcm = MultiChannelMap()
+        mcm.add_channel("Z", np.zeros((8, 8)), ChannelType.HEIGHT, "m")
+        V = [-0.4, 0.0, 0.4]
+        mcm.metadata.extra = {'sts_locations': [
+            {'point_index': 1, 'px': [2, 2], 'reps': 10,
+             'avg_spectrum': {'V': V, 'y': [1e-8, 2e-8, 3e-8]}},
+        ]}
+        backend._multi_channel_map = mcm
+        by_name = {}
+        backend.openPlotWindowRequested.connect(
+            lambda name, spectra: by_name.__setitem__(name, spectra))
+        backend._on_sts_marker_clicked(0)
+        # Only the Mixed window opens (no Forward/Backward in the old schema).
+        assert set(by_name) == {"STS points · Mixed"}
+        assert by_name["STS points · Mixed"][0]['y'] == [1e-8, 2e-8, 3e-8]
+        # Metadata reads the legacy spectrum too.
+        info = backend.getMapSpectraInfo()
+        assert info['sts_point_count'] == 1
+        assert info['bias_points'] == 3
+        assert info['sweeps'] == ['Mixed']
+
+    def test_loc_avg_spectra_prefers_new_over_legacy(self, backend):
+        loc = {'avg_spectra': {'V': [0], 'Mixed': [9]},
+               'avg_spectrum': {'V': [0], 'y': [1]}}
+        assert backend._loc_avg_spectra(loc)['Mixed'] == [9]
+        assert backend._loc_avg_spectra({}) is None
