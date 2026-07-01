@@ -227,6 +227,30 @@ class TestPeakFinding(TestToolImplementationsSetup):
         assert result is not None
         # Should not error, just return empty or minimal results
 
+    def test_find_peaks_promotes_table_to_dataset(self, tool_impl,
+                                                  sample_spectral_data_with_peaks):
+        """Peaks are registered as a SpectralData dataset (browser + workflow)."""
+        tool_impl._datasets['test'] = sample_spectral_data_with_peaks
+        result = tool_impl.find_peaks(MockTask(), 'test', prominence=0.1,
+                                      min_distance=5, fwhm_multiplier=1.5)
+        # peaks_path stays a string (never a dict) so getOutputList can't choke.
+        assert isinstance(result['peaks_path'], str)
+        assert result['dataset'] is not None
+        assert result['dataset_name'] in tool_impl._datasets
+        from src.models.spectral_data import SpectralData
+        assert isinstance(result['dataset'], SpectralData)
+        # No 'original' key → the peak table isn't overlaid on the source graph.
+        assert 'original' not in result['dataset'].metadata.additional_info
+        tool_impl.dataLoaded.emit.assert_called_with(result['dataset_name'])
+
+    def test_find_peaks_no_peaks_no_dataset(self, tool_impl, sample_spectral_data):
+        """No peaks → no dataset object, empty name (safe for the workflow)."""
+        tool_impl._datasets['test'] = sample_spectral_data
+        result = tool_impl.find_peaks(MockTask(), 'test', prominence=100.0,
+                                      min_distance=5, fwhm_multiplier=1.5)
+        assert result['dataset'] is None
+        assert result['dataset_name'] == ""
+
 
 class TestDataManipulation(TestToolImplementationsSetup):
     """Tests for equation-based data manipulation."""

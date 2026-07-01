@@ -122,6 +122,11 @@ class ToolImplementations:
             spectral_data = self._datasets[dataset_name]
             logger.info(f"Smoothing {dataset_name} with {smoothing_type}, window={window_size}")
 
+            # Workflow/QML node params may arrive as floats (e.g. 11.0, 4.0);
+            # scipy.savgol_filter requires plain ints.
+            window_size = int(window_size)
+            poly_order = int(poly_order)
+
             # Ensure window size is odd
             if window_size % 2 == 0:
                 window_size += 1
@@ -185,6 +190,63 @@ class ToolImplementations:
         except Exception as e:
             logger.error(f"Smoothing error: {e}", exc_info=True)
             self.errorOccurred.emit("Smoothing Error", str(e))
+            return ""
+
+    # ========================================================================
+    # Average Curves
+    # ========================================================================
+
+    def average_curves(self, task, dataset_name: str) -> str:
+        """Compute the arithmetic mean of all spectra in a dataset.
+
+        Produces a single averaged spectrum as a new one-column dataset
+        suffixed ``- Average``. NaNs are ignored column-wise (``nanmean``)
+        so partial spectra still contribute. Stamps ``original`` in the
+        metadata so the result overlays onto the source's graph window.
+        """
+        try:
+            if dataset_name not in self._datasets:
+                self.errorOccurred.emit("Error", "Dataset not found")
+                return ""
+
+            spectral_data = self._datasets[dataset_name]
+            spectra = spectral_data.spectra.values
+            logger.info(f"Averaging {dataset_name}: shape={spectra.shape}")
+
+            mean_curve = np.nanmean(spectra, axis=1)
+
+            averaged_df = pd.DataFrame({'Average': mean_curve})
+            averaged_df.insert(0, spectral_data.independent_var_name,
+                               np.asarray(spectral_data.independent_var))
+
+            base_name = self._extract_clean_base_name(dataset_name)
+            convention_name = self._apply_naming_convention(dataset_name, operation="Average")
+            output_path = self._ensure_output_dir('averaged') / f"{convention_name}.csv"
+            averaged_df.to_csv(output_path, index=False)
+
+            friendly_name = f"{base_name} - Average"
+            metadata = SpectralMetadata(
+                source_type=spectral_data.metadata.source_type,
+                dimensions=spectral_data.metadata.dimensions,
+                scan_mode=spectral_data.metadata.scan_mode,
+                units=spectral_data.metadata.units.copy(),
+                additional_info={
+                    'operation': 'average',
+                    'n_averaged': int(spectra.shape[1]),
+                    'original': dataset_name,
+                }
+            )
+            averaged_spectral_data = SpectralData(averaged_df, metadata)
+            self._datasets[friendly_name] = averaged_spectral_data
+            if not self._workflow_mode:
+                self.dataLoaded.emit(friendly_name)
+
+            logger.info(f"Averaged data saved to {output_path}")
+            return str(output_path)
+
+        except Exception as e:
+            logger.error(f"Averaging error: {e}", exc_info=True)
+            self.errorOccurred.emit("Average Curves Error", str(e))
             return ""
 
     # ========================================================================
@@ -1415,9 +1477,50 @@ class ToolImplementations:
 
             logger.info(f"Peak data saved to {output_path}: {len(all_peaks)} peaks found, {len(merged_intervals)} non-overlapping intervals")
 
+            # Promote the peak table to a real dataset so it shows in the
+            # browser and can be captured by workflow dataset-output nodes.
+            # (Previously the tool only returned a dict, which also blanked the
+            # browser: it was stored as an output-file 'path' and getOutputList
+            # then called Path(dict).) position_value is the natural X axis; the
+            # remaining numeric metrics become the "spectra" columns.
+            peak_dataset = None
+            peak_dataset_name = ""
+            if not peaks_df.empty:
+                ordered = (['position_value']
+                           + [c for c in peaks_df.columns if c != 'position_value'])
+                ds_df = peaks_df[ordered].apply(pd.to_numeric, errors='coerce')
+                try:
+                    peak_meta = SpectralMetadata(
+                        source_type='peak_table',
+                        dimensions=(len(ds_df.columns) - 1, 1),
+                        scan_mode='peaks',
+                        units={'x': 'position', 'independent': 'position'},
+                        # No 'original' key on purpose: this table is not a
+                        # spectrum, so it must not be overlaid on the source's
+                        # graph window by the derived-dataset router.
+                        additional_info={
+                            'created_from': 'peak_finder',
+                            'source_dataset': dataset_name,
+                            'num_peaks': len(peaks_df),
+                            'num_intervals': len(merged_intervals),
+                            'peaks_path': str(output_path),
+                        },
+                    )
+                    peak_dataset = SpectralData(ds_df, peak_meta)
+                    base_name = self._extract_clean_base_name(dataset_name)
+                    peak_dataset_name = f"{base_name} - Peaks"
+                    self._datasets[peak_dataset_name] = peak_dataset
+                    if not self._workflow_mode:
+                        self.dataLoaded.emit(peak_dataset_name)
+                except (ValueError, TypeError) as e:
+                    logger.warning("Peak table could not be promoted to a dataset: %s", e)
+                    peak_dataset, peak_dataset_name = None, ""
+
             return {
                 'peaks_path': str(output_path),
-                'intervals': merged_intervals
+                'intervals': merged_intervals,
+                'dataset': peak_dataset,          # SpectralData (or None) for workflow capture
+                'dataset_name': peak_dataset_name,
             }
 
         except Exception as e:

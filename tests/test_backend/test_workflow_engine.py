@@ -949,3 +949,27 @@ class TestNewTools:
         params = TOOL_DEFINITIONS["ImageInput"]["parameters"]
         assert "file_path" in params
         assert params["file_path"]["type"] == "file_select"
+
+
+class TestPeakFinderDatasetOutput:
+    """PeakFinder's 'peaks' output must be capturable by a DatasetOutput node
+    (it was port_type 'table', which no output node could accept)."""
+
+    def test_peaks_output_is_dataset_port(self):
+        peaks_out = next(o for o in TOOL_DEFINITIONS["PeakFinder"]["outputs"]
+                         if o["id"] == "peaks")
+        assert peaks_out["port_type"] == "dataset"
+
+    def test_peakfinder_peaks_connects_to_dataset_output(self):
+        wf = Workflow(id="wf_pk", name="Peak WF")
+        pf = create_node_from_tool("PeakFinder", 0, 0)
+        out = create_node_from_tool("DatasetOutput", 200, 0)
+        wf.add_node(pf)
+        wf.add_node(out)
+        conn = Connection(
+            id="c1",
+            source_node_id=pf.id, source_port_id="peaks",
+            target_node_id=out.id, target_port_id="dataset",
+        )
+        assert wf.validate_connection(conn) is True
+        assert wf.add_connection(conn) is True

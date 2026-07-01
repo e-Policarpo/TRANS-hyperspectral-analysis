@@ -737,7 +737,7 @@ TOOL_DEFINITIONS = {
             {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
         ],
         "outputs": [
-            {"id": "peaks", "name": "Peaks", "port_type": "table", "description": "Peak information table (CSV)"},
+            {"id": "peaks", "name": "Peaks", "port_type": "dataset", "description": "Peak table as a dataset (connect to a Dataset output node to capture)"},
             {"id": "intervals", "name": "Peak Intervals", "port_type": "intervals", "description": "Non-overlapping intervals around peaks for integration"}
         ],
         "parameters": {

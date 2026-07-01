@@ -615,7 +615,10 @@ class WorkflowExecutor:
                     fwhm_multiplier=params.get('fwhm_multiplier', 1.5)
                 )
 
-                outputs['peaks'] = result.get('peaks_path', '')
+                # 'peaks' now carries the peak-table dataset object so it can
+                # connect to a DatasetOutput node (the old "table" path was a
+                # dead-end — no node could capture it).
+                outputs['peaks'] = result.get('dataset')
                 outputs['intervals'] = result.get('intervals', [])
 
         elif tool_name == "ImageSmoothing":

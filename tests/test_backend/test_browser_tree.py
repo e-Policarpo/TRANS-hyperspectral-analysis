@@ -121,3 +121,23 @@ def test_browser_tree_survives_save_load(tmp_path):
     loaded = pm.load_project(path)
     assert loaded is not None
     assert loaded["browser_tree"] == tree
+
+
+# --- getOutputList must never blank the browser (peak-finder regression) -----
+
+def test_get_output_list_survives_non_string_path(backend):
+    """A tool that stored a dict (or None) as an output 'path' must not make
+    getOutputList raise — that blanked the whole project browser."""
+    backend.output_files.append(
+        {'id': 'output_1', 'tool': 'Peak Finding',
+         'path': {'peaks_path': '/x/y.csv', 'intervals': []}})
+    backend.output_files.append(
+        {'id': 'output_2', 'tool': 'X', 'path': None})
+    backend.output_files.append(
+        {'id': 'output_3', 'tool': 'Smoothing', 'path': '/a/b/c.csv'})
+    out = backend.getOutputList()          # must not raise
+    assert len(out) == 3
+    assert out[2]['filename'] == 'c.csv'
+    # The bad entries degrade gracefully to empty filenames.
+    assert out[0]['filename'] == ''
+    assert out[1]['path'] == ''

@@ -1917,9 +1917,27 @@ class AppBackend(ToolImplementations, QObject):
 
     @Slot(result='QVariantList')
     def getOutputList(self):
-        """Get list of output files with metadata."""
-        return [{'id': o['id'], 'tool': o['tool'], 'path': o['path'], 'filename': Path(o['path']).name}
-                for o in self.output_files]
+        """Get list of output files with metadata.
+
+        Paths are coerced to strings defensively — a non-string ``path`` (e.g.
+        a tool that mistakenly returned a dict) must never raise here, or this
+        QML slot returns empty and the whole browser blanks.
+        """
+        out = []
+        for o in self.output_files:
+            p = o.get('path')
+            if isinstance(p, str):
+                try:
+                    fname = Path(p).name if p else ''
+                except (TypeError, ValueError):
+                    fname = ''
+            else:
+                # A non-string path is invalid (e.g. a tool returned a dict);
+                # blank it rather than let Path() raise and empty the browser.
+                p, fname = '', ''
+            out.append({'id': o.get('id', ''), 'tool': o.get('tool', ''),
+                        'path': p, 'filename': fname})
+        return out
 
     @Slot(str, result='QVariantList')
     def loadIntervalsFromFile(self, file_path: str) -> list:
@@ -5622,7 +5640,13 @@ class AppBackend(ToolImplementations, QObject):
             dataset_name=dataset_name,
             prominence=prominence,
             min_distance=min_distance,
-            on_finished=lambda path: self._on_tool_completed("Peak Finding", path)
+            # find_peaks returns a dict; hand _on_tool_completed the CSV path
+            # string (not the dict) so getOutputList doesn't choke on it. The
+            # peak-table dataset is already registered inside find_peaks.
+            on_finished=lambda result: self._on_tool_completed(
+                "Peak Finding",
+                (result or {}).get('peaks_path', '')
+                if isinstance(result, dict) else (result or ''))
         )
 
     @Slot(str, int, int)
