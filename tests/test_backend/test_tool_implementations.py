@@ -409,11 +409,15 @@ class TestBaselineCorrection(TestToolImplementationsSetup):
         name = "test - Fit Coefficients"
         assert name in tool_impl._datasets
         ds = tool_impl._datasets[name]
-        # spectrum_index is the X column; c0..c3 are the coefficient columns.
-        assert ds.independent_var_name == 'spectrum_index'
+        # Spectrum_Index is the X column; c0..c3 are the coefficient columns.
+        assert ds.independent_var_name == 'Spectrum_Index'
         assert list(ds.spectra.columns) == ['c0', 'c1', 'c2', 'c3']
         assert ds.spectra.shape[0] == 10                      # one row per spectrum
         assert np.array_equal(np.asarray(ds.independent_var), np.arange(10))
+        # Built as flat data with the source's dimensions → drops into the Map
+        # Generator (one map per coefficient).
+        assert ds.metadata.data_type == 'flat'
+        assert ds.metadata.dimensions == sample_spectral_data.metadata.dimensions
         # c0 = constant term, c3 = x^3 term (ascending power) — matches polyfit.
         x = sample_spectral_data.independent_var
         y0 = sample_spectral_data.spectra.iloc[:, 0].values

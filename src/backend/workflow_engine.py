@@ -646,7 +646,8 @@ TOOL_DEFINITIONS = {
         ],
         "outputs": [
             {"id": "corrected", "name": "Corrected", "port_type": "dataset", "description": "Baseline-corrected data"},
-            {"id": "coefficients", "name": "Coefficients", "port_type": "dataset", "description": "Fitted coefficients, one row per spectrum (connect to a Dataset output node)"}
+            {"id": "coefficients", "name": "Coefficients", "port_type": "dataset", "description": "Fitted coefficients, one row per spectrum (connect to a Dataset output node)"},
+            {"id": "coefficients_flat", "name": "Coefficients (map)", "port_type": "flat_data", "description": "Fitted coefficients as flat data — connect to a Map Generator to render a coefficient spatially (metallicity map)"}
         ],
         "parameters": {
             "fit_type": {"type": "select", "label": "Method",

@@ -996,3 +996,23 @@ class TestCurveFittingCoefficients:
             target_node_id=out.id, target_port_id="dataset",
         )
         assert wf.add_connection(conn) is True
+
+    def test_coefficients_flat_output_is_flat_data_port(self):
+        outs = {o["id"]: o for o in TOOL_DEFINITIONS["CurveFitting"]["outputs"]}
+        assert "coefficients_flat" in outs
+        assert outs["coefficients_flat"]["port_type"] == "flat_data"
+
+    def test_coefficients_flat_connects_to_map_generator(self):
+        """The coefficients (as flat data) drive the Map Generator — one map
+        per coefficient — for metallicity visualisation."""
+        wf = Workflow(id="wf_cm", name="Coeff Map WF")
+        cf = create_node_from_tool("CurveFitting", 0, 0)
+        mg = create_node_from_tool("MapGenerator", 200, 0)
+        wf.add_node(cf)
+        wf.add_node(mg)
+        conn = Connection(
+            id="c1",
+            source_node_id=cf.id, source_port_id="coefficients_flat",
+            target_node_id=mg.id, target_port_id="flat_data",
+        )
+        assert wf.add_connection(conn) is True

@@ -1090,11 +1090,13 @@ class ToolImplementations:
             params_df.to_csv(params_path, index=False)
 
             # Coefficients dataset: one row per spectrum, one column per fitted
-            # coefficient (plus a spectrum_index column). Lets the user analyse
+            # coefficient (plus a Spectrum_Index column). Lets the user analyse
             # how the polynomial coefficients vary across spectra — e.g. to
-            # infer metallicity — and export/map them. Registered as its own
-            # dataset (browser + workflow capture). No 'original' key so it is
-            # not overlaid on the source's graph window.
+            # infer metallicity — and export/map them. Built as FLAT data
+            # (data_type='flat', 'Spectrum_Index' index, the source's spatial
+            # dimensions) so it drops straight into the Map Generator: each
+            # coefficient column becomes a spatial map. No 'original' key so it
+            # is not overlaid on the source's graph window.
             coeff_dataset = None
             coeff_dataset_name = ""
             numeric_params = params_df.drop(columns=['fit_type'], errors='ignore')
@@ -1103,12 +1105,13 @@ class ToolImplementations:
                     and numeric_params.shape[1] >= 2):
                 coeff_cols = [c for c in numeric_params.columns if c != 'spectrum_index']
                 coeff_df = numeric_params[['spectrum_index'] + coeff_cols].copy()
+                coeff_df = coeff_df.rename(columns={'spectrum_index': 'Spectrum_Index'})
                 try:
                     coeff_meta = SpectralMetadata(
                         source_type='fit_coefficients',
-                        dimensions=(len(coeff_cols), 1),
-                        scan_mode='fit_coeffs',
-                        units={'x': 'spectrum_index', 'independent': 'spectrum_index'},
+                        dimensions=spectral_data.metadata.dimensions,
+                        scan_mode=spectral_data.metadata.scan_mode,
+                        units={'independent': 'Index', 'dependent': 'Coefficient'},
                         additional_info={
                             'created_from': 'curve_fitting',
                             'source_dataset': dataset_name,
@@ -1116,13 +1119,16 @@ class ToolImplementations:
                             'degree': degree,
                             'coefficient_columns': coeff_cols,
                         },
+                        data_type='flat',
                     )
-                    coeff_dataset = SpectralData(coeff_df, coeff_meta)
+                    coeff_dataset = SpectralData(
+                        coeff_df, coeff_meta,
+                        topography=getattr(spectral_data, 'topography', None))
                     coeff_dataset_name = f"{base_name} - Fit Coefficients"
                     self._datasets[coeff_dataset_name] = coeff_dataset
                     if not self._workflow_mode:
                         self.dataLoaded.emit(coeff_dataset_name)
-                    logger.info("Fit coefficients dataset '%s' created (%d spectra x %d coeffs)",
+                    logger.info("Fit coefficients flat dataset '%s' created (%d spectra x %d coeffs)",
                                 coeff_dataset_name, len(coeff_df), len(coeff_cols))
                 except (ValueError, TypeError) as e:
                     logger.warning("Fit coefficients could not be promoted to a dataset: %s", e)
@@ -1269,11 +1275,15 @@ class ToolImplementations:
             base_name = self._extract_clean_base_name(flat_dataset_name)
             file_safe_name = self._sanitize_filename(base_name)
 
-            # Try to get interval info if available (for integrated data), otherwise use value column name
+            # Try to get interval info if available (for integrated data),
+            # otherwise name the map by its value column (e.g. a coefficient
+            # 'c0'/'c1'), falling back to a generic index.
             intervals = spectral_data.metadata.additional_info.get('intervals', [])
             if intervals and value_index < len(intervals):
                 interval_info = intervals[value_index]
                 value_str = f"{interval_info[0]:.3f}_{interval_info[1]:.3f}"
+            elif value_col:
+                value_str = self._sanitize_filename(str(value_col))
             else:
                 value_str = f"val{value_index}"
             map_basename = f"{file_safe_name}_Map_{value_str}"

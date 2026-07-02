@@ -406,7 +406,9 @@ class WorkflowExecutor:
                     outputs['corrected'] = self.app_backend._datasets[result_name]
                 coeff_name = f"{base_name} - Fit Coefficients"
                 if coeff_name in self.app_backend._datasets:
-                    outputs['coefficients'] = self.app_backend._datasets[coeff_name]
+                    coeff_ds = self.app_backend._datasets[coeff_name]
+                    outputs['coefficients'] = coeff_ds          # -> DatasetOutput
+                    outputs['coefficients_flat'] = coeff_ds      # -> MapGenerator (flat_data)
 
         elif tool_name == "MapGenerator":
             # MapGenerator generates TIFF maps for all value columns in flat data
