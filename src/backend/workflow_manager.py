@@ -399,11 +399,14 @@ class WorkflowExecutor:
                     als_lambda=params.get('als_lambda', 1e5),
                     als_p=params.get('als_p', 0.01)
                 )
-                # Get the result dataset using friendly name pattern
+                # Get the result datasets using friendly name pattern
                 base_name = self.app_backend._extract_clean_base_name(dataset_name)
                 result_name = f"{base_name} - Baseline Corrected"
                 if result_name in self.app_backend._datasets:
                     outputs['corrected'] = self.app_backend._datasets[result_name]
+                coeff_name = f"{base_name} - Fit Coefficients"
+                if coeff_name in self.app_backend._datasets:
+                    outputs['coefficients'] = self.app_backend._datasets[coeff_name]
 
         elif tool_name == "MapGenerator":
             # MapGenerator generates TIFF maps for all value columns in flat data

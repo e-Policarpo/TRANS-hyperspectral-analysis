@@ -959,6 +959,10 @@ class ToolImplementations:
             spectral_data = self._datasets[dataset_name]
             logger.info(f"Fitting {fit_type} to {dataset_name}")
 
+            # QML / workflow params can arrive as floats (e.g. 3.0); np.polyfit
+            # and the range()/f-strings below need a plain int.
+            degree = int(degree)
+
             independent_var = spectral_data.independent_var
             spectra = spectral_data.spectra.values
 
@@ -981,10 +985,13 @@ class ToolImplementations:
                 if fit_type == 'polynomial':
                     coeffs = np.polyfit(independent_var, spectrum, degree)
                     baseline = np.polyval(coeffs, independent_var)
+                    # Label by ascending power: c0 = constant term, c1 = x^1,
+                    # ..., c{degree} = x^{degree}. np.polyfit returns coeffs
+                    # highest-power first, so c{p} = coeffs[degree - p].
                     fit_params_list.append({
                         'spectrum_index': i,
                         'fit_type': fit_type,
-                        **{f'coeff_{j}': c for j, c in enumerate(coeffs)}
+                        **{f'c{p}': float(coeffs[degree - p]) for p in range(degree + 1)}
                     })
                 elif fit_type == 'linear':
                     coeffs = np.polyfit(independent_var, spectrum, 1)
@@ -1081,6 +1088,45 @@ class ToolImplementations:
             params_df = pd.DataFrame(fit_params_list)
             params_path = self._ensure_output_dir('fitted') / f"{file_safe_name}_FitParams_{fit_type}.csv"
             params_df.to_csv(params_path, index=False)
+
+            # Coefficients dataset: one row per spectrum, one column per fitted
+            # coefficient (plus a spectrum_index column). Lets the user analyse
+            # how the polynomial coefficients vary across spectra — e.g. to
+            # infer metallicity — and export/map them. Registered as its own
+            # dataset (browser + workflow capture). No 'original' key so it is
+            # not overlaid on the source's graph window.
+            coeff_dataset = None
+            coeff_dataset_name = ""
+            numeric_params = params_df.drop(columns=['fit_type'], errors='ignore')
+            numeric_params = numeric_params.apply(pd.to_numeric, errors='coerce')
+            if ('spectrum_index' in numeric_params.columns
+                    and numeric_params.shape[1] >= 2):
+                coeff_cols = [c for c in numeric_params.columns if c != 'spectrum_index']
+                coeff_df = numeric_params[['spectrum_index'] + coeff_cols].copy()
+                try:
+                    coeff_meta = SpectralMetadata(
+                        source_type='fit_coefficients',
+                        dimensions=(len(coeff_cols), 1),
+                        scan_mode='fit_coeffs',
+                        units={'x': 'spectrum_index', 'independent': 'spectrum_index'},
+                        additional_info={
+                            'created_from': 'curve_fitting',
+                            'source_dataset': dataset_name,
+                            'fit_type': fit_type,
+                            'degree': degree,
+                            'coefficient_columns': coeff_cols,
+                        },
+                    )
+                    coeff_dataset = SpectralData(coeff_df, coeff_meta)
+                    coeff_dataset_name = f"{base_name} - Fit Coefficients"
+                    self._datasets[coeff_dataset_name] = coeff_dataset
+                    if not self._workflow_mode:
+                        self.dataLoaded.emit(coeff_dataset_name)
+                    logger.info("Fit coefficients dataset '%s' created (%d spectra x %d coeffs)",
+                                coeff_dataset_name, len(coeff_df), len(coeff_cols))
+                except (ValueError, TypeError) as e:
+                    logger.warning("Fit coefficients could not be promoted to a dataset: %s", e)
+                    coeff_dataset, coeff_dataset_name = None, ""
 
             # Save baseline diagnostics for debugging
             baseline_df = pd.DataFrame(baseline_values)

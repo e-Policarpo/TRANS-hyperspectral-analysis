@@ -397,6 +397,42 @@ class TestBaselineCorrection(TestToolImplementationsSetup):
         diag_files = list(fitted_dir.glob("*BaselineDiagnostics*.csv"))
         assert len(diag_files) >= 1
 
+    def test_fit_curves_polynomial_creates_coefficients_dataset(
+            self, tool_impl, sample_spectral_data):
+        """Polynomial fit registers a coefficients dataset: one row per
+        spectrum, a spectrum_index column, then one column per coefficient."""
+        tool_impl._datasets['test'] = sample_spectral_data
+        tool_impl._workflow_mode = False
+
+        tool_impl.fit_curves(MockTask(), 'test', fit_type='polynomial', degree=3)
+
+        name = "test - Fit Coefficients"
+        assert name in tool_impl._datasets
+        ds = tool_impl._datasets[name]
+        # spectrum_index is the X column; c0..c3 are the coefficient columns.
+        assert ds.independent_var_name == 'spectrum_index'
+        assert list(ds.spectra.columns) == ['c0', 'c1', 'c2', 'c3']
+        assert ds.spectra.shape[0] == 10                      # one row per spectrum
+        assert np.array_equal(np.asarray(ds.independent_var), np.arange(10))
+        # c0 = constant term, c3 = x^3 term (ascending power) — matches polyfit.
+        x = sample_spectral_data.independent_var
+        y0 = sample_spectral_data.spectra.iloc[:, 0].values
+        expected = np.polyfit(x, y0, 3)   # highest power first: [a3, a2, a1, a0]
+        assert ds.spectra['c0'].iloc[0] == pytest.approx(expected[3])
+        assert ds.spectra['c3'].iloc[0] == pytest.approx(expected[0])
+        # Not stamped 'original' → won't be overlaid on the source graph.
+        assert 'original' not in ds.metadata.additional_info
+
+    def test_fit_curves_float_degree_is_accepted(self, tool_impl, sample_spectral_data):
+        """degree may arrive as a float from QML/workflow — must not crash."""
+        tool_impl._datasets['test'] = sample_spectral_data
+        tool_impl._workflow_mode = False
+        result = tool_impl.fit_curves(MockTask(), 'test',
+                                      fit_type='polynomial', degree=2.0)
+        assert result != ""
+        ds = tool_impl._datasets["test - Fit Coefficients"]
+        assert list(ds.spectra.columns) == ['c0', 'c1', 'c2']
+
     def test_fit_curves_diagnostics_per_spectrum(self, tool_impl, sample_spectral_data):
         """TI-42: Diagnostics contain per-spectrum baseline statistics."""
         tool_impl._datasets['test'] = sample_spectral_data

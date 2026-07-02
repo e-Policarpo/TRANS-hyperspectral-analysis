@@ -973,3 +973,26 @@ class TestPeakFinderDatasetOutput:
         )
         assert wf.validate_connection(conn) is True
         assert wf.add_connection(conn) is True
+
+
+class TestCurveFittingCoefficients:
+    """CurveFitting exposes a 'coefficients' dataset output (row per spectrum)
+    that a DatasetOutput node can capture — for polynomial-coefficient analysis."""
+
+    def test_coefficients_output_is_dataset_port(self):
+        outs = {o["id"]: o for o in TOOL_DEFINITIONS["CurveFitting"]["outputs"]}
+        assert "coefficients" in outs
+        assert outs["coefficients"]["port_type"] == "dataset"
+
+    def test_coefficients_connects_to_dataset_output(self):
+        wf = Workflow(id="wf_cf", name="Fit WF")
+        cf = create_node_from_tool("CurveFitting", 0, 0)
+        out = create_node_from_tool("DatasetOutput", 200, 0)
+        wf.add_node(cf)
+        wf.add_node(out)
+        conn = Connection(
+            id="c1",
+            source_node_id=cf.id, source_port_id="coefficients",
+            target_node_id=out.id, target_port_id="dataset",
+        )
+        assert wf.add_connection(conn) is True

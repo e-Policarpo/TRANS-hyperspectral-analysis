@@ -645,7 +645,8 @@ TOOL_DEFINITIONS = {
             {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
         ],
         "outputs": [
-            {"id": "corrected", "name": "Corrected", "port_type": "dataset", "description": "Baseline-corrected data"}
+            {"id": "corrected", "name": "Corrected", "port_type": "dataset", "description": "Baseline-corrected data"},
+            {"id": "coefficients", "name": "Coefficients", "port_type": "dataset", "description": "Fitted coefficients, one row per spectrum (connect to a Dataset output node)"}
         ],
         "parameters": {
             "fit_type": {"type": "select", "label": "Method",
