@@ -279,9 +279,15 @@ Dialog {
                 }
 
                 ScrollView {
+                    id: selectionScroll
                     Layout.fillWidth: true
                     Layout.fillHeight: true
+                    Layout.minimumWidth: 0
                     clip: true
+                    // Vertical only: without this the TextArea keeps its full
+                    // unwrapped width and a long path scrolls sideways out of
+                    // the box instead of wrapping.
+                    ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
                     TextArea {
                         id: selectionInfo
@@ -291,6 +297,11 @@ Dialog {
                         color: textMuted
                         wrapMode: Text.Wrap
                         selectByMouse: true
+                        // A TextArea inside a ScrollView is sized by its own
+                        // content, so a long path (deep folders, spaces in
+                        // names) overflows the box. Pin it to the available
+                        // width so wrapMode actually takes effect.
+                        width: selectionScroll.availableWidth
 
                         background: Rectangle {
                             color: "transparent"
@@ -304,6 +315,15 @@ Dialog {
                     font.pixelSize: 11
                     color: accentPink
                     visible: text !== ""
+                    // A long single-line Label inflates the layout's implicit
+                    // width past the dialog's fixed 600px, so the text spills
+                    // out of the "Selected:" box. preferredWidth 0 stops the
+                    // text from driving the layout; fillWidth then hands it the
+                    // available width and it wraps inside the box.
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: 0
+                    Layout.minimumWidth: 0
+                    wrapMode: Text.WordWrap
                 }
             }
         }
@@ -313,6 +333,8 @@ Dialog {
             font.pixelSize: 10
             color: textMuted
             Layout.fillWidth: true
+            Layout.preferredWidth: 0
+            Layout.minimumWidth: 0
             wrapMode: Text.WordWrap
         }
     }

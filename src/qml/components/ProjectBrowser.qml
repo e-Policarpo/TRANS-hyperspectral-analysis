@@ -301,7 +301,7 @@ Rectangle {
                                   : browserRoot.getDefaultIcon(rowItem.isFolder ? "folder" : model.type)
                             font.pixelSize: 12
                             font.bold: rowItem.isFolder
-                            color: "#e0e0e0"
+                            color: textLight
                             renderType: Text.NativeRendering
                         }
 
@@ -322,7 +322,7 @@ Rectangle {
                                 text: model.name || ""
                                 font.pixelSize: 12
                                 font.bold: rowItem.isFolder
-                                color: "#e0e0e0"
+                                color: textLight
                                 renderType: Text.NativeRendering
                                 width: nameClip.scrolling ? implicitWidth : nameClip.width
                                 elide: nameClip.scrolling ? Text.ElideNone : Text.ElideRight
@@ -346,7 +346,7 @@ Rectangle {
                         Text {
                             text: rowItem.isFolder ? "" : (model.displayType || "")
                             font.pixelSize: 10
-                            color: "#999999"
+                            color: textMuted
                             renderType: Text.NativeRendering
                             visible: !rowItem.isFolder
                         }
