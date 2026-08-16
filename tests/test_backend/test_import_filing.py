@@ -196,3 +196,54 @@ class TestFilingConvention:
             {"datasets": {"a": _dataset(source_file="/d/run.wip")},
              "active_dataset": "a"})
         assert _paths(backend)["dataset:a"] == "My Analysis"
+
+
+class TestDatasetCount:
+    """The status bar reports how much is loaded, so the count must follow
+    every path that mutates the registry — not just imports. It is backed by
+    an observable dict precisely because there are ~24 such call sites and
+    hand-emitting at each would miss one."""
+
+    def test_starts_at_zero(self, backend):
+        assert backend.datasetCount == 0
+
+    def test_counts_imports(self, backend):
+        backend._on_file_loaded({
+            "datasets": {"a": _dataset(), "b": _dataset()},
+            "active_dataset": "a"})
+        assert backend.datasetCount == 2
+
+    def test_emits_once_for_a_bulk_import(self, backend):
+        seen = []
+        backend.datasetCountChanged.connect(seen.append)
+        backend._on_file_loaded({
+            "datasets": {"a": _dataset(), "b": _dataset(), "c": _dataset()},
+            "active_dataset": "a"})
+        assert seen == [3]
+
+    def test_overwriting_a_name_does_not_change_the_count(self, backend):
+        backend._datasets["a"] = _dataset()
+        seen = []
+        backend.datasetCountChanged.connect(seen.append)
+        backend._datasets["a"] = _dataset()
+        assert backend.datasetCount == 1 and seen == []
+
+    def test_tracks_deletion_and_clear(self, backend):
+        backend._datasets.update({"a": _dataset(), "b": _dataset()})
+        del backend._datasets["a"]
+        assert backend.datasetCount == 1
+        backend._datasets.clear()
+        assert backend.datasetCount == 0
+
+    def test_rename_keeps_the_count(self, backend):
+        backend._datasets["a"] = _dataset()
+        backend._datasets["b"] = backend._datasets.pop("a")
+        assert backend.datasetCount == 1
+
+    def test_signal_carries_the_new_count(self, backend):
+        seen = []
+        backend.datasetCountChanged.connect(seen.append)
+        backend._datasets["a"] = _dataset()
+        backend._datasets["b"] = _dataset()
+        del backend._datasets["a"]
+        assert seen == [1, 2, 1]

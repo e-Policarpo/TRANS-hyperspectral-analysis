@@ -89,6 +89,71 @@ from src.backend.autosave_manager import AutosaveManager
 logger = logging.getLogger(__name__)
 
 
+class _ObservableDict(dict):
+    """A dict that calls ``on_change()`` whenever its contents change.
+
+    Used for the dataset registry so a QML-facing count stays correct without
+    every mutation site having to remember to emit a signal. Bulk operations
+    (``update``, ``clear``) notify once, not per key.
+    """
+
+    __slots__ = ("_on_change",)
+
+    def __init__(self, on_change, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._on_change = on_change
+
+    def _changed(self) -> None:
+        try:
+            self._on_change()
+        except RuntimeError:
+            # The owning QObject can be torn down before the dict during
+            # interpreter shutdown; a stale notification is not worth raising.
+            pass
+
+    def __setitem__(self, key, value):
+        existed = key in self
+        super().__setitem__(key, value)
+        if not existed:
+            self._changed()
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+        self._changed()
+
+    def update(self, *args, **kwargs):
+        before = len(self)
+        super().update(*args, **kwargs)
+        if len(self) != before:
+            self._changed()
+
+    def pop(self, *args, **kwargs):
+        before = len(self)
+        out = super().pop(*args, **kwargs)
+        if len(self) != before:
+            self._changed()
+        return out
+
+    def popitem(self):
+        out = super().popitem()
+        self._changed()
+        return out
+
+    def setdefault(self, key, default=None):
+        existed = key in self
+        out = super().setdefault(key, default)
+        if not existed:
+            self._changed()
+        return out
+
+    def clear(self):
+        if self:
+            super().clear()
+            self._changed()
+        else:
+            super().clear()
+
+
 class AppBackend(ToolImplementations, QObject):
     """
     Main application backend that bridges QML UI to Python logic.
@@ -117,6 +182,7 @@ class AppBackend(ToolImplementations, QObject):
     datasetDeleted = Signal(str)  # dataset_name - emitted when a dataset is deleted
     datasetRenamed = Signal(str, str)  # old_name, new_name - emitted when a dataset is renamed
     activeDatasetChanged = Signal(str)  # active dataset name changed
+    datasetCountChanged = Signal(int)  # number of loaded datasets changed
     projectPathChanged = Signal(str)  # project path changed
     namingConventionChanged = Signal(str)  # naming convention pattern changed
     loadMapInEditor = Signal(str)  # map_path - request to load map in the map editor (file-based path)
@@ -162,7 +228,13 @@ class AppBackend(ToolImplementations, QObject):
         self._current_file_index = 1  # Current index counter for this session
 
         # Data storage
-        self._datasets: Dict[str, SpectralData] = {}
+        # Observable so ``datasetCount`` can never go stale: the dict is
+        # mutated from ~24 places (imports, tool outputs, undo, rename,
+        # project load/close) and hand-emitting a signal at each of them would
+        # reliably miss one. Hooking the container instead makes that
+        # impossible.
+        self._datasets: Dict[str, SpectralData] = _ObservableDict(
+            lambda: self.datasetCountChanged.emit(len(self._datasets)))
         self._active_dataset: Optional[str] = None
         self._workflow_mode: bool = False  # When True, suppress dataLoaded emission for intermediate results
         # Dataset keys known before the current tool run — diffed in
@@ -496,6 +568,16 @@ class AppBackend(ToolImplementations, QObject):
     @Property(str, notify=activeDatasetChanged)
     def activeDataset(self):
         return self._active_dataset or ""
+
+    @Property(int, notify=datasetCountChanged)
+    def datasetCount(self) -> int:
+        """How many datasets are currently loaded.
+
+        Backed by an observable dict (see :class:`_ObservableDict`), so this
+        tracks imports, tool outputs, deletions, renames and project
+        load/close without each of those paths emitting anything itself.
+        """
+        return len(self._datasets)
 
     @Property(QObject, constant=True)
     def dockManager(self):

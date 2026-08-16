@@ -1387,9 +1387,23 @@ ApplicationWindow {
 
                 Text {
                     id: datasetText
-                    text: backend.activeDataset ? "Dataset: " + backend.activeDataset : "No data loaded"
-                    color: backend.activeDataset ? accentBlue : textMuted
+                    // Reports how much is loaded, not just which dataset is
+                    // active — it previously read "No data loaded" whenever
+                    // nothing happened to be selected, even with a full
+                    // project open. datasetCount is backed by an observable
+                    // dict, so it follows imports, tool outputs and deletions.
+                    readonly property int loadedCount: backend ? backend.datasetCount : 0
+                    text: {
+                        if (loadedCount === 0) return "No data loaded"
+                        var n = loadedCount + (loadedCount === 1 ? " dataset" : " datasets")
+                        return backend.activeDataset
+                               ? backend.activeDataset + "  ·  " + n + " loaded"
+                               : n + " loaded"
+                    }
+                    color: loadedCount > 0 ? accentBlue : textMuted
                     font.pixelSize: 12
+                    elide: Text.ElideMiddle
+                    Layout.maximumWidth: 380
                 }
             }
         }
