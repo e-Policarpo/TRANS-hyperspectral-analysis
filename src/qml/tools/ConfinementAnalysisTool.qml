@@ -41,15 +41,17 @@ Item {
     property color accentPurple: themeColor("accentPurple", "#9B4F96")
     property color textLight: themeColor("textLight", "#ffffff")
     property color textMuted: themeColor("textMuted", "#cccccc")
+    property color accentMagenta: themeColor("accentMagenta", "#D60270")
+    property color borderColor: themeColor("borderColor", "#9B4F96")
 
     // The native style paints GroupBox and the editable controls light, which
     // is unreadable against this palette's text. Style them here rather than
     // relying on whatever the host provides.
     component Section: GroupBox {
         id: sectionRoot
-        property color sectionBg: "#2a2a3e"
-        property color sectionBorder: "#3a3a4e"
-        property color sectionTitle: "#F5A9B8"
+        property color sectionBg: root.bgMedium
+        property color sectionBorder: root.bgLight
+        property color sectionTitle: root.accentPink
         Layout.fillWidth: true
         topPadding: 28
         background: Rectangle {
@@ -77,8 +79,8 @@ Item {
             rightPadding: 26
             text: parent.textFromValue(parent.value, parent.locale)
             font: parent.font
-            color: parent.enabled ? "#ffffff" : "#888888"
-            selectionColor: "#5BCEFA"
+            color: parent.enabled ? root.textLight : root.textMuted
+            selectionColor: root.accentBlue
             horizontalAlignment: Qt.AlignHCenter
             verticalAlignment: Qt.AlignVCenter
             readOnly: !parent.editable
@@ -87,8 +89,8 @@ Item {
         }
         background: Rectangle {
             implicitWidth: 132
-            color: "#1a1a2e"
-            border.color: parent.activeFocus ? "#5BCEFA" : "#3a3a4e"
+            color: root.bgDark
+            border.color: parent.activeFocus ? root.accentBlue : root.bgLight
             border.width: 1
             radius: 4
         }
@@ -96,12 +98,12 @@ Item {
             x: parent.width - width
             height: parent.height
             implicitWidth: 24
-            color: parent.up.pressed ? "#3a3a4e" : "#2a2a3e"
-            border.color: "#3a3a4e"
+            color: parent.up.pressed ? root.bgLight : root.bgMedium
+            border.color: root.bgLight
             radius: 4
             Text {
                 text: "+"
-                color: parent.parent.enabled ? "#ffffff" : "#777777"
+                color: parent.parent.enabled ? root.textLight : root.textMuted
                 anchors.centerIn: parent
                 font.pixelSize: 15
             }
@@ -109,12 +111,12 @@ Item {
         down.indicator: Rectangle {
             height: parent.height
             implicitWidth: 24
-            color: parent.down.pressed ? "#3a3a4e" : "#2a2a3e"
-            border.color: "#3a3a4e"
+            color: parent.down.pressed ? root.bgLight : root.bgMedium
+            border.color: root.bgLight
             radius: 4
             Text {
                 text: "\u2212"
-                color: parent.parent.enabled ? "#ffffff" : "#777777"
+                color: parent.parent.enabled ? root.textLight : root.textMuted
                 anchors.centerIn: parent
                 font.pixelSize: 15
             }
@@ -128,14 +130,14 @@ Item {
             rightPadding: 26
             text: comboRoot.displayText
             font: comboRoot.font
-            color: comboRoot.enabled ? "#ffffff" : "#888888"
+            color: comboRoot.enabled ? root.textLight : root.textMuted
             verticalAlignment: Text.AlignVCenter
             elide: Text.ElideRight
         }
         background: Rectangle {
             implicitHeight: 30
-            color: "#1a1a2e"
-            border.color: comboRoot.activeFocus ? "#5BCEFA" : "#3a3a4e"
+            color: root.bgDark
+            border.color: comboRoot.activeFocus ? root.accentBlue : root.bgLight
             border.width: 1
             radius: 4
         }
@@ -143,12 +145,12 @@ Item {
             width: comboRoot.width
             contentItem: Text {
                 text: modelData
-                color: "#ffffff"
+                color: root.textLight
                 verticalAlignment: Text.AlignVCenter
             }
             highlighted: comboRoot.highlightedIndex === index
             background: Rectangle {
-                color: highlighted ? "#3a3a4e" : "#2a2a3e"
+                color: highlighted ? root.bgLight : root.bgMedium
             }
         }
         popup: Popup {
@@ -163,8 +165,8 @@ Item {
                 ScrollIndicator.vertical: ScrollIndicator { }
             }
             background: Rectangle {
-                color: "#2a2a3e"
-                border.color: "#9B4F96"
+                color: root.bgMedium
+                border.color: root.accentPurple
                 border.width: 1
                 radius: 4
             }
@@ -175,7 +177,7 @@ Item {
         id: checkRoot
         contentItem: Text {
             text: checkRoot.text
-            color: "#ffffff"
+            color: root.textLight
             leftPadding: checkRoot.indicator.width + 6
             verticalAlignment: Text.AlignVCenter
         }
@@ -259,15 +261,15 @@ Item {
 
         var corrected = (backgroundCombo.currentText !== "none")
         if (corrected) {
-            previewCanvas.addCurve("raw", r.x, r.raw, "#7f7f7f", 1.0)
-            previewCanvas.addCurve("background", r.x, r.baseline, "#5BCEFA", 1.0)
+            previewCanvas.addCurve("raw", r.x, r.raw, String(root.textMuted), 1.0)
+            previewCanvas.addCurve("background", r.x, r.baseline, String(root.accentBlue), 1.0)
         }
         previewCanvas.addCurve(r.name || "corrected", r.x,
-                               corrected ? r.corrected : r.raw, "#ffffff", 1.5)
+                               corrected ? r.corrected : r.raw, root.textLight, 1.5)
 
         for (var i = 0; i < r.peakX.length; i++) {
             previewCanvas.addFixedInfiniteLine(
-                "pk" + i, "vertical", r.peakX[i], "#F5A9B8", "")
+                "pk" + i, "vertical", r.peakX[i], root.accentPink, "")
         }
 
         statusLabel.text = r.count + (r.count === 1 ? " peak" : " peaks") +
@@ -756,7 +758,7 @@ Item {
                     onClicked: runAnalysis()
                     contentItem: Text {
                         text: runButton.text
-                        color: runButton.enabled ? "#1a1a2e" : "#777777"
+                        color: runButton.enabled ? root.bgDark : root.textMuted
                         font.bold: true
                         horizontalAlignment: Text.AlignHCenter
                         verticalAlignment: Text.AlignVCenter
@@ -765,9 +767,9 @@ Item {
                         implicitWidth: 160
                         implicitHeight: 34
                         radius: 4
-                        color: !runButton.enabled ? "#2a2a3e"
-                             : runButton.pressed ? "#D60270" : accentPink
-                        border.color: runButton.enabled ? accentPink : "#3a3a4e"
+                        color: !runButton.enabled ? root.bgMedium
+                             : runButton.pressed ? root.accentMagenta : accentPink
+                        border.color: runButton.enabled ? accentPink : root.bgLight
                         border.width: 1
                     }
                 }

@@ -40,6 +40,8 @@ Item {
     property color accentPurple: themeColor("accentPurple", "#9B4F96")
     property color textLight: themeColor("textLight", "#ffffff")
     property color textMuted: themeColor("textMuted", "#cccccc")
+    property color accentMagenta: themeColor("accentMagenta", "#D60270")
+    property color borderColor: themeColor("borderColor", "#9B4F96")
 
     property int spectrumCount: 0
     property bool running: false
@@ -55,14 +57,14 @@ Item {
             y: sectionRoot.topPadding - 24
             width: parent.width
             height: parent.height - sectionRoot.topPadding + 24
-            color: "#2a2a3e"
-            border.color: "#3a3a4e"
+            color: root.bgMedium
+            border.color: root.bgLight
             border.width: 1
             radius: 4
         }
         label: Text {
             text: sectionRoot.title
-            color: "#F5A9B8"
+            color: root.accentPink
             font.bold: true
             font.pixelSize: 12
             padding: 4
@@ -75,22 +77,22 @@ Item {
             leftPadding: 8; rightPadding: 26
             text: comboRoot.displayText
             font: comboRoot.font
-            color: comboRoot.enabled ? "#ffffff" : "#888888"
+            color: comboRoot.enabled ? root.textLight : root.textMuted
             verticalAlignment: Text.AlignVCenter
             elide: Text.ElideRight
         }
         background: Rectangle {
             implicitHeight: 30
-            color: "#1a1a2e"
-            border.color: comboRoot.activeFocus ? "#5BCEFA" : "#3a3a4e"
+            color: root.bgDark
+            border.color: comboRoot.activeFocus ? root.accentBlue : root.bgLight
             border.width: 1
             radius: 4
         }
         delegate: ItemDelegate {
             width: comboRoot.width
-            contentItem: Text { text: modelData; color: "#ffffff"; verticalAlignment: Text.AlignVCenter }
+            contentItem: Text { text: modelData; color: root.textLight; verticalAlignment: Text.AlignVCenter }
             highlighted: comboRoot.highlightedIndex === index
-            background: Rectangle { color: highlighted ? "#3a3a4e" : "#2a2a3e" }
+            background: Rectangle { color: highlighted ? root.bgLight : root.bgMedium }
         }
         popup: Popup {
             y: comboRoot.height
@@ -104,7 +106,7 @@ Item {
                 ScrollIndicator.vertical: ScrollIndicator { }
             }
             background: Rectangle {
-                color: "#2a2a3e"; border.color: "#9B4F96"; border.width: 1; radius: 4
+                color: root.bgMedium; border.color: root.accentPurple; border.width: 1; radius: 4
             }
         }
     }
@@ -115,8 +117,8 @@ Item {
             leftPadding: 26; rightPadding: 26
             text: parent.textFromValue(parent.value, parent.locale)
             font: parent.font
-            color: parent.enabled ? "#ffffff" : "#888888"
-            selectionColor: "#5BCEFA"
+            color: parent.enabled ? root.textLight : root.textMuted
+            selectionColor: root.accentBlue
             horizontalAlignment: Qt.AlignHCenter
             verticalAlignment: Qt.AlignVCenter
             readOnly: !parent.editable
@@ -125,23 +127,23 @@ Item {
         }
         background: Rectangle {
             implicitWidth: 132
-            color: "#1a1a2e"
-            border.color: parent.activeFocus ? "#5BCEFA" : "#3a3a4e"
+            color: root.bgDark
+            border.color: parent.activeFocus ? root.accentBlue : root.bgLight
             border.width: 1
             radius: 4
         }
         up.indicator: Rectangle {
             x: parent.width - width; height: parent.height; implicitWidth: 24
-            color: parent.up.pressed ? "#3a3a4e" : "#2a2a3e"
-            border.color: "#3a3a4e"; radius: 4
-            Text { text: "+"; color: parent.parent.enabled ? "#ffffff" : "#777777"
+            color: parent.up.pressed ? root.bgLight : root.bgMedium
+            border.color: root.bgLight; radius: 4
+            Text { text: "+"; color: parent.parent.enabled ? root.textLight : root.textMuted
                    anchors.centerIn: parent; font.pixelSize: 15 }
         }
         down.indicator: Rectangle {
             height: parent.height; implicitWidth: 24
-            color: parent.down.pressed ? "#3a3a4e" : "#2a2a3e"
-            border.color: "#3a3a4e"; radius: 4
-            Text { text: "−"; color: parent.parent.enabled ? "#ffffff" : "#777777"
+            color: parent.down.pressed ? root.bgLight : root.bgMedium
+            border.color: root.bgLight; radius: 4
+            Text { text: "−"; color: parent.parent.enabled ? root.textLight : root.textMuted
                    anchors.centerIn: parent; font.pixelSize: 15 }
         }
     }
@@ -186,13 +188,13 @@ Item {
             return
         }
 
-        previewCanvas.addCurve(r.name || "spectrum", r.x, r.y, "#ffffff", 1.4)
+        previewCanvas.addCurve(r.name || "spectrum", r.x, r.y, String(root.textLight), 1.4)
         // The gap edges bound every other feature, so they are what to check.
-        previewCanvas.addFixedInfiniteLine("gapL", "vertical", r.gapLeft, "#5BCEFA", "")
-        previewCanvas.addFixedInfiniteLine("gapR", "vertical", r.gapRight, "#5BCEFA", "")
+        previewCanvas.addFixedInfiniteLine("gapL", "vertical", r.gapLeft, String(root.accentBlue), "")
+        previewCanvas.addFixedInfiniteLine("gapR", "vertical", r.gapRight, String(root.accentBlue), "")
         for (var i = 0; i < r.stateX.length; i++) {
             previewCanvas.addFixedInfiniteLine("st" + i, "vertical", r.stateX[i],
-                                               "#F5A9B8", "")
+                                               root.accentPink, "")
         }
 
         for (var k = 0; k < r.names.length; k++) {
@@ -553,7 +555,7 @@ Item {
                     onClicked: runExtraction()
                     contentItem: Text {
                         text: runButton.text
-                        color: runButton.enabled ? "#1a1a2e" : "#777777"
+                        color: runButton.enabled ? root.bgDark : root.textMuted
                         font.bold: true
                         horizontalAlignment: Text.AlignHCenter
                         verticalAlignment: Text.AlignVCenter
@@ -562,9 +564,9 @@ Item {
                         implicitWidth: 160
                         implicitHeight: 34
                         radius: 4
-                        color: !runButton.enabled ? "#2a2a3e"
-                             : runButton.pressed ? "#D60270" : accentPink
-                        border.color: runButton.enabled ? accentPink : "#3a3a4e"
+                        color: !runButton.enabled ? root.bgMedium
+                             : runButton.pressed ? root.accentMagenta : accentPink
+                        border.color: runButton.enabled ? accentPink : root.bgLight
                         border.width: 1
                     }
                 }
