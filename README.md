@@ -141,9 +141,14 @@ TRANS_QML/
 │       ├── dialogs/             # Modal dialogs
 │       ├── workflow/            # Node-based workflow editor
 │       └── map_editor/          # Map Editor workstation
-├── tests/                       # Test suite (pytest, 800+ tests)
+├── tests/                       # Test suite (pytest, 1900+ tests)
 ├── docs/                        # Documentation
+├── tools/                       # Standalone CLI utilities (qtipeaks, …)
 ├── workflows/                   # Saved workflow templates
+├── assets/                      # Icons, logos and other static images
+├── archive/                     # Superseded versions & backups (gitignored)
+├── main.py, run.py              # Launchers → src/main.py
+├── run_tests.py, test.sh        # Test runners
 └── requirements.txt
 ```
 

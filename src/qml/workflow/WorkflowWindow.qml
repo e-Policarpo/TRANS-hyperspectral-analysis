@@ -181,6 +181,12 @@ Window {
     // Signal emitted when a parameter changes (for live updates)
     signal nodeParameterChanged(string nodeId, string paramName, var value)
 
+    // Bumped on every parameter change so node delegates re-evaluate their
+    // param-dependent bindings WITHOUT resetting the Repeater model.
+    // (Resetting the model destroyed all node delegates mid-interaction,
+    // which killed the active drag — comment/text nodes became unmovable.)
+    property int nodeParamsVersion: 0
+
     width: 1200
     height: 800
     minimumWidth: 800
@@ -232,19 +238,17 @@ Window {
         property int retryCount: 0
     }
 
-    // Handler for parameter changes - update node data and refresh display
+    // Handler for parameter changes - update node data in place and bump the
+    // version counter so delegates refresh. Never reset nodeRepeater.model
+    // here: that recreates every delegate and cancels any in-progress drag.
     onNodeParameterChanged: function(nodeId, paramName, value) {
-        // Update the node in our local nodes array
         for (var i = 0; i < nodes.length; i++) {
             if (nodes[i].id === nodeId) {
                 if (!nodes[i].parameters) {
                     nodes[i].parameters = {}
                 }
                 nodes[i].parameters[paramName] = value
-                // Force repeater to refresh by reassigning model
-                var updatedNodes = nodes.slice()
-                nodes = updatedNodes
-                nodeRepeater.model = nodes
+                nodeParamsVersion++
                 break
             }
         }

@@ -37,6 +37,11 @@ Rectangle {
     // Version counter from workflowWindow triggers re-evaluation when theme changes
     property int portColorVersion: workflowWindow ? workflowWindow.portColorVersion : 0
 
+    // Bumped by WorkflowWindow whenever any node parameter changes; bindings
+    // that read nodeData.parameters reference this so they re-evaluate
+    // (nodeData itself is mutated in place and emits no change signal)
+    property int paramsVersion: workflowWindow ? workflowWindow.nodeParamsVersion : 0
+
     signal nodeSelected()
     signal nodeMoved(string nodeId, real newX, real newY)
     signal nodePositionChanged(string nodeId, real newX, real newY)  // Emitted during drag
@@ -45,13 +50,13 @@ Rectangle {
 
     x: nodeDataValid && nodeData.x !== undefined ? nodeData.x : 0
     y: nodeDataValid && nodeData.y !== undefined ? nodeData.y : 0
-    width: isCommentNode ? getCommentWidth() : 180
-    height: calculateHeight()
+    width: { var v = paramsVersion; return isCommentNode ? getCommentWidth() : 180 }
+    height: { var v = paramsVersion; return calculateHeight() }
     visible: nodeDataValid
 
-    color: isCommentNode ? getCommentBgColor() : bgMedium
-    opacity: isCommentNode ? getCommentOpacity() : 1.0
-    border.color: isSelected ? accentPink : (isCommentNode ? Qt.darker(getCommentBgColor(), 1.2) : borderColor)
+    color: { var v = paramsVersion; return isCommentNode ? getCommentBgColor() : bgMedium }
+    opacity: { var v = paramsVersion; return isCommentNode ? getCommentOpacity() : 1.0 }
+    border.color: { var v = paramsVersion; return isSelected ? accentPink : (isCommentNode ? Qt.darker(getCommentBgColor(), 1.2) : borderColor) }
     border.width: isSelected ? 2 : 1
     radius: isCommentNode ? 6 : 8
     clip: false  // Allow port circles to extend outside node bounds
@@ -121,6 +126,12 @@ Rectangle {
             } else {
                 parts.push("prominence: " + prom)
             }
+        } else if (nodeData.tool_name === "ConfinementAnalysis") {
+            var bg = params.baseline || "poly-iter"
+            parts.push(bg === "none" ? "no background"
+                                     : bg + " deg " + (params.baseline_degree !== undefined
+                                                       ? params.baseline_degree : 3))
+            if (params.temperature_k > 0) parts.push(params.temperature_k + " K")
         } else if (nodeData.tool_name === "MapGenerator") {
             if (params.column_index !== undefined) {
                 parts.push("col: " + params.column_index)
@@ -398,9 +409,9 @@ Rectangle {
             anchors.fill: parent
             anchors.margins: 10
             anchors.rightMargin: 30  // Leave space for close button
-            text: nodeData.parameters ? (nodeData.parameters.text || "Enter note here...") : "Enter note here..."
-            color: getCommentTextColor()
-            font.pixelSize: getCommentFontSize()
+            text: { var v = paramsVersion; return nodeData.parameters ? (nodeData.parameters.text || "Enter note here...") : "Enter note here..." }
+            color: { var v = paramsVersion; return getCommentTextColor() }
+            font.pixelSize: { var v = paramsVersion; return getCommentFontSize() }
             wrapMode: Text.Wrap
             elide: Text.ElideRight
             verticalAlignment: Text.AlignTop
@@ -504,14 +515,20 @@ Rectangle {
 
                 onPositionChanged: function(mouse) {
                     if (pressed) {
-                        var newWidth = Math.max(100, startWidth + mouse.x - startX)
-                        var newHeight = Math.max(60, startHeight + mouse.y - startY)
-                        // Update node parameters for persistence
+                        var newWidth = Math.round(Math.max(100, startWidth + mouse.x - startX))
+                        var newHeight = Math.round(Math.max(60, startHeight + mouse.y - startY))
+                        // Persist in the backend workflow model
                         if (workflowWindow && workflowWindow.workflowManager) {
                             workflowWindow.workflowManager.setNodeParameter(
-                                workflowWindow.workflowId, nodeData.id, "node_width", Math.round(newWidth))
+                                workflowWindow.workflowId, nodeData.id, "node_width", newWidth)
                             workflowWindow.workflowManager.setNodeParameter(
-                                workflowWindow.workflowId, nodeData.id, "node_height", Math.round(newHeight))
+                                workflowWindow.workflowId, nodeData.id, "node_height", newHeight)
+                        }
+                        // Update the local node data + bump paramsVersion so the
+                        // width/height bindings re-evaluate (live resize)
+                        if (workflowWindow) {
+                            workflowWindow.nodeParameterChanged(nodeData.id, "node_width", newWidth)
+                            workflowWindow.nodeParameterChanged(nodeData.id, "node_height", newHeight)
                         }
                     }
                 }
@@ -656,7 +673,7 @@ Rectangle {
         // Parameter display (centered below ports)
         Rectangle {
             id: paramDisplay
-            visible: getDisplayParameter() !== ""
+            visible: { var v = paramsVersion; return getDisplayParameter() !== "" }
             anchors.bottom: parent.bottom
             anchors.left: parent.left
             anchors.right: parent.right
@@ -669,9 +686,9 @@ Rectangle {
                 id: paramText
                 anchors.fill: parent
                 anchors.margins: 3
-                text: getDisplayParameter()
+                text: { var v = paramsVersion; return getDisplayParameter() }
                 color: isCommentNode ? "#333333" : accentBlue
-                font.pixelSize: isCommentNode ? getCommentFontSize() : 9
+                font.pixelSize: { var v = paramsVersion; return isCommentNode ? getCommentFontSize() : 9 }
                 font.italic: !isCommentNode
                 elide: Text.ElideRight
                 wrapMode: isCommentNode ? Text.Wrap : Text.NoWrap

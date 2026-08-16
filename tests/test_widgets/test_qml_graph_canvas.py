@@ -165,6 +165,66 @@ def test_reset_view_with_no_curves_is_unit_box(app):
 
 
 # ---------------------------------------------------------------------------
+# Cosmetic pen — the curve is stroked while the data→pixel transform is active,
+# so a non-cosmetic pen has its width scaled by the transform. With small-
+# magnitude data (STM currents ~1e-6) that scale is huge and the line floods
+# the whole plot. The pen must be cosmetic so the width stays in device pixels.
+# ---------------------------------------------------------------------------
+
+def _interior_filled_fraction(canvas):
+    """Fraction of the plot interior that differs from the background after
+    one native paint. A thin line covers a few percent; a flood covers ~all."""
+    w, h = int(canvas.width()), int(canvas.height())
+    img = QImage(w, h, QImage.Format_ARGB32)
+    img.fill(canvas._NATIVE_BG_COLOR)
+    p = QPainter(img)
+    canvas._renderNative(p)
+    p.end()
+    bg = canvas._NATIVE_BG_COLOR
+    bg_rgb = (bg.red(), bg.green(), bg.blue())
+    filled = total = 0
+    for y in range(int(h * 0.2), int(h * 0.8), 4):
+        for x in range(int(w * 0.25), int(w * 0.9), 4):
+            px = img.pixel(x, y)
+            rgb = ((px >> 16) & 255, (px >> 8) & 255, px & 255)
+            total += 1
+            if sum(abs(a - b) for a, b in zip(rgb, bg_rgb)) > 60:
+                filled += 1
+    return filled / total
+
+
+def test_small_magnitude_curve_does_not_flood_plot(app):
+    """Regression: an STM-scale curve (y ~ 1e-6) must render as a thin line,
+    not a solid block. Guards the cosmetic-pen fix."""
+    c = _sized_canvas(app)
+    xs = np.linspace(-0.4, 0.4, 580)
+    ys = np.tanh(np.linspace(-3, 3, 580)) * 3e-6
+    c.addCurve("Point_4", list(xs), list(ys))
+    c.resetView()
+    assert _interior_filled_fraction(c) < 0.25
+
+
+def test_curve_pen_is_cosmetic_when_drawn(app):
+    """The pen handed to ``drawPath`` must be cosmetic regardless of data scale."""
+    from PySide6.QtGui import QPainter as _QP
+    c = _sized_canvas(app)
+    c.addCurve("c", list(np.linspace(-0.4, 0.4, 100)),
+               list(np.linspace(-1e-6, 1e-6, 100)))
+    c.resetView()
+    seen = []
+    orig = _QP.drawPath
+    def spy(self, path):
+        seen.append(self.pen().isCosmetic())
+        return orig(self, path)
+    _QP.drawPath = spy
+    try:
+        _paint_once(c)
+    finally:
+        _QP.drawPath = orig
+    assert seen and all(seen)
+
+
+# ---------------------------------------------------------------------------
 # Curve-pick coordinate space — _findNearestCurve must compare the click and
 # the curve samples in the SAME space. In native (default) mode the matplotlib
 # axes is never laid out, so the old transData path could not pick any curve.
@@ -222,3 +282,74 @@ def test_area_select_zoom_is_pixel_exact(app):
     br = c._dataToPixel(x_max, y_min)   # bottom-right
     assert tl == pytest.approx(a, abs=1e-6)
     assert br == pytest.approx(b, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Non-finite curve data — the paint-crash regression.
+#
+# A curve whose y column is all NaN made ``_calculateAutoBounds`` publish a
+# NaN view range (``np.nanmin`` of an all-NaN array is NaN). NaN fails every
+# comparison, so the degenerate-range check in ``_renderNative`` let it
+# through to the tick algorithm, where ``ceil()`` raised
+# "ValueError: cannot convert float NaN to integer" out of
+# ``QQuickPaintedItem.paint`` — on every single frame.
+# ---------------------------------------------------------------------------
+
+
+def test_all_nan_curve_is_ignored_by_auto_bounds(app):
+    """A finite curve still frames correctly when an all-NaN curve
+    shares the plot."""
+    c = _sized_canvas(app)
+    c.addCurve("good", [0.0, 10.0], [0.0, 100.0])
+    c.addCurve("nan", [float("nan")] * 4, [float("nan")] * 4)
+    c.resetView()
+    x0, x1, y0, y1 = c._viewbox.view_range().as_tuple()
+    assert (round(x0, 3), round(x1, 3)) == (-0.5, 10.5)
+    assert (round(y0, 3), round(y1, 3)) == (-5.0, 105.0)
+
+
+def test_partially_nan_curve_bounds_use_finite_samples_only(app):
+    c = _sized_canvas(app)
+    c.addCurve("holes", [0.0, 1.0, float("nan"), 3.0],
+               [5.0, float("nan"), 7.0, 9.0])
+    c.resetView()
+    x0, x1, y0, y1 = c._viewbox.view_range().as_tuple()
+    # Only the pairs (0, 5) and (3, 9) are fully finite.
+    assert (round(x0, 3), round(x1, 3)) == (-0.15, 3.15)
+    assert (round(y0, 3), round(y1, 3)) == (4.8, 9.2)
+
+
+def test_infinite_curve_values_are_ignored_by_auto_bounds(app):
+    """``inf`` bounds crashed the same tick path with OverflowError."""
+    c = _sized_canvas(app)
+    c.addCurve("spike", [0.0, 1.0, 2.0], [1.0, float("inf"), 3.0])
+    c.resetView()
+    x0, x1, y0, y1 = c._viewbox.view_range().as_tuple()
+    assert (round(y0, 3), round(y1, 3)) == (0.9, 3.1)
+    assert (round(x0, 3), round(x1, 3)) == (-0.1, 2.1)
+
+
+@pytest.mark.parametrize("xs, ys", [
+    ([float("nan")] * 3, [float("nan")] * 3),
+    ([0.0, 1.0, 2.0], [float("nan")] * 3),
+    ([float("inf")] * 3, [float("inf")] * 3),
+])
+def test_paint_does_not_raise_for_non_finite_curve(app, xs, ys):
+    """The regression itself: painting a plot whose only curve is
+    non-finite must not raise out of ``paint``."""
+    c = _sized_canvas(app)
+    c.addCurve("bad", xs, ys)
+    c.resetView()
+    _paint_once(c)  # must not raise
+
+
+def test_paint_does_not_raise_for_non_finite_view_range(app):
+    """Even if a non-finite range reaches the canvas from elsewhere
+    (restored zoom state, a log clamp), the render must bail cleanly."""
+    c = _sized_canvas(app)
+    c.addCurve("good", [0.0, 1.0, 2.0], [1.0, 2.0, 3.0])
+    c._viewbox.set_view_range(
+        float("nan"), float("nan"), float("nan"), float("nan"),
+        push_history=False, disable_auto=True,
+    )
+    _paint_once(c)  # must not raise

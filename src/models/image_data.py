@@ -154,6 +154,16 @@ class ImageData:
         Human-readable label (used in the project browser).
     image_id
         Stable identifier; auto-generated when ``None``.
+    channels
+        Optional extra named channels for a *multi-channel* image — e.g. an
+        STM scan holding ``{"Z fwd/up": …, "Z bwd/up": …, "I fwd/up": …}``.
+        Every channel must share ``array``'s shape and mode; the viewer's
+        channel selector switches between them. ``array`` remains the
+        currently-active channel, so all single-channel consumers of
+        :attr:`array` keep working unchanged.
+    active_channel
+        Which key of ``channels`` ``array`` corresponds to. Defaults to the
+        first key when ``channels`` is given.
     """
 
     def __init__(
@@ -164,6 +174,8 @@ class ImageData:
         name: str = "Image",
         image_id: Optional[str] = None,
         file_path: Optional[str] = None,
+        channels: Optional[Dict[str, np.ndarray]] = None,
+        active_channel: Optional[str] = None,
     ):
         if mode is None:
             mode = _infer_mode(array)
@@ -179,6 +191,29 @@ class ImageData:
         # original path for files imported via from_file). Set by the backend
         # after saving; QML's openImage uses it with QDesktopServices.
         self.file_path: Optional[str] = file_path
+
+        # -------------------------------------------------------- channels
+        # ``_channels`` holds *every* channel including the active one, so
+        # ``_array is _channels[_active_channel]``. Empty for a plain
+        # single-channel image — ``is_multichannel`` stays False and nothing
+        # about the existing behaviour changes.
+        self._channels: Dict[str, np.ndarray] = {}
+        self._active_channel: Optional[str] = None
+        if channels:
+            for cname, carr in channels.items():
+                carr = _coerce_to_mode(np.ascontiguousarray(carr), mode)
+                if carr.shape != array.shape:
+                    raise ValueError(
+                        f"Channel {cname!r} has shape {carr.shape}, expected "
+                        f"{array.shape} — all channels must share one shape"
+                    )
+                self._channels[str(cname)] = carr
+            first = next(iter(self._channels))
+            self._active_channel = (
+                active_channel if active_channel in self._channels else first
+            )
+            # Keep the invariant: the active array IS the active channel.
+            self._array = self._channels[self._active_channel]
 
     # ------------------------------------------------------------------ props
     @property
@@ -208,6 +243,76 @@ class ImageData:
     @property
     def n_channels(self) -> int:
         return 1 if self._array.ndim == 2 else int(self._array.shape[2])
+
+    # ------------------------------------------------------ named channels
+    @property
+    def is_multichannel(self) -> bool:
+        """True when this image carries more than one selectable channel."""
+        return len(self._channels) > 1
+
+    @property
+    def channel_names(self) -> list:
+        """Selectable channel names, in insertion order. Empty for a plain
+        single-channel image."""
+        return list(self._channels.keys())
+
+    @property
+    def active_channel_name(self) -> Optional[str]:
+        return self._active_channel
+
+    def set_active_channel(self, name: str) -> bool:
+        """Switch which named channel :attr:`array` exposes.
+
+        Returns ``True`` when the channel changed, ``False`` when ``name`` is
+        unknown or already active (callers use this to skip redundant
+        re-renders).
+        """
+        if name not in self._channels or name == self._active_channel:
+            return False
+        self._active_channel = name
+        self._array = self._channels[name]
+        return True
+
+    def get_channel(self, name: str) -> Optional[np.ndarray]:
+        """Raw array for ``name`` without changing the active channel."""
+        return self._channels.get(name)
+
+    def replace_active_array(self, array: np.ndarray) -> None:
+        """Swap the active channel's pixels *in place*.
+
+        The image keeps its id, name, metadata and channel list — only the
+        pixel data changes. Used by destructive-looking operations (plane
+        levelling) that should overwrite the original rather than spawn a
+        near-duplicate entity in the project browser.
+        """
+        arr = _coerce_to_mode(np.ascontiguousarray(array), self._mode)
+        if arr.shape != self._array.shape:
+            raise ValueError(
+                f"replace_active_array: shape {arr.shape} != {self._array.shape}"
+            )
+        self._array = arr
+        if self._active_channel is not None:
+            self._channels[self._active_channel] = arr
+
+    def add_channel(self, name: str, array: np.ndarray) -> None:
+        """Attach another named channel. Must match the existing shape/mode.
+
+        Adding the *first* channel to a plain single-channel image seeds the
+        channel dict with the current array so the invariant
+        ``_array is _channels[_active_channel]`` holds either way.
+        """
+        arr = _coerce_to_mode(np.ascontiguousarray(array), self._mode)
+        if arr.shape != self._array.shape:
+            raise ValueError(
+                f"Channel {name!r} has shape {arr.shape}, expected "
+                f"{self._array.shape} — all channels must share one shape"
+            )
+        if not self._channels:
+            seed = self._active_channel or self.metadata.additional_info.get(
+                "channel", "Channel 1")
+            self._channels[str(seed)] = self._array
+            self._active_channel = str(seed)
+        self._channels[str(name)] = arr
 
     # ------------------------------------------------------------- factories
     @classmethod
@@ -267,9 +372,55 @@ class ImageData:
             source="file",
             original_filename=path.name,
         )
+        # Recover the physical pixel scale a calibrated TIFF carries, so a
+        # re-imported export — or a file from Gwyddion / Fiji / an instrument —
+        # keeps its real dimensions instead of degrading to bare pixels.
+        if suffix in (".tif", ".tiff"):
+            try:
+                from src.utils.tiff_io import read_tiff_calibration
+                from src.utils.units import pixel_size_to_nm
+                cal = read_tiff_calibration(path)
+                if cal:
+                    px_nm = pixel_size_to_nm(cal["dx"], cal["dy"], cal["unit"])
+                    if px_nm:
+                        metadata.pixel_size_nm = px_nm
+                        metadata.additional_info["pixel_size"] = {
+                            "dx": cal["dx"], "dy": cal["dy"],
+                            "unit": cal["unit"],
+                        }
+                    if cal.get("value_unit"):
+                        metadata.additional_info["value_unit"] = \
+                            cal["value_unit"]
+            except Exception as e:
+                logger.debug("No TIFF calibration recovered from %s: %s",
+                             path, e)
         return cls(
             array=array, mode=mode, metadata=metadata, name=path.stem,
             file_path=str(path),
+        )
+
+    @classmethod
+    def from_channels(
+        cls,
+        channels: Dict[str, np.ndarray],
+        name: str,
+        mode: Optional[Union[ImageMode, str]] = None,
+        metadata: Optional[ImageMetadata] = None,
+        active_channel: Optional[str] = None,
+    ) -> "ImageData":
+        """Build one multi-channel image from ``{channel_name: array}``.
+
+        Used by instrument loaders that read several simultaneous channels of
+        the *same* physical scan (e.g. an STM scan's Z and I, each in up to
+        four trace directions). They become one browsable entity with a
+        channel selector rather than N separate look-alike entities.
+        """
+        if not channels:
+            raise ValueError("from_channels requires at least one channel")
+        first_key = active_channel if active_channel in channels else next(iter(channels))
+        return cls(
+            array=channels[first_key], mode=mode, metadata=metadata,
+            name=name, channels=channels, active_channel=first_key,
         )
 
     @classmethod
@@ -323,9 +474,17 @@ class ImageData:
         cropped = self._array[y0c:y1c, x0c:x1c].copy()
         meta = self.metadata.copy()
         meta.additional_info["crop_origin"] = (x0c, y0c)
+        # Crop every channel, not just the active one — otherwise switching
+        # channel on the cropped result would resurrect a full-size array and
+        # break the shared-shape invariant.
+        cropped_channels = {
+            cname: carr[y0c:y1c, x0c:x1c].copy()
+            for cname, carr in self._channels.items()
+        } or None
         return ImageData(
             array=cropped, mode=self._mode, metadata=meta,
             name=f"{self.name} (crop)",
+            channels=cropped_channels, active_channel=self._active_channel,
         )
 
     def histogram(
@@ -416,10 +575,26 @@ class ImageData:
             return "png", buf.getvalue()
         raise ValueError(f"Unknown encoding format: {format!r}")
 
+    def _encode_channel(self, arr: np.ndarray) -> Tuple[str, bytes]:
+        """Encode one channel array using this image's payload convention."""
+        if self._mode == ImageMode.SINGLE_FLOAT:
+            return "f32_raw", arr.astype("<f4", copy=False).tobytes()
+        # Non-float modes go through the PNG path via a temporary view.
+        tmp = ImageData(array=arr, mode=self._mode, name="_tmp")
+        return tmp.to_bytes()
+
     def to_dict(self) -> Dict[str, Any]:
-        """Serialize for ``.hrt`` project save (bytes are base64-encoded)."""
+        """Serialize for ``.hrt`` project save (bytes are base64-encoded).
+
+        Multi-channel images write the *inactive* channels under
+        ``extra_channels``; the active one stays in the top-level payload as
+        before. That keeps the format backward-compatible (an older reader
+        still gets a usable single-channel image) and avoids storing the
+        active channel's bytes twice — which matters on the >1 GB projects
+        this app is expected to handle.
+        """
         payload_format, raw = self.to_bytes()
-        return {
+        result: Dict[str, Any] = {
             "id": self.id,
             "name": self.name,
             "mode": self._mode.value,
@@ -436,10 +611,29 @@ class ImageData:
                 "additional_info": self.metadata.additional_info,
             },
         }
+        if self.is_multichannel:
+            result["active_channel"] = self._active_channel
+            result["channel_order"] = list(self._channels.keys())
+            extras: Dict[str, Any] = {}
+            for cname, carr in self._channels.items():
+                if cname == self._active_channel:
+                    continue  # already in the top-level payload
+                cfmt, craw = self._encode_channel(carr)
+                extras[cname] = {
+                    "payload_format": cfmt,
+                    "dtype": str(carr.dtype),
+                    "bytes_b64": base64.b64encode(craw).decode("ascii"),
+                }
+            result["extra_channels"] = extras
+        return result
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "ImageData":
-        """Reconstruct an :class:`ImageData` from :meth:`to_dict` output."""
+        """Reconstruct an :class:`ImageData` from :meth:`to_dict` output.
+
+        Payloads without ``extra_channels`` (every project saved before
+        multi-channel images existed) load as plain single-channel images.
+        """
         mode = ImageMode(payload["mode"])
         shape = tuple(payload["shape"])
         dtype = np.dtype(payload["dtype"])
@@ -471,18 +665,52 @@ class ImageData:
             dpi=tuple(dpi) if dpi else None,
             additional_info=dict(meta_dict.get("additional_info") or {}),
         )
+
+        # Rebuild the channel dict when this was a multi-channel image. The
+        # active channel comes from the top-level payload; the rest from
+        # ``extra_channels``. ``channel_order`` restores the loader's original
+        # ordering so the viewer's selector isn't reshuffled by the save.
+        channels: Optional[Dict[str, np.ndarray]] = None
+        active_channel = payload.get("active_channel")
+        extras = payload.get("extra_channels") or {}
+        if active_channel and extras:
+            decoded: Dict[str, np.ndarray] = {active_channel: array}
+            for cname, cpayload in extras.items():
+                cfmt = cpayload.get("payload_format", "f32_raw")
+                craw = base64.b64decode(cpayload["bytes_b64"])
+                cdtype = np.dtype(cpayload.get("dtype", "float32"))
+                if cfmt == "f32_raw":
+                    carr = np.frombuffer(craw, dtype="<f4").reshape(shape)
+                    decoded[cname] = carr.astype(cdtype, copy=False)
+                elif cfmt == "png":
+                    from PIL import Image
+                    with Image.open(io.BytesIO(craw)) as cim:
+                        cim.load()
+                        decoded[cname] = np.asarray(cim).reshape(shape)
+                else:
+                    logger.warning(
+                        "Skipping channel %r with unknown payload_format %r",
+                        cname, cfmt)
+            order = payload.get("channel_order") or list(decoded.keys())
+            channels = {k: decoded[k] for k in order if k in decoded}
+            for k, v in decoded.items():  # any channel missing from the order
+                channels.setdefault(k, v)
+
         return cls(
             array=array, mode=mode, metadata=meta,
             name=payload.get("name", "Image"),
             image_id=payload.get("id"),
+            channels=channels, active_channel=active_channel,
         )
 
     # -------------------------------------------------------------- repr
     def __repr__(self) -> str:
+        chans = (f", channels={len(self._channels)}"
+                 f", active={self._active_channel!r}") if self.is_multichannel else ""
         return (
             f"ImageData(id={self.id!r}, name={self.name!r}, "
             f"mode={self._mode.value}, shape={self.shape}, "
-            f"dtype={self.dtype})"
+            f"dtype={self.dtype}{chans})"
         )
 
 

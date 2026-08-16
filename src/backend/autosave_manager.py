@@ -22,6 +22,16 @@ class AutosaveManager(QObject):
         self._timer.timeout.connect(self._do_autosave)
         self._interval_ms = 5 * 60 * 1000  # 5 minutes default
         self._enabled = True
+        # Only autosave when something actually changed since the last save.
+        # Re-serializing an unchanged multi-GB project every tick was the
+        # main large-dataset pain point.
+        self._dirty = False
+        modified_signal = getattr(app_backend, 'projectModifiedChanged', None)
+        if modified_signal is not None:
+            modified_signal.connect(self._on_modified_changed)
+
+    def _on_modified_changed(self, is_modified: bool):
+        self._dirty = is_modified
 
     @Slot(bool)
     def setEnabled(self, enabled: bool):
@@ -65,17 +75,40 @@ class AutosaveManager(QObject):
         """Save to .autosave.hrt next to the main project file."""
         if not self._app_backend._project_ready or not self._app_backend._project_path:
             return
+        if not self._dirty:
+            logger.debug("Autosave skipped: no changes since last save")
+            return
 
         project_path = self._app_backend._project_path
         project_name = self._app_backend._project_name
         autosave_path = project_path / f"{project_name}.autosave.hrt"
 
-        self._app_backend.worker_manager.submit(
+        # Workflows live in their own .flow files — persist them alongside
+        # the autosave so open editors survive a crash/recovery cycle.
+        try:
+            self._app_backend.workflow_manager.save_all_workflows()
+        except Exception as e:
+            logger.warning(f"Autosave: could not save workflows: {e}")
+
+        # Clear the dirty flag at submit time (not on completion): changes
+        # made while the save is running re-mark it, so they are picked up on
+        # the next tick instead of being lost. Restore on failure/skip.
+        self._dirty = False
+        submitted = self._app_backend.worker_manager.submit_io(
             name="Autosave",
             operation=self._app_backend._do_save_project,
             project_path=autosave_path,
-            on_finished=lambda _: logger.info(f"Autosaved: {autosave_path}")
+            fast=True,  # speed over size for periodic autosaves
+            on_finished=lambda _: logger.info(f"Autosaved: {autosave_path}"),
+            on_error=lambda *_: self._mark_dirty()
         )
+        if not submitted:
+            # A previous autosave is still in flight — keep the changes
+            # flagged for the next tick.
+            self._dirty = True
+
+    def _mark_dirty(self):
+        self._dirty = True
 
     def check_recovery(self, project_path: Path):
         """Check if autosave is newer than main file."""

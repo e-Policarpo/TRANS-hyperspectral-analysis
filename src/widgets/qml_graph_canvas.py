@@ -261,6 +261,8 @@ class QMLGraphCanvas(QQuickPaintedItem):
         self._dirty_curve_ids: set[int] = set()
         self._native_transform: Optional[QTransform] = None
         self._native_inv_transform: Optional[QTransform] = None
+        # Latch so a non-finite view range warns once, not once per frame.
+        self._warned_nonfinite_range: bool = False
 
         # Phase 5 — self-laid-out legend. Owns its own anchor +
         # offset + per-curve visibility set; serialises through
@@ -1138,6 +1140,18 @@ class QMLGraphCanvas(QQuickPaintedItem):
         # View range in post-log coords (transform stays linear).
         x_vmin, x_vmax = self._native_log_safe(self._x_min, self._x_max, x_log)
         y_vmin, y_vmax = self._native_log_safe(self._y_min, self._y_max, y_log)
+        # NaN fails every comparison, so the degenerate-range check below
+        # lets it straight through into the transform and the tick
+        # algorithm. Reject non-finite ranges explicitly.
+        if not all(math.isfinite(v) for v in (x_vmin, x_vmax, y_vmin, y_vmax)):
+            if not self._warned_nonfinite_range:
+                self._warned_nonfinite_range = True
+                logger.warning(
+                    "Non-finite view range (x=%s..%s, y=%s..%s) — skipping "
+                    "render; check the curve data for all-NaN/inf columns.",
+                    x_vmin, x_vmax, y_vmin, y_vmax,
+                )
+            return
         if x_vmax == x_vmin or y_vmax == y_vmin:
             return
 
@@ -1459,6 +1473,34 @@ class QMLGraphCanvas(QQuickPaintedItem):
         color: str,
         label: str,
     ) -> None:
+        self._add_infinite_line(lineId, orientation, value, color, label, True)
+
+    @Slot(str, str, float, str, str)
+    def addFixedInfiniteLine(
+        self,
+        lineId: str,
+        orientation: str,
+        value: float,
+        color: str,
+        label: str,
+    ) -> None:
+        """A line the user cannot drag.
+
+        Markers that annotate a computed result -- a detected peak centre, say
+        -- are read-outs, not controls: dragging one would imply the value
+        could be edited, when in fact the next redraw discards the change.
+        """
+        self._add_infinite_line(lineId, orientation, value, color, label, False)
+
+    def _add_infinite_line(
+        self,
+        lineId: str,
+        orientation: str,
+        value: float,
+        color: str,
+        label: str,
+        movable: bool,
+    ) -> None:
         if not lineId:
             return
         if orientation not in (IL_ORIENT_V, IL_ORIENT_H):
@@ -1471,6 +1513,7 @@ class QMLGraphCanvas(QQuickPaintedItem):
             line_id=lineId,
             orientation=orientation,
             value=float(value),
+            movable=movable,
             pen_color=color or "#FFD700",
             label=label or "",
         )
@@ -1984,11 +2027,25 @@ class QMLGraphCanvas(QQuickPaintedItem):
         y_mins, y_maxs = [], []
 
         for curve in self._curves.values():
-            if curve.visible and len(curve.x) > 0:
-                x_mins.append(np.nanmin(curve.x))
-                x_maxs.append(np.nanmax(curve.x))
-                y_mins.append(np.nanmin(curve.y))
-                y_maxs.append(np.nanmax(curve.y))
+            if not curve.visible or len(curve.x) == 0:
+                continue
+            # Only finite samples define the range. ``np.nanmin`` still
+            # returns NaN for an all-NaN curve (and keeps ±inf as-is), and
+            # a single NaN/inf edge propagates into the view range, the
+            # data→pixel transform and the tick algorithm — where ``ceil``
+            # raises "cannot convert float NaN to integer" and aborts the
+            # paint on every frame. A fully non-finite curve is skipped.
+            xf = np.asarray(curve.x, dtype=float)
+            yf = np.asarray(curve.y, dtype=float)
+            n = min(xf.size, yf.size)  # ragged curve: only the paired head plots
+            xf, yf = xf[:n], yf[:n]
+            finite = np.isfinite(xf) & np.isfinite(yf)
+            if not finite.any():
+                continue
+            x_mins.append(xf[finite].min())
+            x_maxs.append(xf[finite].max())
+            y_mins.append(yf[finite].min())
+            y_maxs.append(yf[finite].max())
 
         if not x_mins:
             return

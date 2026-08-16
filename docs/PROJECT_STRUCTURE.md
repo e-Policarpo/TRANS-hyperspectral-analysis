@@ -156,8 +156,16 @@ UI Thread                    Worker Thread
 TRANS_QML/
 │
 ├── main.py                      # Application entry point
+├── run.py                       # Equivalent launcher
 ├── requirements.txt             # Python dependencies
-├── icon.png                     # Application icon
+│
+├── assets/                      # Static images
+│   ├── icon.png                 # Application icon (loaded by src/main.py)
+│   ├── Slide1.ico
+│   └── LOGO TRANS/
+│
+├── archive/                     # Superseded versions & backups, gitignored
+│                                # (see archive/README.md)
 │
 ├── src/                         # Source code
 │   ├── __init__.py

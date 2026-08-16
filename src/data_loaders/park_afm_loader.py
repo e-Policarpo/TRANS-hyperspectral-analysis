@@ -46,6 +46,7 @@ from struct import unpack_from
 from typing import Optional, Tuple, List, Dict, Any
 
 from .base_loader import BaseDataLoader
+from ..utils.naming import padded_series
 from ..models.spectral_data import SpectralData, SpectralMetadata
 from ..models.topography_data import TopographyData, TopographyMetadata
 
@@ -498,6 +499,11 @@ class ParkAFMLoader(BaseDataLoader):
         # (the visible 8-bit colormapped thumbnail living inside each Park
         # .tiff alongside the float32 data tag — used to be silently dropped).
         preview_images: List[Tuple[str, "ImageData"]] = []
+        # {pixel_shape: {channel_name: rgb_array}} plus the geometry of the
+        # first TIFF seen at that shape. Assembled into multi-channel images
+        # after the loop.
+        preview_channels: Dict[Tuple[int, ...], Dict[str, np.ndarray]] = {}
+        preview_geometry: Dict[Tuple[int, ...], Tuple[Any, str]] = {}
 
         for i, tf in enumerate(siblings_tiff):
             if progress_callback:
@@ -530,23 +536,15 @@ class ParkAFMLoader(BaseDataLoader):
                             float(px_h) * 1000.0 / data.shape[0],
                             float(px_w) * 1000.0 / data.shape[1],
                         )
-                    img_meta = _ImageMetadata(
-                        source="park_tiff_preview",
-                        original_filename=tf.name,
-                        pixel_size_nm=pixel_size_nm,
-                        additional_info={
-                            'park_channel': ch_name,
-                            'park_direction': direction,
-                        },
-                    )
-                    preview_name = f"{tf.stem} (preview)"
-                    preview_images.append((
-                        preview_name,
-                        _ImageData(
-                            array=thumb_arr, metadata=img_meta,
-                            name=preview_name,
-                        ),
-                    ))
+                    # Collect rather than emit: every TIFF in a Park scan is
+                    # one channel/direction of the SAME scan, so they become a
+                    # single multi-channel image with a selector instead of one
+                    # browser row each. Bucketed by pixel shape because
+                    # ImageData requires its channels to share one shape.
+                    preview_channels.setdefault(thumb_arr.shape, {})[
+                        full_name or tf.stem] = thumb_arr
+                    preview_geometry.setdefault(
+                        thumb_arr.shape, (pixel_size_nm, tf.name))
                 except Exception as e:
                     logger.debug(
                         "Could not extract preview from %s: %s", tf.name, e
@@ -610,6 +608,38 @@ class ParkAFMLoader(BaseDataLoader):
         all_channels.update(ppt_channels)
         spectral_data.metadata.additional_info['channels'] = all_channels
 
+        # Assemble the collected per-TIFF previews into multi-channel images —
+        # one per pixel geometry, so a scan's channels/directions ride in a
+        # single browser entity with a channel selector. The scan's physical
+        # pixel size travels with it so the viewer can draw a real scale bar.
+        if preview_channels:
+            try:
+                from src.models.image_data import (
+                    ImageData as _ImageData,
+                    ImageMetadata as _ImageMetadata,
+                )
+                session = Path(key).stem if key else filepath.stem
+                buckets = sorted(preview_channels.items(),
+                                 key=lambda kv: -len(kv[1]))
+                for idx, (shape, channels) in enumerate(buckets):
+                    pixel_size_nm, first_file = preview_geometry.get(
+                        shape, (None, None))
+                    name = f"{session} (preview)"
+                    if idx > 0:
+                        name = f"{session} (preview {shape[1]}×{shape[0]})"
+                    preview_images.append((name, _ImageData.from_channels(
+                        channels, name=name,
+                        metadata=_ImageMetadata(
+                            source="park_tiff_preview",
+                            original_filename=first_file,
+                            pixel_size_nm=pixel_size_nm,
+                            additional_info={'session_label': session},
+                        ),
+                        active_channel=self._pick_park_channel(channels),
+                    )))
+            except Exception as e:
+                logger.debug("Could not assemble Park preview images: %s", e)
+
         # Surface preview images so the browser's "Images" category picks them up.
         if preview_images:
             spectral_data.metadata.additional_info['images'] = preview_images
@@ -622,6 +652,19 @@ class ParkAFMLoader(BaseDataLoader):
         return spectral_data, topography
 
     # ── Internal helpers ──────────────────────────────────────────────
+
+    @staticmethod
+    def _pick_park_channel(names) -> Optional[str]:
+        """Default channel for a Park scan: height topography if present."""
+        if not names:
+            return None
+        for n in names:
+            if 'height' in n.lower() and 'forward' in n.lower():
+                return n
+        for n in names:
+            if 'height' in n.lower():
+                return n
+        return next(iter(names))
 
     def _load_ppt_as_spectral(self, filepath: Path,
                                tiff_maps: Optional[Dict] = None,
@@ -673,7 +716,7 @@ class ParkAFMLoader(BaseDataLoader):
                 spectra[:n_valid, i] = curves[i, :n_valid]
 
         # Build DataFrame: first column = Z displacement, rest = pixel spectra
-        col_names = [f"Px_{i}" for i in range(n_pixels)]
+        col_names = padded_series("Px", n_pixels, start=0)
         df = pd.DataFrame(spectra, columns=col_names)
         df.insert(0, 'Z_um', z_axis)
 

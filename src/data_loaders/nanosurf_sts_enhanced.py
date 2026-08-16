@@ -16,6 +16,7 @@ import logging
 import re
 
 from .base_loader import BaseDataLoader
+from ..utils.naming import padded_series
 from ..models.spectral_data import SpectralData, SpectralMetadata
 from ..models.topography_data import TopographyData
 
@@ -496,6 +497,14 @@ class NanosurfSTSEnhancedLoader(BaseDataLoader):
         except Exception:
             return out
 
+        # Collect every (channel, direction) plane first. They are all views of
+        # the same physical scan, so they become ONE image entity with a
+        # channel selector rather than one browser row per plane. Planes are
+        # bucketed by pixel shape because ``ImageData`` requires its channels
+        # to share a shape — a NID that mixes resolutions still loads, it just
+        # yields one entity per resolution.
+        by_shape: Dict[Tuple[int, int], Dict[str, np.ndarray]] = {}
+        channel_meta: Dict[str, Dict[str, str]] = {}
         for key, value in entries:
             try:
                 category, direction, channel = key
@@ -509,27 +518,55 @@ class NanosurfSTSEnhancedLoader(BaseDataLoader):
                 continue
             if arr.ndim != 2 or arr.size == 0:
                 continue
-            name = f"{file_label} · {channel} ({direction})".strip()
+            cname = f"{channel} ({direction})".strip()
+            by_shape.setdefault(arr.shape, {})[cname] = \
+                arr.astype(np.float32, copy=False)
+            channel_meta[cname] = {"nid_category": category,
+                                   "nid_direction": direction,
+                                   "nid_channel": channel}
+
+        if not by_shape:
+            return out
+
+        source_file = (Path(stm_nid.filename).name
+                       if getattr(stm_nid, "filename", None) else None)
+        # Largest bucket first, so the main scan resolution keeps the plain
+        # label and any odd-sized extras get the disambiguating suffix.
+        buckets = sorted(by_shape.items(), key=lambda kv: -len(kv[1]))
+        for idx, (shape, channels) in enumerate(buckets):
+            name = file_label.strip()
+            if idx > 0:
+                name = f"{name} [{shape[1]}×{shape[0]}]"
             try:
-                img = ImageData(
-                    array=arr.astype(np.float32, copy=False),
-                    mode=ImageMode.SINGLE_FLOAT,
+                img = ImageData.from_channels(
+                    channels, name=name, mode=ImageMode.SINGLE_FLOAT,
                     metadata=ImageMetadata(
                         source="nanosurf_nid_image",
-                        original_filename=Path(stm_nid.filename).name
-                            if getattr(stm_nid, "filename", None) else None,
+                        original_filename=source_file,
                         additional_info={
-                            "nid_category": category,
-                            "nid_direction": direction,
-                            "nid_channel": channel,
+                            "channel_meta": {c: channel_meta[c]
+                                             for c in channels},
                         },
                     ),
-                    name=name,
+                    active_channel=self._pick_nid_channel(channels),
                 )
                 out.append((name, img))
             except Exception as e:
-                logger.debug("Skipping NID image %s/%s: %s", direction, channel, e)
+                logger.debug("Skipping NID image group %s: %s", shape, e)
         return out
+
+    @staticmethod
+    def _pick_nid_channel(names) -> Optional[str]:
+        """Default channel for a NID scan: forward topography when present."""
+        if not names:
+            return None
+        for n in names:
+            if n.startswith("Z-Axis") and "Forward" in n:
+                return n
+        for n in names:
+            if n.startswith("Z-Axis"):
+                return n
+        return next(iter(names))
 
     def _extract_scan_geometry(self, filepath: Path) -> Optional[Dict]:
         """
@@ -1008,7 +1045,7 @@ class NanosurfSTSEnhancedLoader(BaseDataLoader):
             df = self.concatenate_spectra(
                 spectra_list,
                 V_common,
-                column_names=[f"Point_{i+1}" for i in range(len(spectra_list))]
+                column_names=padded_series("Point", len(spectra_list))
             )
             df = df.rename(columns={"Variable": "V"})
 

@@ -10,6 +10,7 @@ import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import Qt.labs.platform 1.1 as Platform
+import "../components"
 
 Rectangle {
     id: editorRoot
@@ -481,60 +482,23 @@ Rectangle {
                 font.pixelSize: 11
             }
 
-            ComboBox {
+            DatasetComboBox {
                 id: selectCombo
                 Layout.fillWidth: true
+                minimumWidth: 100
+                font.pixelSize: 11
+                placeholderText: "Select..."
                 model: paramDef.options || []
                 currentIndex: {
                     var val = currentValue || paramDef.default
                     return paramDef.options ? paramDef.options.indexOf(val) : 0
                 }
 
-                background: Rectangle {
-                    color: bgDark
-                    border.color: selectCombo.activeFocus ? accentBlue : borderColor
-                    radius: 3
-                }
-
-                contentItem: Text {
-                    text: selectCombo.displayText
-                    color: textLight
-                    font.pixelSize: 11
-                    verticalAlignment: Text.AlignVCenter
-                    leftPadding: 8
-                }
-
-                delegate: ItemDelegate {
-                    width: selectCombo.width
-                    contentItem: Text {
-                        text: modelData
-                        color: textLight
-                        font.pixelSize: 11
-                    }
-                    background: Rectangle {
-                        color: highlighted ? bgLight : bgMedium
-                    }
-                }
-
-                popup: Popup {
-                    y: selectCombo.height
-                    width: selectCombo.width
-                    implicitHeight: contentItem.implicitHeight
-                    padding: 1
-
-                    contentItem: ListView {
-                        clip: true
-                        implicitHeight: contentHeight
-                        model: selectCombo.popup.visible ? selectCombo.delegateModel : null
-                        currentIndex: selectCombo.highlightedIndex
-                    }
-
-                    background: Rectangle {
-                        color: bgMedium
-                        border.color: borderColor
-                        radius: 3
-                    }
-                }
+                bgColor: bgDark
+                borderColorNormal: borderColor
+                borderColorFocus: accentBlue
+                textColor: textLight
+                textMutedColor: textMuted
 
                 onCurrentTextChanged: updateParameter(paramName, currentText)
             }
@@ -558,9 +522,12 @@ Rectangle {
                 font.pixelSize: 11
             }
 
-            ComboBox {
+            DatasetComboBox {
                 id: datasetCombo
                 Layout.fillWidth: true
+                minimumWidth: 100
+                font.pixelSize: 11
+                placeholderText: "Select dataset..."
                 model: workflowWindow && workflowWindow.workflowManager ?
                        workflowWindow.workflowManager.getAvailableDatasets() : []
                 currentIndex: {
@@ -569,31 +536,11 @@ Rectangle {
                     return datasets.indexOf(currentValue)
                 }
 
-                background: Rectangle {
-                    color: bgDark
-                    border.color: datasetCombo.activeFocus ? accentPink : borderColor
-                    radius: 3
-                }
-
-                contentItem: Text {
-                    text: datasetCombo.displayText || "Select dataset..."
-                    color: datasetCombo.displayText ? textLight : textMuted
-                    font.pixelSize: 11
-                    verticalAlignment: Text.AlignVCenter
-                    leftPadding: 8
-                }
-
-                delegate: ItemDelegate {
-                    width: datasetCombo.width
-                    contentItem: Text {
-                        text: modelData
-                        color: textLight
-                        font.pixelSize: 11
-                    }
-                    background: Rectangle {
-                        color: highlighted ? bgLight : bgMedium
-                    }
-                }
+                bgColor: bgDark
+                borderColorNormal: borderColor
+                borderColorFocus: accentPink
+                textColor: textLight
+                textMutedColor: textMuted
 
                 onCurrentTextChanged: updateParameter(paramName, currentText)
             }
@@ -637,9 +584,12 @@ Rectangle {
                 font.pixelSize: 11
             }
 
-            ComboBox {
+            DatasetComboBox {
                 id: flatDataCombo
                 Layout.fillWidth: true
+                minimumWidth: 100
+                font.pixelSize: 11
+                placeholderText: "Select flat dataset..."
                 model: workflowWindow && workflowWindow.workflowManager ?
                        workflowWindow.workflowManager.getAvailableFlatDatasets() : []
                 currentIndex: {
@@ -648,31 +598,11 @@ Rectangle {
                     return datasets.indexOf(currentValue)
                 }
 
-                background: Rectangle {
-                    color: bgDark
-                    border.color: flatDataCombo.activeFocus ? accentPink : borderColor
-                    radius: 3
-                }
-
-                contentItem: Text {
-                    text: flatDataCombo.displayText || "Select flat dataset..."
-                    color: flatDataCombo.displayText ? textLight : textMuted
-                    font.pixelSize: 11
-                    verticalAlignment: Text.AlignVCenter
-                    leftPadding: 8
-                }
-
-                delegate: ItemDelegate {
-                    width: flatDataCombo.width
-                    contentItem: Text {
-                        text: modelData
-                        color: textLight
-                        font.pixelSize: 11
-                    }
-                    background: Rectangle {
-                        color: highlighted ? bgLight : bgMedium
-                    }
-                }
+                bgColor: bgDark
+                borderColorNormal: borderColor
+                borderColorFocus: accentPink
+                textColor: textLight
+                textMutedColor: textMuted
 
                 onCurrentTextChanged: updateParameter(paramName, currentText)
             }

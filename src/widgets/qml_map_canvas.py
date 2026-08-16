@@ -239,6 +239,12 @@ class QMLMapCanvas(QQuickPaintedItem):
         self._use_fast_render: bool = _fast_map_render_enabled_default()
         self._native_qimage: Optional[QImage] = None  # cached colourised map
 
+        # Physical axis extent. When set, the map axes are labelled in real
+        # units (e.g. nm) spanning the scan window instead of pixel indices.
+        # ``(x_size, y_size, unit)`` with sizes in ``unit``; None → pixel
+        # indices (default, unchanged for maps without calibration).
+        self._phys_extent: Optional[Tuple[float, float, str]] = None
+
     @Slot()
     def cleanup(self):
         """Release matplotlib resources to prevent memory leaks."""
@@ -888,6 +894,45 @@ class QMLMapCanvas(QQuickPaintedItem):
         self.mapUpdated.emit()
         self.update()
 
+    @Slot(float, float, str)
+    def setPhysicalExtent(self, x_size: float, y_size: float, unit: str = "nm"):
+        """Label the map axes in physical units instead of pixel indices.
+
+        ``x_size``/``y_size`` are the scan-window dimensions in ``unit`` (the
+        full width/height the data spans). Passing a non-positive size clears
+        the physical extent and reverts to pixel-index axes.
+        """
+        if x_size and y_size and x_size > 0 and y_size > 0:
+            self._phys_extent = (float(x_size), float(y_size), unit or "nm")
+        else:
+            self._phys_extent = None
+        self._needs_redraw = True
+        self.update()
+
+    @Slot()
+    def clearPhysicalExtent(self):
+        """Revert to pixel-index axes."""
+        self._phys_extent = None
+        self._needs_redraw = True
+        self.update()
+
+    def _physical_pixel_size(self):
+        """``(dx, dy, unit)`` per pixel, or ``(None, None, None)``.
+
+        The canvas stores the *total* scan extent for axis labelling; exports
+        need it per pixel, so divide by the array shape.
+        """
+        if self._phys_extent is None or self._map_data is None:
+            return (None, None, None)
+        x_size, y_size, unit = self._phys_extent
+        try:
+            rows, cols = self._map_data.shape[:2]
+        except Exception:
+            return (None, None, None)
+        if not rows or not cols:
+            return (None, None, None)
+        return (x_size / cols, y_size / rows, unit)
+
     def getMapData(self) -> Optional[np.ndarray]:
         """Get the current map data"""
         return self._map_data
@@ -1016,21 +1061,30 @@ class QMLMapCanvas(QQuickPaintedItem):
     ) -> None:
         """Frame + major / minor ticks + tick labels.
 
-        Pixel indices, so no log mode and no axis labels — the map
-        canvas has never carried explicit ``xLabel`` / ``yLabel``
-        text. Tick label is integer column / row index.
+        Labels are physical coordinates (with a unit title) when a physical
+        extent has been set via :meth:`setPhysicalExtent`; otherwise they are
+        integer column / row pixel indices (the historical default). Linear
+        either way, so no log mode.
         """
         if self._map_data is None:
             return
         rows, cols = self._map_data.shape
+
+        # Axis domains: physical size spanning the scan window, or pixel counts.
+        phys = self._phys_extent
+        x_max = phys[0] if phys else float(cols)
+        y_max = phys[1] if phys else float(rows)
+        unit = phys[2] if phys else None
+        if x_max <= 0 or y_max <= 0:
+            phys, x_max, y_max, unit = None, float(cols), float(rows), None
 
         pen_axis = QPen(self._NATIVE_AXIS_COLOR)
         pen_axis.setWidthF(1.0)
         painter.setPen(pen_axis)
         painter.drawRect(ax_rect)
 
-        x_levels = tick_values(0.0, float(cols), ax_rect.width())
-        y_levels = tick_values(0.0, float(rows), ax_rect.height())
+        x_levels = tick_values(0.0, x_max, ax_rect.width())
+        y_levels = tick_values(0.0, y_max, ax_rect.height())
 
         x_major_spacing, x_majors = (
             x_levels[0] if x_levels else (1.0, [])
@@ -1055,15 +1109,15 @@ class QMLMapCanvas(QQuickPaintedItem):
         ax_w = ax_rect.width()
         ax_h = ax_rect.height()
         for x in x_majors:
-            if 0.0 <= x <= cols:
-                px = ax_rect.left() + (x / cols) * ax_w
+            if 0.0 <= x <= x_max:
+                px = ax_rect.left() + (x / x_max) * ax_w
                 painter.drawLine(
                     QPointF(px, ax_rect.bottom()),
                     QPointF(px, ax_rect.bottom() + tick_len),
                 )
         for y in y_majors:
-            if 0.0 <= y <= rows:
-                py = ax_rect.top() + (y / rows) * ax_h
+            if 0.0 <= y <= y_max:
+                py = ax_rect.top() + (y / y_max) * ax_h
                 painter.drawLine(
                     QPointF(ax_rect.left() - tick_len, py),
                     QPointF(ax_rect.left(), py),
@@ -1074,8 +1128,8 @@ class QMLMapCanvas(QQuickPaintedItem):
         painter.setFont(f)
         fm = QFontMetricsF(painter.font())
         for x, label in zip(x_majors, x_labels):
-            if 0.0 <= x <= cols:
-                px = ax_rect.left() + (x / cols) * ax_w
+            if 0.0 <= x <= x_max:
+                px = ax_rect.left() + (x / x_max) * ax_w
                 tw = fm.horizontalAdvance(label)
                 painter.drawText(
                     QPointF(
@@ -1085,8 +1139,8 @@ class QMLMapCanvas(QQuickPaintedItem):
                     label,
                 )
         for y, label in zip(y_majors, y_labels):
-            if 0.0 <= y <= rows:
-                py = ax_rect.top() + (y / rows) * ax_h
+            if 0.0 <= y <= y_max:
+                py = ax_rect.top() + (y / y_max) * ax_h
                 tw = fm.horizontalAdvance(label)
                 painter.drawText(
                     QPointF(
@@ -1095,6 +1149,25 @@ class QMLMapCanvas(QQuickPaintedItem):
                     ),
                     label,
                 )
+
+        # Axis unit titles (only when showing physical coordinates).
+        if unit:
+            painter.setPen(self._NATIVE_LABEL_COLOR)
+            title = f"x ({unit})"
+            tw = fm.horizontalAdvance(title)
+            painter.drawText(
+                QPointF(ax_rect.center().x() - tw / 2,
+                        ax_rect.bottom() + tick_len + 2 * fm.height() + 2),
+                title,
+            )
+            painter.save()
+            painter.translate(ax_rect.left() - tick_len - fm.height() * 2.4,
+                              ax_rect.center().y())
+            painter.rotate(-90)
+            ytitle = f"y ({unit})"
+            painter.drawText(QPointF(-fm.horizontalAdvance(ytitle) / 2, 0),
+                             ytitle)
+            painter.restore()
 
     def _renderMatplotlib(self):
         """Render matplotlib figure to cached QImage"""
@@ -1120,6 +1193,12 @@ class QMLMapCanvas(QQuickPaintedItem):
             vmin = np.nanpercentile(self._map_data, self._percentile_clip[0])
             vmax = np.nanpercentile(self._map_data, self._percentile_clip[1])
 
+        # Physical extent → label axes in real units; else pixel indices.
+        phys = self._phys_extent
+        extent = None
+        if phys and phys[0] > 0 and phys[1] > 0:
+            extent = [0.0, phys[0], phys[1], 0.0]  # origin='upper' → y flipped
+
         # Display image
         self._image_handle = self.axes.imshow(
             self._map_data,
@@ -1128,7 +1207,8 @@ class QMLMapCanvas(QQuickPaintedItem):
             vmax=vmax,
             aspect='equal',
             origin='upper',
-            interpolation='nearest'
+            interpolation='nearest',
+            extent=extent,
         )
 
         # Style axes
@@ -1136,9 +1216,15 @@ class QMLMapCanvas(QQuickPaintedItem):
         for spine in self.axes.spines.values():
             spine.set_color('#444444')
 
+        if extent is not None:
+            self.axes.set_xlabel(f"x ({phys[2]})", color='#888888', fontsize=8)
+            self.axes.set_ylabel(f"y ({phys[2]})", color='#888888', fontsize=8)
+
         # Ported pyqtgraph tick layout — keeps axis labelling consistent
-        # across the graph/profile/map canvases. Map axes are pixel
-        # indices (linear), so log mode is off.
+        # across the graph/profile/map canvases. Linear axes, so log is off.
+        # The size arguments are the on-screen axis lengths (they set tick
+        # *density*); the tick *domain* comes from the axes limits, which
+        # ``extent`` above has already switched to physical units.
         apply_pyqtgraph_ticks(
             self.axes,
             x_size_px=float(w),
@@ -1791,9 +1877,14 @@ class QMLMapCanvas(QQuickPaintedItem):
             p = Path(path)
             ext = p.suffix.lower()
 
-            if ext in ['.tif', '.tiff']:
-                import tifffile
-                tifffile.imwrite(str(p), self._map_data.astype(np.float32))
+            if ext in ['.tif', '.tiff', '.gsf']:
+                # Always write BOTH a calibrated TIFF and a .gsf: Gwyddion
+                # only reads dimensions from the latter.
+                from src.utils.field_export import export_field
+                dx, dy, unit = self._physical_pixel_size()
+                export_field(p.with_suffix(''), np.asarray(self._map_data),
+                             dx=dx, dy=dy, unit=unit, title=p.stem,
+                             context="map canvas save")
             elif ext == '.npy':
                 np.save(str(p), self._map_data)
             elif ext == '.csv':

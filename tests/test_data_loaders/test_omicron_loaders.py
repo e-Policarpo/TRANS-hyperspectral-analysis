@@ -19,8 +19,10 @@ import pandas as pd
 from pathlib import Path
 from struct import pack
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 
+from src.data_loaders.omicron_mtrx_loader import (  # noqa: F401
+    _session_label, _session_labels)
 from src.data_loaders.omicron_mtrx_loader import OmicronMatrixSTSLoader
 from src.data_loaders.omicron_flat_loader import OmicronFlatLoader, OmicronImageLoader
 from src.models.spectral_data import SpectralData, SpectralMetadata
@@ -527,8 +529,13 @@ class TestOmicronHelpers:
 
     def test_session_label(self):
         from src.data_loaders.omicron_mtrx_loader import _session_label
+        # The acquisition time is dropped — see TestOmicronSessionLabels for
+        # the date-collision case where it is kept.
         assert _session_label(
-            "default_2026Jun15-203637_STM-STM_Spectroscopy") == "2026Jun15-203637"
+            "default_2026Jun15-203637_STM-STM_Spectroscopy") == "2026Jun15"
+        assert _session_label(
+            "default_2026Jun15-203637_STM-STM_Spectroscopy",
+            keep_time=True) == "2026Jun15-203637"
         # Falls back to the whole base name when the convention doesn't match.
         assert _session_label("oddname") == "oddname"
 
@@ -618,7 +625,9 @@ class TestOmicronSessionBuilders:
         assert isinstance(ds, SpectralData)
         # 2 reps at pt1 + 1 rep at pt2 = 3 spectra
         assert ds.num_spectra == 3
-        assert list(ds.data.columns) == ['V', 'P1R1', 'P1R2', 'P2R1']
+        # Column indices are zero-padded so alphabetical ordering (tables,
+        # legends, browser) matches acquisition order.
+        assert list(ds.data.columns) == ['V', 'P01R01', 'P01R02', 'P02R01']
         sm = ds.metadata.additional_info['spectrum_meta']
         assert len(sm) == 3
         assert sm[0]['point_index'] == 1 and sm[0]['rep'] == 1
@@ -640,7 +649,7 @@ class TestOmicronSessionBuilders:
         sess = self._fake_session()
         ds = sts_loader.build_point_dataset(sess, sess['batches'][0], 'pt1')
         assert ds.num_spectra == 2  # two repetitions
-        assert list(ds.data.columns) == ['V', 'Rep_1', 'Rep_2']
+        assert list(ds.data.columns) == ['V', 'Rep_01', 'Rep_02']
         assert ds.metadata.scan_mode == 'point'
         ai = ds.metadata.additional_info
         assert ai['location_px'] == [10, 20]
@@ -802,6 +811,364 @@ class TestOmicronLineScanDataset:
                                    [2.0, 2.0, 3.0, np.nan, 6.0])
 
 
+class TestOmicronAreaBinding:
+    """Spectrum → scan-map binding by acquisition time + scan area."""
+
+    @staticmethod
+    def _geom(w=1e-8, h=1e-8, x=0.0, y=0.0, angle=0.0, ts=None):
+        return {'width_m': w, 'height_m': h, 'x_offset_m': x,
+                'y_offset_m': y, 'angle': angle, 'timestamp': ts}
+
+    @staticmethod
+    def _groups(*specs):
+        """specs: (run, scan, geom) → the {(run,scan): {chan: (path, info)}}
+        shape _build_images passes in."""
+        return {(r, s): {'Z': (Path(f'x--{r}_{s}.Z_mtrx'), g)}
+                for r, s, g in specs}
+
+    @staticmethod
+    def _batch(idx, ts=None, run=None):
+        return {'point_index': idx, 'first_timestamp': ts, 'parent_run': run}
+
+    def test_rescans_of_one_area_share_their_spectra(self, sts_loader):
+        """Re-scanning the same spot creates a new (run, scan) but the same
+        physical area — the spectra must show on every one of those maps."""
+        t = datetime(2026, 6, 15, 20, 0, 0)
+        groups = self._groups(
+            (5, 1, self._geom(x=1e-9, y=2e-9, ts=t)),
+            (11, 1, self._geom(x=1.1e-9, y=2.1e-9,
+                               ts=t + timedelta(minutes=10))),
+        )
+        b = self._batch(1, ts=t + timedelta(minutes=1), run=5)
+        area_of_rs, by_area = sts_loader._assign_spectra_to_areas(groups, [b])
+        # Both scans landed in one area...
+        assert area_of_rs[(5, 1)] == area_of_rs[(11, 1)]
+        # ...and the spectrum shows on it.
+        assert by_area[area_of_rs[(5, 1)]] == [b]
+
+    def test_spectra_never_leak_onto_a_different_area(self, sts_loader):
+        """The Run-Cycle bug: a later scan of a *different* area in the same
+        run cycle used to inherit the spectra."""
+        t = datetime(2026, 6, 15, 20, 0, 0)
+        groups = self._groups(
+            (12, 1, self._geom(w=8e-6, h=8e-6, ts=t)),
+            # Same run cycle, but a much smaller window somewhere else.
+            (12, 6, self._geom(w=2.34e-6, h=1.56e-6, x=-2.8e-6, y=1.4e-6,
+                               ts=t + timedelta(minutes=30))),
+        )
+        b = self._batch(2, ts=t + timedelta(minutes=1), run=12)
+        area_of_rs, by_area = sts_loader._assign_spectra_to_areas(groups, [b])
+        assert area_of_rs[(12, 1)] != area_of_rs[(12, 6)]
+        assert by_area.get(area_of_rs[(12, 1)]) == [b]
+        assert by_area.get(area_of_rs[(12, 6)]) is None
+
+    def test_spectrum_attaches_to_most_recent_prior_scan(self, sts_loader):
+        t = datetime(2026, 6, 15, 20, 0, 0)
+        groups = self._groups(
+            (1, 1, self._geom(x=0.0, ts=t)),
+            (2, 1, self._geom(x=5e-7, ts=t + timedelta(minutes=10))),
+        )
+        late = self._batch(1, ts=t + timedelta(minutes=20), run=1)
+        area_of_rs, by_area = sts_loader._assign_spectra_to_areas(groups, [late])
+        # Taken after the second scan → belongs to the second area, even though
+        # its Run Cycle says 1.
+        assert by_area[area_of_rs[(2, 1)]] == [late]
+
+    def test_spectrum_before_any_scan_attaches_to_the_first(self, sts_loader):
+        t = datetime(2026, 6, 15, 20, 0, 0)
+        groups = self._groups((1, 1, self._geom(ts=t)))
+        early = self._batch(1, ts=t - timedelta(minutes=5), run=1)
+        area_of_rs, by_area = sts_loader._assign_spectra_to_areas(groups, [early])
+        assert by_area[area_of_rs[(1, 1)]] == [early]
+
+    def test_falls_back_to_run_cycle_without_timestamps(self, sts_loader):
+        """Older exports / borrowed headers have no scan timestamps; binding
+        must degrade to the legacy Run-Cycle behaviour, not vanish."""
+        groups = self._groups(
+            (5, 1, self._geom(ts=None)),
+            (9, 1, self._geom(x=5e-7, ts=None)),
+        )
+        b = self._batch(1, ts=None, run=9)
+        area_of_rs, by_area = sts_loader._assign_spectra_to_areas(groups, [b])
+        assert area_of_rs[(9, 1)] == (9, 1)
+        assert by_area[(9, 1)] == [b]
+        assert (5, 1) not in by_area
+
+    def test_untimestamped_spectrum_falls_back_per_item(self, sts_loader):
+        """One spectrum missing a timestamp must not push the whole session
+        onto the legacy path."""
+        t = datetime(2026, 6, 15, 20, 0, 0)
+        groups = self._groups(
+            (5, 1, self._geom(ts=t)),
+            (9, 1, self._geom(x=5e-7, ts=t + timedelta(minutes=10))),
+        )
+        timed = self._batch(1, ts=t + timedelta(minutes=1), run=5)
+        untimed = self._batch(2, ts=None, run=9)
+        area_of_rs, by_area = sts_loader._assign_spectra_to_areas(
+            groups, [timed, untimed])
+        assert timed in by_area[area_of_rs[(5, 1)]]
+        assert untimed in by_area[area_of_rs[(9, 1)]]
+
+    @pytest.mark.parametrize("g2,same", [
+        ({}, True),                                    # identical
+        ({'x': 1e-10}, True),                          # sub-nm drift
+        ({'w': 1.02e-8, 'h': 1.02e-8}, True),          # 2 % size wobble
+        ({'w': 2e-8, 'h': 2e-8}, False),               # 2x zoom
+        ({'x': 5e-7}, False),                          # moved far away
+        ({'angle': 0.5}, True),                        # within angle tol
+        ({'angle': 30.0}, False),                      # rotated scan frame
+    ])
+    def test_same_area_tolerances(self, sts_loader, g2, same):
+        base = self._geom()
+        other = dict(base)
+        for k, v in g2.items():
+            other[{'w': 'width_m', 'h': 'height_m', 'x': 'x_offset_m',
+                   'y': 'y_offset_m', 'angle': 'angle'}[k]] = v
+        assert sts_loader._same_area(base, other) is same
+
+    def test_degenerate_geometry_is_not_an_area(self, sts_loader):
+        assert sts_loader._same_area(
+            self._geom(w=0.0), self._geom(w=0.0)) is False
+
+
+class TestOmicronHeaderResolution:
+    """Session identity + header borrowing for header-less sessions."""
+
+    @pytest.mark.parametrize("name,expected", [
+        ("default_2026Jun15-203637_STM-STM_Spectroscopy--3_1.I(V)_mtrx",
+         "default_2026Jun15-203637_STM-STM_Spectroscopy"),
+        ("default_2026Jun15-203637_STM-STM_Spectroscopy--12_4.Z_mtrx",
+         "default_2026Jun15-203637_STM-STM_Spectroscopy"),
+        # A header maps to the same base as its data files.
+        ("default_2026Jun15-203637_STM-STM_Spectroscopy_0001.mtrx",
+         "default_2026Jun15-203637_STM-STM_Spectroscopy"),
+    ])
+    def test_session_base_identifies_session(self, name, expected):
+        assert OmicronMatrixSTSLoader._session_base(Path(name)) == expected
+
+    def test_discover_sessions_from_data_files_not_headers(self, sts_loader,
+                                                           tmp_path):
+        """A directory with no header at all must still enumerate its
+        sessions — that is what makes a header-less folder loadable."""
+        for n in ["A_STM-STM_Spectroscopy--1_1.I(V)_mtrx",
+                  "A_STM-STM_Spectroscopy--2_1.I(V)_mtrx",
+                  "B_STM-STM_Spectroscopy--1_1.Z_mtrx",
+                  "notes.txt"]:
+            (tmp_path / n).write_bytes(b"")
+        assert sts_loader._discover_session_bases(tmp_path) == [
+            "A_STM-STM_Spectroscopy", "B_STM-STM_Spectroscopy"]
+
+    def test_own_header_is_preferred(self, sts_loader, tmp_path):
+        (tmp_path / "A_0001.mtrx").write_bytes(b"")
+        (tmp_path / "B_0001.mtrx").write_bytes(b"")
+        header, is_own = sts_loader._resolve_header("A", tmp_path)
+        assert header == tmp_path / "A_0001.mtrx"
+        assert is_own is True
+
+    def test_borrows_from_same_folder(self, sts_loader, tmp_path):
+        (tmp_path / "B_0001.mtrx").write_bytes(b"")
+        header, is_own = sts_loader._resolve_header("A", tmp_path)
+        assert header == tmp_path / "B_0001.mtrx"
+        assert is_own is False
+
+    def test_borrows_from_sibling_folder(self, sts_loader, tmp_path):
+        day1 = tmp_path / "29-Jun-2026"
+        day2 = tmp_path / "30-Jun-2026"
+        day1.mkdir()
+        day2.mkdir()
+        (day2 / "B_0001.mtrx").write_bytes(b"")
+        header, is_own = sts_loader._resolve_header("A", day1)
+        assert header == day2 / "B_0001.mtrx"
+        assert is_own is False
+
+    def test_no_header_anywhere_returns_none(self, sts_loader, tmp_path):
+        d = tmp_path / "lonely"
+        d.mkdir()
+        assert sts_loader._resolve_header("A", d) == (None, False)
+
+    def test_borrowed_curve_drops_the_foreign_location(self, sts_loader,
+                                                       monkeypatch):
+        """The borrowed header carries ITS OWN session's STS location. Passing
+        it on would put the spectrum at a plausible but wrong coordinate, so it
+        must be cleared rather than inherited."""
+        foreign = {'location_px': (253, 17), 'location_m': (1e-9, 2e-9),
+                   'parent_image': 'other--1_1.Z_mtrx', 'V': np.zeros(3),
+                   'forward': np.zeros(3), 'backward': np.zeros(3),
+                   'mixed': np.zeros(3)}
+        monkeypatch.setattr(sts_loader, '_open_injected_data',
+                            lambda *a, **k: True)
+        monkeypatch.setattr(sts_loader, '_extract_curve',
+                            lambda md, f: dict(foreign))
+        tpl = {'raw_param': b'', 'param': {}, 'channel_id': {}}
+        curve = sts_loader._curve_borrowed(tpl, Path("A--1_1.I(V)_mtrx"))
+        assert curve['location_px'] is None
+        assert curve['location_m'] is None
+        assert curve['parent_image'] is None
+        # ...and the curve is flagged, because absolute I may be mis-scaled by
+        # a preamp-gain factor that nothing in the bricklet reveals.
+        assert curve['scaling_borrowed'] is True
+
+
+class TestOmicronTraceChannels:
+    """Scan-direction handling, without needing a real session on disk."""
+
+    def test_trace_labels_cover_all_four_a2m_directions(self):
+        """The label map must stay in step with access2theMatrix; an unmapped
+        direction would silently leak its raw name into the channel list."""
+        a2m = pytest.importorskip("access2thematrix.access2thematrix")
+        assert set(OmicronMatrixSTSLoader._TRACE_LABELS) == \
+            set(a2m.MtrxData.ALL_2D_TRACES)
+
+    @pytest.mark.parametrize("names,expected", [
+        (['I fwd/up', 'Z fwd/up', 'Z bwd/up'], 'Z fwd/up'),   # prefer Z fwd/up
+        (['I', 'Z'], 'Z'),                                     # single-pass scan
+        (['I fwd/up', 'Z bwd/down'], 'Z bwd/down'),            # any Z beats I
+        (['I fwd/up', 'I bwd/up'], 'I fwd/up'),                # no Z at all
+        ([], None),
+    ])
+    def test_pick_active_channel(self, names, expected):
+        assert OmicronMatrixSTSLoader._pick_active_channel(names) == expected
+
+    def test_single_trace_scan_keeps_bare_channel_name(self, sts_loader,
+                                                       monkeypatch):
+        """A scan with only one direction must not be renamed to 'Z fwd/up' —
+        that would break existing projects and the default-channel lookup."""
+        info = {'traces': {'fwd/up': np.zeros((4, 4))}, 'data': np.zeros((4, 4)),
+                'channel_name': 'Z', 'unit': 'm', 'width_m': 1e-8,
+                'height_m': 1e-8, 'x_offset_m': 0.0, 'y_offset_m': 0.0,
+                'angle': 0.0, 'timestamp': None}
+        maps = self._build(sts_loader, monkeypatch, info)
+        assert list(maps[0]['channels']) == ['Z']
+        assert maps[0]['active_channel'] == 'Z'
+
+    def test_multi_trace_scan_suffixes_every_channel(self, sts_loader,
+                                                     monkeypatch):
+        info = {'traces': {'fwd/up': np.zeros((4, 4)), 'bwd/up': np.ones((4, 4))},
+                'data': np.zeros((4, 4)), 'channel_name': 'Z', 'unit': 'm',
+                'width_m': 1e-8, 'height_m': 1e-8, 'x_offset_m': 0.0,
+                'y_offset_m': 0.0, 'angle': 0.0, 'timestamp': None}
+        maps = self._build(sts_loader, monkeypatch, info)
+        assert set(maps[0]['channels']) == {'Z fwd/up', 'Z bwd/up'}
+        assert maps[0]['channel_units'] == {'Z fwd/up': 'm', 'Z bwd/up': 'm'}
+
+    @staticmethod
+    def _build(loader, monkeypatch, info):
+        """Run _build_images over one fake scan file returning ``info``."""
+        monkeypatch.setattr(loader, '_image_via_a2m',
+                            lambda md, f: dict(info))
+        return loader._build_images(
+            None, [Path('default_2026Jun15-203637--1_1.Z_mtrx')], 'L', [])[0]
+
+
+class TestOmicronSessionLabels:
+    """Session labels drop the acquisition time so browser rows and exported
+    filenames stay readable — unless the date alone would be ambiguous."""
+
+    _B1 = 'default_2026Jun29-203950_STM-STM_Spectroscopy'
+    _B2 = 'default_2026Jun29-214512_STM-STM_Spectroscopy'
+    _B3 = 'default_2026Jul02-101500_STM-STM_Spectroscopy'
+
+    def test_time_is_dropped(self):
+        assert _session_label(self._B1) == '2026Jun29'
+
+    def test_time_can_be_kept_explicitly(self):
+        assert _session_label(self._B1, keep_time=True) == '2026Jun29-203950'
+
+    def test_distinct_dates_all_lose_their_times(self):
+        labels = _session_labels([self._B1, self._B3])
+        assert set(labels.values()) == {'2026Jun29', '2026Jul02'}
+
+    def test_same_date_keeps_times_so_sessions_stay_distinct(self):
+        """Two sessions on one day would otherwise merge into a single browser
+        folder and collide their scan names."""
+        labels = _session_labels([self._B1, self._B2])
+        assert set(labels.values()) == {'2026Jun29-203950', '2026Jun29-214512'}
+        assert len(set(labels.values())) == 2
+
+    def test_unconventional_base_falls_back_to_itself(self):
+        assert _session_label('random_name') == 'random_name'
+
+
+class TestOmicronScanImages:
+    """One image entity per physical scan, carrying every channel × trace.
+
+    Previously each channel became its own browser entry ("… Z", "… I"),
+    which filled the project browser with near-identical rows. Now the
+    channels ride inside one image and the viewer offers a selector.
+    """
+
+    @staticmethod
+    def _images(loader, monkeypatch, info, files=None):
+        monkeypatch.setattr(loader, '_image_via_a2m',
+                            lambda md, f: dict(info))
+        files = files or [Path('default_2026Jun15-203637--1_1.Z_mtrx')]
+        return loader._build_images(None, files, 'L', [])[1]
+
+    @staticmethod
+    def _info(**over):
+        base = {'traces': {'fwd/up': np.zeros((4, 5)),
+                           'bwd/up': np.ones((4, 5))},
+                'data': np.zeros((4, 5)), 'channel_name': 'Z', 'unit': 'm',
+                'width_m': 2e-8, 'height_m': 1e-8, 'x_offset_m': 0.0,
+                'y_offset_m': 0.0, 'angle': 0.0, 'timestamp': None}
+        base.update(over)
+        return base
+
+    def test_one_image_per_scan_not_one_per_channel(self, sts_loader,
+                                                    monkeypatch):
+        images = self._images(sts_loader, monkeypatch, self._info())
+        assert len(images) == 1
+        name, img = images[0]
+        assert img.is_multichannel
+        assert set(img.channel_names) == {'Z fwd/up', 'Z bwd/up'}
+
+    def test_image_name_has_no_channel_suffix(self, sts_loader, monkeypatch):
+        """The entity is the scan, so its name is the scan title."""
+        images = self._images(sts_loader, monkeypatch, self._info())
+        name, img = images[0]
+        assert name == img.name
+        assert not name.endswith(' Z')
+
+    def test_scan_title_is_zero_padded(self, sts_loader, monkeypatch):
+        images = self._images(sts_loader, monkeypatch, self._info())
+        assert images[0][0] == 'L 01_01'
+
+    def test_default_channel_is_z_forward_up(self, sts_loader, monkeypatch):
+        _, img = self._images(sts_loader, monkeypatch, self._info())[0]
+        assert img.active_channel_name == 'Z fwd/up'
+
+    def test_channel_data_is_kept_distinct(self, sts_loader, monkeypatch):
+        _, img = self._images(sts_loader, monkeypatch, self._info())[0]
+        assert np.allclose(img.get_channel('Z fwd/up'), 0.0)
+        assert np.allclose(img.get_channel('Z bwd/up'), 1.0)
+
+    def test_pixel_size_is_derived_from_scan_geometry(self, sts_loader,
+                                                      monkeypatch):
+        """20 nm over 5 columns = 4 nm/px in x; 10 nm over 4 rows = 2.5 in y."""
+        _, img = self._images(sts_loader, monkeypatch, self._info())[0]
+        dy, dx = img.metadata.pixel_size_nm
+        assert dx == pytest.approx(4.0)
+        assert dy == pytest.approx(2.5)
+
+    def test_missing_geometry_leaves_pixel_size_unset(self, sts_loader,
+                                                      monkeypatch):
+        info = self._info(width_m=0.0, height_m=0.0)
+        _, img = self._images(sts_loader, monkeypatch, info)[0]
+        assert img.metadata.pixel_size_nm is None
+
+    def test_channel_units_are_carried(self, sts_loader, monkeypatch):
+        _, img = self._images(sts_loader, monkeypatch, self._info())[0]
+        units = img.metadata.additional_info['channel_units']
+        assert units == {'Z fwd/up': 'm', 'Z bwd/up': 'm'}
+
+    def test_single_trace_scan_still_produces_an_image(self, sts_loader,
+                                                       monkeypatch):
+        info = self._info(traces={'fwd/up': np.zeros((4, 5))})
+        images = self._images(sts_loader, monkeypatch, info)
+        assert len(images) == 1
+        assert images[0][1].channel_names == ['Z']
+
+
 # A complete real MATRIX session (header + spectra + scan images). Smart import
 # needs the whole session (access2theMatrix reads the _0001.mtrx header chain),
 # so these run against a real on-disk session rather than synthetic fixtures.
@@ -846,10 +1213,35 @@ class TestOmicronLoaderRealSession:
         tagged = [m for m in session['maps'] if m['locations']]
         assert tagged, "expected at least one map tagged with spectrum locations"
         m = tagged[0]
-        assert 'Z' in m['channels'] or 'I' in m['channels']
+        # Channels are per scan direction (see OM-REAL-05); the base signal
+        # name is still Z / I.
+        bases = {n.split()[0] for n in m['channels']}
+        assert 'Z' in bases or 'I' in bases
         assert m['width_m'] > 0 and m['height_m'] > 0
         loc = m['locations'][0]
         assert loc['px'] is not None and 'point_index' in loc
+
+    def test_all_scan_directions_become_channels(self, session):
+        """OM-REAL-05: Each acquired scan direction (trace/retrace × up/down)
+        is exposed as its own map channel, not just the primary pass."""
+        m = session['maps'][0]
+        names = set(m['channels'])
+        # This session runs X-retrace but not Y-retrace → fwd/up + bwd/up.
+        assert {'Z fwd/up', 'Z bwd/up', 'I fwd/up', 'I bwd/up'} <= names
+        # Forward and backward are genuinely different data, not a duplicate.
+        assert not np.array_equal(m['channels']['Z fwd/up'],
+                                  m['channels']['Z bwd/up'])
+        # Every channel shares one pixel grid so they can live on one map.
+        shapes = {v.shape for v in m['channels'].values()}
+        assert len(shapes) == 1
+        assert m['channel_units']['Z fwd/up'] == m['channel_units']['Z bwd/up']
+
+    def test_default_channel_is_z_forward_up(self, session):
+        """OM-REAL-06: Topography's forward/up pass is what opens by default,
+        regardless of which channel the files happen to enumerate first."""
+        for m in session['maps']:
+            assert m['active_channel'] == 'Z fwd/up'
+            assert m['active_channel'] in m['channels']
 
     def test_overview_and_point_datasets(self, sts_loader, session):
         """OM-REAL-04: Builders produce an overview + one dataset per point."""

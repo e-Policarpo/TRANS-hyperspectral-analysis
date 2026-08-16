@@ -77,6 +77,9 @@ class MapEditorBackend(QObject):
         # Linked datasets for spectrum viewing (name -> SpectralData)
         self._linked_datasets: Dict[str, SpectralData] = {}
         self._active_dataset: Optional[str] = None
+        # >0 while a beginLinkBatch/endLinkBatch pair is open: link/clear
+        # calls mutate state but hold back linkedDatasetsChanged.
+        self._link_batch_depth = 0
 
         # Cache for QML properties
         self._channel_names: List[str] = []
@@ -213,6 +216,24 @@ class MapEditorBackend(QObject):
     # Dataset Linking for Spectrum Viewing
     # =========================================================================
 
+    @Slot()
+    def beginLinkBatch(self):
+        """Suppress ``linkedDatasetsChanged`` until :meth:`endLinkBatch`.
+
+        The workstation relinks *every* dataset whenever new data loads, so
+        without batching one import emitted one signal per dataset — each of
+        which re-evaluates every binding on ``linkedDatasets``. With a few
+        thousand imported Matrix datasets that alone is quadratic.
+        """
+        self._link_batch_depth += 1
+
+    @Slot()
+    def endLinkBatch(self):
+        """End a batch opened by :meth:`beginLinkBatch` and emit once."""
+        self._link_batch_depth = max(0, self._link_batch_depth - 1)
+        if self._link_batch_depth == 0:
+            self.linkedDatasetsChanged.emit()
+
     @Slot(str, 'QVariant')
     def linkDataset(self, name: str, spectral_data):
         """
@@ -229,8 +250,10 @@ class MapEditorBackend(QObject):
         if self._active_dataset is None or "truncated" in name.lower():
             self._active_dataset = name
 
-        self.linkedDatasetsChanged.emit()
-        logger.info(f"Linked dataset '{name}' with {spectral_data.num_spectra} spectra")
+        if not self._link_batch_depth:
+            self.linkedDatasetsChanged.emit()
+        logger.debug("Linked dataset '%s' with %s spectra",
+                     name, spectral_data.num_spectra)
 
     # =========================================================================
     # Line-scan / point-set viewing (non-area spatially-resolved spectra)
@@ -325,7 +348,8 @@ class MapEditorBackend(QObject):
         """Clear all linked datasets"""
         self._linked_datasets.clear()
         self._active_dataset = None
-        self.linkedDatasetsChanged.emit()
+        if not self._link_batch_depth:
+            self.linkedDatasetsChanged.emit()
 
     @Slot(str)
     def setActiveDataset(self, name: str):
@@ -536,10 +560,42 @@ class MapEditorBackend(QObject):
             active = self._multi_channel_map.active_channel
             if active:
                 self._canvas.setMapData(active.data)
+            self._push_physical_extent(mcm)
             self._push_sts_markers(mcm)
         self.mapDataChanged.emit()
         self.channelListChanged.emit()
         self.activeChannelChanged.emit(self.activeChannelName)
+
+    # Scan-size units seen on MapMetadata, as nanometres per unit.
+    _UNITS_TO_NM = {'m': 1e9, 'mm': 1e6, 'um': 1e3, 'µm': 1e3, 'nm': 1.0}
+
+    def _push_physical_extent(self, mcm):
+        """Feed the canvas the map's physical scan size so its axes read in real
+        units (nm / µm) instead of pixel indices.
+
+        Reads ``metadata.physical_size`` (y, x) and ``physical_units``. Maps
+        without calibration (size missing / non-positive) revert the canvas to
+        pixel-index axes.
+        """
+        if self._canvas is None or not hasattr(self._canvas, 'setPhysicalExtent'):
+            return
+        size = getattr(mcm.metadata, 'physical_size', None)   # (y, x) in units
+        units = getattr(mcm.metadata, 'physical_units', 'm') or 'm'
+        if (not size or size[0] is None or size[1] is None
+                or size[0] <= 0 or size[1] <= 0):
+            self._canvas.clearPhysicalExtent()
+            return
+        if units not in self._UNITS_TO_NM:
+            # Unrecognised unit: show the raw numbers under their own label
+            # rather than silently mis-scaling them by up to 1e9.
+            self._canvas.setPhysicalExtent(float(size[1]), float(size[0]), units)
+            return
+        to_nm = self._UNITS_TO_NM[units]
+        x_nm, y_nm = float(size[1]) * to_nm, float(size[0]) * to_nm
+        disp_unit = 'nm'
+        if max(x_nm, y_nm) >= 1000.0:      # switch to µm for large scan windows
+            x_nm, y_nm, disp_unit = x_nm / 1000.0, y_nm / 1000.0, 'µm'
+        self._canvas.setPhysicalExtent(x_nm, y_nm, disp_unit)
 
     def _push_sts_markers(self, mcm):
         """Show, on the canvas, where spectra were taken on this scan image.
@@ -793,6 +849,9 @@ class MapEditorBackend(QObject):
         # Update canvas
         if self._canvas and mcmap.active_channel:
             self._canvas.setMapData(mcmap.active_channel.data)
+            # Refresh the axis calibration too, so a map set this way doesn't
+            # inherit the previously loaded map's physical extent.
+            self._push_physical_extent(mcmap)
 
             # Link spectral data if available
             if mcmap.has_spectral_link:
@@ -1210,17 +1269,20 @@ class MapEditorBackend(QObject):
                 data = median_filter(data, size=size)
 
             elif operation == "plane_level":
-                # Subtract a fitted plane
-                rows, cols = data.shape
-                x = np.arange(cols)
-                y = np.arange(rows)
-                X, Y = np.meshgrid(x, y)
+                # Least-squares plane (order-1 polynomial), NaN-aware.
+                from src.processing.plane_correction import polynomial_level
+                data = polynomial_level(data, order=1)
 
-                # Fit plane: z = ax + by + c
-                A = np.column_stack([X.ravel(), Y.ravel(), np.ones(X.size)])
-                coeffs, _, _, _ = np.linalg.lstsq(A, data.ravel(), rcond=None)
-                plane = (coeffs[0] * X + coeffs[1] * Y + coeffs[2])
-                data = data - plane
+            elif operation == "poly_level":
+                # Polynomial plane correction of configurable order.
+                from src.processing.plane_correction import polynomial_level
+                data = polynomial_level(data, order=int(params.get('order', 2)))
+
+            elif operation == "facet_level":
+                # Facet reorientation: level the dominant facet to horizontal.
+                from src.processing.plane_correction import facet_level
+                data = facet_level(
+                    data, iterations=int(params.get('iterations', 6)))
 
             elif operation == "row_align":
                 # Subtract row medians
@@ -1256,28 +1318,56 @@ class MapEditorBackend(QObject):
     # Export
     # =========================================================================
 
+    def _channel_pixel_scale(self, data_shape):
+        """Physical pixel size ``(dx, dy, unit)`` for the current map, or Nones.
+
+        Derives per-pixel size from the map's ``physical_size`` (y, x) and the
+        channel's pixel dimensions, so exported TIFFs carry a real spatial
+        scale instead of pixel indices.
+        """
+        meta = getattr(self._multi_channel_map, 'metadata', None)
+        size = getattr(meta, 'physical_size', None)   # (y, x) in units
+        unit = getattr(meta, 'physical_units', 'nm') or 'nm'
+        if (not size or size[0] is None or size[1] is None
+                or size[0] <= 0 or size[1] <= 0):
+            return None, None, None
+        rows, cols = data_shape
+        if not rows or not cols:
+            return None, None, None
+        return float(size[1]) / cols, float(size[0]) / rows, unit
+
     @Slot(str, str)
     def exportChannel(self, channel_name: str, file_path: str):
-        """Export a channel to file (TIFF and CSV formats only)"""
+        """Export a channel to file (TIFF and CSV formats only).
+
+        TIFFs keep the real float32 values and embed the physical pixel scale
+        plus an ImageJ display range, so they open calibrated and with contrast
+        (not black) in Fiji / Gwyddion.
+        """
         if self._multi_channel_map is None:
             return
+
+        def _write_tiff(target: Path, arr: np.ndarray):
+            import tifffile
+            from src.utils.tiff_io import imagej_tiff_kwargs
+            data = arr.astype(np.float32)
+            dx, dy, unit = self._channel_pixel_scale(data.shape)
+            tifffile.imwrite(str(target), data,
+                             **imagej_tiff_kwargs(data, dx=dx, dy=dy, unit=unit))
 
         try:
             path = Path(file_path.replace("file://", ""))
             channel = self._multi_channel_map.get_channel(channel_name)
 
             if path.suffix.lower() in ['.tif', '.tiff']:
-                import tifffile
-                tifffile.imwrite(str(path), channel.data.astype(np.float32))
+                _write_tiff(path, channel.data)
             elif path.suffix.lower() == '.csv':
                 np.savetxt(str(path), channel.data, delimiter=',', fmt='%.6e')
             elif path.suffix.lower() == '.png':
                 # PNG format is no longer supported - save as TIFF instead
                 logger.warning(f"PNG format no longer supported. Saving as TIFF instead.")
-                tiff_path = path.with_suffix('.tiff')
-                import tifffile
-                tifffile.imwrite(str(tiff_path), channel.data.astype(np.float32))
-                path = tiff_path
+                path = path.with_suffix('.tiff')
+                _write_tiff(path, channel.data)
             else:
                 logger.warning(f"Unsupported format {path.suffix}. Use .tiff or .csv")
                 return

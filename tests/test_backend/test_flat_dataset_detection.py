@@ -74,7 +74,7 @@ class TestFlatDatasetDetection:
             'Bandgap (eV)': np.random.rand(10)
         })
         metadata = SpectralMetadata(
-            source_type='bandgap_flat',
+            source_type='bandgap',
             dimensions=(5, 2),
             scan_mode='forward',
             units={'independent': 'Index', 'dependent': 'eV'},
@@ -174,7 +174,7 @@ class TestSourceTypeGeneralization:
         return MockBackend()
 
     def test_bandgap_source_type(self, tool_impl, sample_spectral_data):
-        """ST-01: Bandgap creates source_type='bandgap_flat'."""
+        """ST-01: Bandgap creates source_type='bandgap'."""
         tool_impl._datasets['test'] = sample_spectral_data
         from unittest.mock import MagicMock
         task = MagicMock()
@@ -192,11 +192,11 @@ class TestSourceTypeGeneralization:
                 break
 
         assert bandgap_ds is not None
-        assert bandgap_ds.metadata.source_type == 'bandgap_flat'
+        assert bandgap_ds.metadata.source_type == 'bandgap'
         assert 'original_source_type' in bandgap_ds.metadata.additional_info
 
     def test_doping_source_type(self, tool_impl, sample_spectral_data):
-        """ST-02: Doping creates source_type='doping_flat'."""
+        """ST-02: Doping creates source_type='doping'."""
         tool_impl._datasets['test'] = sample_spectral_data
         from unittest.mock import MagicMock
         task = MagicMock()
@@ -213,7 +213,7 @@ class TestSourceTypeGeneralization:
                 break
 
         assert doping_ds is not None
-        assert doping_ds.metadata.source_type == 'doping_flat'
+        assert doping_ds.metadata.source_type == 'doping'
         assert 'original_source_type' in doping_ds.metadata.additional_info
 
     def test_original_source_type_preserved(self, tool_impl, sample_spectral_data):

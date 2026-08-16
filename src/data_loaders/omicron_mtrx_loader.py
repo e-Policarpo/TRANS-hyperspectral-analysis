@@ -43,6 +43,8 @@ import pandas as pd
 
 from .base_loader import BaseDataLoader
 from ..models.spectral_data import SpectralData
+from ..utils.naming import pad as _pad
+from ..utils.naming import strip_acquisition_time as _strip_time
 from ..models.topography_data import TopographyData
 
 logger = logging.getLogger(__name__)
@@ -87,14 +89,36 @@ def _read_tlkb_seconds(path: Path) -> Optional[datetime]:
         return None
 
 
-def _session_label(base: str) -> str:
+def _session_label(base: str, keep_time: bool = False) -> str:
     """Short, human-friendly session label from a result-file base name.
 
-    ``default_2026Jun15-203637_STM-STM_Spectroscopy`` -> ``2026Jun15-203637``.
+    ``default_2026Jun15-203637_STM-STM_Spectroscopy`` -> ``2026Jun15``.
     Falls back to the whole base name when the convention doesn't match.
+
+    The acquisition time is dropped because it makes browser rows and exported
+    filenames hard to scan. Pass ``keep_time=True`` to retain it — see
+    :func:`_session_labels`, which does exactly that for the one case where the
+    date alone is ambiguous.
     """
     m = re.search(r'default_([0-9A-Za-z-]+?)_', base)
-    return m.group(1) if m else base
+    label = m.group(1) if m else base
+    return label if keep_time else _strip_time(label)
+
+
+def _session_labels(bases) -> Dict[str, str]:
+    """Map each result-file base name to its display label.
+
+    Times are stripped, **except** where two sessions share a date — dropping it
+    there would merge two distinct measurement sessions into one browser folder
+    and collide their scan names. Those keep the full date-time.
+    """
+    short = {base: _session_label(base) for base in bases}
+    counts: Dict[str, int] = {}
+    for label in short.values():
+        counts[label] = counts.get(label, 0) + 1
+    return {base: (label if counts[label] == 1
+                   else _session_label(base, keep_time=True))
+            for base, label in short.items()}
 
 
 def _parse_run_scan(filename: str) -> Tuple[int, int]:
@@ -178,42 +202,69 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
         """Import the full session that ``filepath`` belongs to.
 
         ``filepath`` may be a ``_0001.mtrx`` header or any session data file.
-        Returns an overview :class:`SpectralData` whose ``additional_info``
-        carries the structured session payload (``sessions``, ``images``).
+        The session is identified by the *data file's* own base name, so a
+        session whose ``_0001.mtrx`` header is missing still loads: a compatible
+        header from another session in the directory is borrowed for scaling
+        (see :meth:`_resolve_header`). Returns an overview :class:`SpectralData`
+        whose ``additional_info`` carries the structured session payload.
         """
         filepath = Path(filepath)
-        header = filepath if filepath.name.endswith('_0001.mtrx') \
-            else self._find_header(filepath)
-        if header is None:
-            raise ValueError(
-                f"No _0001.mtrx session header found for {filepath.name}")
+        base = self._session_base(filepath)
 
-        session = self._build_session(header, progress_callback)
+        session = self._build_session(base, filepath.parent, progress_callback)
         if session is None or not session['batches']:
             raise ValueError(
-                f"No spectroscopy data found in session {header.name}")
+                f"No spectroscopy data found for session {base}")
 
         primary = self._build_primary(
-            [session], session.get('images', []), str(header.parent))
+            [session], session.get('images', []), str(filepath.parent))
         if progress_callback:
             progress_callback(1, 1, "Complete!")
         self.last_loaded_path = filepath
         return primary, None
 
-    def load_from_directory(self, directory: Path, progress_callback=None
-                            ) -> Tuple[SpectralData, Optional[TopographyData]]:
-        """Import every MATRIX session found in ``directory``."""
+    def load_from_directory(self, directory: Path, progress_callback=None,
+                            should_cancel=None
+                            ) -> Tuple[Optional[SpectralData],
+                                       Optional[TopographyData]]:
+        """Import every MATRIX session found in ``directory``.
+
+        Sessions are discovered from the *data files* present (grouped by base
+        name), not from ``_0001.mtrx`` headers, so a directory whose header
+        files are missing still loads — each session borrows a compatible
+        header for scaling when its own is absent.
+
+        ``progress_callback(done, total, message)`` is forwarded down to the
+        per-curve loop — a single session can hold tens of thousands of
+        curves, so per-session progress alone leaves the UI looking frozen.
+        ``should_cancel()`` is polled in that loop; when it returns True the
+        load aborts and ``(None, None)`` is returned.
+        """
         directory = Path(directory)
-        headers = sorted(directory.glob("*_0001.mtrx"))
-        if not headers:
-            raise ValueError(f"No _0001.mtrx session headers in {directory}")
+        bases = self._discover_session_bases(directory)
+        if not bases:
+            raise ValueError(f"No Omicron MATRIX data files in {directory}")
 
         sessions: List[dict] = []
         images: List[Tuple[str, Any]] = []
-        for i, header in enumerate(headers):
-            if progress_callback:
-                progress_callback(i, len(headers), f"Reading {header.name}")
-            session = self._build_session(header, None)
+        # Labels are resolved together: the acquisition time is dropped unless
+        # two sessions share a date, where it is the only thing telling them
+        # apart.
+        _labels = _session_labels(bases)
+        for i, base in enumerate(bases):
+            if should_cancel is not None and should_cancel():
+                logger.info("MATRIX load of %s cancelled", directory)
+                return None, None
+            # Scope each session's curve progress into its slice of the whole,
+            # so the bar advances smoothly across a multi-session folder.
+            def _prog(done, total, msg, _i=i, _n=len(bases), _b=base):
+                if progress_callback and total:
+                    progress_callback(_i * 100 + int(100 * done / total),
+                                      _n * 100, f"{_b}: {msg}")
+            session = self._build_session(base, directory, _prog, should_cancel,
+                                          label=_labels.get(base))
+            if session is None and should_cancel is not None and should_cancel():
+                return None, None
             if session and session['batches']:
                 sessions.append(session)
                 images.extend(session.get('images', []))
@@ -223,7 +274,7 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
 
         primary = self._build_primary(sessions, images, str(directory))
         if progress_callback:
-            progress_callback(len(headers), len(headers), "Complete!")
+            progress_callback(len(bases), len(bases), "Complete!")
         self.last_loaded_path = directory
         return primary, None
 
@@ -277,10 +328,92 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
     # Session building
     # ------------------------------------------------------------------
 
-    def _session_files(self, header: Path) -> Tuple[List[Path], List[Path]]:
-        """Enumerate (spectroscopy, image) data files for a session header."""
-        base = header.name[:-len('_0001.mtrx')]  # e.g. default_..._Spectroscopy
-        directory = header.parent
+    @staticmethod
+    def _session_base(filepath: Path) -> str:
+        """Session base name for any file that belongs to a session.
+
+        A data file ``default_..._Spectroscopy--3_1.I(V)_mtrx`` and a header
+        ``default_..._Spectroscopy_0001.mtrx`` both map to the same base
+        ``default_..._Spectroscopy``. The base — not the header — is the
+        session's identity, so a session with a missing header still resolves.
+        """
+        name = filepath.name
+        if '--' in name:
+            return name.rsplit('--', 1)[0]
+        m = re.match(r'(.*?)_\d{4}\.mtrx$', name)
+        return m.group(1) if m else name
+
+    def _discover_session_bases(self, directory: Path) -> List[str]:
+        """Distinct session base names present as data files in ``directory``."""
+        exts = tuple(self.SPECTROSCOPY_EXTENSIONS) + tuple(self.IMAGE_EXTENSIONS)
+        bases = set()
+        try:
+            for f in directory.iterdir():
+                n = f.name
+                if '--' in n and n.endswith(exts) and f.is_file():
+                    bases.add(n.rsplit('--', 1)[0])
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Could not scan %s for sessions: %s", directory, exc)
+        return sorted(bases)
+
+    @staticmethod
+    def _first_header_in(directory: Path) -> Optional[Path]:
+        """First ``*_0001.mtrx`` in ``directory`` (non-recursive), or None."""
+        try:
+            hs = sorted(directory.glob("*_0001.mtrx"))
+        except Exception:
+            hs = []
+        return hs[0] if hs else None
+
+    def _resolve_header(self, base: str, directory: Path
+                        ) -> Tuple[Optional[Path], bool]:
+        """Locate the parameter header to scale ``base``'s data files.
+
+        Returns ``(header_path, is_own)``. Search order:
+
+        1. The session's own ``{base}_0001.mtrx`` (``is_own=True``).
+        2. Any ``*_0001.mtrx`` in the same folder (borrowed).
+        3. Any ``*_0001.mtrx`` in the parent folder or a sibling folder
+           (borrowed, one level only — the day-folder layout keeps all
+           sessions of an instrument under one parent).
+
+        MATRIX transfer functions are shared across sessions on the same
+        instrument setup, so a borrowed header scales spectra correctly
+        (verified); the per-spectrum STS location and the scan-window geometry,
+        however, are only right with the session's own header — see
+        :meth:`_build_session`. A borrowed header only scales correctly when the
+        sweep configuration matched, which is normal within one instrument setup
+        but not guaranteed across very different experiments.
+        """
+        own = directory / f"{base}_0001.mtrx"
+        if own.exists():
+            return own, True
+
+        # Same folder.
+        h = self._first_header_in(directory)
+        if h is not None:
+            return h, False
+
+        # Parent folder, then sibling folders (one level, deterministic order).
+        parent = directory.parent
+        search_dirs: List[Path] = []
+        if parent != directory:
+            search_dirs.append(parent)
+            try:
+                search_dirs.extend(
+                    sorted(p for p in parent.iterdir()
+                           if p.is_dir() and p != directory))
+            except Exception:
+                pass
+        for d in search_dirs:
+            h = self._first_header_in(d)
+            if h is not None:
+                return h, False
+        return None, False
+
+    def _session_files(self, base: str, directory: Path
+                       ) -> Tuple[List[Path], List[Path]]:
+        """Enumerate (spectroscopy, image) data files for a session base."""
         prefix = f"{base}--"
         spec, imgs = [], []
         for f in directory.iterdir():
@@ -292,18 +425,43 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
                 imgs.append(f)
         return spec, imgs
 
-    def _build_session(self, header: Path, progress_callback
-                       ) -> Optional[dict]:
-        """Parse one session into a structured dict (batches, maps, images)."""
+    def _build_session(self, base: str, directory: Path, progress_callback,
+                       should_cancel=None,
+                       label: Optional[str] = None) -> Optional[dict]:
+        """Parse one session into a structured dict (batches, maps, images).
+
+        ``base`` identifies the session by its data-file base name; the header
+        is resolved separately (own or borrowed). With a borrowed header,
+        spectra are scaled from the shared transfer functions but STS locations
+        and scan maps are unavailable (a borrowed header's scan geometry does
+        not match these bricklets), so image parsing is skipped.
+        """
         if _a2m is None:
-            logger.error("access2theMatrix not installed; cannot read %s", header)
+            logger.error("access2theMatrix not installed; cannot read %s", base)
             return None
 
-        base = header.name[:-len('_0001.mtrx')]
-        label = _session_label(base)
-        spec_files, image_files = self._session_files(header)
+        header, header_is_own = self._resolve_header(base, directory)
+        if label is None:
+            label = _session_label(base)
+        spec_files, image_files = self._session_files(base, directory)
         if not spec_files:
             return None
+        if header is None:
+            logger.warning(
+                "Session %s has no _0001.mtrx header and none is available to "
+                "borrow in %s; cannot scale — skipping.", base, directory)
+            return None
+        if not header_is_own:
+            where = ("this folder" if header.parent == directory
+                     else f"folder '{header.parent.name}'")
+            logger.warning(
+                "Session %s has no _0001.mtrx header; borrowing '%s' from %s. "
+                "The bias axis is reliable, but CURRENT VALUES MAY BE MIS-SCALED "
+                "by a constant gain factor if the preamp range differed between "
+                "the two runs (observed ×101 between real sessions) — treat "
+                "absolute I as unverified. STS locations and scan maps are "
+                "unavailable without the session's own header.",
+                base, header.name, where)
 
         # Pick the primary spectroscopy channel present in this session.
         present = {self._ext_channel(f) for f in spec_files}
@@ -321,24 +479,44 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
         # The incremental cursor makes it O(N); any file not reached in header
         # order falls back to a from-scratch open().
         md = self._new_md()
-        raw_param = self._read_header_chain(header)
-        header_ok = raw_param[:len(self.MAGIC_NUMBER)] == self.MAGIC_NUMBER
-        if header_ok:
-            md.raw_param = raw_param
-            md.param = {'BREF': ''}
-            md.channel_id = {}
+        raw_param = b''
+        header_ok = False
+        borrowed = None
+        if header_is_own:
+            raw_param = self._read_header_chain(header)
+            header_ok = raw_param[:len(self.MAGIC_NUMBER)] == self.MAGIC_NUMBER
+            if header_ok:
+                md.raw_param = raw_param
+                md.param = {'BREF': ''}
+                md.channel_id = {}
+        else:
+            # Borrowed header: pre-parse its param stream once for injection.
+            borrowed = self._borrowed_template(header)
+            if borrowed is None:
+                logger.warning(
+                    "Borrowed header '%s' is unreadable; skipping %s.",
+                    header.name, base)
+                return None
         cursor = [12]
 
         sample_name = dataset_name = ''
         batches: Dict[Any, dict] = {}
         total = len(primary_files)
         for done, f in enumerate(primary_files):
-            if progress_callback and (done % 64 == 0):
-                progress_callback(done, total, f"Reading {f.name}")
+            if done % 64 == 0:
+                if should_cancel is not None and should_cancel():
+                    logger.info("Session %s cancelled after %d/%d curves",
+                                base, done, total)
+                    return None
+                if progress_callback:
+                    progress_callback(done, total,
+                                      f"{done}/{total} curves")
             curve = None
             if header_ok:
                 curve = self._curve_incremental(md, raw_param, cursor, f)
-            if curve is None:
+            if curve is None and borrowed is not None:
+                curve = self._curve_borrowed(borrowed, f)
+            if curve is None and header_is_own:
                 curve = self._curve_via_a2m(self._new_md(), f)
             if curve is None:
                 continue
@@ -389,7 +567,13 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
         line_scans = self._detect_line_scans(ordered)
 
         # Scan images -> maps + pictures; tag each map with the spectra on it.
-        maps, images = self._build_images(md, image_files, label, ordered)
+        # Only with the session's own header: a borrowed header's scan geometry
+        # (Width/Height/Points/Lines) does not match these bricklets, so the
+        # maps would be mis-scaled or reshaped wrongly. Spectra still load.
+        if header_is_own:
+            maps, images = self._build_images(md, image_files, label, ordered)
+        else:
+            maps, images = [], []
 
         n_points = len(ordered)
         spatial_layout = 'point' if n_points <= 1 else 'line'
@@ -398,7 +582,13 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
             'label': label,
             'base': base,
             'header': str(header),
-            'source_dir': str(header.parent),
+            # The session's own folder — not the header's, which may have been
+            # borrowed from a sibling directory.
+            'source_dir': str(directory),
+            # True when scaling came from another session's header: the bias
+            # axis is reliable but absolute current may be off by a constant
+            # preamp-gain factor, and STS locations/maps are unavailable.
+            'header_borrowed': not header_is_own,
             'sample_name': sample_name,
             'dataset_name': dataset_name,
             'channel': primary_channel,
@@ -593,6 +783,105 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
             return None
         return self._extract_curve(md, filepath)
 
+    def _borrowed_template(self, header: Path) -> Optional[dict]:
+        """Pre-parse a *borrowed* header's param stream once, for injection.
+
+        When a session's own ``_0001.mtrx`` is missing, another session's
+        header supplies the (shared) transfer functions and channel dictionary
+        needed to scale raw ADC samples. Its ``BREF`` entries never match this
+        session's files, so scanning the whole stream simply leaves the
+        experiment configuration in ``param`` — exactly the state a2m's
+        ``open()`` reaches before reading a bricklet. The parsed state is
+        snapshotted so each file reuses it without re-scanning the header.
+        """
+        raw = self._read_header_chain(header)
+        if raw[:len(self.MAGIC_NUMBER)] != self.MAGIC_NUMBER:
+            return None
+        md = self._new_md()
+        md.raw_param = raw
+        md.param = {'BREF': ''}
+        md.channel_id = {}
+        dp, n = 12, len(raw)
+        try:
+            while dp < n:
+                dp = md._scan_raw_param(dp, raw)
+        except Exception as exc:
+            logger.debug("Could not parse borrowed header %s: %s", header, exc)
+            return None
+        return {'raw_param': raw,
+                'param': dict(md.param),
+                'channel_id': dict(md.channel_id)}
+
+    def _curve_borrowed(self, template: dict, filepath: Path) -> Optional[dict]:
+        """Extract a spectroscopy curve using a borrowed header ``template``.
+
+        Mirrors the tail of a2m's ``open()``: inject the pre-parsed param
+        state, read this file's bricklet, and let ``_cu_data`` scale it with the
+        borrowed transfer functions.
+
+        Two caveats, both handled here:
+
+        * **The STS location belongs to the borrowed header's session**, not to
+          this file, so it is a plausible-looking but wrong coordinate. It is
+          cleared to ``None`` rather than passed on.
+        * **The current scaling is only right if the preamp gain matched.**
+          Verified against real sessions: two runs recorded on the same
+          instrument an hour apart differed by an exact ×101 gain factor, so a
+          borrowed header can silently mis-scale I by orders of magnitude.
+          Nothing in the bricklet lets us detect this — the session's own
+          header is precisely what is missing — so the curve is tagged
+          ``scaling_borrowed`` and the caller surfaces it.
+        """
+        md = self._new_md()
+        md.raw_param = template['raw_param']
+        md.param = dict(template['param'])
+        md.channel_id = dict(template['channel_id'])
+        if not self._open_injected_data(md, filepath, is_curve=True):
+            return None
+        curve = self._extract_curve(md, filepath)
+        if curve is not None:
+            curve['location_px'] = None
+            curve['location_m'] = None
+            curve['parent_image'] = None
+            curve['scaling_borrowed'] = True
+        return curve
+
+    def _open_injected_data(self, md, filepath: Path, is_curve: bool) -> bool:
+        """Read one bricklet into ``md`` whose ``param`` is already populated.
+
+        Replicates the data-reading half of a2m's ``open()`` (the param half
+        having been supplied by a borrowed :meth:`_borrowed_template`). Returns
+        True when a usable ``md.scan`` was produced.
+        """
+        try:
+            md.raw_data = filepath.read_bytes()
+        except Exception:
+            return False
+        if md.raw_data[:len(self.MAGIC_NUMBER)] != self.MAGIC_NUMBER:
+            return False
+        md.channel_name = self._ext_channel(filepath)
+        md.result_data_file = str(filepath)
+        md.data = np.array([])
+        md.data_item_count = 0
+        md.bricklet_size = 0
+        md.axis = None
+        try:
+            md._scan_raw_data(len(self.MAGIC_NUMBER), md.raw_data)
+            if is_curve:
+                scan = md._cu_data()
+                if md.object_type != 'curve':
+                    return False
+                md.scan = scan
+                md.traces = (['trace', 'retrace']
+                             if getattr(scan, 'ndim', 0) == 2
+                             and scan.shape[0] == 3 else ['trace'])
+            else:
+                md.scan, md.axis = md._im_data()
+                md.traces = [md.ALL_2D_TRACES[0]]
+        except Exception:
+            return False
+        return getattr(md.scan, 'size', 0) > 0
+
     def _extract_curve(self, md, filepath: Path) -> Optional[dict]:
         """Build the curve dict from an ``MtrxData`` whose header+data are
         already parsed for ``filepath`` (``md.scan``/``traces``/``param`` set)."""
@@ -675,6 +964,112 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
     # Image / map extraction (access2theMatrix)
     # ------------------------------------------------------------------
 
+    # Area-matching tolerances. Two scans are the "same area" when their scan
+    # size matches within _AREA_SIZE_RTOL, their probe offset within
+    # _AREA_OFFSET_FRAC of the scan size (with a small absolute floor for tiny
+    # scans, to absorb sub-nm thermal drift between re-scans), and their scan
+    # angle within _AREA_ANGLE_TOL degrees.
+    _AREA_SIZE_RTOL = 0.03
+    _AREA_OFFSET_FRAC = 0.08
+    _AREA_OFFSET_FLOOR_M = 2e-9
+    _AREA_ANGLE_TOL = 1.5
+
+    def _same_area(self, g1: dict, g2: dict) -> bool:
+        """True if two scan geometries cover the same physical area."""
+        w1, h1 = g1['width_m'], g1['height_m']
+        w2, h2 = g2['width_m'], g2['height_m']
+        if not (w1 and h1 and w2 and h2):
+            return False
+
+        def _rclose(a, b):
+            return abs(a - b) <= self._AREA_SIZE_RTOL * max(abs(a), abs(b), 1e-12)
+
+        if not (_rclose(w1, w2) and _rclose(h1, h2)):
+            return False
+        tol = max(self._AREA_OFFSET_FRAC * max(w1, h1, w2, h2),
+                  self._AREA_OFFSET_FLOOR_M)
+        if abs(g1['x_offset_m'] - g2['x_offset_m']) > tol:
+            return False
+        if abs(g1['y_offset_m'] - g2['y_offset_m']) > tol:
+            return False
+        if abs((g1.get('angle') or 0.0) - (g2.get('angle') or 0.0)) \
+                > self._AREA_ANGLE_TOL:
+            return False
+        return True
+
+    def _assign_spectra_to_areas(self, groups: dict, batches: List[dict]
+                                 ) -> Tuple[dict, dict]:
+        """Map each scan to an area, and each spectrum-batch to an area.
+
+        Returns ``(area_of_rs, by_area)`` where ``area_of_rs[(run, scan)]`` is a
+        scan's area key and ``by_area[area_key]`` is the list of batches to show
+        on every map of that area. Binding is purely by timestamp + geometry;
+        the acquisition-time ordering is what separates spectra taken over one
+        area from a later, different area at the same run cycle.
+
+        Falls back to Run-Cycle binding only when timestamps are unavailable
+        (older exports / borrowed headers), so behaviour degrades gracefully.
+        """
+        from bisect import bisect_right
+
+        scans = []
+        for rs, chans in groups.items():
+            geom = next(iter(chans.values()))[1]
+            scans.append({'rs': rs, 'ts': geom.get('timestamp'), 'geom': geom})
+
+        # Scan timestamps are required to cluster/order areas; individual
+        # spectra missing a timestamp are handled per-item below, so one bad
+        # spectrum doesn't force the whole session onto the legacy path.
+        have_ts = bool(scans) and all(s['ts'] is not None for s in scans)
+
+        area_of_rs: Dict[Tuple[int, int], Any] = {}
+        by_area: Dict[Any, List[dict]] = {}
+
+        if not have_ts:
+            # Legacy fallback: bind by Run Cycle, each scan its own key.
+            for rs in groups:
+                area_of_rs[rs] = rs
+            for b in batches:
+                run = b.get('parent_run')
+                if run is None:
+                    continue
+                for rs in groups:
+                    if rs[0] == int(run):
+                        by_area.setdefault(rs, []).append(b)
+            return area_of_rs, by_area
+
+        # Time-order the scans and cluster them into areas (greedy: match each
+        # scan against the representative geometry of every known area).
+        scans.sort(key=lambda s: s['ts'])
+        reps: List[dict] = []
+        for s in scans:
+            aid = next((i for i, rep in enumerate(reps)
+                        if self._same_area(rep, s['geom'])), None)
+            if aid is None:
+                reps.append(s['geom'])
+                aid = len(reps) - 1
+            s['area'] = aid
+            area_of_rs[s['rs']] = aid
+
+        # Each spectrum → area of the most-recent scan taken at or before it
+        # (spectra taken before the very first scan attach to the first area).
+        # A spectrum with no timestamp falls back to matching its Run Cycle.
+        scan_ts = [s['ts'] for s in scans]
+        for b in batches:
+            ts = b.get('first_timestamp')
+            if ts is not None:
+                i = max(bisect_right(scan_ts, ts) - 1, 0)
+                by_area.setdefault(scans[i]['area'], []).append(b)
+                continue
+            run = b.get('parent_run')
+            if run is None:
+                continue
+            for s in scans:
+                if s['rs'][0] == int(run):
+                    by_area.setdefault(s['area'], []).append(b)
+                    break
+        return area_of_rs, by_area
+
     def _build_images(self, md, image_files: List[Path], label: str,
                       batches: List[dict]
                       ) -> Tuple[List[dict], List[Tuple[str, Any]]]:
@@ -688,14 +1083,6 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
         """
         from ..models.image_data import ImageData, ImageMetadata, ImageMode
 
-        # Index batches by the Run Cycle of the scan they were taken on, so the
-        # scan images can be tagged with the spectra measured on them.
-        by_run: Dict[int, List[dict]] = {}
-        for b in batches:
-            run = b.get('parent_run')
-            if run is not None:
-                by_run.setdefault(int(run), []).append(b)
-
         # Group scan files by (run, scan): one physical scan, several channels.
         groups: Dict[Tuple[int, int], Dict[str, Tuple[Path, dict]]] = {}
         for f in sorted(image_files, key=lambda p: _parse_run_scan(p.name)):
@@ -704,15 +1091,30 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
                 continue
             groups.setdefault(_parse_run_scan(f.name), {})[info['channel_name']] = (f, info)
 
+        # Bind each spectrum to the scan it belongs to *by acquisition time and
+        # scan area* — not by Run Cycle. Scans are clustered into physical AREAS
+        # by geometry (probe offset + scan size + angle); a spectrum belongs to
+        # the area of the most-recent scan taken before it, and shows on every
+        # scan-map of that area (re-scans of the same spot inherit its spectra).
+        # A spectrum taken over a *different* area is never inherited across.
+        # See :meth:`_assign_spectra_to_areas`.
+        area_of_rs, by_area = self._assign_spectra_to_areas(groups, batches)
+
         maps: List[dict] = []
         images: List[Tuple[str, Any]] = []
+        # Zero-pad run/scan so the browser's alphabetical ordering matches
+        # acquisition order (…_09, _10, _11 rather than _1, _10, _11, _2).
+        # Widths come from the largest index in this session, so a 9-scan
+        # session stays two digits.
+        max_run = max((rs[0] for rs in groups), default=1)
+        max_scan = max((rs[1] for rs in groups), default=1)
         for (run, scan), chans in sorted(groups.items()):
             geom = next(iter(chans.values()))[1]  # shapes/geometry are shared
-            title = f"{label} {run}_{scan}"
+            title = f"{label} {_pad(run, max_run)}_{_pad(scan, max_scan)}"
             parent_files = {f.name for f, _ in chans.values()}
 
             seen, locations = set(), []
-            for b in by_run.get(run, []):
+            for b in by_area.get(area_of_rs.get((run, scan)), []):
                 if b['point_index'] in seen:
                     continue
                 seen.add(b['point_index'])
@@ -747,12 +1149,26 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
                 })
             locations.sort(key=lambda d: d['point_index'])
 
+            # Expand every scan channel (Z, I) into one map channel per scan
+            # direction — e.g. "Z fwd/up", "Z bwd/up", "Z fwd/down",
+            # "Z bwd/down". A channel with a single trace keeps its bare name
+            # ("Z") so single-pass scans are unchanged.
+            channels: Dict[str, np.ndarray] = {}
+            channel_units: Dict[str, str] = {}
+            for cn, (f, info) in chans.items():
+                tr = info.get('traces') or {'': info.get('data')}
+                multi = len(tr) > 1
+                for tlabel, data in tr.items():
+                    name = f"{cn} {tlabel}" if (multi and tlabel) else cn
+                    channels[name] = data
+                    channel_units[name] = info['unit']
+
             ts = geom['timestamp']
             maps.append({
                 'title': title,
-                'channels': {cn: info['data'] for cn, (f, info) in chans.items()},
-                'channel_units': {cn: info['unit'] for cn, (f, info) in chans.items()},
-                'active_channel': 'Z' if 'Z' in chans else next(iter(chans)),
+                'channels': channels,
+                'channel_units': channel_units,
+                'active_channel': self._pick_active_channel(channels),
                 'width_m': geom['width_m'],
                 'height_m': geom['height_m'],
                 'x_offset_m': geom['x_offset_m'],
@@ -763,63 +1179,134 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
                 'locations': locations,
             })
 
-            # Browsable pictures (one per channel): float single-channel; the
-            # image viewer applies a colormap + range controls, so the raw
-            # scaled array travels untouched (no colormap baked in).
-            for cn, (f, info) in chans.items():
-                try:
-                    # Physical pixel size (dy, dx) in nm, for the viewer ruler.
-                    rows, cols = info['data'].shape
+            # ONE browsable picture per physical scan, carrying every channel ×
+            # trace direction (Z fwd/up, Z bwd/up, I fwd/up, …) so the viewer
+            # offers a channel selector instead of the project browser filling
+            # up with near-identical "… Z" / "… I" entities.
+            #
+            # Channels are float single-channel: the image viewer applies the
+            # colormap and range, so the raw scaled array travels untouched.
+            try:
+                img_channels = {
+                    cn: data.astype(np.float32)
+                    for cn, data in channels.items()
+                }
+                if img_channels:
+                    rows, cols = next(iter(img_channels.values())).shape
+                    # Physical pixel size (dy, dx) in nm — drives the viewer's
+                    # scale bar and axis ticks.
                     px_nm = None
                     if rows and cols and geom['width_m'] and geom['height_m']:
                         px_nm = (geom['height_m'] / rows * 1e9,
                                  geom['width_m'] / cols * 1e9)
+                    active = self._pick_active_channel(img_channels)
                     meta = ImageMetadata(
                         source="omicron_matrix_scan",
-                        original_filename=f.name,
+                        original_filename=sorted(parent_files)[0]
+                            if parent_files else None,
                         pixel_size_nm=px_nm,
-                        additional_info={'channel': cn, 'unit': info['unit'],
-                                         'session_label': label},
+                        additional_info={
+                            'channel': active,
+                            'channel_units': dict(channel_units),
+                            'session_label': label,
+                            'source_files': sorted(parent_files),
+                        },
                     )
-                    img = ImageData.from_array(
-                        info['data'].astype(np.float32),
+                    img = ImageData.from_channels(
+                        img_channels, name=title,
                         mode=ImageMode.SINGLE_FLOAT, metadata=meta,
-                        name=f"{title} {cn}")
-                    images.append((f"{title} {cn}", img))
-                except Exception as exc:
-                    logger.debug("Could not wrap scan %s as image: %s", f.name, exc)
+                        active_channel=active)
+                    images.append((title, img))
+            except Exception as exc:
+                logger.debug("Could not wrap scan %s as image: %s", title, exc)
 
         return maps, images
 
+    # Short, stable labels for the four scan directions a2m exposes
+    # (trace/retrace × up/down). ``forward`` is the trace, ``backward`` the
+    # retrace; ``up``/``down`` is the slow (Y) scan direction.
+    _TRACE_LABELS = {
+        'forward/up': 'fwd/up', 'backward/up': 'bwd/up',
+        'forward/down': 'fwd/down', 'backward/down': 'bwd/down',
+    }
+
+    @staticmethod
+    def _pick_active_channel(names) -> Optional[str]:
+        """Default channel for a map: prefer the Z forward/up topography."""
+        if not names:
+            return None
+        for pref in ('Z fwd/up', 'Z'):
+            if pref in names:
+                return pref
+        zs = [n for n in names if n.upper().startswith('Z')]
+        return zs[0] if zs else next(iter(names))
+
     def _image_via_a2m(self, md, filepath: Path) -> Optional[dict]:
-        """Read a single scan image (forward/up trace) via access2theMatrix."""
+        """Read a scan image via access2theMatrix, with *all* available traces.
+
+        A MATRIX scan can hold up to four directions — trace/retrace (forward /
+        backward, the fast X pass) crossed with up/down (the slow Y pass). All
+        that are present are returned under ``traces`` keyed by a short label
+        (``fwd/up`` …); geometry/timestamp are shared. Traces whose pixel shape
+        differs from the first (e.g. an interrupted down pass) are dropped so
+        every trace can share one multi-channel map.
+        """
         try:
-            traces, _msg = md.open(str(filepath))
+            avail, _msg = md.open(str(filepath))
         except Exception as exc:
             logger.warning("a2m could not open image %s: %s", filepath.name, exc)
             return None
-        if not traces or md.axis is None:
+        if not avail or md.axis is None:
             return None
-        try:
-            im, _ = md.select_image(traces[0])
-        except Exception as exc:
-            logger.warning("a2m select_image failed for %s: %s", filepath.name, exc)
+
+        traces: Dict[str, np.ndarray] = {}
+        geom: Optional[dict] = None
+        primary_shape: Optional[Tuple[int, int]] = None
+        # ``avail`` is ``{index: 'forward/up', …}`` enumerated in
+        # ``ALL_2D_TRACES`` order, so sorting by index puts forward/up first.
+        for _idx, tname in sorted(avail.items()):
+            try:
+                im, _ = md.select_image(tname)
+            except Exception as exc:
+                logger.debug("select_image(%s) failed for %s: %s",
+                             tname, filepath.name, exc)
+                continue
+            data = np.asarray(im.data, dtype=np.float64)
+            if data.size == 0 or data.ndim != 2 or min(data.shape) < 1:
+                continue
+            if primary_shape is None:
+                primary_shape = data.shape
+            elif data.shape != primary_shape:
+                logger.debug("Skipping trace %s of %s: shape %s != %s",
+                             tname, filepath.name, data.shape, primary_shape)
+                continue
+            # NB: the down (Y-retrace) pass starts where the up pass ended, so
+            # its raw rows run the other way — but access2theMatrix already
+            # reverses them (``select_image`` returns the down passes in the same
+            # spatial frame as the up passes). Verified against real scans: the
+            # topography lines up vertically as-is; an extra flip would
+            # re-mirror it. So the trace is stored exactly as a2m returns it.
+            traces[self._TRACE_LABELS.get(str(tname), str(tname))] = data
+            if geom is None:
+                name_unit = getattr(im, 'channel_name_and_unit',
+                                    ['', '']) or ['', '']
+                geom = {
+                    'channel_name': name_unit[0] or md.channel_name or 'Z',
+                    'unit': name_unit[1] or 'm',
+                    'width_m': float(getattr(im, 'width', 0.0) or 0.0),
+                    'height_m': float(getattr(im, 'height', 0.0) or 0.0),
+                    'x_offset_m': float(getattr(im, 'x_offset', 0.0) or 0.0),
+                    'y_offset_m': float(getattr(im, 'y_offset', 0.0) or 0.0),
+                    'angle': float(getattr(im, 'angle', 0.0) or 0.0),
+                    'timestamp': _read_tlkb_seconds(filepath),
+                }
+        if geom is None or not traces:
             return None
-        data = np.asarray(im.data, dtype=np.float64)
-        if data.size == 0 or data.ndim != 2 or min(data.shape) < 1:
-            return None
-        name_unit = getattr(im, 'channel_name_and_unit', ['', '']) or ['', '']
-        return {
-            'data': data,
-            'channel_name': name_unit[0] or md.channel_name or 'Z',
-            'unit': name_unit[1] or 'm',
-            'width_m': float(getattr(im, 'width', 0.0) or 0.0),
-            'height_m': float(getattr(im, 'height', 0.0) or 0.0),
-            'x_offset_m': float(getattr(im, 'x_offset', 0.0) or 0.0),
-            'y_offset_m': float(getattr(im, 'y_offset', 0.0) or 0.0),
-            'angle': float(getattr(im, 'angle', 0.0) or 0.0),
-            'timestamp': _read_tlkb_seconds(filepath),
-        }
+        geom['traces'] = traces
+        # Primary trace, for the browsable-picture path: forward/up when it was
+        # acquired, else whichever direction came first.
+        geom['data'] = traces.get('fwd/up', next(iter(traces.values())))
+        return geom
 
     # ------------------------------------------------------------------
     # Dataset builders (consumed by the backend, per session)
@@ -850,12 +1337,17 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
         fwd_cols: Dict[str, np.ndarray] = {}
         bwd_cols: Dict[str, np.ndarray] = {}
         spectrum_meta: List[dict] = []
+        # Zero-padded so the overview's columns sort in acquisition order in
+        # tables and graph legends (P01R1 … P10R1, not P1R1, P10R1, P2R1).
+        max_point = max((b['point_index'] for b in modal), default=1)
+        max_rep = max((len(b['mixed']) for b in modal), default=1)
         for b in modal:
             for r in range(len(b['mixed'])):
                 spec = b['mixed'][r]
                 if len(spec) != modal_len:
                     continue
-                col = f"P{b['point_index']}R{r + 1}"
+                col = (f"P{_pad(b['point_index'], max_point)}"
+                       f"R{_pad(r + 1, max_rep)}")
                 mix_cols[col] = spec
                 fwd_cols[col] = b['forward'][r]
                 bwd_cols[col] = b['backward'][r]
@@ -904,9 +1396,11 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
         keep = [r for r, s in enumerate(batch['mixed']) if len(s) == modal_len]
         rep_V = batch.get('rep_V') or [batch['V']] * len(batch['mixed'])
         V = rep_V[keep[0]]
-        mix_cols = {f"Rep_{i + 1}": batch['mixed'][r] for i, r in enumerate(keep)}
-        fwd_cols = {f"Rep_{i + 1}": batch['forward'][r] for i, r in enumerate(keep)}
-        bwd_cols = {f"Rep_{i + 1}": batch['backward'][r] for i, r in enumerate(keep)}
+        n_reps = len(keep)
+        rep_name = [f"Rep_{_pad(i + 1, n_reps)}" for i in range(n_reps)]
+        mix_cols = {rep_name[i]: batch['mixed'][r] for i, r in enumerate(keep)}
+        fwd_cols = {rep_name[i]: batch['forward'][r] for i, r in enumerate(keep)}
+        bwd_cols = {rep_name[i]: batch['backward'][r] for i, r in enumerate(keep)}
         df = self._sweep_df(V, mix_cols)
         sweep_channels = {
             'Forward': self._sweep_df(V, fwd_cols),

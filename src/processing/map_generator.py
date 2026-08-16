@@ -39,6 +39,23 @@ class MapGenerator:
     
     def __init__(self):
         self.intervals: List[Tuple[float, float]] = []
+        # Physical geometry of the generated maps, when the caller knows it.
+        # Exports embed these so the files open correctly scaled in Gwyddion
+        # rather than as bare pixel grids. See ``set_pixel_size``.
+        self.pixel_size_x: Optional[float] = None
+        self.pixel_size_y: Optional[float] = None
+        self.pixel_unit: Optional[str] = None
+        self.value_unit: Optional[str] = None
+
+    def set_pixel_size(self, dx: float, dy: float, unit: str,
+                       value_unit: Optional[str] = None):
+        """Record the physical size of one map pixel, so exported fields
+        carry real dimensions. ``dx``/``dy`` are per-pixel in ``unit``."""
+        self.pixel_size_x = dx
+        self.pixel_size_y = dy
+        self.pixel_unit = unit
+        self.value_unit = value_unit
+        logger.info("Map pixel size set: %s x %s %s", dx, dy, unit)
     
     def set_integration_intervals(self, intervals: List[Tuple[float, float]]):
         """Set integration intervals for map generation."""
@@ -163,13 +180,19 @@ class MapGenerator:
         else:
             normalized_map = np.zeros_like(map_data)
         
-        # Convert to 8-bit
+        # Convert to 8-bit — for the PNG *preview* only. The TIFF/GSF below
+        # keep the real physical values; normalising those away made the
+        # exports useless for quantitative work in Gwyddion.
         image_data = normalized_map.astype(np.uint8)
-        
-        # Save as TIFF (preserves data better)
-        tiff_path = output_path.with_suffix('.tiff')
-        tifffile.imwrite(str(tiff_path), image_data)
-        
+
+        # Calibrated field exports (real float values + physical scale).
+        from src.utils.field_export import export_field
+        export_field(output_path, np.asarray(map_data),
+                     dx=self.pixel_size_x, dy=self.pixel_size_y,
+                     unit=self.pixel_unit, value_unit=self.value_unit,
+                     title=output_path.name,
+                     context="MapGenerator._save_map_as_image")
+
         # Save as PNG for quick viewing
         png_path = output_path.with_suffix('.png')
         image = Image.fromarray(image_data)
@@ -298,13 +321,32 @@ class MapGenerator:
         else:
             normalized_topo = np.zeros_like(topo_array)
         
-        # Convert to 8-bit and save
+        # Convert to 8-bit — PNG preview only; the calibrated exports below
+        # keep the real height values.
         image_data = normalized_topo.astype(np.uint8)
-        
-        # Save TIFF
+
+        # Calibrated field exports. TopographyData records the scanned area as
+        # ``physical_size`` (height, width), which divides down to a per-pixel
+        # size so the file opens with true dimensions in Gwyddion.
+        from src.utils.field_export import export_field
+        meta = getattr(topography_data, 'metadata', None)
+        phys = getattr(meta, 'physical_size', None)
+        dx = dy = None
+        unit = getattr(meta, 'units', None) or 'um'
+        if phys and len(phys) == 2 and topo_array.ndim == 2:
+            rows, cols = topo_array.shape
+            try:
+                if float(phys[0]) > 0 and float(phys[1]) > 0 and rows and cols:
+                    dy = float(phys[0]) / rows
+                    dx = float(phys[1]) / cols
+            except (TypeError, ValueError):
+                dx = dy = None
+        export_field(output_base, np.asarray(topo_array),
+                     dx=dx, dy=dy, unit=unit if dx else None,
+                     value_unit=unit, title="topography",
+                     context="topography map export")
         tiff_path = output_base.with_suffix('.tiff')
-        tifffile.imwrite(str(tiff_path), image_data)
-        
+
         # Save PNG
         png_path = output_base.with_suffix('.png')
         image = Image.fromarray(image_data)

@@ -62,8 +62,11 @@ class ProjectManager:
     def __init__(self):
         self.current_project_path: Optional[Path] = None
         self.project_modified: bool = False
+        # Gzip level for the save in progress (set per-save by save_project)
+        self._save_compresslevel: int = 1
 
-    def save_project(self, project_path: Path, project_data: Dict[str, Any]) -> bool:
+    def save_project(self, project_path: Path, project_data: Dict[str, Any],
+                     fast: bool = False) -> bool:
         """
         Save project to .HRT file with optimized binary storage.
 
@@ -78,13 +81,21 @@ class ProjectManager:
             - graphs: List of graph window states
             - workspace: Main window and dock layout state
             - metadata: Project metadata
+        fast : bool
+            Speed over size: gzip level 0 (stored blocks) on both layers.
+            Float64 spectral data barely compresses anyway (~5%), so this
+            trades a modestly larger file for a several-times-faster save —
+            right for autosaves of GB-scale projects. The byte format stays
+            a valid HRT2 gzip stream, so the load path is unchanged.
 
         Returns:
         --------
         bool : Success status
         """
         try:
-            logger.info(f"Saving project to {project_path}")
+            logger.info(f"Saving project to {project_path} (fast={fast})")
+            # Compression level used for this save (arrays + outer stream)
+            self._save_compresslevel = 0 if fast else 1
 
             # Ensure .hrt extension
             if project_path.suffix.lower() != '.hrt':
@@ -123,14 +134,20 @@ class ProjectManager:
                 'browser_tree': project_data.get('browser_tree', {}),
             }
 
-            # Save to file (compressed)
-            json_str = json.dumps(project_json, ensure_ascii=False)
-            compressed = gzip.compress(json_str.encode('utf-8'))
-
+            # Save to file (compressed). The JSON is streamed straight into a
+            # gzip stream instead of building one multi-GB string and
+            # gzip.compress()-ing it: the bulk of the payload is base64 of
+            # already-compressed arrays, so a high outer compression level
+            # only burns minutes of CPU for zero size gain (this froze the
+            # app on GB-scale projects). Level 1 + streaming keeps peak
+            # memory flat and the byte format identical for the load path.
             with open(project_path, 'wb') as f:
                 # Write magic header for format detection
                 f.write(b'HRT2')  # Magic bytes for v2.0
-                f.write(compressed)
+                with gzip.GzipFile(fileobj=f, mode='wb',
+                                   compresslevel=self._save_compresslevel) as gz:
+                    with io.TextIOWrapper(gz, encoding='utf-8') as text_stream:
+                        json.dump(project_json, text_stream, ensure_ascii=False)
 
             self.current_project_path = project_path
             self.project_modified = False
@@ -541,10 +558,17 @@ class ProjectManager:
         return datasets
 
     def _numpy_to_base64(self, arr: np.ndarray) -> str:
-        """Convert numpy array to compressed base64 string."""
+        """Convert numpy array to compressed base64 string.
+
+        Uses the current save's compression level (0 for fast autosaves,
+        1 otherwise). Float64 spectral data only compresses a few percent at
+        ANY gzip level — the mantissa bits are effectively noise — so high
+        levels just burn minutes at GB scale for no size gain.
+        """
         buffer = io.BytesIO()
         np.save(buffer, arr, allow_pickle=False)
-        compressed = gzip.compress(buffer.getvalue())
+        compressed = gzip.compress(buffer.getvalue(),
+                                   compresslevel=self._save_compresslevel)
         return base64.b64encode(compressed).decode('ascii')
 
     def _base64_to_numpy(self, b64_str: str) -> np.ndarray:

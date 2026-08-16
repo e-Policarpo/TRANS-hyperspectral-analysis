@@ -479,6 +479,19 @@ TOOL_DEFINITIONS = {
         }
     },
 
+    "IntervalInput": {
+        "display_name": "Intervals",
+        "category": "Input",
+        "description": "Provide [start, end] intervals to the workflow",
+        "inputs": [],
+        "outputs": [
+            {"id": "intervals", "name": "Intervals", "port_type": "intervals", "description": "List of [start, end] intervals"}
+        ],
+        "parameters": {
+            "intervals": {"type": "interval_list", "label": "Intervals", "required": True}
+        }
+    },
+
     # ===========================================================================
     # OUTPUT NODES
     # ===========================================================================
@@ -534,6 +547,20 @@ TOOL_DEFINITIONS = {
         "outputs": [],
         "parameters": {
             "output_name": {"type": "string", "label": "Output Name", "required": True, "default": "FlatData"},
+            "save_csv": {"type": "bool", "label": "Save as CSV", "default": True}
+        }
+    },
+
+    "IntervalOutput": {
+        "display_name": "Intervals",
+        "category": "Output",
+        "description": "Save intervals ([start, end] pairs) to project outputs",
+        "inputs": [
+            {"id": "intervals", "name": "Intervals", "port_type": "intervals", "required": True, "description": "Interval list to save (e.g. from Peak Finder)"}
+        ],
+        "outputs": [],
+        "parameters": {
+            "output_name": {"type": "string", "label": "Output Name", "required": True, "default": "Intervals"},
             "save_csv": {"type": "bool", "label": "Save as CSV", "default": True}
         }
     },
@@ -654,6 +681,9 @@ TOOL_DEFINITIONS = {
                         "options": ["endpoints", "als", "rubberband", "polynomial", "linear", "exponential"],
                         "default": "endpoints"},
             "degree": {"type": "int", "label": "Degree (poly/endpoints)", "default": 1, "min": 1, "max": 10},
+            "basis": {"type": "select", "label": "Coefficient basis",
+                      "options": ["power", "legendre", "chebyshev"], "default": "power",
+                      "description": "Basis for the polynomial/endpoints fit. The orthogonal bases fit the same curve but return decorrelated coefficients on a normalised axis — comparable between spectra, and usable as classification features."},
             "als_lambda": {"type": "float", "label": "ALS Smoothness", "default": 100000.0, "min": 100, "max": 10000000},
             "als_p": {"type": "float", "label": "ALS Asymmetry", "default": 0.01, "min": 0.001, "max": 0.5}
         }
@@ -746,6 +776,95 @@ TOOL_DEFINITIONS = {
             "prominence": {"type": "float", "label": "Min Prominence", "default": 0.0, "min": 0, "description": "Minimum peak prominence to detect. Leave at 0 for adaptive (noise-aware) per-spectrum threshold."},
             "min_distance": {"type": "int", "label": "Min Distance", "default": 5, "min": 1, "description": "Minimum distance between peaks (indices)"},
             "fwhm_multiplier": {"type": "float", "label": "FWHM Multiplier", "default": 1.5, "min": 0.5, "max": 5.0, "description": "Interval width as multiplier of FWHM"}
+        }
+    },
+
+    "ConfinementAnalysis": {
+        "display_name": "Confinement Analysis",
+        "category": "Analysis",
+        "description": "Subtract a background and detect peaks in one pass, with an occupancy table",
+        "inputs": [
+            {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
+        ],
+        "outputs": [
+            {"id": "peak_matrix", "name": "Peak Matrix", "port_type": "dataset", "description": "Occupancy table on the measured energy axis: 1 where a spectrum has a peak, blank elsewhere"},
+            {"id": "peak_matrix_binned", "name": "Peak Matrix (binned)", "port_type": "dataset", "description": "The same table binned at k_B*T — only produced when a temperature is set"},
+            {"id": "peak_matrix_offset", "name": "Peak Matrix (offset)", "port_type": "dataset", "description": "Occupancy table marked with each column's own number instead of 1, so plotting separates the spectra onto their own rows"},
+            {"id": "peak_matrix_binned_offset", "name": "Peak Matrix (binned, offset)", "port_type": "dataset", "description": "The offset table on the k_B*T bins — only produced when a temperature is set"},
+            {"id": "peaks", "name": "Peaks", "port_type": "dataset", "description": "Peak list, one row per detected peak"},
+            {"id": "corrected", "name": "Corrected", "port_type": "dataset", "description": "Spectra with the background removed"},
+            {"id": "baseline", "name": "Background", "port_type": "dataset", "description": "The fitted background that was subtracted"},
+            {"id": "coefficients", "name": "Coefficients", "port_type": "flat_data", "description": "Polynomial background coefficients per spectrum — connect to a Map Generator for a metallicity map"},
+            {"id": "peak_count", "name": "Peak Count", "port_type": "flat_data", "description": "Peaks per spectrum — connect to a Map Generator to map them spatially"},
+            {"id": "intervals", "name": "Peak Intervals", "port_type": "intervals", "description": "Non-overlapping intervals around peaks for integration"}
+        ],
+        "parameters": {
+            # Fundo
+            "baseline": {"type": "select", "label": "Background",
+                         "options": ["poly-iter", "poly", "als", "rubberband", "endpoints", "none"],
+                         "default": "poly-iter",
+                         "description": "poly-iter strips the peaks out of the fit so small features survive the height threshold"},
+            "baseline_degree": {"type": "int", "label": "Degree", "default": 3, "min": 0, "max": 15},
+            "baseline_basis": {"type": "select", "label": "Coefficient basis",
+                               "options": ["power", "legendre", "chebyshev"], "default": "power",
+                               "description": "Basis for the polynomial background. Orthogonal bases give decorrelated coefficients that can be compared between spectra and fed to PCA."},
+            "baseline_iterations": {"type": "int", "label": "Iterations (poly-iter)", "default": 25, "min": 1, "max": 500},
+            "als_lambda": {"type": "float", "label": "ALS Smoothness", "default": 100000.0, "min": 100, "max": 10000000},
+            "als_p": {"type": "float", "label": "ALS Asymmetry", "default": 0.01, "min": 0.001, "max": 0.5},
+            # Thermal grouping
+            "temperature_k": {"type": "float", "label": "Temperature (K)", "default": 0.0, "min": 0, "max": 5000,
+                              "description": "Acquisition temperature. k_B*T becomes the peak-position error bar and the energy bin width (94 K = 8.1 meV). 0 disables grouping."},
+            "x_energy_unit": {"type": "select", "label": "X axis unit", "options": ["eV", "meV"], "default": "eV",
+                              "description": "Unit of the independent variable, so k_B*T is computed in the same units"},
+            # Dados
+            "xmin": {"type": "float", "label": "From Xmin", "default": None, "required": False,
+                     "description": "Search range start (leave empty for the full sweep)"},
+            "xmax": {"type": "float", "label": "To Xmax", "default": None, "required": False},
+            # Filtro
+            "direction": {"type": "select", "label": "Direction", "options": ["positive", "negative", "both"], "default": "positive"},
+            "height": {"type": "float", "label": "Height (%)", "default": 5.0, "min": 0, "max": 100,
+                       "description": "Threshold as a percentage of the corrected curve's span inside the search window"},
+            "height_mode": {"type": "select", "label": "Measured as", "options": ["range", "prominence", "max"], "default": "range"},
+            "smooth_points": {"type": "int", "label": "Smooth (half-width)", "default": 2, "min": 0, "max": 500,
+                              "description": "0 disables it. An unsmoothed search over-detects badly on noisy spectra."},
+            "smooth_type": {"type": "select", "label": "Smoother", "options": ["average", "savgol"], "default": "average"},
+            "deriv_smooth_type": {"type": "select", "label": "Derivative smoothing", "options": ["none", "average", "savgol"], "default": "none"},
+            "deriv_smooth_points": {"type": "int", "label": "Derivative points", "default": 2, "min": 0, "max": 500},
+            # Selection
+            "max_peaks": {"type": "int", "label": "Keep at most (0 = all)", "default": 0, "min": 0, "max": 100000},
+            "min_distance": {"type": "float", "label": "Min. separation", "default": 0.0, "min": 0,
+                             "description": "In X units. Defaults to k_B*T when a temperature is set."},
+            "interpolate_center": {"type": "bool", "label": "Interpolate centres", "default": False},
+            "fwhm_multiplier": {"type": "float", "label": "FWHM Multiplier", "default": 1.5, "min": 0.5, "max": 5.0,
+                                "description": "Interval width as a multiplier of FWHM"}
+        }
+    },
+
+    "SpectralFeatures": {
+        "display_name": "Spectral Features",
+        "category": "Analysis",
+        "description": "Reduce each spectrum to physical features (gap, doping, metallicity, confined states) for classification",
+        "inputs": [
+            {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
+        ],
+        "outputs": [
+            {"id": "features", "name": "Features", "port_type": "flat_data", "description": "One row per spectrum, one column per feature — connect to a Map Generator to map any feature spatially, or use as the input to classification"}
+        ],
+        "parameters": {
+            "normalize": {"type": "select", "label": "Normalisation",
+                          "options": ["max", "band-edge", "area", "none"], "default": "max",
+                          "description": "Per-spectrum scaling. Without it the dominant variation is tip height, not sample physics."},
+            "gap_delta": {"type": "float", "label": "Gap threshold", "default": 0.05, "min": 0.001, "max": 0.5,
+                          "description": "Fraction of the normalised maximum that counts as a band edge"},
+            "poly_degree": {"type": "int", "label": "Metallicity degree", "default": 4, "min": 1, "max": 10},
+            "poly_basis": {"type": "select", "label": "Coefficient basis",
+                           "options": ["legendre", "chebyshev", "power"], "default": "legendre",
+                           "description": "Legendre is the only one that decorrelates on a uniformly sampled sweep, which is what makes the coefficients usable as features"},
+            "edge_fraction": {"type": "float", "label": "Band-edge fraction", "default": 0.15, "min": 0.01, "max": 0.49},
+            "state_noise_sigmas": {"type": "float", "label": "State threshold (sigma)", "default": 4.0, "min": 0.5, "max": 20.0,
+                                   "description": "In-gap states must clear this many noise sigmas; a percentage threshold inside a flat gap just counts noise"},
+            "state_width_samples": {"type": "int", "label": "State width (samples)", "default": 11, "min": 3, "max": 101,
+                                    "description": "Narrower features are suppressed before gap detection, so a confined state is not mistaken for a band edge"}
         }
     },
 
@@ -966,8 +1085,8 @@ TOOL_DEFINITIONS = {
             {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
         ],
         "outputs": [
-            {"id": "bandgap_data", "name": "Bandgap Data", "port_type": "flat_data"},
-            {"id": "doping_data", "name": "Doping Data", "port_type": "flat_data"}
+            {"id": "bandgap_data", "name": "Bandgap Data", "port_type": "dataset", "description": "Per-spectrum bandgap table (index, gap, edges, valid)"},
+            {"id": "doping_data", "name": "Doping Data", "port_type": "dataset", "description": "Per-spectrum doping table (index, type, offset, valid)"}
         ],
         "parameters": {
             "smoothing": {"type": "float", "default": 1.0, "min": 0, "max": 50, "label": "Smoothing (%)"},
@@ -1102,6 +1221,7 @@ def get_tool_categories() -> List[Dict]:
         "ImageOutput": 2,
         "FlatDataOutput": 3,
         "TextOutput": 4,
+        "IntervalOutput": 5,
         # Annotations
         "CommentNode": 0,
         # Processing tools - ordered by typical workflow
@@ -1118,9 +1238,11 @@ def get_tool_categories() -> List[Dict]:
         "CosmicRayFilter": 9,
         "BackgroundSubtraction": 10,
         # Analysis tools
-        "PeakFinder": 0,
-        "DetectBandgapDoping": 1,
-        "DiracPointEstimator": 2,
+        "ConfinementAnalysis": 0,
+        "SpectralFeatures": 1,
+        "PeakFinder": 2,
+        "DetectBandgapDoping": 3,
+        "DiracPointEstimator": 4,
         # Visualization
         "MapGenerator": 0,
         # Image Processing - image tools first, then map processing

@@ -425,3 +425,96 @@ estiver no `Unified-UI` (e cole o hash do commit ao lado).
   (`backend.cancelAllOperations()` → `worker_manager.cancel_all` +
   `cancel_current`) e re-emite o close, que fecha as janelas de
   workflow normalmente.*
+
+## Datasets grandes (>1 GB) — reportado 2026-07-14
+
+- [x] **Autosave travava tudo por minutos.** Com um projeto de 1.2 GB o
+  autosave re-serializava o projeto inteiro a cada 5 min (gzip-9 por
+  array + `json.dumps` de uma string de vários GB segurando o GIL +
+  gzip-9 do JSON inteiro de novo — recomprimindo base64 já comprimido)
+  no MESMO worker das ferramentas, então qualquer operação (ex.
+  derivada) ficava presa na fila atrás dele.
+  *Fix: (1) thread de I/O dedicada (`TRANS-IOWorker` em worker.py,
+  `submit_io`) — saves/autosaves/exports nunca mais bloqueiam tarefas
+  interativas; (2) autosave dirty-aware (autosave_manager.py escuta
+  `projectModifiedChanged`) — projeto sem mudanças = tick vira no-op;
+  (3) save streams `json.dump` direto num `gzip.GzipFile` nível 1 (sem
+  string gigante intermediária, sem dupla compressão cara) e autosave
+  usa `fast=True` (gzip nível 0 — float64 espectral mal comprime em
+  QUALQUER nível). Benchmark 417 MB: 6.4 s (autosave fast) / 35 s (save
+  manual) vs ~42 s+ antes; round-trip de load verificado idêntico,
+  formato HRT2 inalterado.*
+- [x] **Cliques repetidos empilhavam a mesma operação.** Sem feedback
+  de fila, cada clique em "Calculate Derivative" enfileirava um
+  recompute inteiro; pior, `WorkerManager._task_callbacks` é chaveado
+  por nome, então submissões duplicadas sobrescreviam os callbacks da
+  task em voo (resultado descartado em silêncio).
+  *Fix: `WorkerManager` ignora submissão cujo nome já está
+  pendente/rodando (worker.py `_submit_to`); cancelamentos limpam a
+  entrada para não bloquear re-submissões futuras.*
+- [x] **Import escrevia CSVs na main thread.** `_on_file_loaded` /
+  `_on_folder_loaded` gravavam cada dataset importado como CSV
+  sincronamente no callback da main thread — em imports de GB a UI
+  congelava pela duração da exportação.
+  *Fix: `_persist_imported_datasets` (app_backend.py) enfileira o lote
+  na thread de I/O com nome único sequencial.*
+- [x] **Binding loop no DatasetComboBox.** `calculatedWidth` /
+  `popupContentWidth` escreviam `TextMetrics.text` DENTRO do binding
+  que lê `advanceWidth` de volta → loop detectado (spam no console) e
+  re-varredura constante do modelo inteiro — caro com muitos datasets.
+  *Fix: medir com `FontMetrics.advanceWidth(texto)` (chamada de
+  função, sem dependência de propriedade) em DatasetComboBox.qml.*
+- [x] **Fila de imports ficava mais lenta a cada pasta (superlinear).**
+  Enfileirar 10 pastas MATRIX de uma vez: cada import terminava mais
+  devagar que o anterior. Não era o loader (é stateless por chamada) —
+  era trabalho de main thread proporcional ao projeto INTEIRO, repetido
+  por entidade nova: (a) `ProjectBrowser.rebuildRows()` rodava a cada
+  `imageAdded`/`mapCreated`/`noteAdded`/`dataLoaded`/`browserTreeChanged`,
+  ou seja dezenas de reconstruções completas por import, cada uma com um
+  `getDatasetInfo()` por dataset; (b) `linkDatasetsFromBackend` religava
+  todos os datasets a cada import, com 2 travessias QML↔Python e um
+  `linkedDatasetsChanged` POR dataset; (c) os TIFFs das imagens de scan
+  eram gravados inline no callback. Além do custo direto, essa main
+  thread ocupada rouba o GIL da thread do loader, atrasando os imports
+  seguintes.
+  *Fix: `rebuildRows()` vira agendamento (Timer 16 ms → `rebuildRowsNow()`),
+  novo `getDatasetEntries()` em bulk substitui o `getDatasetInfo()` por
+  dataset, `relinkDatasetsToMapEditor()` faz clear+link em Python com
+  `beginLinkBatch`/`endLinkBatch` (1 sinal), relink coalescido por Timer
+  em Main.qml, e `_absorb_dataset_images` enfileira os TIFFs na thread de
+  I/O (`openImage` já grava sob demanda).*
+- [x] **Import "travava" por horas sem carregar nada — arquivos no iCloud.**
+  `Load 01-Jul-2026` rodou 4h sem terminar (log 2026-08-10 18:05→22:07).
+  NÃO era o loader: com a pasta baixada, 18-Jun (4204 arq.) carrega em 2,1s.
+  Diagnóstico: `~/Documents` está no iCloud Drive com "Optimize Mac Storage",
+  e **303.144 dos 397.286 arquivos são placeholders** (st_size real,
+  `st_blocks == 0`). Cada `read_bytes()` bloqueia até o macOS baixar o
+  arquivo; `brctl status` mostrava o downloader falhando com
+  `"Network Unavailable" (NSURLErrorDomain:-1009)`. Assinatura clássica:
+  processo `sleeping`, **0% CPU**, RSS estável, um `.I(V)_mtrx` aberto —
+  indistinguível de travamento. 4 pastas estão 100% não-baixadas.
+  *Fix: pré-checagem `_check_downloaded` / `_count_dataless` em
+  `_do_load_folder` — falha na hora com mensagem explicando o que fazer
+  (Finder → Download Now / desligar Optimize Storage), em vez de bloquear a
+  fila inteira atrás de uma pasta.*
+- [x] **Import de pasta não tinha progresso nem cancelamento.** O caminho de
+  diretório passava `progress_callback=None` para `_build_session`, então a
+  fase mais longa (dezenas de milhares de curvas) não emitia nada, e
+  `task.cancelled` só era checado ANTES de começar.
+  *Fix: `load_from_directory(..., should_cancel=)` encaminha progresso
+  por-curva (a cada 64) e checa cancelamento no mesmo ponto; retorna
+  `(None, None)` ao cancelar e `_on_file_loaded`/`_on_folder_loaded`
+  toleram `None`.*
+- [ ] **`_build_images` custa ~26 s fixos** (30 arquivos de scan × ~0,87 s em
+  `_image_via_a2m`, que reabre o header de 28 MB por imagem). Não é o
+  travamento, mas é o maior custo fixo de uma sessão. Vale reusar o header
+  já parseado.
+- [ ] **`_detect_line_scans` é quadrático** (`_is_line` refaz `np.asarray`
+  sobre todo o prefixo a cada crescimento do run): ×3,8 a cada 2× pontos.
+  Irrelevante hoje (54 pontos), mas explode se uma sessão virar uma linha
+  de milhares de pontos.
+- [x] **Importar N pastas exigia N idas ao diálogo.** `FolderDialog` do
+  Qt não tem multi-seleção.
+  *Fix: `importFromFolder` — se a pasta escolhida não tem dados próprios
+  mas as subpastas têm, cada subpasta com dados vira um import na fila
+  (`_folder_has_data`). Escolher "STM UHV" enfileira as 10 pastas de dia.*

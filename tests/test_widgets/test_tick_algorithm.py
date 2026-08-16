@@ -307,3 +307,48 @@ def test_format_tick_strings_log_mode_short_circuits():
     )
     assert exp is None
     assert any("10" in lbl for lbl in labels[1:])  # log labels show 10ⁿ
+
+
+# ---------------------------------------------------------------------------
+# Non-finite ranges
+#
+# An all-NaN curve (or one carrying inf) propagates into the view range and
+# reached ``tick_values``, where ``ceil()`` raised "cannot convert float NaN
+# to integer" from inside ``QQuickPaintedItem.paint`` — aborting the render
+# on every frame. A non-finite range now yields no ticks instead.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("lo, hi", [
+    (float("nan"), float("nan")),
+    (float("nan"), 1.0),
+    (0.0, float("nan")),
+    (float("-inf"), float("inf")),
+    (0.0, float("inf")),
+    (float("-inf"), 0.0),
+])
+def test_tick_values_returns_empty_for_non_finite_range(lo, hi):
+    assert tick_values(lo, hi, 300.0) == []
+
+
+@pytest.mark.parametrize("lo, hi", [
+    (float("nan"), float("nan")),
+    (float("nan"), 1.0),
+    (0.0, float("inf")),
+])
+def test_tick_values_non_finite_range_in_log_mode(lo, hi):
+    """The log post-process does its own ``int(floor(...))`` — it must
+    not be reached with a non-finite range either."""
+    assert tick_values(lo, hi, 300.0, log=True) == []
+
+
+@pytest.mark.parametrize("lo, hi", [
+    (float("nan"), float("nan")),
+    (float("-inf"), float("inf")),
+])
+def test_tick_spacing_returns_empty_for_non_finite_range(lo, hi):
+    assert tick_spacing(lo, hi, 300.0) == []
+
+
+def test_minor_tick_values_returns_empty_for_non_finite_range():
+    assert minor_tick_values(float("nan"), float("nan"), 300.0) == []

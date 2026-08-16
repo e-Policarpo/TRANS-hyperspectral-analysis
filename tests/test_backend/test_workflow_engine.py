@@ -1016,3 +1016,180 @@ class TestCurveFittingCoefficients:
             target_node_id=mg.id, target_port_id="flat_data",
         )
         assert wf.add_connection(conn) is True
+
+
+class TestConfinementAnalysisNode:
+    """The Confinement Analysis node: background + peaks in one pass, with the
+    occupancy table and the two flat outputs that make it mappable."""
+
+    def test_node_is_registered_in_the_analysis_category(self):
+        node_def = TOOL_DEFINITIONS["ConfinementAnalysis"]
+        assert node_def["category"] == "Analysis"
+        assert node_def["display_name"] == "Confinement Analysis"
+
+    def test_takes_a_single_dataset_input(self):
+        inputs = TOOL_DEFINITIONS["ConfinementAnalysis"]["inputs"]
+        assert [i["id"] for i in inputs] == ["dataset"]
+        assert inputs[0]["port_type"] == "dataset"
+        assert inputs[0]["required"] is True
+
+    def test_exposes_every_output_the_tool_produces(self):
+        outs = {o["id"]: o for o in TOOL_DEFINITIONS["ConfinementAnalysis"]["outputs"]}
+        assert set(outs) == {"peak_matrix", "peak_matrix_binned", "peak_matrix_offset",
+                             "peak_matrix_binned_offset", "peaks", "corrected",
+                             "baseline", "coefficients", "peak_count", "intervals"}
+        # Datasets go to DatasetOutput; the flat ones feed the Map Generator.
+        for port in ("peak_matrix", "peak_matrix_binned", "peak_matrix_offset",
+                     "peak_matrix_binned_offset", "peaks", "corrected", "baseline"):
+            assert outs[port]["port_type"] == "dataset", port
+        for port in ("coefficients", "peak_count"):
+            assert outs[port]["port_type"] == "flat_data", port
+        assert outs["intervals"]["port_type"] == "intervals"
+
+    def test_parameters_cover_the_tool_surface(self):
+        params = TOOL_DEFINITIONS["ConfinementAnalysis"]["parameters"]
+        expected = {"baseline", "baseline_degree", "baseline_iterations",
+                    "als_lambda", "als_p", "temperature_k", "x_energy_unit",
+                    "xmin", "xmax", "direction", "height", "height_mode",
+                    "smooth_points", "smooth_type", "deriv_smooth_type",
+                    "deriv_smooth_points", "max_peaks", "min_distance",
+                    "interpolate_center", "fwhm_multiplier"}
+        assert expected <= set(params)
+
+    def test_parameter_names_match_the_engine(self):
+        """The params map is handed straight to params_from_dict, so a typo
+        here would be silently ignored rather than raising."""
+        from src.processing.peak_detection import Params
+        params = TOOL_DEFINITIONS["ConfinementAnalysis"]["parameters"]
+        engine_fields = set(Params().__dataclass_fields__)
+        # fwhm_multiplier is a tool argument, not a detection parameter.
+        assert set(params) - {"fwhm_multiplier"} <= engine_fields
+
+    def test_defaults_are_the_recommended_starting_point(self):
+        params = TOOL_DEFINITIONS["ConfinementAnalysis"]["parameters"]
+        assert params["baseline"]["default"] == "poly-iter"
+        assert params["height"]["default"] == 5.0
+        assert params["temperature_k"]["default"] == 0.0  # grouping off unless asked
+        assert params["max_peaks"]["default"] == 0        # 0 means "all"
+
+    def test_background_options_match_the_engine(self):
+        from src.processing.peak_detection import BASELINE_KINDS
+        options = TOOL_DEFINITIONS["ConfinementAnalysis"]["parameters"]["baseline"]["options"]
+        assert set(options) == set(BASELINE_KINDS)
+
+    def test_created_node_carries_the_defaults(self):
+        node = create_node_from_tool("ConfinementAnalysis", 0, 0)
+        assert node.parameters["baseline"] == "poly-iter"
+        assert node.parameters["temperature_k"] == 0.0
+
+    def test_outputs_connect_to_the_matching_output_nodes(self):
+        wf = Workflow(id="wf_ca", name="Confinement WF")
+        node = create_node_from_tool("ConfinementAnalysis", 0, 0)
+        dataset_out = create_node_from_tool("DatasetOutput", 300, 0)
+        flat_out = create_node_from_tool("FlatDataOutput", 300, 200)
+        for n in (node, dataset_out, flat_out):
+            wf.add_node(n)
+
+        matrix_conn = Connection(
+            id="c1", source_node_id=node.id, source_port_id="peak_matrix",
+            target_node_id=dataset_out.id, target_port_id="dataset")
+        assert wf.validate_connection(matrix_conn) is True
+        assert wf.add_connection(matrix_conn) is True
+
+        counts_conn = Connection(
+            id="c2", source_node_id=node.id, source_port_id="peak_count",
+            target_node_id=flat_out.id, target_port_id="flat_data")
+        assert wf.validate_connection(counts_conn) is True
+
+    def test_peak_count_can_drive_a_map_generator(self):
+        """The spatial view of a hyperspectral run."""
+        wf = Workflow(id="wf_map", name="Map WF")
+        node = create_node_from_tool("ConfinementAnalysis", 0, 0)
+        mapper = create_node_from_tool("MapGenerator", 300, 0)
+        wf.add_node(node)
+        wf.add_node(mapper)
+        conn = Connection(
+            id="c1", source_node_id=node.id, source_port_id="peak_count",
+            target_node_id=mapper.id, target_port_id="flat_data")
+        assert wf.validate_connection(conn) is True
+
+    def test_intervals_feed_the_integration_node(self):
+        wf = Workflow(id="wf_int", name="Integration WF")
+        node = create_node_from_tool("ConfinementAnalysis", 0, 0)
+        integration = create_node_from_tool("Integration", 300, 0)
+        wf.add_node(node)
+        wf.add_node(integration)
+        conn = Connection(
+            id="c1", source_node_id=node.id, source_port_id="intervals",
+            target_node_id=integration.id, target_port_id="intervals")
+        assert wf.validate_connection(conn) is True
+
+    def test_appears_first_among_the_analysis_tools(self):
+        from src.backend.workflow_engine import get_tool_categories
+        analysis = next(c for c in get_tool_categories() if c["category"] == "Analysis")
+        assert analysis["tools"][0] == "ConfinementAnalysis"
+        assert "PeakFinder" in analysis["tools"], "the old tool stays available"
+
+
+class TestConfinementDefaultsAgree:
+    """The product defaults live in two places (the tool applies them, the
+    node definition shows them in the UI); they must not drift apart."""
+
+    def test_node_defaults_match_the_tool_defaults(self):
+        from src.backend.tool_implementations import CONFINEMENT_DEFAULTS
+        params = TOOL_DEFINITIONS["ConfinementAnalysis"]["parameters"]
+        for name, value in CONFINEMENT_DEFAULTS.items():
+            assert params[name]["default"] == value, name
+
+    def test_smoothing_is_on_by_default(self):
+        """An unsmoothed search over-detects badly on noisy spectra, and a
+        hyperspectral run has nobody watching the preview."""
+        from src.backend.tool_implementations import CONFINEMENT_DEFAULTS
+        assert CONFINEMENT_DEFAULTS["smooth_points"] == 2
+        assert TOOL_DEFINITIONS["ConfinementAnalysis"]["parameters"]["smooth_points"]["default"] == 2
+
+
+class TestSpectralFeaturesNode:
+    """Feature extraction as a workflow node — flat output so it maps."""
+
+    def test_registered_in_analysis(self):
+        node_def = TOOL_DEFINITIONS["SpectralFeatures"]
+        assert node_def["category"] == "Analysis"
+        assert node_def["display_name"] == "Spectral Features"
+
+    def test_features_output_is_flat_so_it_can_be_mapped(self):
+        outs = {o["id"]: o for o in TOOL_DEFINITIONS["SpectralFeatures"]["outputs"]}
+        assert set(outs) == {"features"}
+        assert outs["features"]["port_type"] == "flat_data"
+
+    def test_parameter_names_match_the_config(self):
+        """Params go straight to _feature_config; a typo would be ignored."""
+        from src.processing.spectral_features import FeatureConfig
+        params = TOOL_DEFINITIONS["SpectralFeatures"]["parameters"]
+        assert set(params) <= set(FeatureConfig().__dataclass_fields__)
+
+    def test_defaults_match_the_config_defaults(self):
+        from src.processing.spectral_features import FeatureConfig
+        params = TOOL_DEFINITIONS["SpectralFeatures"]["parameters"]
+        config = FeatureConfig()
+        for name, spec in params.items():
+            assert spec["default"] == getattr(config, name), name
+
+    def test_defaults_to_legendre(self):
+        assert TOOL_DEFINITIONS["SpectralFeatures"]["parameters"]["poly_basis"]["default"] \
+            == "legendre"
+
+    def test_feeds_a_map_generator(self):
+        wf = Workflow(id="wf_feat", name="Features WF")
+        node = create_node_from_tool("SpectralFeatures", 0, 0)
+        mapper = create_node_from_tool("MapGenerator", 300, 0)
+        wf.add_node(node)
+        wf.add_node(mapper)
+        conn = Connection(id="c1", source_node_id=node.id, source_port_id="features",
+                          target_node_id=mapper.id, target_port_id="flat_data")
+        assert wf.validate_connection(conn) is True
+
+    def test_takes_the_confinement_tool_position_after_it(self):
+        from src.backend.workflow_engine import get_tool_categories
+        analysis = next(c for c in get_tool_categories() if c["category"] == "Analysis")
+        assert analysis["tools"][:2] == ["ConfinementAnalysis", "SpectralFeatures"]

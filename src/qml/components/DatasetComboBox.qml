@@ -25,15 +25,16 @@ ComboBox {
     property color textColor: "#ffffff"
     property color textMutedColor: "#cccccc"
 
-    // Calculate optimal width based on model content
+    // Calculate optimal width based on model content.
+    // Measured via FontMetrics.advanceWidth(text) — a plain function call.
+    // (Writing TextMetrics.text inside this binding and reading its
+    // advanceWidth back created a binding loop that re-walked the whole
+    // model over and over — very costly with many datasets loaded.)
     property int calculatedWidth: {
         var maxWidth = minimumWidth
         if (model) {
             for (var i = 0; i < model.length; i++) {
-                var itemText = model[i]
-                var textWidth = textMetrics.advanceWidth + 50  // padding + arrow
-                textMetrics.text = itemText
-                textWidth = textMetrics.advanceWidth + 50
+                var textWidth = fontMetrics.advanceWidth(model[i]) + 50  // padding + arrow
                 if (textWidth > maxWidth) {
                     maxWidth = textWidth
                 }
@@ -42,11 +43,10 @@ ComboBox {
         return Math.min(maxWidth, maximumWidth)
     }
 
-    // Text metrics for measuring
-    TextMetrics {
-        id: textMetrics
+    // Font metrics for measuring
+    FontMetrics {
+        id: fontMetrics
         font: root.font
-        text: ""
     }
 
     implicitWidth: calculatedWidth
@@ -191,17 +191,11 @@ ComboBox {
             var maxW = root.width
             if (root.model) {
                 for (var i = 0; i < root.model.length; i++) {
-                    popupTextMetrics.text = root.model[i]
-                    var itemW = popupTextMetrics.advanceWidth + 30
+                    var itemW = fontMetrics.advanceWidth(root.model[i]) + 30
                     if (itemW > maxW) maxW = itemW
                 }
             }
             return Math.min(maxW, maximumWidth + 50)
-        }
-
-        TextMetrics {
-            id: popupTextMetrics
-            font: root.font
         }
 
         background: Rectangle {

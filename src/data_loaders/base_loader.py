@@ -17,6 +17,7 @@ import numpy as np
 
 from ..models.spectral_data import SpectralData, SpectralMetadata
 from ..models.topography_data import TopographyData, TopographyMetadata
+from ..utils.naming import padded_series
 
 logger = logging.getLogger(__name__)
 
@@ -205,7 +206,10 @@ class BaseDataLoader(ABC):
         data_array = np.column_stack(spectra_list)
         
         if column_names is None:
-            column_names = [f"Spectrum_{i+1}" for i in range(len(spectra_list))]
+            # Zero-padded (Spectrum_01 … Spectrum_12) so the alphabetical
+            # ordering used by tables, legends and the browser matches
+            # acquisition order. See ``src/utils/naming.py``.
+            column_names = padded_series("Spectrum", len(spectra_list))
         
         df = pd.DataFrame(data_array, columns=column_names)
         

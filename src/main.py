@@ -77,8 +77,13 @@ def main():
     app.setOrganizationName("Research Lab")
     app.setOrganizationDomain("trans-qml.org")
 
-    # Set application icon (icon is in parent directory)
-    icon_path = Path(__file__).parent.parent / "icon.png"
+    # Set application icon. Lives in <project>/assets/; the bare parent-dir
+    # path is the pre-reorganisation location, kept as a fallback so a
+    # checkout that predates the move still finds it.
+    project_root = Path(__file__).parent.parent
+    icon_path = project_root / "assets" / "icon.png"
+    if not icon_path.exists():
+        icon_path = project_root / "icon.png"
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
         logger.info(f"Application icon set: {icon_path}")

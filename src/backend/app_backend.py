@@ -10,11 +10,15 @@ License: GPL
 
 import json
 import logging
+import math
 import sys
 import numpy as np
 import pandas as pd
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Any
+
+from src.utils.naming import pad as _pad, strip_acquisition_time
+import shutil
 import tempfile
 from PySide6.QtCore import QObject, Signal, Slot, Property, QUrl
 from PySide6.QtWidgets import QFileDialog, QApplication
@@ -42,7 +46,38 @@ from src.data_loaders.omicron_mtrx_loader import OmicronMatrixSTSLoader
 from src.data_loaders.omicron_flat_loader import OmicronFlatLoader
 from src.data_loaders.park_afm_loader import ParkAFMLoader
 from src.data_loaders.witec_wip_loader import WitecWipLoader
-from src.backend.tool_implementations import ToolImplementations
+from src.backend.tool_implementations import (
+    CONFINEMENT_DEFAULTS,
+    ToolImplementations,
+    _feature_config,
+)
+from src.backend.peak_fitting import estimate_noise_sigma
+from src.processing.peak_detection import Params, analyze, params_from_dict
+from src.processing.spectral_features import (
+    feature_columns,
+    gap_features,
+    normalize_spectrum,
+    spectrum_features,
+)
+
+
+def normalized_x_list(x) -> list:
+    """Plain floats for QML; QVariantMap will not carry a numpy array."""
+    return [float(v) for v in x]
+
+
+def _format_feature(value) -> str:
+    """Readout string for one feature. NaN means 'could not be measured',
+    which is information, so it is shown rather than hidden as 0."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if not math.isfinite(v):
+        return "--"
+    if v == 0:
+        return "0"
+    return f"{v:.4g}" if 1e-3 <= abs(v) < 1e5 else f"{v:.3e}"
 from src.backend.worker import WorkerManager
 from src.backend.project_manager import ProjectManager
 from src.backend.dock_manager import DockManager
@@ -99,6 +134,9 @@ class AppBackend(ToolImplementations, QObject):
     imageAdded = Signal(str, str)  # image_id, name
     imageDeleted = Signal(str)  # image_id
     imageRenamed = Signal(str, str)  # image_id, new_name
+    imagePixelsChanged = Signal(str)  # image_id — pixels replaced in place
+                                      # (channel switch, leveling, revert);
+                                      # viewers must re-pull the image:// URL
     noteAdded = Signal(str, str)  # note_id, name
     noteDeleted = Signal(str)  # note_id
     noteRenamed = Signal(str, str)  # note_id, new_name
@@ -197,6 +235,7 @@ class AppBackend(ToolImplementations, QObject):
         self.worker_manager.worker_completed.connect(self._on_worker_completed)
         self.worker_manager.worker_failed.connect(self._on_worker_failed)
         self.worker_manager.worker_cancelled.connect(self._on_worker_cancelled)
+        self.worker_manager.task_rejected.connect(self._on_task_rejected)
 
         # Initialize project manager
         self.project_manager = ProjectManager()
@@ -215,6 +254,12 @@ class AppBackend(ToolImplementations, QObject):
 
         # Initialize autosave manager
         self._autosave_manager = AutosaveManager(self, parent=self)
+
+        # Sequence for import-persistence I/O batches (unique task names so
+        # overlapping import batches never dedup-collide in the worker)
+        self._persist_batch_seq = 0
+        # Same, for deferred TIFF writes of images absorbed from imports.
+        self._image_write_seq = 0
 
         # Flag to suppress undo registration during undo/redo operations
         self._suppress_undo = False
@@ -253,6 +298,18 @@ class AppBackend(ToolImplementations, QObject):
 
         # Image entities (first-class, alongside datasets and maps)
         self._images: Dict[str, ImageData] = {}
+
+        # "Extract images as .gwy (Gwyddion readable)" — the import dialog's
+        # checkbox, on by default. When set, every imported scan is written
+        # out as a multi-channel Gwyddion file so the data is immediately
+        # analysable there. When cleared, imports write nothing to disk.
+        self._extract_gwy_on_import: bool = True
+
+        # Pre-levelling pixel backups, keyed ``(image_id, channel_name)``.
+        # Levelling overwrites images in place, so this is what makes the
+        # correction undoable and keeps re-levelling from stacking on an
+        # already-corrected surface. In-memory only — see ``levelImage``.
+        self._image_raw_pixels: Dict[Tuple[str, Optional[str]], np.ndarray] = {}
 
         # Note entities — text annotations surfaced from measurement files
         # (e.g. WITec ``TDText`` blocks) plus user-added notes. Stored as a
@@ -309,6 +366,26 @@ class AppBackend(ToolImplementations, QObject):
             logger.info(f"Auto-saved imported dataset to {output_path}")
         except Exception as e:
             logger.warning(f"Could not auto-save imported dataset {name!r} as CSV: {e}")
+
+    def _persist_imported_datasets(self, datasets: dict) -> None:
+        """Queue CSV persistence of freshly imported datasets on the I/O
+        worker. Writing GB-scale imports synchronously in the main-thread
+        load callback froze the UI for the duration of the export."""
+        if self._output_base_dir is None or not datasets:
+            return
+        to_persist = dict(datasets)
+        self._persist_batch_seq += 1
+
+        def _write_batch(task):
+            for _name, _ds in to_persist.items():
+                if task.cancelled:
+                    return
+                self._autosave_imported_dataset(_name, _ds)
+
+        self.worker_manager.submit_io(
+            name=f"Persist imports #{self._persist_batch_seq}",
+            operation=_write_batch,
+        )
 
     def _sanitize_filename(self, name: str) -> str:
         """
@@ -457,6 +534,38 @@ class AppBackend(ToolImplementations, QObject):
         if backend is not None and hasattr(backend, "set_app_backend"):
             backend.set_app_backend(self)
         logger.info("Map editor backend registered with app backend")
+
+    @Slot()
+    def relinkDatasetsToMapEditor(self):
+        """Re-link every dataset into the map editor, in Python, in one batch.
+
+        The workstation used to loop in QML calling ``getDataset`` +
+        ``linkDataset`` per dataset — two bridge crossings and one
+        ``linkedDatasetsChanged`` emission each, re-run on every import. Doing
+        it here costs one call and one signal regardless of dataset count.
+        """
+        me = self._map_editor_backend
+        if me is None:
+            return
+        # Integrated datasets hold no spectra; the link order matches
+        # getDatasetListWithInfo (truncated → discretized → name) so the
+        # dataset linkDataset() auto-activates is the same one as before.
+        names = [n for n, d in self._datasets.items()
+                 if 'intervals' not in (d.metadata.additional_info or {})]
+        names.sort(key=lambda n: (
+            not ('truncated' in n.lower() or 'T_' in n),
+            not ('discretized' in n.lower() or 'Discretized' in n),
+            n,
+        ))
+
+        me.beginLinkBatch()
+        try:
+            me.clearLinkedDatasets()
+            for name in names:
+                me.linkDataset(name, self._datasets[name])
+        finally:
+            me.endLinkBatch()
+        logger.info("Relinked %d dataset(s) into the map editor", len(names))
 
     @Slot('QVariantList')
     def setEmbeddedWindowStates(self, states):
@@ -754,6 +863,7 @@ class AppBackend(ToolImplementations, QObject):
         self.output_files.clear()
         self._images.clear()
         self._notes.clear()
+        self.workflow_manager.clear_workflows()
 
         # Scan for existing outputs if the project has them
         if self._outputs_created:
@@ -819,6 +929,7 @@ class AppBackend(ToolImplementations, QObject):
         self.output_files.clear()
         self._images.clear()
         self._notes.clear()
+        self.workflow_manager.clear_workflows()
 
         self.projectReadyChanged.emit(False)
         self.status = "No project open"
@@ -886,6 +997,7 @@ class AppBackend(ToolImplementations, QObject):
             self._active_dataset = None
             self.maps.clear()
             self.output_files.clear()
+            self.workflow_manager.clear_workflows()
 
             # Load datasets from project file
             loaded_datasets = project_data.get('datasets', {})
@@ -1048,7 +1160,7 @@ class AppBackend(ToolImplementations, QObject):
         # Ask QML to collect embedded window states before we save
         self.collectWindowStatesRequested.emit()
 
-        self.worker_manager.submit(
+        self.worker_manager.submit_io(
             name="Save Project",
             operation=self._do_save_project,
             project_path=save_path,
@@ -1085,12 +1197,109 @@ class AppBackend(ToolImplementations, QObject):
             filepath = Path(str(file_path))
             self._import_single_file_path(filepath)
 
+    # Suffixes whose presence makes a folder importable (format detection).
+    _IMPORTABLE_SUFFIXES = ('.nid', '.txt', '.I(V)_mtrx', '_0001.mtrx',
+                            '.Z_flat', '.I_flat')
+    # Every suffix a loader actually opens — the set the cloud-placeholder
+    # pre-flight must cover (scan images included; they are read too).
+    _DATA_SUFFIXES = _IMPORTABLE_SUFFIXES + ('.Z_mtrx', '.I_mtrx')
+
+    @staticmethod
+    def _count_dataless(paths) -> Tuple[int, int]:
+        """Count ``(dataless, total)`` among ``paths``.
+
+        A *dataless* file is a cloud placeholder — iCloud Drive with "Optimize
+        Mac Storage", or any File Provider: the directory entry has the real
+        ``st_size`` but **zero blocks allocated**, because the bytes live only
+        in the cloud. ``stat`` does not trigger a download, but *reading* one
+        blocks until macOS fetches it; with no network that is an unbounded
+        stall at 0% CPU, which is indistinguishable from a hung import.
+        """
+        dataless = total = 0
+        for p in paths:
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            total += 1
+            if st.st_size > 0 and getattr(st, 'st_blocks', 1) == 0:
+                dataless += 1
+        return dataless, total
+
+    def _check_downloaded(self, dirpath: Path) -> None:
+        """Raise if ``dirpath``'s data files aren't materialised on disk.
+
+        Failing fast with a instruction beats blocking forever on a
+        placeholder read: the task ends, the queue drains, and the user is
+        told what to do instead of watching a spinner for hours.
+        """
+        try:
+            candidates = [f for f in dirpath.iterdir()
+                          if f.name.endswith(self._DATA_SUFFIXES)]
+        except OSError:
+            return
+        dataless, total = self._count_dataless(candidates)
+        if not dataless:
+            return
+        logger.warning("%s: %d/%d data files are cloud placeholders",
+                       dirpath.name, dataless, total)
+        raise ValueError(
+            f"{dataless} of {total} measurement files in '{dirpath.name}' are "
+            f"not downloaded — they are iCloud Drive placeholders that exist "
+            f"only in the cloud.\n\n"
+            f"Reading them would block until macOS downloads each one, which "
+            f"is why an import like this appears to hang.\n\n"
+            f"To fix: open the folder in Finder, select all, right-click → "
+            f"\"Download Now\" (or turn off System Settings → Apple Account → "
+            f"iCloud → iCloud Drive → \"Optimize Mac Storage\"), wait for the "
+            f"download to finish, then import again."
+        )
+
+    @staticmethod
+    def _folder_has_data(dirpath: Path) -> bool:
+        """True if ``dirpath`` itself holds files a folder import can read.
+
+        Mirrors the format detection in :meth:`_do_load_folder`, so a folder
+        this returns False for is one that import would reject.
+        """
+        try:
+            for f in dirpath.iterdir():
+                if f.name.endswith(AppBackend._IMPORTABLE_SUFFIXES):
+                    return True
+        except OSError:
+            return False
+        return False
+
     @Slot(str)
     def importFromFolder(self, folder_path):
-        """Import from a folder path."""
-        logger.info(f"Importing folder: {folder_path}")
-        self.status = f"Importing folder: {Path(folder_path).name}..."
-        self._import_folder_path(Path(folder_path))
+        """Import from a folder path.
+
+        If the folder holds no readable measurement files of its own but its
+        immediate subfolders do, every such subfolder is queued as its own
+        import. That's how a whole run of MATRIX session folders (one per
+        measurement day) is imported in a single action instead of picking
+        each one by hand.
+        """
+        folder = Path(folder_path)
+        logger.info(f"Importing folder: {folder}")
+
+        if not self._folder_has_data(folder):
+            try:
+                subdirs = sorted(d for d in folder.iterdir()
+                                 if d.is_dir() and self._folder_has_data(d))
+            except OSError:
+                subdirs = []
+            if subdirs:
+                logger.info("No data directly in %s — queueing %d subfolder(s)",
+                            folder, len(subdirs))
+                self.status = (f"Importing {len(subdirs)} folders "
+                               f"from {folder.name}...")
+                for sub in subdirs:
+                    self._import_folder_path(sub)
+                return
+
+        self.status = f"Importing folder: {folder.name}..."
+        self._import_folder_path(folder)
 
     @Slot(str)
     def importSmartMap(self, file_path):
@@ -1183,18 +1392,19 @@ class AppBackend(ToolImplementations, QObject):
         point becomes a per-point dataset (its reps). Sessions with no line
         scans keep the overview + per-point layout. Scan images ride along as
         ``matrix_maps`` + the first dataset's ``images`` payload; everything is
-        filed into the per-session folder via ``matrix_folders``.
+        filed into the per-session folder via ``browser_folders`` (the same
+        loader-agnostic contract every other loader can use).
         """
         loader = self.omicron_sts_loader
         sessions = spectral_data.metadata.additional_info.get('sessions', [])
         result = {
             'datasets': {}, 'active_dataset': None,
-            'matrix_maps': [], 'matrix_folders': {},
+            'matrix_maps': [], 'browser_folders': {},
         }
 
         def _add(name, ds, label):
             result['datasets'][name] = ds
-            result['matrix_folders'][f"dataset:{name}"] = label
+            result['browser_folders'][f"dataset:{name}"] = label
             if result['active_dataset'] is None:
                 result['active_dataset'] = name
             return ds
@@ -1498,13 +1708,16 @@ class AppBackend(ToolImplementations, QObject):
         subsequently-fired per-entity ``imageAdded`` / ``noteAdded`` signals
         end up appending to a model that the next refresh wipes again.
         """
+        if not result:
+            logger.info("Load produced no result (cancelled)")
+            return
+
         # Add datasets to application state
         self._datasets.update(result['datasets'])
 
-        # Persist each imported dataset to disk as CSV, mirroring how tool
-        # outputs are written into the project's output structure.
-        for _ds_name, _ds in result['datasets'].items():
-            self._autosave_imported_dataset(_ds_name, _ds)
+        # Persist the imported datasets to disk as CSV (on the I/O worker),
+        # mirroring how tool outputs are written into the project structure.
+        self._persist_imported_datasets(result['datasets'])
 
         # Surface images and notes attached by loaders BEFORE the broadcast
         # signal so the subsequent browser refresh sees them. Snapshot the
@@ -1517,40 +1730,45 @@ class AppBackend(ToolImplementations, QObject):
         self._absorb_dataset_notes(result)
         self._absorb_matrix_maps(result)
 
-        # Auto-file freshly imported measurement data into type folders.
+        # Auto-file freshly imported measurement data into type folders, and
+        # within those into a per-session subfolder — the convention every
+        # loader follows, not just Omicron MATRIX. A loader can name the group
+        # explicitly (``browser_folders`` for datasets, ``session_label`` on
+        # images/maps/notes); otherwise ``_group_label`` derives it from the
+        # source file or directory the loader already recorded.
+        #
         # Tables/graphs are never imported, so they are untouched (stay at
         # root, per the user's choice). Existing placements are respected, so
-        # re-imports and user-moved items don't get yanked back. Matrix
-        # datasets are filed into a per-session subfolder under Spectral Data.
-        _matrix_folders = result.get('matrix_folders', {})
+        # re-imports and user-moved items don't get yanked back.
+        _ds_folders = dict(result.get('matrix_folders', {}) or {})
+        _ds_folders.update(result.get('browser_folders', {}) or {})
         _filed = False
-        for _name in result.get('datasets', {}):
+
+        def _file(ref: str, type_folder: str, sub: Optional[str]) -> bool:
+            if sub:
+                return self._auto_file_sub(ref, type_folder, sub)
+            return self._auto_file(ref, type_folder)
+
+        for _name, _sd in result.get('datasets', {}).items():
             _ref = f"dataset:{_name}"
-            _sub = _matrix_folders.get(_ref)
-            if _sub:
-                _filed |= self._auto_file_sub(_ref, "Spectral Data", _sub)
-            else:
-                _filed |= self._auto_file(_ref, "Spectral Data")
-        # Images and maps from a Matrix session carry a ``session_label`` so
-        # they nest under Images/<session> and Maps/<session>, mirroring the
-        # per-session Spectral Data subfolders. Other imports stay flat.
+            _sub = _ds_folders.get(_ref) or self._group_label(
+                getattr(getattr(_sd, 'metadata', None), 'additional_info', None))
+            _filed |= _file(_ref, "Spectral Data", _sub)
         for _img_id in self._images.keys() - _images_before:
             _img = self._images.get(_img_id)
-            _sub = (getattr(_img, 'metadata', None)
-                    and (_img.metadata.additional_info or {}).get('session_label'))
-            if _sub:
-                _filed |= self._auto_file_sub(f"image:{_img_id}", "Images", _sub)
-            else:
-                _filed |= self._auto_file(f"image:{_img_id}", "Images")
+            _meta = getattr(_img, 'metadata', None)
+            _info = dict((_meta.additional_info or {}) if _meta else {})
+            # Images carry ``original_filename`` as a typed field, not in
+            # additional_info, so fold it in before deriving.
+            if _meta is not None and getattr(_meta, 'original_filename', None):
+                _info.setdefault('original_filename', _meta.original_filename)
+            _filed |= _file(f"image:{_img_id}", "Images", self._group_label(_info))
         for _note_id in self._notes.keys() - _notes_before:
-            _filed |= self._auto_file(f"note:{_note_id}", "Notes")
+            _note = self._notes.get(_note_id) or {}
+            _filed |= _file(f"note:{_note_id}", "Notes", self._group_label(_note))
         for _m in self.maps:
             if _m['id'] not in _maps_before:
-                _sub = _m.get('session_label')
-                if _sub:
-                    _filed |= self._auto_file_sub(f"map:{_m['id']}", "Maps", _sub)
-                else:
-                    _filed |= self._auto_file(f"map:{_m['id']}", "Maps")
+                _filed |= _file(f"map:{_m['id']}", "Maps", self._group_label(_m))
         if _filed:
             self.browserTreeChanged.emit()
 
@@ -1641,6 +1859,10 @@ class AppBackend(ToolImplementations, QObject):
             logger.info("Folder load cancelled before starting")
             return None
 
+        # Cloud placeholders would make every read block on a download; refuse
+        # up front rather than stall the whole queue behind one folder.
+        self._check_downloaded(dirpath)
+
         nid_files = list(dirpath.glob("*.nid"))
         txt_files = list(dirpath.glob("*.txt"))
         iv_mtrx_files = [f for f in dirpath.iterdir() if f.name.endswith('.I(V)_mtrx')]
@@ -1690,8 +1912,11 @@ class AppBackend(ToolImplementations, QObject):
 
             spectral_data, _topography = self.omicron_sts_loader.load_from_directory(
                 dirpath,
-                progress_callback=progress_callback
+                progress_callback=progress_callback,
+                should_cancel=lambda: task.cancelled,
             )
+            if spectral_data is None:      # cancelled mid-load
+                return None
             result = self._matrix_result_from_spectral(spectral_data)
 
         elif flat_files:
@@ -1717,6 +1942,10 @@ class AppBackend(ToolImplementations, QObject):
 
     def _on_folder_loaded(self, result: dict):
         """Handle folder loading completion in main thread."""
+        if not result:
+            # Cancelled (or nothing found) — the loader returns None.
+            logger.info("Folder load produced no result (cancelled)")
+            return
         # Omicron session imports carry maps / per-session folders / scan
         # pictures — route them through the full import handler so those are
         # absorbed (images, in-memory maps, nested folders) exactly like smart
@@ -1728,9 +1957,8 @@ class AppBackend(ToolImplementations, QObject):
         # Add datasets to application state
         self._datasets.update(result['datasets'])
 
-        # Persist each imported dataset to disk as CSV, mirroring tool outputs.
-        for _ds_name, _ds in result['datasets'].items():
-            self._autosave_imported_dataset(_ds_name, _ds)
+        # Persist the imported datasets to disk as CSV (on the I/O worker).
+        self._persist_imported_datasets(result['datasets'])
 
         # Set active dataset
         if result['active_dataset']:
@@ -1768,6 +1996,13 @@ class AppBackend(ToolImplementations, QObject):
         self.errorOccurred.emit(f"{operation_name} Error", error_message)
         logger.error(f"Worker failed: {operation_name} - {error_message}")
         self.isBusyChanged.emit(self.worker_manager.is_busy())
+
+    def _on_task_rejected(self, operation_name: str):
+        """A duplicate submission was dropped (same-named task in flight).
+        Status-bar feedback only — this is expected on repeat clicks while
+        the first run is still queued/running, not an error."""
+        self.status = f"{operation_name} is already queued — please wait"
+        logger.info(f"Duplicate submission dropped: {operation_name}")
 
     def _on_worker_cancelled(self, operation_name: str):
         """Called when a worker is cancelled."""
@@ -2052,67 +2287,50 @@ class AppBackend(ToolImplementations, QObject):
         return d
 
     @staticmethod
-    def _pixel_scale_tiff_kwargs(image: "ImageData") -> Dict[str, Any]:
-        """Build tifffile kwargs for writing a viewer-friendly TIFF.
+    def _image_pixel_scale(image: "ImageData"):
+        """Physical pixel size of ``image`` as ``(dx, dy, unit)``, or Nones.
 
-        Three things are bundled here so every TIFF we emit is openable
-        by macOS Preview / Adobe / Fiji without modification:
-
-        1. **Pixel-scale tags** (when the image carries calibration):
-           ``XResolution`` / ``YResolution`` as pixels-per-unit, with
-           ``ResolutionUnit=NONE`` and an ImageJ-style ``description``
-           carrying ``unit=…`` so Fiji picks up the physical scale.
-           The rational is encoded with a fixed denominator (1e6) so we
-           don't saturate the uint32 numerator on small pixel sizes
-           (~0.12 µm/px would otherwise blow up to 4 294 967 295 / N
-           and trip strict TIFF parsers).
-        2. **Multi-strip layout** (``rowsperstrip=64``): single-strip
-           TIFFs covering tens of megabytes break macOS Preview, which
-           tries to read the whole strip into memory in one go.
-        3. **``metadata=None``** suppresses tifffile's auto
-           ``{"shape": [...]}`` tag — that tag duplicates
-           ``ImageDescription`` (resulting in two tag-270 entries),
-           which is non-standard and confuses some viewers.
-
-        Returns the kwargs dict; safe to ``**``-splat into
-        ``tifffile.imwrite``.
+        Prefers an explicit ``additional_info['pixel_size']`` dict (WITec &c.);
+        falls back to ``metadata.pixel_size_nm`` (``(dy, dx)`` in nm), which is
+        what the Omicron scan images carry.
         """
-        kwargs: Dict[str, Any] = {
-            "metadata": None,
-            "rowsperstrip": 64,
-        }
         meta = getattr(image, "metadata", None)
         ai = getattr(meta, "additional_info", None) or {}
         ps = ai.get("pixel_size")
-        if not isinstance(ps, dict):
-            return kwargs
-        try:
-            dx = float(ps.get("dx") or 0.0)
-            dy = float(ps.get("dy") or 0.0)
-        except (TypeError, ValueError):
-            return kwargs
-        if dx <= 0 or dy <= 0:
-            return kwargs
-        unit = str(ps.get("unit") or "µm").strip()
-        ij_unit = {
-            "µm": "micron", "um": "micron", "micron": "micron",
-            "microns": "micron",
-            "nm": "nm", "mm": "mm", "cm": "cm", "m": "meter",
-        }.get(unit, unit)
+        if isinstance(ps, dict):
+            try:
+                dx = float(ps.get("dx") or 0.0)
+                dy = float(ps.get("dy") or 0.0)
+            except (TypeError, ValueError):
+                dx = dy = 0.0
+            if dx > 0 and dy > 0:
+                return dx, dy, str(ps.get("unit") or "µm").strip()
+        ps_nm = getattr(meta, "pixel_size_nm", None)  # (dy, dx) in nm
+        if ps_nm and len(ps_nm) == 2 and ps_nm[0] and ps_nm[1]:
+            try:
+                return float(ps_nm[1]), float(ps_nm[0]), "nm"
+            except (TypeError, ValueError):
+                pass
+        return None, None, None
 
-        # Fixed-denominator rational keeps the encoding readable on any
-        # parser (and avoids tifffile's saturation behaviour on tiny
-        # pixel sizes).
-        denom = 1_000_000
-        x_num = int(round((1.0 / dx) * denom))
-        y_num = int(round((1.0 / dy) * denom))
+    @staticmethod
+    def _pixel_scale_tiff_kwargs(image: "ImageData",
+                                 data: "np.ndarray" = None) -> Dict[str, Any]:
+        """Build tifffile kwargs for writing a viewer-friendly TIFF.
 
-        kwargs.update({
-            "resolution": ((x_num, denom), (y_num, denom)),
-            "resolutionunit": "NONE",
-            "description": f"ImageJ=1.54p\nunit={ij_unit}\n",
-        })
-        return kwargs
+        Delegates to :func:`src.utils.tiff_io.imagej_tiff_kwargs`, which is
+        shared with the map editor's channel export so both emit identically
+        calibrated files. See that function for what the kwargs carry
+        (pixel-scale tags, float display range, multi-strip, no auto-shape tag).
+
+        ``data`` is the array actually being written (defaults to
+        ``image.array``); the display range is derived from it, so pass the
+        composited array when writing something other than the raw image.
+        """
+        from src.utils.tiff_io import imagej_tiff_kwargs
+        arr = image.array if data is None else data
+        dx, dy, unit = AppBackend._image_pixel_scale(image)
+        return imagej_tiff_kwargs(arr, dx=dx, dy=dy, unit=unit)
 
     def _save_image_to_tiff(self, image: "ImageData") -> Optional[str]:
         """Persist ``image`` as a TIFF on disk and return its absolute path.
@@ -2131,8 +2349,7 @@ class AppBackend(ToolImplementations, QObject):
         except ImportError:
             logger.error("tifffile is required to save image entities")
             return None
-        safe = self._sanitize_filename(image.name or image.id) or image.id
-        target = self._images_dir() / f"{image.id}_{safe}.tiff"
+        target = self._image_export_basename(image, ".tiff")
         try:
             tifffile.imwrite(
                 str(target), image.array,
@@ -2144,14 +2361,228 @@ class AppBackend(ToolImplementations, QObject):
         image.file_path = str(target)
         return image.file_path
 
+    def _save_image_to_gsf(self, image: "ImageData") -> List[str]:
+        """Write ``image`` as Gwyddion Simple Field(s). Returns the paths.
+
+        **This is the primary export**, written as soon as data is imported:
+        Gwyddion is the analysis tool for this SPM data and ``.gsf`` is the only
+        format it reads real dimensions from. TIFF is secondary and written
+        lazily, on demand, by :meth:`_save_image_to_tiff`.
+
+        A multi-channel scan yields **one file per channel** (GSF holds a single
+        field), so every trace direction is separately openable. Colour images
+        are skipped — GSF is a scalar-field format.
+        """
+        if not image.mode.is_single_channel:
+            return []
+        from src.utils.gsf_io import write_gsf
+        from src.utils.units import to_nm
+
+        dx, dy, unit = self._image_pixel_scale(image)
+        x_real = y_real = None
+        xy_units = ""
+        if dx and dy and unit:
+            dx_nm, dy_nm = to_nm(dx, unit), to_nm(dy, unit)
+            if dx_nm and dy_nm:
+                x_real = dx_nm * image.width * 1e-9   # nm → m
+                y_real = dy_nm * image.height * 1e-9
+                xy_units = "m"
+        if x_real is None:
+            logger.warning(
+                "Image %r has no physical pixel size — its .gsf will open in "
+                "Gwyddion as bare pixels.", image.name)
+
+        info = image.metadata.additional_info or {}
+        units_by_channel = info.get('channel_units') or {}
+        # Multi-channel scans write one field per channel; a plain image writes
+        # a single file under its own name.
+        channels = image.channel_names or [None]
+        written: List[str] = []
+        for channel in channels:
+            data = image.get_channel(channel) if channel else image.array
+            if data is None:
+                continue
+            if channel:
+                chan_safe = self._sanitize_filename(channel) or "channel"
+                target = self._image_export_basename(
+                    image, f"__{chan_safe}.gsf")
+                title = f"{image.name} · {channel}"
+                z_units = units_by_channel.get(channel) or info.get("unit")
+            else:
+                target = self._image_export_basename(image, ".gsf")
+                title = image.name
+                z_units = info.get("unit")
+            try:
+                written.append(write_gsf(
+                    target, np.asarray(data, dtype=np.float32),
+                    x_real=x_real, y_real=y_real, xy_units=xy_units,
+                    z_units=z_units, title=title,
+                ))
+            except Exception as e:
+                logger.error("Could not write GSF %s: %s", target, e)
+
+        if written:
+            # Recorded in metadata (not ``file_path``, which stays the
+            # OS-openable raster) so the paths survive into the .hrt.
+            image.metadata.additional_info['gsf_paths'] = written
+        return written
+
+    def _image_export_basename(self, image: "ImageData", suffix: str) -> Path:
+        """Readable, collision-safe export path for ``image``.
+
+        The image id used to be prefixed onto every filename
+        (``img_9d33de3f7f06_2026Jun29-203950_08_11.gwy``), which guaranteed
+        uniqueness at the cost of being unreadable. The name alone is used
+        instead; if a *different* image already claims it, a numeric suffix is
+        appended rather than silently overwriting someone's export.
+        """
+        safe = self._sanitize_filename(image.name or image.id) or image.id
+        directory = self._images_dir()
+        owners = getattr(self, "_export_name_owner", None)
+        if owners is None:
+            owners = self._export_name_owner = {}
+
+        candidate = f"{safe}{suffix}"
+        n = 1
+        while True:
+            target = directory / candidate
+            owner = owners.get(str(target))
+            if owner in (None, image.id) and (owner is not None
+                                              or not target.exists()):
+                owners[str(target)] = image.id
+                return target
+            if owner == image.id:
+                return target
+            n += 1
+            candidate = f"{safe}_{n:02d}{suffix}"
+
+    def _image_scan_extent(self, image: "ImageData"):
+        """``(x_real, y_real, xy_units)`` — the image's total scan extent in SI
+        base units, or ``(None, None, "")`` when uncalibrated."""
+        from src.utils.units import to_nm
+        dx, dy, unit = self._image_pixel_scale(image)
+        if dx and dy and unit:
+            dx_nm, dy_nm = to_nm(dx, unit), to_nm(dy, unit)
+            if dx_nm and dy_nm:
+                return (dx_nm * image.width * 1e-9,
+                        dy_nm * image.height * 1e-9, "m")
+        return (None, None, "")
+
+    def _save_image_to_gwy(self, image: "ImageData") -> Optional[str]:
+        """Write ``image`` as a multi-channel Gwyddion ``.gwy``.
+
+        Every channel of the scan rides in one document, each with its own
+        title and value unit, so Gwyddion offers the same channel selector the
+        app does. Returns the path, or ``None`` when the image isn't a scalar
+        field or ``gwyfile`` isn't installed.
+        """
+        from src.utils.gwy_io import gwy_available, write_gwy
+
+        if not image.mode.is_single_channel or not gwy_available():
+            return None
+        channels = ({name: image.get_channel(name)
+                     for name in image.channel_names}
+                    if image.channel_names else {image.name: image.array})
+        channels = {k: v for k, v in channels.items() if v is not None}
+        if not channels:
+            return None
+
+        x_real, y_real, xy_units = self._image_scan_extent(image)
+        if x_real is None:
+            logger.warning(
+                "Image %r has no physical pixel size — its .gwy will open in "
+                "Gwyddion without real dimensions.", image.name)
+        info = image.metadata.additional_info or {}
+        target = self._image_export_basename(image, ".gwy")
+        try:
+            path = write_gwy(
+                target, channels, x_real=x_real, y_real=y_real,
+                xy_units=xy_units, z_units=info.get('channel_units') or {},
+                default_z_unit=info.get('unit'))
+        except Exception as e:
+            logger.error("Could not write GWY %s: %s", target, e)
+            return None
+        image.metadata.additional_info['gwy_path'] = path
+        return path
+
+    @Slot(str, str, result=str)
+    def exportImageAsGwy(self, image_id: str, file_path: str = "") -> str:
+        """Export an image as a multi-channel Gwyddion ``.gwy``.
+
+        Browser right-click entry. ``file_path`` may be empty to write into the
+        project's images directory, or a chosen destination (``file://`` URLs
+        are accepted). Returns the path written, or "" on failure.
+        """
+        image = self._images.get(image_id)
+        if image is None:
+            self.errorOccurred.emit("Export Failed",
+                                    f"Image not found: {image_id}")
+            return ""
+        from src.utils.gwy_io import gwy_available
+        if not gwy_available():
+            self.errorOccurred.emit(
+                "Export Failed",
+                "Writing .gwy needs the 'gwyfile' package "
+                "(pip install gwyfile).")
+            return ""
+        if not image.mode.is_single_channel:
+            self.errorOccurred.emit(
+                "Export Failed",
+                "Gwyddion files hold scalar fields — this is a colour image.")
+            return ""
+
+        written = self._save_image_to_gwy(image)
+        if not written:
+            self.errorOccurred.emit("Export Failed",
+                                    f"Could not export {image.name}.")
+            return ""
+        target = str(file_path or "").replace("file://", "")
+        if target and Path(target).resolve() != Path(written).resolve():
+            try:
+                Path(target).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(written, target)
+                written = target
+            except Exception as e:
+                self.errorOccurred.emit("Export Failed", str(e))
+                return ""
+        n = len(image.channel_names) or 1
+        self.status = f"Exported {image.name} → {Path(written).name} ({n} channels)"
+        logger.info("Exported image %s as GWY: %s (%d channels)",
+                    image_id, written, n)
+        return written
+
+    def _refresh_image_exports(self, image: "ImageData") -> None:
+        """Rewrite an image's on-disk exports after its pixels change.
+
+        Levelling, reverting and channel switches mutate the array in place, so
+        the primary ``.gsf`` must be regenerated or Gwyddion would keep opening
+        the pre-correction surface. The secondary TIFF is refreshed only if one
+        was already written — otherwise it stays lazily deferred.
+        """
+        self._save_image_to_gsf(image)
+        existing = getattr(image, "file_path", None)
+        if existing:
+            image.file_path = None   # defeat the "already written" short-circuit
+            self._save_image_to_tiff(image)
+
     def _absorb_dataset_images(self, result: dict):
         """Pull images out of any loaded dataset's metadata into the registry.
 
-        Each absorbed image is saved as a TIFF under
-        ``<project_outputs>/images/`` so the project browser's double-click
-        handler can hand the file straight to the OS image viewer.
+        Each absorbed scan is written straight out as **Gwyddion Simple Field**
+        (``.gsf``, one file per channel) under ``<project_outputs>/images/``,
+        so imported data is immediately analysable in Gwyddion with correct
+        physical dimensions. TIFF is secondary: ``openImage`` /
+        ``openImageInOS`` write one lazily when the user actually wants an
+        OS-viewable raster.
+
+        The write is queued on the I/O worker rather than done here: a Matrix
+        session carries dozens of scan images, and writing them all inline
+        froze the main thread (and starved the loader thread of the GIL) at the
+        end of every import. Nothing downstream depends on the write having
+        finished.
         """
         seen_ids = set()
+        pending = []
         for ds_name, sd in result.get('datasets', {}).items():
             if not hasattr(sd, 'metadata'):
                 continue
@@ -2166,14 +2597,44 @@ class AppBackend(ToolImplementations, QObject):
                     continue
                 if name and name != image.name:
                     image.name = name
-                # Persist to disk so the OS can open it directly.
-                self._save_image_to_tiff(image)
+                # Inherit the owning dataset's session so the image is filed
+                # beside it under Images/<session>. Deriving from the image's
+                # own filename instead would give a Park import one subfolder
+                # per preview TIFF. A loader that set the label explicitly
+                # (Omicron MATRIX) keeps its own.
+                _group = self._group_label(sd.metadata.additional_info)
+                if _group:
+                    image.metadata.additional_info.setdefault(
+                        'session_label', _group)
                 self._images[image.id] = image
+                pending.append(image)
                 self.imageAdded.emit(image.id, image.name)
                 logger.info(
-                    "Registered image %s (%r) from dataset %r → %s",
-                    image.id, image.name, ds_name, image.file_path,
+                    "Registered image %s (%r) from dataset %r",
+                    image.id, image.name, ds_name,
                 )
+
+        if pending:
+            self._image_write_seq += 1
+
+            # Gated on the import dialog's "extract images as .gwy" option
+            # (on by default). Off means no automatic extraction at all —
+            # images stay in-app until explicitly exported.
+            if not self._extract_gwy_on_import:
+                logger.info("Skipping Gwyddion extraction for %d image(s) "
+                            "(disabled for this import)", len(pending))
+                return
+
+            def _write_images(task, images=pending):
+                for img in images:
+                    if task.cancelled:
+                        return
+                    self._save_image_to_gwy(img)
+
+            self.worker_manager.submit_io(
+                name=f"Write images #{self._image_write_seq}",
+                operation=_write_images,
+            )
 
     @Slot(str)
     def openImage(self, image_id: str):
@@ -2246,6 +2707,61 @@ class AppBackend(ToolImplementations, QObject):
         """Return the :class:`ImageData` for the given id, or ``None``."""
         return self._images.get(image_id)
 
+    extractGwyOnImportChanged = Signal(bool)
+
+    def _get_extract_gwy(self) -> bool:
+        return self._extract_gwy_on_import
+
+    def _set_extract_gwy(self, value: bool) -> None:
+        v = bool(value)
+        if v == self._extract_gwy_on_import:
+            return
+        self._extract_gwy_on_import = v
+        self.extractGwyOnImportChanged.emit(v)
+        logger.info("Extract images as .gwy on import: %s", v)
+
+    extractGwyOnImport = Property(
+        bool, fget=_get_extract_gwy, fset=_set_extract_gwy,
+        notify=extractGwyOnImportChanged,
+    )
+
+    @Slot(result=bool)
+    def isGwyExportAvailable(self) -> bool:
+        """Whether ``.gwy`` writing is possible (the ``gwyfile`` package is
+        installed). QML disables the option and explains why when False."""
+        from src.utils.gwy_io import gwy_available
+        return gwy_available()
+
+    @Slot(str, result='QVariantList')
+    def getImageChannels(self, image_id: str) -> list:
+        """Selectable channel names for a multi-channel image.
+
+        Returns an empty list for ordinary single-channel images, which is
+        what QML uses to decide whether to show the channel selector at all.
+        """
+        image = self._images.get(image_id)
+        return list(image.channel_names) if image is not None else []
+
+    @Slot(str, str, result=bool)
+    def setImageChannel(self, image_id: str, channel: str) -> bool:
+        """Switch which named channel a multi-channel image displays.
+
+        The image entity keeps its identity (same id, same browser row) — only
+        the pixels it exposes change — so every open viewer of this image
+        follows the switch. Returns ``True`` when the channel actually changed.
+        """
+        image = self._images.get(image_id)
+        if image is None:
+            return False
+        if not image.set_active_channel(str(channel)):
+            return False
+        # No export rewrite needed: every channel already has its own .gsf from
+        # import. Only the in-app display follows the switch.
+        image.metadata.additional_info['channel'] = str(channel)
+        self.imagePixelsChanged.emit(image_id)
+        logger.info("Image %s → channel %r", image_id, channel)
+        return True
+
     @Slot(str)
     def addImageFromFile(self, file_path: str):
         """Load an image from disk and register it as a project entity.
@@ -2264,6 +2780,8 @@ class AppBackend(ToolImplementations, QObject):
             )
             return
         self._images[image.id] = image
+        if self._auto_file(f"image:{image.id}", "Images"):
+            self.browserTreeChanged.emit()
         self.imageAdded.emit(image.id, image.name)
         logger.info("Loaded image from file: %s (%s)", path, image.id)
 
@@ -2273,6 +2791,12 @@ class AppBackend(ToolImplementations, QObject):
         if image_id in self._images:
             deleted_image = self._images[image_id]
             del self._images[image_id]
+            # Hold the raw-pixel backups aside rather than dropping them, so
+            # an undo of this delete can still revert levelling.
+            stashed_raw = {k: v for k, v in self._image_raw_pixels.items()
+                           if k[0] == image_id}
+            for k in stashed_raw:
+                del self._image_raw_pixels[k]
             self.imageDeleted.emit(image_id)
             logger.info("Deleted image %s", image_id)
 
@@ -2280,6 +2804,7 @@ class AppBackend(ToolImplementations, QObject):
             if not self._suppress_undo:
                 def undo_delete():
                     self._images[image_id] = deleted_image
+                    self._image_raw_pixels.update(stashed_raw)
                     self.imageAdded.emit(image_id, deleted_image.name)
                     self.projectModifiedChanged.emit(True)
 
@@ -2378,6 +2903,20 @@ class AppBackend(ToolImplementations, QObject):
             'data_min': float(np.min(image.array)) if image.array.ndim < 3 else 0.0,
             'data_max': float(np.max(image.array)) if image.array.ndim < 3 else 255.0,
         }
+        # Named channels (multi-channel scans) — drives the viewer's channel
+        # selector. Absent/empty for ordinary single-channel images.
+        if image.is_multichannel:
+            result['channels'] = list(image.channel_names)
+            result['active_channel'] = image.active_channel_name
+            units = ai.get('channel_units') or {}
+            if isinstance(units, dict):
+                result['channel_units'] = units
+        # Physical pixel size (dy, dx) in nm — drives the scale bar and the
+        # axis ticks. The typed metadata field is authoritative; the
+        # ``additional_info`` variant is the older per-loader convention.
+        px_nm = getattr(image.metadata, 'pixel_size_nm', None)
+        if px_nm and len(px_nm) == 2 and px_nm[0] and px_nm[1]:
+            result['pixel_size_nm'] = [float(px_nm[0]), float(px_nm[1])]
         if 'pixel_size' in ai:
             result['pixel_size'] = ai['pixel_size']
         if 'world_bounds' in ai:
@@ -2770,9 +3309,10 @@ class AppBackend(ToolImplementations, QObject):
             if fmt_norm in ("tif", "tiff"):
                 # Save via tifffile so the pixel-scale tags survive.
                 import tifffile
+                overlay_arr = np.array(pil)
                 tifffile.imwrite(
-                    str(out), np.array(pil),
-                    **self._pixel_scale_tiff_kwargs(image),
+                    str(out), overlay_arr,
+                    **self._pixel_scale_tiff_kwargs(image, data=overlay_arr),
                 )
             else:
                 pil.save(str(out), format=fmt_norm.upper())
@@ -2809,6 +3349,9 @@ class AppBackend(ToolImplementations, QObject):
         # Persist to disk and register.
         self._save_image_to_tiff(cropped)
         self._images[cropped.id] = cropped
+        if self._auto_file_like(f"image:{cropped.id}",
+                                f"image:{image_id}", "Images"):
+            self.browserTreeChanged.emit()
         self.imageAdded.emit(cropped.id, cropped.name)
         logger.info(
             "Cropped image %s → %s (%d×%d, file=%s)",
@@ -2816,6 +3359,113 @@ class AppBackend(ToolImplementations, QObject):
             cropped.file_path,
         )
         return cropped.id
+
+    @Slot(str, str, 'QVariantMap', result=str)
+    def levelImage(self, image_id: str, operation: str,
+                   params: Dict = None) -> str:
+        """Apply a surface-leveling ``operation`` to a single-channel image.
+
+        Supported operations: ``plane_level`` (least-squares plane),
+        ``poly_level`` (polynomial plane correction; ``order`` param), and
+        ``facet_level`` (facet reorientation).
+
+        The correction **overwrites the image in place** — same id, same name,
+        same project-browser row — rather than spawning a separate "(plane)"
+        entity beside the original. Returns the (unchanged) image id, or an
+        empty string on failure.
+
+        The untouched pixels are stashed in memory first, so:
+
+        - :meth:`revertImageToRaw` can undo the correction, and
+        - re-levelling always re-derives from the raw data instead of stacking
+          a second correction on top of an already-corrected surface.
+
+        The stash is per (image, channel) and deliberately **not** written to
+        the ``.hrt`` — it would double the on-disk size of every levelled
+        image, which matters on multi-GB projects.
+        """
+        from src.processing.plane_correction import apply_leveling
+
+        image = self._images.get(image_id)
+        if image is None:
+            self.errorOccurred.emit(
+                "Leveling Failed", f"Image not found: {image_id}")
+            return ""
+        if not image.mode.is_single_channel:
+            self.errorOccurred.emit(
+                "Leveling Failed",
+                "Leveling applies to single-channel (height/current) images, "
+                "not colour images.")
+            return ""
+        # Level the *raw* surface, not whatever correction is already applied.
+        # Without this, running plane→poly (or nudging the polynomial order)
+        # would fit a second correction on top of the first.
+        raw = self._raw_image_pixels(image, image_id)
+        try:
+            leveled = apply_leveling(
+                operation, np.asarray(raw, dtype=np.float64), params or {})
+        except KeyError:
+            self.errorOccurred.emit(
+                "Leveling Failed", f"Unknown operation: {operation}")
+            return ""
+        except Exception as e:
+            self.errorOccurred.emit("Leveling Failed", str(e))
+            return ""
+
+        image.replace_active_array(leveled.astype(np.float32))
+        image.metadata.additional_info['leveling'] = operation
+        if params:
+            image.metadata.additional_info['leveling_params'] = dict(params)
+        self._refresh_image_exports(image)
+        self.imagePixelsChanged.emit(image_id)
+        logger.info("Leveled image %s in place (%s, channel=%s)",
+                    image_id, operation, image.active_channel_name)
+        return image_id
+
+    def _raw_image_pixels(self, image, image_id: str) -> np.ndarray:
+        """Pixels of ``image``'s active channel as they were before any
+        levelling, stashing them on first use.
+
+        Keyed per (image, channel) so switching channels on a multi-channel
+        scan levels and reverts each one independently.
+        """
+        key = (image_id, image.active_channel_name)
+        if key not in self._image_raw_pixels:
+            self._image_raw_pixels[key] = np.array(image.array, copy=True)
+        return self._image_raw_pixels[key]
+
+    @Slot(str, result=bool)
+    def revertImageToRaw(self, image_id: str) -> bool:
+        """Undo levelling on the image's active channel.
+
+        Returns ``False`` when the channel was never levelled (nothing stashed)
+        or the image is gone. The stash is in-memory only, so this does not
+        survive a save/reload — reverting after a reload means re-importing.
+        """
+        image = self._images.get(image_id)
+        if image is None:
+            return False
+        key = (image_id, image.active_channel_name)
+        raw = self._image_raw_pixels.pop(key, None)
+        if raw is None:
+            return False
+        image.replace_active_array(raw)
+        image.metadata.additional_info.pop('leveling', None)
+        image.metadata.additional_info.pop('leveling_params', None)
+        self._refresh_image_exports(image)
+        self.imagePixelsChanged.emit(image_id)
+        logger.info("Reverted image %s (channel=%s) to raw",
+                    image_id, image.active_channel_name)
+        return True
+
+    @Slot(str, result=bool)
+    def imageHasRawBackup(self, image_id: str) -> bool:
+        """Whether the active channel can be reverted (drives the QML button's
+        enabled state)."""
+        image = self._images.get(image_id)
+        if image is None:
+            return False
+        return (image_id, image.active_channel_name) in self._image_raw_pixels
 
     # ------------------------------------------------------------------
     # Note entity slots
@@ -2900,6 +3550,12 @@ class AppBackend(ToolImplementations, QObject):
                     'text': entry.get('text', ''),
                     'source': entry.get('source', 'unknown'),
                 }
+                # Same session as the dataset that carried it, so the note is
+                # filed under Notes/<session> alongside its measurement.
+                _group = entry.get('session_label') or self._group_label(
+                    sd.metadata.additional_info)
+                if _group:
+                    note['session_label'] = _group
                 if entry.get('rtf_bytes'):
                     note['rtf_bytes'] = entry['rtf_bytes']
                 self._save_note_to_txt(note)
@@ -3297,6 +3953,9 @@ class AppBackend(ToolImplementations, QObject):
             )
             self._save_image_to_tiff(image)
             self._images[image.id] = image
+            if self._auto_file_like(f"image:{image.id}",
+                                    f"map:{map_id}", "Images"):
+                self.browserTreeChanged.emit()
             self.imageAdded.emit(image.id, image.name)
             logger.info("Converted in-memory map %s → image %s (%s)",
                         map_id, image.id, image.file_path)
@@ -3346,6 +4005,9 @@ class AppBackend(ToolImplementations, QObject):
         )
         self._save_image_to_tiff(image)
         self._images[image.id] = image
+        if self._auto_file_like(f"image:{image.id}",
+                                f"map:{map_id}", "Images"):
+            self.browserTreeChanged.emit()
         self.imageAdded.emit(image.id, image.name)
         logger.info("Converted on-disk map %s → image %s (from %s, saved %s)",
                     map_id, image.id, path, image.file_path)
@@ -3415,7 +4077,7 @@ class AppBackend(ToolImplementations, QObject):
         out_path = out_dir / f"{safe}.tiff"
         tifffile.imwrite(
             str(out_path), map_data,
-            **self._pixel_scale_tiff_kwargs(image),
+            **self._pixel_scale_tiff_kwargs(image, data=map_data),
         )
 
         # ----- Spatial sidecar -----------------------------------------
@@ -3492,6 +4154,30 @@ class AppBackend(ToolImplementations, QObject):
         }
         logger.debug(f"getDatasetInfo({dataset_name}): {info}")
         return info
+
+    @Slot(result='QVariantList')
+    def getDatasetEntries(self):
+        """Every dataset's browser info in ONE call.
+
+        The project browser used to call :meth:`getDatasetInfo` once per
+        dataset on every tree rebuild; after a batch of Matrix imports that is
+        thousands of QML→Python round-trips per rebuild. Same fields as
+        ``getDatasetInfo``, in registration order.
+        """
+        out = []
+        for name, data in self._datasets.items():
+            try:
+                out.append({
+                    'name': name,
+                    'type': data.metadata.source_type,
+                    'dimensions': list(data.metadata.dimensions),
+                    'num_spectra': data.num_spectra,
+                    'num_points': data.num_points,
+                    'independent_var': data.independent_var_name,
+                })
+            except Exception as e:
+                logger.warning("getDatasetEntries: skipping %r (%s)", name, e)
+        return out
 
     @Slot(str, result=bool)
     def deleteDataset(self, dataset_name: str) -> bool:
@@ -3883,12 +4569,23 @@ class AppBackend(ToolImplementations, QObject):
 
         logger.info(f"Submitting project save to worker: {project_path}")
         self.status = "Saving project..."
-        self.worker_manager.submit(
+        self._persist_workflows()
+        self.worker_manager.submit_io(
             name=f"Save Project",
             operation=self._do_save_project,
             project_path=project_path,
             on_finished=lambda _: self._on_project_saved(project_path)
         )
+
+    def _persist_workflows(self):
+        """Write all in-memory workflows to the project's workflows dir.
+
+        Runs on the main thread (cheap JSON writes) so open workflow editors
+        are never mutated concurrently with the save."""
+        try:
+            self.workflow_manager.save_all_workflows()
+        except Exception as e:
+            logger.warning(f"Could not save workflows with project: {e}")
 
     @Slot()
     def saveProjectAs(self):
@@ -3909,15 +4606,19 @@ class AppBackend(ToolImplementations, QObject):
         project_path = Path(file_path)
         logger.info(f"Submitting project save to worker: {project_path}")
         self.status = "Saving project..."
-        self.worker_manager.submit(
+        self._persist_workflows()
+        self.worker_manager.submit_io(
             name=f"Save Project",
             operation=self._do_save_project,
             project_path=project_path,
             on_finished=lambda _: self._on_project_saved(project_path)
         )
 
-    def _do_save_project(self, task, project_path: Path):
-        """Internal method to save project (runs in worker thread)."""
+    def _do_save_project(self, task, project_path: Path, fast: bool = False):
+        """Internal method to save project (runs in worker thread).
+
+        ``fast=True`` (autosave) trades file size for save speed — see
+        ProjectManager.save_project."""
         from datetime import datetime
 
         # Check if cancelled
@@ -3965,7 +4666,8 @@ class AppBackend(ToolImplementations, QObject):
             'browser_tree': self._browser_tree,
         }
 
-        success = self.project_manager.save_project(project_path, project_data)
+        success = self.project_manager.save_project(project_path, project_data,
+                                                    fast=fast)
 
         if not success:
             raise Exception(f"Failed to save project: {project_path}")
@@ -4078,7 +4780,9 @@ class AppBackend(ToolImplementations, QObject):
         dataset_name = base
         counter = 1
         while dataset_name in self._datasets:
-            dataset_name = f"{base} ({counter})"
+            # Padded so a name that collides many times still sorts in
+            # order: "Table dataset (02)" before "(10)".
+            dataset_name = f"{base} ({_pad(counter, counter)})"
             counter += 1
 
         try:
@@ -4273,6 +4977,66 @@ class AppBackend(ToolImplementations, QObject):
         self._browser_tree["placements"][item_ref] = \
             self._ensure_browser_subfolder(sub_name, parent_id)
         return True
+
+    def _auto_file_like(self, item_ref: str, source_ref: str,
+                        fallback_folder: str) -> bool:
+        """File ``item_ref`` wherever ``source_ref`` already lives.
+
+        Derived entities (a crop, a map channel converted to an image) belong
+        beside the thing they came from — including inside whatever folder the
+        user moved that thing into. Falls back to the plain type folder when
+        the source is at root or unknown.
+        """
+        if not item_ref or item_ref in self._browser_tree["placements"]:
+            return False
+        parent = self._browser_tree["placements"].get(source_ref)
+        if parent and self._folder_exists(parent):
+            self._browser_tree["placements"][item_ref] = parent
+            return True
+        return self._auto_file(item_ref, fallback_folder)
+
+    # Metadata keys a loader may use to identify the measurement session an
+    # entity came from, most explicit first. Loaders are not required to set
+    # any of them — the fallbacks derive a sensible group from whatever path
+    # information they did record, so a *new* loader inherits the convention
+    # without opting in.
+    _GROUP_LABEL_KEYS = (
+        "session_label",      # explicit, set by the loader (Omicron MATRIX)
+        "source_file",        # single-file import (Neaspec, WITec)
+        "original_filename",  # images carry this
+        "source_directory",   # folder import (Park, Nanosurf, Omicron flat)
+        "dataset_name",
+    )
+
+    @staticmethod
+    def _group_label(info: Optional[Dict[str, Any]]) -> Optional[str]:
+        """Browser subfolder name for an imported entity, or ``None``.
+
+        Imports are filed as ``<Type>/<group>`` so a session's datasets,
+        images, maps and notes stay together instead of all landing in one
+        flat "Spectral Data" pile. The group is the measurement session:
+        an explicit label when the loader set one, otherwise the source
+        file stem or containing directory.
+        """
+        if not info:
+            return None
+        for key in AppBackend._GROUP_LABEL_KEYS:
+            raw = info.get(key)
+            if not raw or not isinstance(raw, str):
+                continue
+            if key == "session_label" or key == "dataset_name":
+                label = raw.strip()
+            else:
+                p = Path(raw)
+                # A file contributes its stem, a directory its own name.
+                label = (p.stem if p.suffix else p.name).strip()
+            # Drop the acquisition clock-time so browser folders read
+            # "2026Jun29" rather than "2026Jun29-203950". Applies to every
+            # loader, since they all funnel through here.
+            label = strip_acquisition_time(label)
+            if label and label not in (".", "..", "/"):
+                return label
+        return None
 
     def _absorb_matrix_maps(self, result: dict):
         """Register Omicron scan images carried in ``result['matrix_maps']`` as
@@ -5107,17 +5871,21 @@ class AppBackend(ToolImplementations, QObject):
                 op_suffix = f"median_k{size}"
 
             elif operation == 'plane_level':
-                # Fit and subtract a plane
-                rows, cols = data.shape
-                x = np.arange(cols)
-                y = np.arange(rows)
-                X, Y = np.meshgrid(x, y)
-
-                A = np.column_stack([X.ravel(), Y.ravel(), np.ones(X.size)])
-                coeffs, _, _, _ = np.linalg.lstsq(A, data.ravel(), rcond=None)
-                plane = (coeffs[0] * X + coeffs[1] * Y + coeffs[2])
-                result = data - plane
+                from src.processing.plane_correction import polynomial_level
+                result = polynomial_level(data, order=1)
                 op_suffix = "planelevel"
+
+            elif operation == 'poly_level':
+                from src.processing.plane_correction import polynomial_level
+                order = int(params.get('order', 2))
+                result = polynomial_level(data, order=order)
+                op_suffix = f"polylevel_o{order}"
+
+            elif operation == 'facet_level':
+                from src.processing.plane_correction import facet_level
+                result = facet_level(
+                    data, iterations=int(params.get('iterations', 6)))
+                op_suffix = "facetlevel"
 
             elif operation == 'row_align':
                 # Subtract row medians
@@ -5136,30 +5904,12 @@ class AppBackend(ToolImplementations, QObject):
                 op_suffix = "norm"
 
             elif operation == 'polynomial_bg_removal':
-                order = params.get('order', 2)
-                # Fit 2D polynomial and subtract
-                rows, cols = data.shape
-                x = np.arange(cols)
-                y = np.arange(rows)
-                X, Y = np.meshgrid(x, y)
-
-                # Build polynomial terms up to given order
-                terms = []
-                for i in range(order + 1):
-                    for j in range(order + 1 - i):
-                        terms.append((X**i * Y**j).ravel())
-
-                A = np.column_stack(terms)
-                coeffs, _, _, _ = np.linalg.lstsq(A, data.ravel(), rcond=None)
-
-                background = np.zeros_like(data)
-                idx = 0
-                for i in range(order + 1):
-                    for j in range(order + 1 - i):
-                        background += coeffs[idx] * (X**i * Y**j)
-                        idx += 1
-
-                result = data - background
+                # Shared implementation normalises coordinates to [-1, 1]; the
+                # old inline fit used raw pixel indices, so an order-6 term with
+                # X~666 reached ~1e16 and the lstsq was hopelessly conditioned.
+                from src.processing.plane_correction import polynomial_level
+                order = int(params.get('order', 2))
+                result = polynomial_level(data, order=order)
                 op_suffix = f"polybg_o{order}"
 
             else:
@@ -5177,11 +5927,19 @@ class AppBackend(ToolImplementations, QObject):
             output_path = None
 
             if params.get('save_tiff', True):
-                import tifffile
-                tiff_path = maps_dir / f"{output_name}.tif"
-                tifffile.imwrite(str(tiff_path), result.astype(np.float32))
-                output_path = str(tiff_path)
-                logger.info(f"Saved processed map: {tiff_path}")
+                from src.utils.field_export import export_field
+                from src.utils.tiff_io import read_tiff_calibration
+                # Inherit the input map's calibration so a processed map keeps
+                # its real dimensions instead of degrading to pixels.
+                cal = read_tiff_calibration(input_path) or {}
+                written = export_field(
+                    maps_dir / output_name, np.asarray(result),
+                    dx=cal.get('dx'), dy=cal.get('dy'), unit=cal.get('unit'),
+                    value_unit=cal.get('value_unit'), title=output_name,
+                    context=f"map operation {operation}")
+                output_path = written.get('tiff')
+                logger.info("Saved processed map: %s",
+                            ", ".join(sorted(written.values())))
 
             if params.get('save_png', False):
                 import matplotlib.cm as cm
@@ -5511,8 +6269,14 @@ class AppBackend(ToolImplementations, QObject):
         )
 
     @Slot(str, str, int)
-    def fitCurves(self, dataset_name: str, fit_type: str, degree: int):
-        """QML wrapper for curve fitting - runs in background thread."""
+    @Slot(str, str, int, str)
+    def fitCurves(self, dataset_name: str, fit_type: str, degree: int,
+                  basis: str = 'power'):
+        """QML wrapper for curve fitting - runs in background thread.
+
+        Overloaded so the three-argument call sites keep working; ``basis``
+        selects the polynomial basis for the coefficient table.
+        """
         logger.info(f"Submitting curve fitting for {dataset_name} to worker")
         self.status = f"Fitting curves for {dataset_name}..."
         self.worker_manager.submit(
@@ -5521,6 +6285,7 @@ class AppBackend(ToolImplementations, QObject):
             dataset_name=dataset_name,
             fit_type=fit_type,
             degree=degree,
+            basis=basis,
             on_finished=lambda path: self._on_tool_completed("Curve Fitting", path)
         )
 
@@ -5648,6 +6413,160 @@ class AppBackend(ToolImplementations, QObject):
                 (result or {}).get('peaks_path', '')
                 if isinstance(result, dict) else (result or ''))
         )
+
+    @Slot(str, "QVariantMap")
+    def runConfinementAnalysis(self, dataset_name: str, params: dict):
+        """QML wrapper for Confinement Analysis - runs in background thread.
+
+        ``params`` carries every knob as a map rather than a long positional
+        signature; unknown keys are ignored downstream, so the QML tool can
+        hand over its whole state object.
+        """
+        logger.info(f"Submitting confinement analysis for {dataset_name} to worker")
+        self.status = f"Analysing {dataset_name}..."
+        self.worker_manager.submit(
+            name=f"Confinement Analysis {dataset_name}",
+            operation=self.analyze_confinement,
+            dataset_name=dataset_name,
+            params=dict(params or {}),
+            # The tool returns a dict of datasets; hand _on_tool_completed the
+            # CSV path string only. A dict reaching a Signal(str) arrives as ""
+            # and getOutputList would then call Path({}).
+            on_finished=lambda result: self._on_tool_completed(
+                "Confinement Analysis",
+                (result or {}).get('peaks_path', '')
+                if isinstance(result, dict) else (result or ''))
+        )
+
+    @Slot(str, int, "QVariantMap", result="QVariantMap")
+    def previewConfinementAnalysis(self, dataset_name: str, spectrum_index: int, params: dict):
+        """Analyse ONE spectrum synchronously, for the tool's live preview.
+
+        Returns plain lists so QML can plot them directly. Single-spectrum
+        work is milliseconds, so this stays on the GUI thread; the caller is
+        expected to debounce it.
+        """
+        blank = {'ok': False, 'x': [], 'raw': [], 'baseline': [], 'corrected': [],
+                 'peakX': [], 'peakY': [], 'count': 0, 'error': ''}
+        try:
+            if dataset_name not in self._datasets:
+                blank['error'] = "Dataset not found"
+                return blank
+
+            spectral_data = self._datasets[dataset_name]
+            spectra = spectral_data.spectra
+            index = max(0, min(int(spectrum_index), spectra.shape[1] - 1))
+
+            detect_params = params_from_dict({**CONFINEMENT_DEFAULTS, **dict(params or {})})
+            detect_params.validate()
+
+            x = np.asarray(spectral_data.independent_var, dtype=np.float64)
+            y = np.asarray(spectra.values[:, index], dtype=np.float64)
+            result = analyze(x, y, detect_params)
+
+            show_baseline = detect_params.baseline != 'none'
+            return {
+                'ok': True,
+                'x': result.x.tolist(),
+                'raw': result.y_raw.tolist(),
+                'baseline': result.baseline.tolist() if show_baseline else [],
+                'corrected': result.y_corrected.tolist(),
+                'peakX': [pk.x for pk in result.peaks],
+                'peakY': [pk.y_corrected if show_baseline else pk.y for pk in result.peaks],
+                'count': len(result.peaks),
+                'name': str(spectra.columns[index]),
+                'error': '',
+            }
+        except Exception as e:
+            logger.debug("Confinement preview failed: %s", e, exc_info=True)
+            blank['error'] = str(e)
+            return blank
+
+    @Slot(str, "QVariantMap")
+    def extractSpectralFeatures(self, dataset_name: str, params: dict):
+        """QML wrapper for spectral feature extraction - background thread."""
+        logger.info(f"Submitting spectral feature extraction for {dataset_name}")
+        self.status = f"Extracting features from {dataset_name}..."
+        self.worker_manager.submit(
+            name=f"Spectral Features {dataset_name}",
+            operation=self.extract_spectral_features,
+            dataset_name=dataset_name,
+            params=dict(params or {}),
+            # Hand _on_tool_completed the CSV path, not the result dict: a
+            # dict reaching a Signal(str) arrives as "".
+            on_finished=lambda result: self._on_tool_completed(
+                "Spectral Features",
+                (result or {}).get('features_path', '')
+                if isinstance(result, dict) else (result or ''))
+        )
+
+    @Slot(str, int, "QVariantMap", result="QVariantMap")
+    def previewSpectralFeatures(self, dataset_name: str, spectrum_index: int, params: dict):
+        """Features of ONE spectrum, plus what they were measured from.
+
+        Returns the normalised curve, the detected gap edges and the in-gap
+        state positions so the tool can show *why* it got those numbers --
+        a gap edge in the wrong place is obvious on the plot and invisible
+        in the table. Single-spectrum work is milliseconds, so this stays on
+        the GUI thread; the caller debounces it.
+        """
+        blank = {'ok': False, 'x': [], 'y': [], 'gapLeft': 0.0, 'gapRight': 0.0,
+                 'stateX': [], 'stateY': [], 'names': [], 'values': [],
+                 'name': '', 'valid': False, 'error': ''}
+        try:
+            if dataset_name not in self._datasets:
+                blank['error'] = "Dataset not found"
+                return blank
+
+            spectral_data = self._datasets[dataset_name]
+            spectra = spectral_data.spectra
+            index = max(0, min(int(spectrum_index), spectra.shape[1] - 1))
+
+            config = _feature_config(dict(params or {}))
+            config.validate()
+
+            x = np.asarray(spectral_data.independent_var, dtype=np.float64)
+            y = np.asarray(spectra.values[:, index], dtype=np.float64)
+
+            normalized = normalize_spectrum(x, y, config.normalize, config.edge_fraction)
+            gap = gap_features(x, normalized, config.gap_delta, config.state_width_samples)
+            row = spectrum_features(x, y, config)
+
+            # Re-run the in-gap search so the states can be drawn where they
+            # were counted, rather than the user taking the number on trust.
+            search = Params(**{**vars(config.confinement_params()),
+                               "xmin": gap["gap_left"], "xmax": gap["gap_right"]})
+            state_x, state_y = [], []
+            try:
+                result = analyze(x, normalized, search)
+                floor = config.state_noise_sigmas * estimate_noise_sigma(result.y_corrected)
+                for pk in result.peaks:
+                    if pk.prominence > floor:
+                        state_x.append(pk.x)
+                        state_y.append(pk.y)
+            except Exception:
+                logger.debug("Preview in-gap search failed", exc_info=True)
+
+            ordered = [c for c in feature_columns(config)
+                       if c not in ('Spectrum_Index',) and c in row]
+            return {
+                'ok': True,
+                'x': normalized_x_list(x),
+                'y': [float(v) for v in normalized],
+                'gapLeft': float(gap['gap_left']),
+                'gapRight': float(gap['gap_right']),
+                'stateX': state_x,
+                'stateY': state_y,
+                'names': ordered,
+                'values': [_format_feature(row[c]) for c in ordered],
+                'name': str(spectra.columns[index]),
+                'valid': bool(row.get('valid', 0.0)),
+                'error': '',
+            }
+        except Exception as e:
+            logger.debug("Spectral feature preview failed: %s", e, exc_info=True)
+            blank['error'] = str(e)
+            return blank
 
     @Slot(str, int, int)
     def discretizeMap(self, image_path: str, target_x: int, target_y: int):
@@ -6086,7 +7005,7 @@ class AppBackend(ToolImplementations, QObject):
             dataset_name = f"Image_{path.stem}"
             counter = 1
             while dataset_name in self._datasets:
-                dataset_name = f"Image_{path.stem}_{counter}"
+                dataset_name = f"Image_{path.stem}_{_pad(counter, counter)}"
                 counter += 1
 
             # Store as map data in Maps list
@@ -6101,8 +7020,14 @@ class AppBackend(ToolImplementations, QObject):
 
                 # Save data
                 if extension in ['.tif', '.tiff']:
-                    import tifffile
-                    tifffile.imwrite(str(dest_path), data.astype(np.float32))
+                    from src.utils.field_export import export_field
+                    from src.utils.tiff_io import read_tiff_calibration
+                    cal = read_tiff_calibration(file_path) or {}
+                    export_field(
+                        maps_dir / dataset_name, np.asarray(data),
+                        dx=cal.get('dx'), dy=cal.get('dy'),
+                        unit=cal.get('unit'), title=dataset_name,
+                        context="imported map copy")
                 else:
                     np.save(str(maps_dir / f"{dataset_name}.npy"), data)
                     dest_path = maps_dir / f"{dataset_name}.npy"

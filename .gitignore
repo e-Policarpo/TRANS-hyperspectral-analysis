@@ -16,6 +16,20 @@ build/
 # Archives
 *.zip
 
+# Old versions, backups and superseded copies. Kept on disk for reference,
+# deliberately out of the repo — see archive/README.md.
+archive/
+
+# Test / tooling caches
+.pytest_cache/
+.benchmarks/
+.ipynb_checkpoints/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+
 # IDE
 .vscode/
 .idea/

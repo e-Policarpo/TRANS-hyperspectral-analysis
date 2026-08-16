@@ -16,6 +16,8 @@ from typing import Dict, List, Optional, Any, Callable
 from datetime import datetime
 from PySide6.QtCore import QObject, Signal, Slot
 
+from src.utils.naming import pad as _pad
+
 from src.backend.workflow_engine import (
     Workflow, WorkflowNode, Connection, Port, PortType,
     TOOL_DEFINITIONS, create_node_from_tool, get_tool_categories, get_tool_info
@@ -99,7 +101,7 @@ class WorkflowExecutor:
                     self.node_outputs[node_id] = node_result
 
                     # If this is an output node, add to results
-                    if node.tool_name in ['DatasetOutput', 'MapOutput', 'ImageOutput', 'TableOutput', 'FlatDataOutput', 'TextOutput']:
+                    if node.tool_name in ['DatasetOutput', 'MapOutput', 'ImageOutput', 'TableOutput', 'FlatDataOutput', 'TextOutput', 'IntervalOutput']:
                         output_name = node.parameters.get('output_name', f'output_{node_id}')
                         results[output_name] = node_result
 
@@ -215,6 +217,17 @@ class WorkflowExecutor:
             dataset_name = params.get('dataset_name')
             if dataset_name and dataset_name in self.app_backend._datasets:
                 outputs['flat_data'] = self.app_backend._datasets[dataset_name]
+
+        elif tool_name == "IntervalInput":
+            intervals_param = params.get('intervals', []) or []
+            intervals = []
+            for interval in intervals_param:
+                if isinstance(interval, dict):
+                    intervals.append(interval)
+                elif isinstance(interval, (list, tuple)) and len(interval) >= 2:
+                    intervals.append([interval[0], interval[1]])
+            outputs['intervals'] = intervals
+            logger.info(f"IntervalInput provided {len(intervals)} intervals")
 
         elif tool_name == "MapInput":
             file_path = params.get('file_path')
@@ -397,7 +410,8 @@ class WorkflowExecutor:
                     fit_type=params.get('fit_type', 'endpoints'),
                     degree=params.get('degree', 1),
                     als_lambda=params.get('als_lambda', 1e5),
-                    als_p=params.get('als_p', 0.01)
+                    als_p=params.get('als_p', 0.01),
+                    basis=params.get('basis', 'power')
                 )
                 # Get the result datasets using friendly name pattern
                 base_name = self.app_backend._extract_clean_base_name(dataset_name)
@@ -626,6 +640,57 @@ class WorkflowExecutor:
                 outputs['peaks'] = result.get('dataset')
                 outputs['intervals'] = result.get('intervals', [])
 
+        elif tool_name == "ConfinementAnalysis":
+            dataset = inputs.get('dataset')
+            if dataset:
+                if isinstance(dataset, str):
+                    logger.error(f"ConfinementAnalysis received string instead of dataset: {dataset}")
+                    return outputs
+
+                dataset_name = self._get_temp_dataset_name(dataset)
+                self.app_backend._datasets[dataset_name] = dataset
+
+                class MockTask:
+                    cancelled = False
+                    progress = 0
+
+                # fwhm_multiplier is a tool argument rather than a detection
+                # parameter, so it travels separately from the params map.
+                detection_params = {k: v for k, v in params.items() if k != 'fwhm_multiplier'}
+                result = self.app_backend.analyze_confinement(
+                    MockTask(), dataset_name,
+                    params=detection_params,
+                    fwhm_multiplier=params.get('fwhm_multiplier', 1.5),
+                )
+
+                for port, key in (('peak_matrix', 'peak_matrix'),
+                                  ('peak_matrix_binned', 'peak_matrix_binned'),
+                                  ('peak_matrix_offset', 'peak_matrix_offset'),
+                                  ('peak_matrix_binned_offset', 'peak_matrix_binned_offset'),
+                                  ('peaks', 'peaks'),
+                                  ('corrected', 'corrected'), ('baseline', 'baseline'),
+                                  ('coefficients', 'coefficients'), ('peak_count', 'peak_count')):
+                    outputs[port] = result.get(key)
+                outputs['intervals'] = result.get('intervals', [])
+
+        elif tool_name == "SpectralFeatures":
+            dataset = inputs.get('dataset')
+            if dataset:
+                if isinstance(dataset, str):
+                    logger.error(f"SpectralFeatures received string instead of dataset: {dataset}")
+                    return outputs
+
+                dataset_name = self._get_temp_dataset_name(dataset)
+                self.app_backend._datasets[dataset_name] = dataset
+
+                class MockTask:
+                    cancelled = False
+                    progress = 0
+
+                result = self.app_backend.extract_spectral_features(
+                    MockTask(), dataset_name, params=dict(params))
+                outputs['features'] = result.get('features')
+
         elif tool_name == "ImageSmoothing":
             image_path = inputs.get('image')
             if image_path:
@@ -745,7 +810,8 @@ class WorkflowExecutor:
                             if not Path(path).exists():
                                 logger.error(f"Map file not found: {path}")
                                 continue
-                            map_name = f"{output_name}_{i+1}" if len(map_path) > 1 else output_name
+                            map_name = (f"{output_name}_{_pad(i + 1, len(map_path))}"
+                                        if len(map_path) > 1 else output_name)
                             self.app_backend._open_map_window(str(path), f"wf_map_{node.id}_{i}", map_name)
                             # Register map in project browser
                             self.app_backend._map_id_counter += 1
@@ -783,7 +849,8 @@ class WorkflowExecutor:
                 # Handle both single paths and lists of paths
                 if isinstance(image_path, list):
                     for i, path in enumerate(image_path):
-                        image_name = f"{output_name}_{i+1}" if len(image_path) > 1 else output_name
+                        image_name = (f"{output_name}_{_pad(i + 1, len(image_path))}"
+                                      if len(image_path) > 1 else output_name)
                         # Copy/convert to output directory if needed
                         if params.get('display', True):
                             self.app_backend._open_map_window(str(path), f"wf_image_{node.id}_{i}", image_name)
@@ -820,6 +887,50 @@ class WorkflowExecutor:
 
                 outputs['result'] = flat_data
                 logger.info(f"Flat data saved as: {output_name}")
+
+        elif tool_name == "IntervalOutput":
+            intervals_raw = inputs.get('intervals') or []
+            # Normalize to [start, end] pairs (accepts dicts with lower/upper too)
+            interval_pairs = []
+            for interval in intervals_raw:
+                if isinstance(interval, dict):
+                    start = interval.get('lower', interval.get('start'))
+                    end = interval.get('upper', interval.get('end'))
+                    if start is not None and end is not None:
+                        interval_pairs.append([start, end])
+                elif isinstance(interval, (list, tuple)) and len(interval) >= 2:
+                    interval_pairs.append([interval[0], interval[1]])
+
+            if interval_pairs:
+                user_output_name = params.get('output_name', 'Intervals')
+                output_name = self._format_output_name(user_output_name)
+                outputs['result'] = interval_pairs
+
+                if params.get('save_csv', True):
+                    try:
+                        import pandas as pd
+                        safe_filename = output_name.replace(" ", "_").replace("(", "").replace(")", "").replace("-", "_")
+                        output_path = self.app_backend._ensure_output_dir('curves') / f"{safe_filename}.csv"
+                        df = pd.DataFrame(interval_pairs, columns=['Start', 'End'])
+                        df.to_csv(output_path, index=False)
+
+                        # Register so it shows in ProjectBrowser
+                        self.app_backend._output_id_counter += 1
+                        output_id = f"output_{self.app_backend._output_id_counter}"
+                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        self.app_backend.output_files.append({
+                            'id': output_id,
+                            'type': 'Intervals',
+                            'path': str(output_path),
+                            'timestamp': timestamp,
+                            'name': output_name
+                        })
+                        self.app_backend.outputCreated.emit(output_id, "Intervals", str(output_path))
+                        logger.info(f"Intervals saved as: {output_name} -> {output_path}")
+                    except Exception as e:
+                        logger.warning(f"Could not save intervals to CSV: {e}")
+            else:
+                logger.warning("IntervalOutput received no intervals")
 
         # Map Processing Nodes
         elif tool_name == "MapGaussianFilter":
@@ -1120,6 +1231,9 @@ class WorkflowManager(QObject):
         self.workflows: Dict[str, Workflow] = {}
         self.current_workflow: Optional[Workflow] = None
         self.executor: Optional[WorkflowExecutor] = None
+        # workflow_id -> last saved file path; lets a rename replace the old
+        # .flow file instead of leaving a stale duplicate behind
+        self._workflow_paths: Dict[str, str] = {}
 
     def _get_workflows_dir(self) -> Path:
         """Get the workflows directory for the current project, creating it if needed."""
@@ -1284,6 +1398,18 @@ class WorkflowManager(QObject):
             with open(file_path, 'w', encoding='utf-8') as f:
                 json.dump(workflow_data, f, indent=2)
 
+            # If the workflow was renamed, remove the file saved under the
+            # old name so the saved list stays stable (no stale duplicates)
+            old_path = self._workflow_paths.get(workflow_id)
+            if old_path and Path(old_path) != file_path:
+                try:
+                    if Path(old_path).exists():
+                        Path(old_path).unlink()
+                        logger.info(f"Removed stale workflow file after rename: {old_path}")
+                except Exception as e:
+                    logger.warning(f"Could not remove old workflow file {old_path}: {e}")
+            self._workflow_paths[workflow_id] = str(file_path)
+
             self.workflowSaved.emit(str(file_path))
             logger.info(f"Saved workflow to {file_path}")
             return str(file_path)
@@ -1291,6 +1417,34 @@ class WorkflowManager(QObject):
         except Exception as e:
             logger.error(f"Error saving workflow: {e}")
             return ""
+
+    def clear_workflows(self):
+        """Forget all in-memory workflows.
+
+        Called when a project is opened or closed so workflows from the
+        previous project are not written into the new project's workflows
+        directory (and rename cleanup cannot touch the old project's files).
+        """
+        self.workflows.clear()
+        self._workflow_paths.clear()
+        self.current_workflow = None
+        logger.info("Cleared in-memory workflows")
+
+    def save_all_workflows(self) -> int:
+        """Persist every in-memory workflow that has content.
+
+        Called when the project is saved so open workflow editors survive a
+        save/reopen cycle even if the user never pressed Save in the editor.
+        """
+        count = 0
+        for workflow_id, workflow in list(self.workflows.items()):
+            if not workflow.nodes:
+                continue  # skip empty "New Workflow" placeholders
+            if self.saveWorkflow(workflow_id):
+                count += 1
+        if count:
+            logger.info(f"Saved {count} workflow(s) with the project")
+        return count
 
     @Slot(str, result=str)
     def loadWorkflow(self, file_path: str) -> str:
@@ -1302,6 +1456,7 @@ class WorkflowManager(QObject):
             workflow = Workflow.from_dict(data)
             self.workflows[workflow.id] = workflow
             self.current_workflow = workflow
+            self._workflow_paths[workflow.id] = str(Path(file_path))
             self.workflowLoaded.emit(workflow.name)
             logger.info(f"Loaded workflow: {workflow.name}")
             return workflow.id

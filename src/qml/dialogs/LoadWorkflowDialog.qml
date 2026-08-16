@@ -333,7 +333,15 @@ Dialog {
     }
 
     function openWorkflowFromId(workflowId, workflowName) {
-        // Create workflow window component
+        // Route through the main window so the new window is registered in
+        // openWorkflowWindows (closed on shutdown) and gets the theme colors.
+        if (mainWin && mainWin.openWorkflowWindowFromId) {
+            mainWin.openWorkflowWindowFromId(workflowId, workflowName)
+            return
+        }
+
+        // Fallback (should not normally happen): untracked window
+        console.warn("LoadWorkflowDialog: main window not available, creating untracked workflow window")
         var component = Qt.createComponent("../workflow/WorkflowWindow.qml")
         if (component.status === Component.Ready) {
             var window = component.createObject(null, {

@@ -10,6 +10,7 @@ import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
+import QtQuick.Dialogs
 import "../dialogs"
 
 Rectangle {
@@ -656,6 +657,22 @@ Rectangle {
             }
         }
 
+        // Every channel of the scan in one Gwyddion document, carrying the
+        // real scan dimensions and per-channel value units.
+        MenuItem {
+            text: "Export as .gwy (Gwyddion)…"
+            visible: itemMenu.row && itemMenu.row.type === "image"
+            height: visible ? implicitHeight : 0
+            enabled: backend ? backend.isGwyExportAvailable() : false
+            onTriggered: {
+                if (!backend || !itemMenu.row || !itemMenu.row.id) return
+                gwyExportDialog.imageId = itemMenu.row.id
+                gwyExportDialog.currentFile =
+                    "file:///" + (itemMenu.row.name || "scan") + ".gwy"
+                gwyExportDialog.open()
+            }
+        }
+
         MenuItem {
             text: "Open in OS editor…"
             visible: itemMenu.row && itemMenu.row.type === "note"
@@ -1002,6 +1019,26 @@ Rectangle {
 
     // -- Tree building & helpers -------------------------------------------
 
+    // Coalesced rebuild. A single import fires one signal PER registered
+    // entity (imageAdded × N, mapCreated × N, noteAdded × N, plus dataLoaded
+    // and browserTreeChanged), and each one used to run a full
+    // gatherItems()+re-flatten over EVERY item in the project. That made the
+    // cost of import k proportional to (new entities) × (total items), i.e.
+    // quadratic across a queue of imports — a batch of Matrix folders took
+    // increasingly long per folder while the main thread also starved the
+    // loader thread of the GIL. Every caller now just schedules; the timer
+    // collapses a whole burst into one rebuild on the next event-loop turn.
+    Timer {
+        id: rebuildTimer
+        interval: 16
+        repeat: false
+        onTriggered: browserRoot.rebuildRowsNow()
+    }
+
+    function rebuildRows() {
+        rebuildTimer.restart()
+    }
+
     // Public refresh entry point (refresh button, Connections, onCompleted).
     function refreshBrowser() {
         browserRoot.rebuildRows()
@@ -1026,12 +1063,16 @@ Rectangle {
         if (!backend) return items
         var i
 
-        var datasets = backend.getDatasetList()
+        // One bulk call, not one getDatasetInfo() bridge round-trip per
+        // dataset: with a few thousand imported Matrix datasets the per-item
+        // calls dominated the rebuild.
+        var datasets = backend.getDatasetEntries
+                       ? backend.getDatasetEntries() : []
         for (i = 0; i < datasets.length; i++) {
-            var info = backend.getDatasetInfo(datasets[i]) || {}
+            var info = datasets[i] || {}
             items.push({
-                kind: "item", type: "dataset", id: datasets[i],
-                ref: "dataset:" + datasets[i], name: datasets[i],
+                kind: "item", type: "dataset", id: info.name,
+                ref: "dataset:" + info.name, name: info.name,
                 displayType: info.type || "Dataset",
                 dimensions: info.dimensions || [],
                 numSpectra: info.num_spectra || 0,
@@ -1114,7 +1155,9 @@ Rectangle {
 
     // Flatten getBrowserTree() + items into ``treeModel``, the ordered list the
     // ListView renders. Honors per-folder expand state and the current sort.
-    function rebuildRows() {
+    // The actual (expensive) rebuild — never call this directly from a signal
+    // handler; go through rebuildRows() so bursts coalesce.
+    function rebuildRowsNow() {
         treeModel.clear()
         if (!backend)
             return
@@ -1359,6 +1402,23 @@ Rectangle {
                 browserRoot.selectedRef = "dataset:" + newName
             }
             browserRoot.rebuildRows()
+        }
+    }
+
+    // Destination picker for "Export as .gwy". The backend writes every
+    // channel of the scan into the one file.
+    FileDialog {
+        id: gwyExportDialog
+        property string imageId: ""
+        title: "Export image as Gwyddion .gwy"
+        fileMode: FileDialog.SaveFile
+        nameFilters: ["Gwyddion files (*.gwy)"]
+        defaultSuffix: "gwy"
+        onAccepted: {
+            if (backend && gwyExportDialog.imageId)
+                backend.exportImageAsGwy(gwyExportDialog.imageId,
+                                         selectedFile.toString())
+            gwyExportDialog.imageId = ""
         }
     }
 

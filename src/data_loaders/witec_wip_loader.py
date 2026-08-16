@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 
 from ..models.image_data import ImageData, ImageMetadata, ImageMode
+from ..utils.units import pixel_size_to_nm
 from ..models.spectral_data import SpectralData, SpectralMetadata
 from ..models.topography_data import TopographyData
 from .base_loader import BaseDataLoader, ProgressCallback
@@ -899,8 +900,10 @@ class WitecWipLoader(BaseDataLoader):
         img.metadata.additional_info['pixel_size'] = {
             'dx': float(dx), 'dy': float(dy), 'unit': st.standard_unit or 'µm',
         }
-        if st.standard_unit in ('µm', 'um', 'micron', 'microns'):
-            img.metadata.pixel_size_nm = (float(dy) * 1000.0, float(dx) * 1000.0)
+        # Any length unit, not just µm — a nm- or mm-calibrated project used to
+        # fall through here uncalibrated, losing the viewer's scale bar.
+        img.metadata.pixel_size_nm = pixel_size_to_nm(
+            float(dx), float(dy), st.standard_unit or 'µm')
         # World-coord bounds of the image rectangle.
         wx0, wy0 = st.world_xy(0, 0)
         wx1, wy1 = st.world_xy(bm.width, bm.height)

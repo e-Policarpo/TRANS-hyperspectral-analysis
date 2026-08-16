@@ -139,3 +139,110 @@ def test_tiff_resolution_rational_doesnt_saturate(tmp_path):
         assert x_res[0] / x_res[1] == pytest.approx(
             1.0 / 0.12384560767640458, rel=1e-5,
         )
+
+
+# ---------------------------------------------------------------------------
+# Display range — float maps used to open all-black
+# ---------------------------------------------------------------------------
+
+def _float_image(dx=None, dy=None, unit=None, pixel_size_nm=None) -> ImageData:
+    """A float32 map of physical values (~1e-9), the all-black case."""
+    rng = np.random.default_rng(0)
+    arr = (rng.normal(0.0, 1.0, (80, 64)).astype(np.float32) * 1e-9) + 5e-9
+    info = {}
+    if dx is not None:
+        info["pixel_size"] = {"dx": dx, "dy": dy, "unit": unit}
+    meta = ImageMetadata(source="omicron_mtrx", additional_info=info)
+    if pixel_size_nm is not None:
+        meta.pixel_size_nm = pixel_size_nm
+    return ImageData(array=arr, mode=ImageMode.SINGLE_FLOAT, metadata=meta, name="zmap")
+
+
+def test_float_image_gets_display_range():
+    """float32 physical values carry no implicit range, so viewers render them
+    black. A min/max must be embedded."""
+    img = _float_image(dx=0.5, dy=0.5, unit="nm")
+    desc = AppBackend._pixel_scale_tiff_kwargs(img)["description"]
+    assert "min=" in desc and "max=" in desc
+    lo = float(desc.split("min=")[1].split("\n")[0])
+    hi = float(desc.split("max=")[1].split("\n")[0])
+    assert hi > lo
+    # Range must bracket the bulk of the data, in physical units (~1e-9).
+    assert lo == pytest.approx(np.percentile(img.array, 1), rel=1e-6)
+    assert hi == pytest.approx(np.percentile(img.array, 99), rel=1e-6)
+
+
+def test_display_range_is_robust_to_outliers():
+    """A single hot pixel must not flatten the contrast of everything else —
+    that is what the 1–99 % clip is for."""
+    img = _float_image(dx=0.5, dy=0.5, unit="nm")
+    img.array[0, 0] = 1e3          # cosmic-ray-scale spike
+    desc = AppBackend._pixel_scale_tiff_kwargs(img)["description"]
+    hi = float(desc.split("max=")[1].split("\n")[0])
+    assert hi < 1e-6, "display max chased the outlier instead of clipping it"
+
+
+def test_integer_image_gets_no_display_range():
+    """Integer data already displays correctly; a range would be noise."""
+    img = _calibrated_image(0.5, 0.5, "µm")   # uint16
+    desc = AppBackend._pixel_scale_tiff_kwargs(img)["description"]
+    assert "min=" not in desc and "max=" not in desc
+
+
+def test_display_range_survives_round_trip(tmp_path):
+    """Written file must expose the range as ImageJ metadata, and the real
+    float values must come back bit-for-bit."""
+    img = _float_image(dx=0.5, dy=0.5, unit="nm")
+    out = tmp_path / "zmap.tiff"
+    tifffile.imwrite(
+        str(out), img.array,
+        **AppBackend._pixel_scale_tiff_kwargs(img),
+    )
+    with tifffile.TiffFile(str(out)) as tf:
+        ij = tf.imagej_metadata
+        assert ij is not None and "min" in ij and "max" in ij
+        assert ij["unit"] == "nm"
+        assert len([t for t in tf.pages[0].tags.values() if t.code == 270]) == 1
+    assert np.array_equal(tifffile.imread(str(out)), img.array)
+
+
+def test_data_override_drives_display_range():
+    """When something other than ``image.array`` is written (an overlay
+    composite, a converted map), the range must come from what is actually
+    being written."""
+    img = _float_image(dx=0.5, dy=0.5, unit="nm")
+    other = np.full((10, 10), 42.0, dtype=np.float32)
+    desc = AppBackend._pixel_scale_tiff_kwargs(img, data=other)["description"]
+    lo = float(desc.split("min=")[1].split("\n")[0])
+    hi = float(desc.split("max=")[1].split("\n")[0])
+    # Constant array: helper must still emit a non-degenerate range.
+    assert lo == pytest.approx(42.0)
+    assert hi > lo
+
+
+# ---------------------------------------------------------------------------
+# pixel_size_nm fallback — how Omicron scan images carry their scale
+# ---------------------------------------------------------------------------
+
+def test_pixel_size_nm_fallback_supplies_scale():
+    """Omicron images carry scale on ``metadata.pixel_size_nm`` (dy, dx) rather
+    than the ``pixel_size`` dict; without the fallback they exported uncalibrated."""
+    img = _float_image(pixel_size_nm=(0.25, 0.5))    # (dy, dx) nm
+    dx, dy, unit = AppBackend._image_pixel_scale(img)
+    assert (dx, dy, unit) == (0.5, 0.25, "nm")
+    kw = AppBackend._pixel_scale_tiff_kwargs(img)
+    (xn, xd), (yn, yd) = kw["resolution"]
+    assert xn / xd == pytest.approx(1.0 / 0.5)
+    assert yn / yd == pytest.approx(1.0 / 0.25)
+    assert "unit=nm" in kw["description"]
+
+
+def test_pixel_size_dict_wins_over_pixel_size_nm():
+    """An explicit pixel_size dict is the more specific source."""
+    img = _float_image(dx=2.0, dy=4.0, unit="µm", pixel_size_nm=(0.25, 0.5))
+    assert AppBackend._image_pixel_scale(img) == (2.0, 4.0, "µm")
+
+
+def test_pixel_size_nm_ignored_when_incomplete():
+    img = _float_image(pixel_size_nm=(0.0, 0.5))
+    assert AppBackend._image_pixel_scale(img) == (None, None, None)

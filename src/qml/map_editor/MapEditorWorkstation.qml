@@ -1289,7 +1289,6 @@ Item {
     function linkDatasetsFromBackend(appBackend) {
         // Clear existing
         datasetListModel.clear()
-        mapBackend.clearLinkedDatasets()
 
         // Get dataset list with info
         var datasets = appBackend.getDatasetListWithInfo()
@@ -1304,13 +1303,14 @@ Item {
                 "is_integrated": false,  // Integrated datasets are now excluded by backend
                 "selected": info.is_truncated  // Auto-select truncated spectral datasets
             })
-
-            // Link the actual SpectralData object
-            var spectralData = appBackend.getDataset(info.name)
-            if (spectralData) {
-                mapBackend.linkDataset(info.name, spectralData)
-            }
         }
+
+        // Link the SpectralData objects in one Python-side batch (clear +
+        // link-all + a single linkedDatasetsChanged). Looping here instead
+        // cost two bridge crossings and one signal per dataset, re-run on
+        // every import — the dominant cost once a project holds thousands of
+        // imported Matrix datasets.
+        appBackend.relinkDatasetsToMapEditor()
 
         console.log("Linked", datasetListModel.count, "datasets for spectrum viewing")
     }

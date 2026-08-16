@@ -15,6 +15,7 @@ from typing import Optional, Tuple, List
 import logging
 
 from .base_loader import BaseDataLoader
+from ..utils.naming import padded_series
 from ..models.spectral_data import SpectralData, SpectralMetadata
 from ..models.topography_data import TopographyData
 
@@ -177,7 +178,7 @@ class NanosurfSTSLoader(BaseDataLoader):
         df = self.concatenate_spectra(
             concatenated_spectra,
             V_common,
-            column_names=[f"Point_{i+1}" for i in range(len(concatenated_spectra))]
+            column_names=padded_series("Point", len(concatenated_spectra))
         )
         
         # Rename voltage column
@@ -265,7 +266,7 @@ class NanosurfSTSLoader(BaseDataLoader):
             # Create DataFrame
             df = self.concatenate_spectra(
                 spectra, V,
-                column_names=[f"Point_{i+1}" for i in range(n_points)]
+                column_names=padded_series("Point", n_points)
             )
             
             # Guess dimensions

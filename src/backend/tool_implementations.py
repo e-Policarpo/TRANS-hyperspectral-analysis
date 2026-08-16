@@ -15,10 +15,131 @@ from typing import Optional, Dict, List, Tuple
 from scipy import signal, interpolate, optimize
 from PIL import Image
 import logging
+import warnings
 
 from src.models.spectral_data import SpectralData, SpectralMetadata
+from src.processing.spectral_features import (
+    FeatureConfig,
+    feature_columns,
+    feature_table,
+)
+from src.processing.peak_detection import (
+    Analysis,
+    POLYNOMIAL_BASES,
+    als_baseline,
+    analyze_many,
+    binned_peak_matrix,
+    coefficient_names,
+    endpoint_baseline,
+    energy_bins,
+    eval_polynomial,
+    fit_polynomial,
+    normalized_axis,
+    group_peaks_by_bin,
+    params_from_dict,
+    peak_matrix,
+    rubberband_baseline,
+)
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Confinement Analysis helpers
+# =============================================================================
+
+#: Product defaults for Confinement Analysis, applied before the caller's own
+#: values. They deliberately differ from the bare engine defaults, which are
+#: the identity (no background, no smoothing) as befits a primitive:
+#:
+#: - ``poly-iter`` because the band edges otherwise bury the in-gap states.
+#: - ``smooth_points=2`` because on real, noisy spectra an unsmoothed search
+#:   over-detects badly -- on 1%-noise test data it found 278 peaks where 53
+#:   were planted, against 47 with a 5-sample window. QtiPlot defaults to no
+#:   smoothing, but it is used one curve at a time with the result on screen;
+#:   here a hyperspectral run is unattended.
+#:
+#: Must stay in step with the ConfinementAnalysis node definition; a test
+#: asserts they agree.
+CONFINEMENT_DEFAULTS = {
+    'baseline': 'poly-iter',
+    'smooth_points': 2,
+}
+
+
+#: FeatureConfig fields that must survive QML/JSON as ints.
+_INT_FEATURE_FIELDS = ('poly_degree', 'doping_smooth_points', 'state_width_samples')
+
+
+def _feature_config(raw: Optional[dict]) -> FeatureConfig:
+    """Build a FeatureConfig from a loose dict of QML/workflow values.
+
+    Same contract as :func:`params_from_dict`: unknown keys are dropped and
+    the integer fields are cast back, because QML sends every number as a
+    float.
+    """
+    config = FeatureConfig()
+    if not raw:
+        return config
+    for key, value in raw.items():
+        if not hasattr(config, key) or value is None or key == 'confinement':
+            continue
+        if key in _INT_FEATURE_FIELDS:
+            value = int(value)
+        elif isinstance(getattr(config, key), float):
+            value = float(value)
+        setattr(config, key, value)
+    return config
+
+
+def _expand(values: np.ndarray, idx: np.ndarray, n_samples: int) -> np.ndarray:
+    """Scatter in-window values back onto the full axis, NaN outside it."""
+    full = np.full(n_samples, np.nan)
+    if len(idx):
+        full[idx] = values
+    return full
+
+
+def _peak_fwhm(result: Analysis, full_indices) -> np.ndarray:
+    """Peak widths at half prominence, in samples, on the corrected curve."""
+    if not len(full_indices):
+        return np.empty(0)
+    # result.idx maps window position -> full position; invert for peak_widths.
+    lookup = {int(f): int(w) for w, f in enumerate(result.idx)}
+    window_positions = [lookup[int(i)] for i in full_indices if int(i) in lookup]
+    if not window_positions:
+        return np.zeros(len(full_indices))
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            widths = signal.peak_widths(result.y_corrected,
+                                        np.asarray(window_positions, dtype=np.intp),
+                                        rel_height=0.5)[0]
+        return np.asarray(widths, dtype=np.float64)
+    except Exception:
+        logger.debug("peak_widths failed; reporting zero FWHM", exc_info=True)
+        return np.zeros(len(window_positions))
+
+
+def _fit_coefficients(result: Analysis, degree: int, basis: str = "power") -> np.ndarray:
+    """Ascending-order coefficients of this spectrum's fitted background.
+
+    Refits the stored background curve rather than re-deriving it, so the
+    numbers describe exactly what was subtracted. Index 0 is the constant
+    term, matching the Curve Fitting tool's convention.
+
+    The fit runs on the normalised axis, so an orthogonal basis is orthogonal
+    over the spectrum's own range and the coefficients are comparable between
+    spectra -- which is what makes them usable as classification features.
+    """
+    if result.baseline.size != result.x.size or result.x.size <= degree + 1:
+        return np.zeros(degree + 1)
+    try:
+        with np.errstate(all="ignore"):
+            return fit_polynomial(normalized_axis(result.x), result.baseline, degree, basis)
+    except Exception:
+        logger.debug("Background coefficient refit failed", exc_info=True)
+        return np.zeros(degree + 1)
 
 
 class ToolImplementations:
@@ -810,120 +931,12 @@ class ToolImplementations:
     # Curve Fitting / Baseline Correction
     # ========================================================================
 
-    def _als_baseline(self, y, lam=1e5, p=0.01, niter=10):
-        """
-        Asymmetric Least Squares baseline correction.
-
-        This method iteratively fits a smooth baseline that stays below the peaks,
-        making it ideal for spectroscopy data where you want to preserve peak features.
-
-        Parameters:
-        -----------
-        y : array
-            Input spectrum
-        lam : float
-            Smoothness parameter (larger = smoother baseline). Default 1e5.
-        p : float
-            Asymmetry parameter (smaller = baseline pushed below peaks). Default 0.01.
-        niter : int
-            Number of iterations. Default 10.
-
-        Returns:
-        --------
-        baseline : array
-            Estimated baseline
-        """
-        from scipy import sparse
-        from scipy.sparse.linalg import spsolve
-
-        L = len(y)
-        D = sparse.diags([1, -2, 1], [0, -1, -2], shape=(L, L - 2))
-        D = lam * D.dot(D.T)
-        w = np.ones(L)
-
-        for _ in range(niter):
-            W = sparse.spdiags(w, 0, L, L)
-            Z = W + D
-            z = spsolve(Z, w * y)
-            w = p * (y > z) + (1 - p) * (y < z)
-
-        return z
-
-    def _rubberband_baseline(self, x, y):
-        """
-        Rubber band baseline correction using convex hull.
-
-        Creates a baseline by stretching a "rubber band" under the spectrum,
-        touching only the lowest points. Good for spectra with broad features.
-
-        Parameters:
-        -----------
-        x : array
-            Independent variable (e.g., voltage)
-        y : array
-            Spectrum values
-
-        Returns:
-        --------
-        baseline : array
-            Estimated baseline
-        """
-        from scipy.spatial import ConvexHull
-
-        # Create points for convex hull (flip y to get lower envelope)
-        points = np.column_stack([x, -y])
-
-        try:
-            hull = ConvexHull(points)
-            # Get vertices on the lower envelope (which is upper envelope of -y)
-            hull_points = points[hull.vertices]
-            # Sort by x
-            hull_points = hull_points[np.argsort(hull_points[:, 0])]
-            # Interpolate to get baseline at all x points
-            baseline = -np.interp(x, hull_points[:, 0], hull_points[:, 1])
-        except Exception:
-            # Fallback to linear if convex hull fails
-            baseline = np.linspace(y[0], y[-1], len(y))
-
-        return baseline
-
-    def _endpoint_baseline(self, x, y, n_points=10, degree=1):
-        """
-        Endpoint-based baseline correction.
-
-        Fits a polynomial only to the endpoints of the spectrum, preserving
-        features in the middle. Ideal for STS data where you want to remove
-        a linear/polynomial trend but keep the peaks.
-
-        Parameters:
-        -----------
-        x : array
-            Independent variable
-        y : array
-            Spectrum values
-        n_points : int
-            Number of points to use from each end. Default 10.
-        degree : int
-            Polynomial degree for the fit. Default 1 (linear).
-
-        Returns:
-        --------
-        baseline : array
-            Estimated baseline
-        """
-        # Use points from both ends
-        n = min(n_points, len(y) // 4)  # Don't use more than 25% from each end
-
-        x_ends = np.concatenate([x[:n], x[-n:]])
-        y_ends = np.concatenate([y[:n], y[-n:]])
-
-        coeffs = np.polyfit(x_ends, y_ends, degree)
-        baseline = np.polyval(coeffs, x)
-
-        return baseline
+    # The baseline estimators live in src.processing.peak_detection so that
+    # this tool and Confinement Analysis share one implementation.
 
     def fit_curves(self, task, dataset_name: str, fit_type: str, degree: int = 2,
-                   als_lambda: float = 1e5, als_p: float = 0.01) -> str:
+                   als_lambda: float = 1e5, als_p: float = 0.01,
+                   basis: str = 'power') -> str:
         """
         Fit curves to spectral data and subtract baseline.
 
@@ -945,6 +958,12 @@ class ToolImplementations:
             ALS smoothness parameter (larger = smoother). Default 1e5.
         als_p : float
             ALS asymmetry parameter (smaller = baseline below peaks). Default 0.01.
+        basis : str
+            Polynomial basis for the 'polynomial' and 'endpoints' fits:
+            'power' (monomials, the historical behaviour), 'legendre' or
+            'chebyshev'. The orthogonal bases fit the same curve but return
+            decorrelated coefficients on a normalised axis, which is what
+            makes them comparable between spectra and usable as features.
 
         Returns:
         --------
@@ -962,6 +981,9 @@ class ToolImplementations:
             # QML / workflow params can arrive as floats (e.g. 3.0); np.polyfit
             # and the range()/f-strings below need a plain int.
             degree = int(degree)
+            if basis not in POLYNOMIAL_BASES:
+                raise ValueError(
+                    f"basis must be one of {POLYNOMIAL_BASES}, got {basis!r}")
 
             independent_var = spectral_data.independent_var
             spectra = spectral_data.spectra.values
@@ -983,15 +1005,24 @@ class ToolImplementations:
                     return ""
 
                 if fit_type == 'polynomial':
-                    coeffs = np.polyfit(independent_var, spectrum, degree)
-                    baseline = np.polyval(coeffs, independent_var)
-                    # Label by ascending power: c0 = constant term, c1 = x^1,
-                    # ..., c{degree} = x^{degree}. np.polyfit returns coeffs
-                    # highest-power first, so c{p} = coeffs[degree - p].
+                    if basis == 'power':
+                        # Untouched historical path: monomials on the raw axis,
+                        # so previously exported coefficient maps stay valid.
+                        coeffs = np.polyfit(independent_var, spectrum, degree)
+                        baseline = np.polyval(coeffs, independent_var)
+                        # Label by ascending power: c0 = constant term, c1 = x^1,
+                        # ..., c{degree} = x^{degree}. np.polyfit returns coeffs
+                        # highest-power first, so c{p} = coeffs[degree - p].
+                        ordered = [float(coeffs[degree - p]) for p in range(degree + 1)]
+                    else:
+                        t = normalized_axis(independent_var)
+                        ordered = fit_polynomial(t, spectrum, degree, basis)
+                        baseline = eval_polynomial(ordered, t, basis)
+                        ordered = [float(v) for v in ordered]
                     fit_params_list.append({
                         'spectrum_index': i,
                         'fit_type': fit_type,
-                        **{f'c{p}': float(coeffs[degree - p]) for p in range(degree + 1)}
+                        **dict(zip(coefficient_names(degree, basis), ordered))
                     })
                 elif fit_type == 'linear':
                     coeffs = np.polyfit(independent_var, spectrum, 1)
@@ -1029,7 +1060,7 @@ class ToolImplementations:
                         })
                 elif fit_type == 'als':
                     # Asymmetric Least Squares - preserves peaks
-                    baseline = self._als_baseline(spectrum, lam=als_lambda, p=als_p)
+                    baseline = als_baseline(spectrum, lam=als_lambda, p=als_p)
                     fit_params_list.append({
                         'spectrum_index': i,
                         'fit_type': fit_type,
@@ -1038,20 +1069,21 @@ class ToolImplementations:
                     })
                 elif fit_type == 'rubberband':
                     # Convex hull rubber band
-                    baseline = self._rubberband_baseline(independent_var, spectrum)
+                    baseline = rubberband_baseline(independent_var, spectrum)
                     fit_params_list.append({
                         'spectrum_index': i,
                         'fit_type': fit_type
                     })
                 elif fit_type == 'endpoints':
                     # Fit only to endpoints - good for STS
-                    baseline = self._endpoint_baseline(independent_var, spectrum,
-                                                       n_points=max(5, len(spectrum)//20),
-                                                       degree=degree)
+                    baseline = endpoint_baseline(independent_var, spectrum,
+                                                 n_points=max(5, len(spectrum)//20),
+                                                 degree=degree, basis=basis)
                     fit_params_list.append({
                         'spectrum_index': i,
                         'fit_type': fit_type,
-                        'degree': degree
+                        'degree': degree,
+                        'basis': basis
                     })
                 else:
                     raise ValueError(f"Unknown fit type: {fit_type}")
@@ -1117,6 +1149,7 @@ class ToolImplementations:
                             'source_dataset': dataset_name,
                             'fit_type': fit_type,
                             'degree': degree,
+                            'basis': basis,
                             'coefficient_columns': coeff_cols,
                         },
                         data_type='flat',
@@ -1290,7 +1323,8 @@ class ToolImplementations:
             output_base = self._ensure_output_dir('maps') / map_basename
 
             # Save as images
-            self._save_map_images(map_data, output_base)
+            self._save_map_images(map_data, output_base,
+                                  source_metadata=spectral_data.metadata)
 
             # Save numerical data as CSV
             csv_path = output_base.with_suffix('.csv')
@@ -1303,22 +1337,27 @@ class ToolImplementations:
             logger.error(f"Map generation error: {e}", exc_info=True)
             raise
 
-    def _save_map_images(self, map_data: np.ndarray, output_base: Path):
-        """Save map data as TIFF and CSV only (no PNG outputs)."""
-        import tifffile
+    def _save_map_images(self, map_data: np.ndarray, output_base: Path,
+                         source_metadata=None):
+        """Save map data as TIFF and CSV only (no PNG outputs).
 
-        # Save as 16-bit TIFF (preserving more precision than 8-bit)
-        # Use string concatenation instead of with_suffix() to avoid issues
-        # when basename contains dots (e.g., "Map_-0.500_-0.300" would have .300 treated as suffix)
-        tiff_path = Path(str(output_base) + '.tiff')
-        # Normalize to 16-bit range for TIFF
-        if np.ptp(map_data) > 0:
-            normalized_map = 65535 * (map_data - np.min(map_data)) / np.ptp(map_data)
-        else:
-            normalized_map = np.zeros_like(map_data)
-        image_data = normalized_map.astype(np.uint16)
-        tifffile.imwrite(str(tiff_path), image_data)
-        logger.info(f"TIFF saved to: {tiff_path}")
+        The TIFF keeps the **real float32 values** and carries the physical
+        pixel scale when the source dataset recorded its scan geometry, so the
+        file opens in Gwyddion with true dimensions and true Z values. It used
+        to be normalised to 0–65535 uint16, which threw the physical quantity
+        away and made the export unusable for quantitative work.
+        """
+        from src.utils.field_export import export_field_from_metadata
+
+        info = getattr(source_metadata, 'additional_info', None) or {}
+        # Units live on the metadata object, not inside additional_info.
+        if getattr(source_metadata, 'units', None) and 'units' not in info:
+            info = {**info, 'units': source_metadata.units}
+        written = export_field_from_metadata(
+            output_base, np.asarray(map_data), info=info,
+            title=output_base.name,
+            context=f"generated map {output_base.name}")
+        logger.info("Map exported: %s", ", ".join(sorted(written.values())))
 
         # Save as CSV for raw data
         csv_path = Path(str(output_base) + '.csv')
@@ -1326,8 +1365,9 @@ class ToolImplementations:
         logger.info(f"CSV saved to: {csv_path}")
 
         # Verify files were created
-        if not tiff_path.exists():
-            logger.error(f"TIFF file was not created at: {tiff_path}")
+        for kind, produced in written.items():
+            if not Path(produced).exists():
+                logger.error("%s file was not created at: %s", kind, produced)
         if not csv_path.exists():
             logger.error(f"CSV file was not created at: {csv_path}")
 
@@ -1584,6 +1624,444 @@ class ToolImplementations:
             self.errorOccurred.emit("Peak Finding Error", str(e))
             return {'peaks_path': '', 'intervals': []}
 
+    # ========================================================================
+    # Confinement Analysis
+    # ========================================================================
+
+    def analyze_confinement(self, task, dataset_name: str,
+                            params: Optional[dict] = None,
+                            fwhm_multiplier: float = 1.5,
+                            emit_matrix: bool = True,
+                            matrix_column_limit: int = 4096) -> dict:
+        """
+        Background subtraction and peak detection in a single pass.
+
+        Supersedes Peak Indexing (which had no background handling, search
+        window or derivative smoothing) and the baseline half of Curve
+        Fitting. Running both together is not a convenience: the height
+        threshold is a percentage of the CORRECTED curve's span inside the
+        search window, so subtracting the background first is what lets small
+        in-gap features clear a threshold the band edges would otherwise
+        dominate.
+
+        Parameters:
+        -----------
+        dataset_name : str
+            Dataset to analyse.
+        params : dict
+            Any field of :class:`src.processing.peak_detection.Params`.
+            Unknown keys are ignored so QML and the workflow engine can pass
+            their whole parameter map.
+        fwhm_multiplier : float
+            Integration interval width as a multiple of each peak's FWHM,
+            matching the Peak Indexing behaviour that feeds the Integration
+            tool.
+        emit_matrix : bool
+            Build the peak-occupancy dataset. One column per spectrum, so it
+            is skipped above ``matrix_column_limit`` spectra unless forced.
+        matrix_column_limit : int
+            Spectrum count above which the occupancy table is suppressed.
+
+        Returns:
+        --------
+        dict with the created SpectralData objects (for workflow capture),
+        their names, the merged intervals and the CSV paths.
+        """
+        empty = {'peaks': None, 'peak_matrix': None, 'peak_matrix_binned': None,
+                 'peak_matrix_offset': None, 'peak_matrix_binned_offset': None,
+                 'corrected': None, 'baseline': None, 'coefficients': None,
+                 'peak_count': None, 'intervals': [], 'peaks_path': '',
+                 'matrix_path': '', 'binned_matrix_path': '',
+                 'offset_matrix_path': '', 'binned_offset_matrix_path': '',
+                 'dataset_names': {}}
+        try:
+            if dataset_name not in self._datasets:
+                self.errorOccurred.emit("Error", "Dataset not found")
+                return empty
+
+            spectral_data = self._datasets[dataset_name]
+            independent_var = np.asarray(spectral_data.independent_var, dtype=np.float64)
+            spectra = np.asarray(spectral_data.spectra.values, dtype=np.float64)
+            n_samples, n_spectra = spectra.shape
+
+            detect_params = params_from_dict({**CONFINEMENT_DEFAULTS, **(params or {})})
+            detect_params.validate()
+
+            # A temperature sets the resolution limit two ways, and both are
+            # needed. Binning alone would leave a pair 3 meV apart reported
+            # separately whenever they straddle a bin edge, so k_B*T also
+            # becomes the minimum separation: peaks closer than that are one
+            # feature and only the most prominent survives.
+            if detect_params.bin_width > 0 and not detect_params.min_distance:
+                detect_params.min_distance = detect_params.bin_width
+
+            logger.info(
+                "ConfinementAnalysis: %s — %d spectra x %d points, background=%s(deg %d), "
+                "height=%.3g%% (%s), window=%s..%s",
+                dataset_name, n_spectra, n_samples, detect_params.baseline,
+                detect_params.baseline_degree, detect_params.height,
+                detect_params.height_mode, detect_params.xmin, detect_params.xmax,
+            )
+
+            results = analyze_many(
+                independent_var, spectra, detect_params,
+                should_cancel=lambda: bool(getattr(task, 'cancelled', False)),
+            )
+            if len(results) < n_spectra:
+                logger.info("ConfinementAnalysis cancelled after %d/%d spectra",
+                            len(results), n_spectra)
+                return empty
+
+            base_name = self._extract_clean_base_name(dataset_name)
+            convention_name = self._apply_naming_convention(dataset_name, operation="Confinement")
+            file_safe_name = self._sanitize_filename(base_name)
+            peaks_dir = self._ensure_output_dir('peaks')
+            columns = list(spectral_data.spectra.columns)
+            created: dict = {}
+
+            def _register(suffix: str, frame: pd.DataFrame, metadata: SpectralMetadata):
+                name = f"{base_name} - {suffix}"
+                try:
+                    dataset = SpectralData(frame, metadata)
+                except (ValueError, TypeError) as exc:
+                    logger.warning("ConfinementAnalysis: '%s' could not be built: %s", name, exc)
+                    return None, ""
+                self._datasets[name] = dataset
+                if not self._workflow_mode:
+                    self.dataLoaded.emit(name)
+                created[suffix] = name
+                return dataset, name
+
+            def _meta(source_type, extra, *, overlay=False, flat=False):
+                info = {'created_from': 'confinement_analysis',
+                        'source_dataset': dataset_name, **extra}
+                if overlay:
+                    # Routes the result onto the source's graph window.
+                    info['original'] = dataset_name
+                return SpectralMetadata(
+                    source_type=source_type,
+                    dimensions=spectral_data.metadata.dimensions,
+                    scan_mode=spectral_data.metadata.scan_mode,
+                    units=dict(spectral_data.metadata.units or {}),
+                    additional_info=info,
+                    data_type='flat' if flat else spectral_data.metadata.data_type,
+                )
+
+            # Thermal grouping: k_B*T is both the position error bar and the
+            # bin width, so peaks the experiment cannot tell apart are not
+            # reported apart.
+            bin_width = detect_params.bin_width
+            edges, bin_centers = (energy_bins(independent_var, bin_width)
+                                  if bin_width > 0 else (None, None))
+            if bin_width > 0:
+                logger.info("ConfinementAnalysis: grouping at T=%.6g K -> kBT=%.6g %s, %d bins",
+                            detect_params.temperature_k, bin_width,
+                            detect_params.x_energy_unit, len(bin_centers))
+
+            settings = {'background': detect_params.baseline,
+                        'degree': detect_params.baseline_degree,
+                        'basis': detect_params.baseline_basis,
+                        'height_percent': detect_params.height,
+                        'height_mode': detect_params.height_mode,
+                        'direction': detect_params.direction,
+                        'temperature_k': detect_params.temperature_k,
+                        'kbt': bin_width,
+                        'x_energy_unit': detect_params.x_energy_unit}
+
+            # -- 1. peak list -------------------------------------------------
+            x_step = float(np.mean(np.diff(independent_var))) if n_samples > 1 else 1.0
+            rows, raw_intervals = [], []
+            for i, result in enumerate(results):
+                if not result.peaks:
+                    continue
+
+                if edges is not None:
+                    kept = [(pk, int(b)) for b, pk, _ in group_peaks_by_bin(result.peaks, edges)]
+                else:
+                    kept = [(pk, -1) for pk in result.peaks]
+
+                widths = _peak_fwhm(result, [pk.index for pk, _ in kept])
+                for j, ((pk, bin_index), fwhm_idx) in enumerate(zip(kept, widths)):
+                    fwhm_value = float(fwhm_idx) * abs(x_step)
+                    half = (fwhm_value * float(fwhm_multiplier)) / 2.0
+                    row = {
+                        'spectrum_index': i,
+                        'spectrum_name': columns[i] if i < len(columns) else f"col{i}",
+                        'peak_number': j,
+                        'position_index': pk.index,
+                        'position_value': pk.x,
+                        'height': pk.y,
+                        'height_corrected': pk.y_corrected,
+                        'prominence': pk.prominence,
+                        'fwhm_indices': float(fwhm_idx),
+                        'fwhm_value': fwhm_value,
+                        'interval_start': pk.x - half,
+                        'interval_end': pk.x + half,
+                    }
+                    if edges is not None:
+                        row['bin_index'] = bin_index
+                        row['bin_center'] = float(bin_centers[bin_index])
+                    rows.append(row)
+                    raw_intervals.append([pk.x - half, pk.x + half, pk.x, pk.prominence])
+
+            peaks_df = pd.DataFrame(rows)
+            peaks_path = peaks_dir / f"{convention_name}.csv"
+            peaks_df.to_csv(peaks_path, index=False)
+
+            if not peaks_df.empty:
+                ordered = ['position_value'] + [c for c in peaks_df.columns
+                                                if c not in ('position_value', 'spectrum_name')]
+                _register('Peaks', peaks_df[ordered].apply(pd.to_numeric, errors='coerce'),
+                          _meta('peak_table', {'num_peaks': len(peaks_df), **settings}))
+
+            # -- 2. occupancy matrices ----------------------------------------
+            # Two tables, because they answer different questions. The
+            # full-resolution one keeps every peak on the measured energy
+            # axis; the binned one is the confinement table, coarse enough
+            # that regions can be compared column by column. Emitting only
+            # the binned version would throw away positions that the raw
+            # axis still resolves, so both are written when a temperature is
+            # set, each to its own CSV.
+            matrix_path = ''
+            binned_matrix_path = ''
+            offset_matrix_path = ''
+            binned_offset_matrix_path = ''
+
+            def _emit_matrix(suffix: str, matrix: np.ndarray, axis_values, filename: str,
+                             extra: dict):
+                frame = pd.DataFrame(matrix, columns=columns)
+                frame.insert(0, spectral_data.independent_var_name, axis_values)
+                path = peaks_dir / filename
+                # Write bare integers and empty cells. A float column would
+                # render as "1.0", and a global float_format would round the
+                # energy axis, so only the mark columns are stringified -- the
+                # in-memory dataset stays numeric (value / NaN).
+                export_df = frame.copy()
+                for column in columns:
+                    values = frame[column].to_numpy()
+                    as_int = np.nan_to_num(values, nan=0.0).astype(np.int64).astype(str)
+                    export_df[column] = np.where(np.isfinite(values), as_int, '')
+                export_df.to_csv(path, index=False)
+                marked = int(np.isfinite(matrix).sum())
+                _register(suffix, frame,
+                          _meta('peak_matrix',
+                                {'total_peaks': marked,
+                                 'n_rows': int(len(axis_values)),
+                                 **extra, **settings}))
+                return str(path)
+
+            if emit_matrix and n_spectra > int(matrix_column_limit):
+                logger.warning(
+                    "ConfinementAnalysis: %d spectra exceeds the %d-column limit; "
+                    "skipping the occupancy tables (peak counts are still emitted)",
+                    n_spectra, int(matrix_column_limit))
+            elif emit_matrix:
+                matrix_path = _emit_matrix(
+                    'Peak Matrix', peak_matrix(n_samples, results), independent_var,
+                    f"{file_safe_name}_PeakMatrix.csv", {'binned': False})
+
+                # Same marks, but each column carries its own 1-based number
+                # instead of a flat 1. Plotting the 1/blank table stacks every
+                # spectrum on one line; numbering offsets them onto separate
+                # rows so the columns can be told apart.
+                offset_matrix_path = _emit_matrix(
+                    'Peak Matrix (offset)',
+                    peak_matrix(n_samples, results, mark_by_column=True),
+                    independent_var, f"{file_safe_name}_PeakMatrix_offset.csv",
+                    {'binned': False, 'offset': True})
+
+                if edges is not None:
+                    binned_matrix_path = _emit_matrix(
+                        'Peak Matrix (binned)', binned_peak_matrix(results, edges),
+                        bin_centers, f"{file_safe_name}_PeakMatrix_binned.csv",
+                        {'binned': True, 'n_bins': int(len(bin_centers))})
+
+                    binned_offset_matrix_path = _emit_matrix(
+                        'Peak Matrix (binned, offset)',
+                        binned_peak_matrix(results, edges, mark_by_column=True),
+                        bin_centers, f"{file_safe_name}_PeakMatrix_binned_offset.csv",
+                        {'binned': True, 'offset': True, 'n_bins': int(len(bin_centers))})
+
+            # -- 3. corrected + background ------------------------------------
+            # raw minus background, NOT the smoothed curve the search ran on.
+            # Smoothing is a detection aid and is on by default, so folding it
+            # into an exported dataset would quietly alter the user's data;
+            # this also matches what Curve Fitting's 'corrected' output means.
+            corrected = np.array([_expand(r.y_raw - r.baseline, r.idx, n_samples)
+                                  if r.baseline.size == r.y_raw.size
+                                  else _expand(r.y_raw, r.idx, n_samples)
+                                  for r in results]).T
+            corrected_df = pd.DataFrame(corrected, columns=columns)
+            corrected_df.insert(0, spectral_data.independent_var_name, independent_var)
+            _register('Background Corrected', corrected_df,
+                      _meta(spectral_data.metadata.source_type, settings, overlay=True))
+
+            if detect_params.baseline != 'none':
+                background = np.array([_expand(r.baseline, r.idx, n_samples) for r in results]).T
+                background_df = pd.DataFrame(background, columns=columns)
+                background_df.insert(0, spectral_data.independent_var_name, independent_var)
+                _register('Background', background_df,
+                          _meta(spectral_data.metadata.source_type, settings, overlay=True))
+
+            # -- 4. flat outputs for the Map Generator -------------------------
+            if detect_params.baseline in ('poly', 'poly-iter'):
+                degree = int(detect_params.baseline_degree)
+                basis = detect_params.baseline_basis
+                names = coefficient_names(degree, basis)
+                coeff_rows = []
+                for i, result in enumerate(results):
+                    coeffs = _fit_coefficients(result, degree, basis)
+                    coeff_rows.append({'Spectrum_Index': i,
+                                       **{name: coeffs[p] for p, name in enumerate(names)}})
+                _register('Fit Coefficients', pd.DataFrame(coeff_rows),
+                          _meta('fit_coefficients',
+                                {'coefficient_columns': names, 'basis': basis, **settings},
+                                flat=True))
+
+            counts_df = pd.DataFrame({
+                'Spectrum_Index': np.arange(len(results)),
+                'Peak_Count': [len(r.peaks) for r in results],
+            })
+            _register('Peak Count', counts_df,
+                      _meta('peak_count', settings, flat=True))
+
+            merged_intervals = self._merge_peak_intervals(raw_intervals, independent_var)
+            logger.info("ConfinementAnalysis: %d peaks over %d spectra, %d intervals; created %s",
+                        len(peaks_df), n_spectra, len(merged_intervals),
+                        ", ".join(created.values()) or "nothing")
+
+            return {
+                'peaks': self._datasets.get(created.get('Peaks', '')),
+                'peak_matrix': self._datasets.get(created.get('Peak Matrix', '')),
+                'peak_matrix_binned': self._datasets.get(created.get('Peak Matrix (binned)', '')),
+                'peak_matrix_offset': self._datasets.get(created.get('Peak Matrix (offset)', '')),
+                'peak_matrix_binned_offset': self._datasets.get(
+                    created.get('Peak Matrix (binned, offset)', '')),
+                'corrected': self._datasets.get(created.get('Background Corrected', '')),
+                'baseline': self._datasets.get(created.get('Background', '')),
+                'coefficients': self._datasets.get(created.get('Fit Coefficients', '')),
+                'peak_count': self._datasets.get(created.get('Peak Count', '')),
+                'intervals': merged_intervals,
+                'peaks_path': str(peaks_path),
+                'matrix_path': matrix_path,
+                'binned_matrix_path': binned_matrix_path,
+                'offset_matrix_path': offset_matrix_path,
+                'binned_offset_matrix_path': binned_offset_matrix_path,
+                'dataset_names': created,
+            }
+
+        except Exception as e:
+            logger.error(f"Confinement analysis error: {e}", exc_info=True)
+            self.errorOccurred.emit("Confinement Analysis Error", str(e))
+            return empty
+
+    # ========================================================================
+    # Spectral Features
+    # ========================================================================
+
+    def extract_spectral_features(self, task, dataset_name: str,
+                                  params: Optional[dict] = None) -> dict:
+        """Reduce every spectrum to a row of physical features.
+
+        Emits one flat dataset -- ``<base> - Features`` -- with a column per
+        quantity (gap width, doping offset, band-edge coefficients, confined
+        state count, ...). Being flat data, every column is immediately a
+        spatial map via the Map Generator, and the table is the input to
+        PCA / clustering.
+
+        Parameters
+        ----------
+        params : dict
+            Any field of :class:`src.processing.spectral_features.FeatureConfig`.
+            Unknown keys are ignored, so QML and the workflow engine can pass
+            their whole parameter map.
+        """
+        empty = {'features': None, 'dataset_name': '', 'features_path': '',
+                 'n_valid': 0, 'n_total': 0}
+        try:
+            if dataset_name not in self._datasets:
+                self.errorOccurred.emit("Error", "Dataset not found")
+                return empty
+
+            spectral_data = self._datasets[dataset_name]
+            independent_var = np.asarray(spectral_data.independent_var, dtype=np.float64)
+            spectra = np.asarray(spectral_data.spectra.values, dtype=np.float64)
+
+            config = _feature_config(params)
+            config.validate()
+
+            logger.info(
+                "SpectralFeatures: %s — %d spectra, normalize=%s, gap delta=%.3g, "
+                "%s degree %d",
+                dataset_name, spectra.shape[1], config.normalize, config.gap_delta,
+                config.poly_basis, config.poly_degree)
+
+            rows = feature_table(
+                independent_var, spectra, config,
+                should_cancel=lambda: bool(getattr(task, 'cancelled', False)),
+            )
+            if len(rows) < spectra.shape[1]:
+                logger.info("SpectralFeatures cancelled after %d/%d spectra",
+                            len(rows), spectra.shape[1])
+                return empty
+
+            # Fixed column order, and numeric only: 'doping_type' is a label
+            # and 'invalid_reason' is free text, so neither belongs in a table
+            # destined for PCA. Both are kept in the CSV for inspection.
+            columns = [c for c in feature_columns(config) if c in (rows[0] if rows else {})]
+            frame = pd.DataFrame(rows)
+            csv_path = self._ensure_output_dir('peaks') / \
+                f"{self._apply_naming_convention(dataset_name, operation='Features')}.csv"
+            frame.to_csv(csv_path, index=False)
+
+            numeric = frame[columns].apply(pd.to_numeric, errors='coerce')
+            n_valid = int(numeric['valid'].sum()) if 'valid' in numeric else 0
+
+            base_name = self._extract_clean_base_name(dataset_name)
+            name = f"{base_name} - Features"
+            metadata = SpectralMetadata(
+                source_type='spectral_features',
+                dimensions=spectral_data.metadata.dimensions,
+                scan_mode=spectral_data.metadata.scan_mode,
+                units={'independent': 'Index', 'dependent': 'Feature'},
+                # No 'original' key: a feature table is not a spectrum and
+                # must not be overlaid on the source's graph window.
+                additional_info={
+                    'created_from': 'spectral_features',
+                    'source_dataset': dataset_name,
+                    'feature_columns': [c for c in columns if c != 'Spectrum_Index'],
+                    'normalize': config.normalize,
+                    'basis': config.poly_basis,
+                    'poly_degree': config.poly_degree,
+                    'gap_delta': config.gap_delta,
+                    'n_valid': n_valid,
+                    'n_total': int(len(rows)),
+                    'features_path': str(csv_path),
+                },
+                data_type='flat',
+            )
+            try:
+                dataset = SpectralData(numeric, metadata,
+                                       topography=getattr(spectral_data, 'topography', None))
+            except (ValueError, TypeError) as exc:
+                logger.warning("Feature table could not be promoted to a dataset: %s", exc)
+                return empty
+
+            self._datasets[name] = dataset
+            if not self._workflow_mode:
+                self.dataLoaded.emit(name)
+
+            logger.info("SpectralFeatures: '%s' created (%d spectra, %d valid, %d features)",
+                        name, len(rows), n_valid, len(columns) - 1)
+            return {'features': dataset, 'dataset_name': name,
+                    'features_path': str(csv_path),
+                    'n_valid': n_valid, 'n_total': int(len(rows))}
+
+        except Exception as e:
+            logger.error(f"Spectral feature extraction error: {e}", exc_info=True)
+            self.errorOccurred.emit("Spectral Features Error", str(e))
+            return empty
+
     def _merge_peak_intervals(self, raw_intervals: list, independent_var: np.ndarray) -> list:
         """
         Merge overlapping intervals and remove duplicates, keeping the most prominent peaks.
@@ -1720,13 +2198,26 @@ class ToolImplementations:
                     discretized[i, j] = block.mean(axis=(0, 1)).astype(np.uint8)
 
             # Save discretized image as TIFF with readable filename
-            import tifffile
             filename = Path(image_path).stem
             # Clean up the filename using helper
             base_name = self._extract_clean_base_name(filename)
             file_safe_name = self._sanitize_filename(base_name)
-            output_path = self._ensure_output_dir('discretized') / f"{file_safe_name}_discretized_{target_x}x{target_y}.tiff"
-            tifffile.imwrite(str(output_path), discretized)
+            base = (self._ensure_output_dir('discretized')
+                    / f"{file_safe_name}_discretized_{target_x}x{target_y}")
+            # Discretising preserves the scanned AREA while reducing the pixel
+            # count, so the per-pixel size scales up by the block factor.
+            from src.utils.field_export import export_field
+            from src.utils.tiff_io import read_tiff_calibration
+            cal = read_tiff_calibration(image_path) or {}
+            dx = dy = None
+            if cal.get('dx') and cal.get('dy'):
+                dx = cal['dx'] * (original_width / max(target_x, 1))
+                dy = cal['dy'] * (original_height / max(target_y, 1))
+            written = export_field(
+                base, np.asarray(discretized, dtype=np.float32),
+                dx=dx, dy=dy, unit=cal.get('unit'),
+                title=base.name, context="map discretisation")
+            output_path = written.get('tiff', str(base) + '.tiff')
 
             # Status update will be handled by callback in main thread
             logger.info(f"Map discretized from {original_width}x{original_height} to {target_x}x{target_y}, saved to {output_path}")
@@ -2337,7 +2828,7 @@ class ToolImplementations:
 
             bandgap_name = f"{bandgap_base} - Bandgap"
             bandgap_metadata = SpectralMetadata(
-                source_type="bandgap_flat",
+                source_type="bandgap",
                 dimensions=spectral_data.metadata.dimensions,
                 scan_mode=spectral_data.metadata.scan_mode,
                 units={'independent': 'Index', 'dependent': 'eV'},
@@ -2370,7 +2861,7 @@ class ToolImplementations:
 
             doping_name = f"{doping_base} - Doping"
             doping_metadata = SpectralMetadata(
-                source_type="doping_flat",
+                source_type="doping",
                 dimensions=spectral_data.metadata.dimensions,
                 scan_mode=spectral_data.metadata.scan_mode,
                 units={'independent': 'Index', 'dependent': 'V'},

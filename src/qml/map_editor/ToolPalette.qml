@@ -32,6 +32,7 @@ Rectangle {
     property color bgLight: mainWin ? mainWin.bgLight : "#3a3a4e"
     property color accentPink: mainWin ? mainWin.accentPink : "#F5A9B8"
     property color accentBlue: mainWin ? mainWin.accentBlue : "#5BCEFA"
+    property color accentPurple: mainWin ? mainWin.accentPurple : "#9B4F96"
     property color textLight: mainWin ? mainWin.textLight : "#ffffff"
     property color textMuted: mainWin ? mainWin.textMuted : "#B0A0B8"
     property color borderColor: mainWin ? mainWin.borderColor : "#7B3F76"
@@ -145,6 +146,16 @@ Rectangle {
             tooltipText: "Smooth - Gaussian/Median filter"
             isActive: false
             onClicked: filterDialog.open()
+        }
+
+        // Level/Flatten Tool
+        ToolPaletteButton {
+            id: levelTool
+            toolName: "level"
+            iconText: "F"
+            tooltipText: "Flatten - Plane / Polynomial / Facet leveling, Row align"
+            isActive: false
+            onClicked: levelDialog.open()
         }
 
         Item { Layout.fillHeight: true }
@@ -431,6 +442,91 @@ Rectangle {
             }
 
             filterRequested(filterType, params)
+        }
+    }
+
+    // Level / Flatten Dialog
+    Dialog {
+        id: levelDialog
+        title: "Flatten / Level"
+        modal: true
+        width: 300
+        x: (parent.width - width) / 2 + 100
+        y: (parent.height - height) / 2
+        standardButtons: Dialog.Apply | Dialog.Close
+
+        background: Rectangle {
+            color: bgMedium
+            border.color: accentBlue
+            border.width: 1
+            radius: 6
+        }
+
+        // Combo index → backend operation name.
+        readonly property var levelOps: [
+            "plane_level", "poly_level", "facet_level", "row_align"
+        ]
+
+        contentItem: ColumnLayout {
+            spacing: 10
+
+            Label {
+                text: "Background subtraction / surface leveling for the active channel."
+                color: textMuted
+                wrapMode: Text.Wrap
+                Layout.fillWidth: true
+                Layout.preferredWidth: 260
+                font.pixelSize: 11
+            }
+
+            Label { text: "Method"; color: textLight; font.bold: true }
+
+            ComboBox {
+                id: levelMethodCombo
+                Layout.fillWidth: true
+                model: [
+                    "Plane Level (least-squares plane)",
+                    "Polynomial Plane Correction",
+                    "Facet Reorientation (dominant facet)",
+                    "Row Align (median line correction)"
+                ]
+            }
+
+            // Polynomial order — only for the polynomial method.
+            RowLayout {
+                Layout.fillWidth: true
+                visible: levelMethodCombo.currentIndex === 1
+                Label { text: "Polynomial order:"; color: textLight }
+                SpinBox {
+                    id: polyOrderSpin
+                    from: 1; to: 6; value: 2
+                }
+                Item { Layout.fillWidth: true }
+            }
+
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 260
+                wrapMode: Text.Wrap
+                color: accentPurple
+                font.pixelSize: 10
+                text: {
+                    switch (levelMethodCombo.currentIndex) {
+                    case 0: return "Fits and subtracts a single tilted plane."
+                    case 1: return "Subtracts a fitted polynomial surface — removes gentle bowing / scanner creep. Higher order = more flexible."
+                    case 2: return "Levels so the most common surface facet is horizontal; robust to steps and spikes that pull a plane fit off true."
+                    case 3: return "Subtracts the median of each row — removes line-to-line drift streaks."
+                    default: return ""
+                    }
+                }
+            }
+        }
+
+        onApplied: {
+            var op = levelDialog.levelOps[levelMethodCombo.currentIndex]
+            var params = {}
+            if (op === "poly_level") params.order = polyOrderSpin.value
+            filterRequested(op, params)
         }
     }
 

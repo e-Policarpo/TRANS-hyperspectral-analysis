@@ -85,6 +85,20 @@ Item {
                     value: 2
                     visible: fitTypeCombo.currentIndex === 0
                 }
+
+                Label {
+                    id: basisLabel
+                    text: "Coefficient Basis:"
+                    visible: fitTypeCombo.currentIndex === 0
+                }
+                ComboBox {
+                    id: basisCombo
+                    Layout.fillWidth: true
+                    model: ["power", "legendre", "chebyshev"]
+                    visible: fitTypeCombo.currentIndex === 0
+                    // Same fitted curve either way; the orthogonal bases give
+                    // decorrelated coefficients that compare across spectra.
+                }
             }
         }
 
@@ -129,6 +143,8 @@ Item {
     function updateDegreeVisibility() {
         degreeLabel.visible = fitTypeCombo.currentIndex === 0
         degreeSpin.visible = fitTypeCombo.currentIndex === 0
+        basisLabel.visible = fitTypeCombo.currentIndex === 0
+        basisCombo.visible = fitTypeCombo.currentIndex === 0
     }
 
     function performFitting() {
@@ -139,7 +155,8 @@ Item {
         var result = backend.fitCurves(
             datasetCombo.currentText,
             fitType,
-            degreeSpin.value
+            degreeSpin.value,
+            basisCombo.currentText
         )
 
         if (result) {

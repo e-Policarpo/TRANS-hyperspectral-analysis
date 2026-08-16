@@ -9,7 +9,7 @@ License: GPL
 """
 
 import logging
-from typing import Callable, Any
+from typing import Any, Callable, List
 from queue import Queue
 from PySide6.QtCore import (
     QThread, Signal, QObject, QMutex, QMutexLocker, QCoreApplication, Slot,
@@ -43,11 +43,11 @@ class PersistentWorker(QThread):
     task_completed = Signal(str, object)  # task name, result
     task_failed = Signal(str, str, str)  # task name, error title, error message
 
-    def __init__(self):
+    def __init__(self, name: str = "TRANS-PersistentWorker"):
         super().__init__()
         # Name the thread so any future "QThread destroyed while running"
         # diagnostics point here instead of an anonymous ''.
-        self.setObjectName("TRANS-PersistentWorker")
+        self.setObjectName(name)
         self.task_queue = Queue()
         self._running = True
         self._current_task = None
@@ -134,22 +134,35 @@ class WorkerManager(QObject):
     worker_completed = Signal(str)  # operation name
     worker_failed = Signal(str, str)  # operation name, error message
     worker_cancelled = Signal(str)  # operation name
+    task_rejected = Signal(str)  # duplicate submission dropped (name pending)
 
     def __init__(self, max_concurrent=1):  # Only 1 since we have single thread
         super().__init__()
         self.worker = PersistentWorker()
+        # Separate thread for saves / disk persistence, so a multi-minute
+        # project save never queues interactive tasks (derivatives, imports)
+        # behind it.
+        self.io_worker = PersistentWorker("TRANS-IOWorker")
         self._shutdown_done = False
+        # Workers that outlived shutdown's budget. Holding the reference keeps
+        # Qt from destroying a QThread that is still running, which aborts with
+        # "QThread: Destroyed while thread is still running".
+        self._abandoned: List[PersistentWorker] = []
 
-        # Store callbacks to invoke them in main thread
+        # Store callbacks to invoke them in main thread.
+        # A name present here also means "this task is queued or running" —
+        # submit() uses that to drop duplicate submissions.
         self._task_callbacks = {}  # task_name -> (on_finished, on_error)
 
         # Connect worker signals
-        self.worker.task_started.connect(self._on_task_started)
-        self.worker.task_completed.connect(self._on_task_completed)
-        self.worker.task_failed.connect(self._on_task_failed)
+        for w in (self.worker, self.io_worker):
+            w.task_started.connect(self._on_task_started)
+            w.task_completed.connect(self._on_task_completed)
+            w.task_failed.connect(self._on_task_failed)
 
-        # Start the persistent worker
+        # Start the persistent workers
         self.worker.start()
+        self.io_worker.start()
 
         # Stop the thread on application exit. Connecting here (when the
         # backend is constructed, before the QML engine is even loaded) means
@@ -190,12 +203,42 @@ class WorkerManager(QObject):
         *args, **kwargs
             Arguments for operation
         """
+        return self._submit_to(self.worker, name, operation, args, kwargs,
+                               on_finished, on_error)
+
+    def submit_io(self,
+                  name: str,
+                  operation: Callable,
+                  *args,
+                  on_finished: Callable = None,
+                  on_error: Callable = None,
+                  **kwargs):
+        """Submit a save/persistence operation to the dedicated I/O thread.
+
+        Use this for project saves, autosaves and disk exports so they never
+        block interactive tasks on the main worker.
+        """
+        return self._submit_to(self.io_worker, name, operation, args, kwargs,
+                               on_finished, on_error)
+
+    def _submit_to(self, worker, name, operation, args, kwargs,
+                   on_finished, on_error) -> bool:
+        # Drop duplicate submissions: a task with this name is still queued or
+        # running (repeated button clicks, autosave ticking while the previous
+        # autosave hasn't finished). Re-submitting would both waste a full
+        # recompute and clobber the stored callbacks of the in-flight task.
+        if name in self._task_callbacks:
+            logger.info(f"Task '{name}' already pending — duplicate submission ignored")
+            self.task_rejected.emit(name)
+            return False
+
         # Store callbacks to invoke them in main thread
         self._task_callbacks[name] = (on_finished, on_error)
 
         # Don't pass callbacks to task - we'll handle them via signals
         task = Task(name, operation, args, kwargs, None, None)
-        self.worker.submit_task(task)
+        worker.submit_task(task)
+        return True
 
     def _on_task_started(self, name: str):
         """Handle task start."""
@@ -231,12 +274,16 @@ class WorkerManager(QObject):
 
     def cancel_all(self):
         """Cancel all pending tasks."""
-        # Clear the queue
-        while not self.worker.task_queue.empty():
-            try:
-                self.worker.task_queue.get_nowait()
-            except:
-                break
+        # Clear the queues, releasing the pending-name entries so the same
+        # task names can be submitted again later.
+        for w in (self.worker, self.io_worker):
+            while not w.task_queue.empty():
+                try:
+                    task = w.task_queue.get_nowait()
+                    if task is not None:
+                        self._task_callbacks.pop(task.name, None)
+                except:
+                    break
         logger.info("All pending tasks cancelled")
 
     def cancel_current(self):
@@ -244,6 +291,10 @@ class WorkerManager(QObject):
         if self.worker._current_task:
             self.worker._current_task.cancelled = True
             task_name = self.worker._current_task.name
+            # A cancelled task emits neither completed nor failed, so drop its
+            # callback entry here — otherwise the name would stay "pending"
+            # and dedup would silently swallow every future submission of it.
+            self._task_callbacks.pop(task_name, None)
             logger.info(f"Cancelling current task: {task_name}")
             self.worker_cancelled.emit(task_name)
             return True
@@ -257,25 +308,79 @@ class WorkerManager(QObject):
         """Check if worker is processing a task."""
         return self.worker._current_task_name is not None or not self.worker.task_queue.empty()
 
+    #: An idle worker stops the moment it sees the poison pill; these budgets
+    #: only matter when a task is still running. A project save legitimately
+    #: takes tens of seconds at GB scale, so the I/O worker -- the one that
+    #: might be holding a half-written .hrt -- gets far longer than the
+    #: compute worker, whose work is always reproducible.
+    COMPUTE_DRAIN_MS = 15_000
+    IO_DRAIN_MS = 300_000
+    _DRAIN_LOG_INTERVAL_MS = 3_000
+
+    def _drain(self, worker: PersistentWorker, budget_ms: int) -> bool:
+        """Wait for a worker to finish, logging what it is still doing."""
+        waited = 0
+        while waited < budget_ms:
+            slice_ms = min(self._DRAIN_LOG_INTERVAL_MS, budget_ms - waited)
+            if worker.wait(slice_ms):
+                return True
+            waited += slice_ms
+            busy = worker._current_task_name
+            logger.info("%s still busy after %.0fs%s", worker.objectName(),
+                        waited / 1000.0, f" running '{busy}'" if busy else "")
+        return False
+
     @Slot()
     def shutdown(self):
-        """Stop the worker thread and wait for it to finish.
+        """Stop the worker threads and wait for them to finish.
 
-        Idempotent and bounded: safe to call from both the aboutToQuit signal
-        and an explicit cleanup, and it never blocks forever (a stuck thread is
-        terminated as a last resort) so the app can always exit cleanly.
+        Idempotent, and safe to call from both the aboutToQuit signal and an
+        explicit cleanup.
+
+        A task that is mid-flight is never killed. ``QThread.terminate()`` on
+        a thread executing Python is undefined behaviour -- it was crashing
+        the app when the user quit right after a save -- and on the I/O worker
+        it would also leave a truncated project file behind. Waiting costs a
+        slow quit; terminating costs the user's data.
         """
         if self._shutdown_done:
             return
         self._shutdown_done = True
         try:
-            if self.worker.isRunning():
-                logger.info("WorkerManager: stopping worker thread...")
-                self.worker.stop()
-                if not self.worker.wait(3000):
-                    logger.warning("Worker did not stop in 3s; terminating")
-                    self.worker.terminate()
-                    self.worker.wait(1000)
+            for w, budget in ((self.worker, self.COMPUTE_DRAIN_MS),
+                              (self.io_worker, self.IO_DRAIN_MS)):
+                if not w.isRunning():
+                    continue
+                logger.info(f"WorkerManager: stopping {w.objectName()}...")
+                w.stop()
+                if self._drain(w, budget):
+                    continue
+
+                stuck = w._current_task_name
+                if stuck:
+                    # Past the budget and still working. Leave it be: a
+                    # half-written file is worse than a slow exit, and the
+                    # process teardown will reclaim the thread.
+                    logger.error(
+                        "%s still running '%s' after %.0fs; leaving it to finish "
+                        "rather than terminating mid-operation",
+                        w.objectName(), stuck, budget / 1000.0)
+                    self._abandoned.append(w)
+                else:
+                    # Idle but unresponsive: nothing in flight to corrupt.
+                    logger.warning("%s did not stop in %.0fs; terminating",
+                                   w.objectName(), budget / 1000.0)
+                    w.terminate()
+                    w.wait(1000)
             logger.info("WorkerManager shutdown complete")
         except Exception as e:
             logger.error(f"Error during WorkerManager shutdown: {e}")
+
+    def has_pending_io(self) -> bool:
+        """True while a project write is queued or running.
+
+        The UI can use this to hold a quit until the save lands, instead of
+        letting the user close into a several-second stall.
+        """
+        return (self.io_worker._current_task_name is not None
+                or not self.io_worker.task_queue.empty())

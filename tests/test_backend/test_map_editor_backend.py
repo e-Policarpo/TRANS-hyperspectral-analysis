@@ -518,6 +518,86 @@ class TestProcessingOperations:
         assert len(signal_emitted) == 1
         assert signal_emitted[0][1] == True
 
+    def test_applyProcessing_poly_level(self, backend_with_map):
+        """Polynomial plane correction removes a bowed background."""
+        signal_emitted = []
+        backend_with_map.processingFinished.connect(
+            lambda op, success, msg: signal_emitted.append((op, success, msg))
+        )
+        chan = backend_with_map._multi_channel_map.active_channel
+        rows, cols = chan.data.shape
+        Y, X = np.mgrid[0:rows, 0:cols].astype(float)
+        chan.data = ((X - cols / 2) / (cols / 2)) ** 2 * 500.0
+
+        backend_with_map.applyProcessing("poly_level", {"order": 2})
+
+        assert signal_emitted == [("poly_level", True, "")] or \
+            signal_emitted[0][:2] == ("poly_level", True)
+        assert np.abs(
+            backend_with_map._multi_channel_map.active_channel.data
+        ).max() < 1e-6, "order-2 bowing should be fully removed"
+
+    def test_applyProcessing_poly_level_defaults_order(self, backend_with_map):
+        """A missing order must not raise — it defaults to 2."""
+        signal_emitted = []
+        backend_with_map.processingFinished.connect(
+            lambda op, success, msg: signal_emitted.append((op, success, msg))
+        )
+        backend_with_map.applyProcessing("poly_level", {})
+        assert signal_emitted[0][1] is True
+
+    def test_applyProcessing_poly_level_accepts_float_order(self, backend_with_map):
+        """QML hands numeric params through as floats; order must be cast."""
+        signal_emitted = []
+        backend_with_map.processingFinished.connect(
+            lambda op, success, msg: signal_emitted.append((op, success, msg))
+        )
+        backend_with_map.applyProcessing("poly_level", {"order": 3.0})
+        assert signal_emitted[0][1] is True
+
+    def test_applyProcessing_facet_level(self, backend_with_map):
+        """Facet reorientation flattens the dominant facet."""
+        signal_emitted = []
+        backend_with_map.processingFinished.connect(
+            lambda op, success, msg: signal_emitted.append((op, success, msg))
+        )
+        chan = backend_with_map._multi_channel_map.active_channel
+        rows, cols = chan.data.shape
+        Y, X = np.mgrid[0:rows, 0:cols].astype(float)
+        chan.data = 0.5 * X + 0.25 * Y
+
+        backend_with_map.applyProcessing("facet_level", {})
+
+        assert signal_emitted[0][1] is True
+        assert np.ptp(
+            backend_with_map._multi_channel_map.active_channel.data) < 1e-6
+
+    def test_applyProcessing_plane_level_is_nan_aware(self, backend_with_map):
+        """The old inline plane fit produced an all-NaN result when a single
+        pixel was NaN; the shared implementation ignores them."""
+        signal_emitted = []
+        backend_with_map.processingFinished.connect(
+            lambda op, success, msg: signal_emitted.append((op, success, msg))
+        )
+        chan = backend_with_map._multi_channel_map.active_channel
+        rows, cols = chan.data.shape
+        Y, X = np.mgrid[0:rows, 0:cols].astype(float)
+        chan.data = 3.0 * X + 2.0 * Y + 7.0
+        chan.data[0, 0] = np.nan
+
+        backend_with_map.applyProcessing("plane_level", {})
+
+        out = backend_with_map._multi_channel_map.active_channel.data
+        assert signal_emitted[0][1] is True
+        assert np.isnan(out[0, 0])
+        assert np.isfinite(out[1:, 1:]).all(), "NaN must not poison the fit"
+        assert np.nanmax(np.abs(out)) < 1e-9
+
+    def test_leveling_operations_are_recorded_in_history(self, backend_with_map):
+        backend_with_map.applyProcessing("facet_level", {})
+        chan = backend_with_map._multi_channel_map.active_channel
+        assert any(h['operation'] == "facet_level" for h in chan.history)
+
     def test_applyProcessing_normalize(self, backend_with_map):
         """Test applying normalization"""
         signal_emitted = []

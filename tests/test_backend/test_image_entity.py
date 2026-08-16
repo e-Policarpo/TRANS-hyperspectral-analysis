@@ -211,6 +211,188 @@ def test_crop_image_empty_rect_emits_error(backend, tmp_path):
     assert errors
 
 
+# =============================================================================
+# Leveling / flatten
+# =============================================================================
+
+def _tilted_float_image(rows=40, cols=50, pixel_size_nm=None) -> ImageData:
+    Y, X = np.mgrid[0:rows, 0:cols].astype(np.float64)
+    arr = (3.0 * X + 2.0 * Y + 7.0).astype(np.float32)
+    img = ImageData.from_array(arr, mode=ImageMode.SINGLE_FLOAT, name="topo")
+    if pixel_size_nm is not None:
+        img.metadata.pixel_size_nm = pixel_size_nm
+    return img
+
+
+def test_level_image_overwrites_in_place(backend, tmp_path):
+    """Leveling replaces the image's pixels rather than spawning a sibling
+    entity — the project browser keeps one row per scan."""
+    backend._output_base_dir = tmp_path
+    img = _tilted_float_image()
+    backend._images[img.id] = img
+    name_before = img.name
+    n_entities = len(backend._images)
+
+    changed = []
+    backend.imagePixelsChanged.connect(changed.append)
+
+    same_id = backend.levelImage(img.id, "plane_level", {})
+
+    assert same_id == img.id
+    assert len(backend._images) == n_entities  # no new entity
+    leveled = backend._images[img.id]
+    assert leveled.name == name_before        # and no renaming
+    assert np.abs(leveled.array).max() < 1e-3  # tilt removed
+    # The primary export is the Gwyddion field, refreshed in place so Gwyddion
+    # doesn't keep opening the pre-correction surface. The TIFF stays lazy —
+    # it is only written when something actually asks for a raster.
+    gsf_paths = leveled.metadata.additional_info.get("gsf_paths") or []
+    assert gsf_paths and all(Path(p).exists() for p in gsf_paths)
+    assert changed == [img.id]
+
+
+def test_level_image_stashes_raw_and_reverts(backend, tmp_path):
+    backend._output_base_dir = tmp_path
+    img = _tilted_float_image()
+    backend._images[img.id] = img
+    original = img.array.copy()
+
+    assert backend.imageHasRawBackup(img.id) is False
+    backend.levelImage(img.id, "plane_level", {})
+    assert backend.imageHasRawBackup(img.id) is True
+
+    assert backend.revertImageToRaw(img.id) is True
+    np.testing.assert_array_equal(backend._images[img.id].array, original)
+    # Backup is consumed by the revert.
+    assert backend.imageHasRawBackup(img.id) is False
+    assert backend.revertImageToRaw(img.id) is False
+
+
+def test_relevelling_refits_the_raw_surface(backend, tmp_path):
+    """Applying leveling twice must not stack two corrections."""
+    backend._output_base_dir = tmp_path
+    img = _tilted_float_image()
+    backend._images[img.id] = img
+
+    backend.levelImage(img.id, "plane_level", {})
+    once = backend._images[img.id].array.copy()
+    backend.levelImage(img.id, "plane_level", {})
+    twice = backend._images[img.id].array
+
+    np.testing.assert_allclose(once, twice, atol=1e-6)
+
+
+def test_revert_is_scoped_to_the_active_channel(backend, tmp_path):
+    """Multi-channel scans level and revert each channel independently."""
+    backend._output_base_dir = tmp_path
+    rows, cols = 16, 16
+    Y, X = np.mgrid[0:rows, 0:cols].astype(np.float32)
+    img = ImageData.from_channels(
+        {"Z fwd/up": X * 2.0 + Y, "I fwd/up": Y * 3.0},
+        name="scan", mode=ImageMode.SINGLE_FLOAT)
+    backend._images[img.id] = img
+
+    backend.levelImage(img.id, "plane_level", {})
+    assert backend.imageHasRawBackup(img.id) is True
+
+    assert backend.setImageChannel(img.id, "I fwd/up") is True
+    # The other channel was never levelled, so it has nothing to revert.
+    assert backend.imageHasRawBackup(img.id) is False
+    assert backend.revertImageToRaw(img.id) is False
+
+    backend.setImageChannel(img.id, "Z fwd/up")
+    assert backend.imageHasRawBackup(img.id) is True
+
+
+def test_level_image_poly_order_is_honoured(backend, tmp_path):
+    backend._output_base_dir = tmp_path
+    rows, cols = 40, 50
+    Y, X = np.mgrid[0:rows, 0:cols].astype(np.float64)
+    bowed = (((X - cols / 2) / (cols / 2)) ** 2 * 500.0).astype(np.float32)
+    img = ImageData.from_array(bowed, mode=ImageMode.SINGLE_FLOAT, name="bow")
+    backend._images[img.id] = img
+
+    backend.levelImage(img.id, "plane_level", {})
+    after_plane = backend._images[img.id].array.copy()
+    # Leveling overwrites in place, but always re-fits the *raw* surface, so
+    # switching method here is a clean comparison rather than a stacked one.
+    backend.levelImage(img.id, "poly_level", {"order": 2})
+    after_poly = backend._images[img.id].array
+
+    # A plane cannot remove curvature; an order-2 polynomial can.
+    assert np.abs(after_plane).max() > 1.0
+    assert np.abs(after_poly).max() < 1e-2
+
+
+def test_level_image_facet(backend, tmp_path):
+    backend._output_base_dir = tmp_path
+    img = _tilted_float_image()
+    backend._images[img.id] = img
+    same_id = backend.levelImage(img.id, "facet_level", {})
+    assert same_id == img.id
+    assert np.ptp(backend._images[img.id].array) < 1e-2
+
+
+def test_level_image_keeps_pixel_scale_calibrated(backend, tmp_path):
+    """The leveled result must stay spatially calibrated."""
+    backend._output_base_dir = tmp_path
+    img = _tilted_float_image(pixel_size_nm=(0.25, 0.5))
+    backend._images[img.id] = img
+    same_id = backend.levelImage(img.id, "plane_level", {})
+    assert backend._images[same_id].metadata.pixel_size_nm == (0.25, 0.5)
+    assert AppBackend._image_pixel_scale(backend._images[same_id])[2] == "nm"
+
+
+def test_level_image_records_operation_in_metadata(backend, tmp_path):
+    backend._output_base_dir = tmp_path
+    img = _tilted_float_image()
+    backend._images[img.id] = img
+    name_before = img.name
+    same_id = backend.levelImage(img.id, "facet_level", {})
+    leveled = backend._images[same_id]
+    assert leveled.metadata.additional_info.get("leveling") == "facet_level"
+    # Overwritten in place: the entity keeps its name, no "(facet)" suffix.
+    assert leveled.name == name_before
+
+
+def test_level_image_rejects_colour_images(backend, tmp_path):
+    backend._output_base_dir = tmp_path
+    rgb = ImageData.from_array(
+        np.zeros((8, 8, 3), dtype=np.uint8), mode=ImageMode.RGB, name="rgb")
+    backend._images[rgb.id] = rgb
+    errors = []
+    backend.errorOccurred.connect(lambda t, m: errors.append((t, m)))
+
+    assert backend.levelImage(rgb.id, "plane_level", {}) == ""
+    assert errors and "single-channel" in errors[-1][1]
+
+
+def test_level_image_unknown_operation_emits_error(backend, tmp_path):
+    backend._output_base_dir = tmp_path
+    img = _tilted_float_image()
+    backend._images[img.id] = img
+    errors = []
+    backend.errorOccurred.connect(lambda t, m: errors.append((t, m)))
+
+    assert backend.levelImage(img.id, "not_an_op", {}) == ""
+    assert errors and "Unknown operation" in errors[-1][1]
+
+
+def test_level_image_missing_id_emits_error(backend):
+    errors = []
+    backend.errorOccurred.connect(lambda t, m: errors.append((t, m)))
+    assert backend.levelImage("nope", "plane_level", {}) == ""
+    assert errors
+
+
+def test_level_image_accepts_none_params(backend, tmp_path):
+    """QML may omit the params map entirely."""
+    backend._output_base_dir = tmp_path
+    img = _tilted_float_image()
+    backend._images[img.id] = img
+    assert backend.levelImage(img.id, "plane_level", None)
+
+
 def test_get_image_histogram_returns_counts(backend):
     arr = np.tile(np.arange(0, 256, dtype=np.uint8), (16, 1))
     img = ImageData.from_array(arr, name="hist_src")

@@ -1,8 +1,11 @@
-# TRANS-QML Dependencies
+# T.R.A.N.S. — Tools for Research and Analysis for Nano Spectroscopy
 # Hyperspectral Data Analysis Platform
 #
 # Install with: pip install -r requirements.txt
-# Python version: 3.8+
+# Python: 3.9+ (developed and verified on 3.13; see "Verified environment" below)
+#
+# Floors are the oldest version known to carry an API this project uses. They
+# are deliberately not ceilings — see the note at the bottom before pinning.
 
 # ============================================================================
 # Core Qt/QML Framework
@@ -17,6 +20,7 @@ PySide6-Essentials>=6.5.0         # Essential Qt components
 numpy>=1.24.0                     # Numerical arrays and operations
 pandas>=2.0.0                     # DataFrames for spectral data handling
 scipy>=1.10.0                     # Signal processing, optimization, interpolation
+scikit-learn>=1.3.0               # KMeans clustering (backend/tool_implementations.py)
 
 # ============================================================================
 # Visualization
@@ -28,32 +32,22 @@ Pillow>=10.0.0                    # Image generation and manipulation (PIL)
 # File I/O
 # ============================================================================
 h5py>=3.0.0                       # HDF5 file format for .hrt project files
+tifffile>=2023.7.10               # Calibrated TIFF read/write (utils/tiff_io.py,
+                                  # image import/export, ImageJ metadata)
 access2theMatrix>=0.4.4           # Omicron/Scienta MATRIX result-file parsing engine (STS curves + scan images)
+gwyfile>=0.3.0                    # Gwyddion .gwy export (multi-channel, calibrated).
+                                  # Pure Python — no Gwyddion install needed.
+                                  # Optional at runtime: src/utils/gwy_io.py
+                                  # degrades gracefully via gwy_available().
 # NSFopen - now vendored in src/data_loaders/nsfopen/ (MIT licensed, by Nanosurf AG)
-
-# ============================================================================
-# Signal/Image Processing
-# ============================================================================
-scikit-image>=0.21.0              # Advanced image processing filters
-
-# ============================================================================
-# Optional: Performance Optimization
-# ============================================================================
-numba>=0.57.0                     # JIT compilation for numerical functions
-
-# ============================================================================
-# Utilities
-# ============================================================================
-python-dateutil>=2.8.0            # Date/time parsing
-pytz>=2023.3                      # Timezone support
 
 # ============================================================================
 # macOS-Specific (Optional)
 # ============================================================================
-# For proper menu bar display on macOS, install:
-# pip install pyobjc-framework-Cocoa
-# This is optional - the application will work without it,
-# but the menu bar may show "Python" instead of "T.R.A.N.S."
+# Sets the app name in the menu bar via NSBundle (main.py). Guarded by an
+# ImportError handler, so the app runs without it — the menu bar just shows
+# "Python" instead of "T.R.A.N.S.".
+pyobjc-framework-Cocoa>=9.0; sys_platform == "darwin"
 
 # ============================================================================
 # Development & Testing (Optional)
@@ -63,3 +57,22 @@ pytz>=2023.3                      # Timezone support
 # pytest-cov>=4.0.0               # Coverage reporting
 # pytest-qt>=4.0.0                # Qt testing support
 # pytest-benchmark>=4.0.0         # Micro-benchmarks for the pyqtgraph-port rendering work
+
+# ============================================================================
+# Verified environment
+# ============================================================================
+# The combination below is what the test suite is green against. Reproduce it
+# exactly when a version-sensitive bug needs bisecting:
+#
+#   Python 3.13.9
+#   numpy 1.26.4          scipy 1.16.3         pandas 2.3.3
+#   PySide6 6.10.0        matplotlib 3.10.7    Pillow 12.0.0
+#   tifffile 2025.10.16   h5py 3.15.1          scikit-learn 1.7.2
+#   access2theMatrix 0.4.4                     pyobjc-framework-Cocoa 12.1
+#
+# Staying on Python 3.9 caps five of these at their last 3.9-compatible
+# release (numpy 2.0.2, scipy 1.13.1, matplotlib 3.9.4, scikit-learn 1.6.1,
+# tifffile 2024.8.30); 3.10+ is required to go past them.
+#
+# Removed 2026-08-01, unused by any import: scikit-image, numba,
+# python-dateutil, pytz (the last two arrive transitively with pandas).

@@ -85,14 +85,15 @@ ApplicationWindow {
                 "1D FFT", "2D FFT", "Curve Smoothing", "Image Smoothing",
                 "Derivative Calculator", "Curve Fitting", "Gradient Filter",
                 "Integration Utility", "Map Generator", "Spatial Average",
-                "Truncate Data", "Curve Analysis", "Peak Indexing",
+                "Truncate Data", "Curve Analysis", "Confinement Analysis",
+                "Spectral Features", "Peak Indexing",
                 "Average Curves", "Filter Bad Data", "Cosmic Ray Filter",
                 "Background Subtraction",
                 "Dirac Point Estimator", "Detect Bandgap & Doping",
                 "Spectral Axis Converter", "Multi-Peak Fitting"
             ]
         } else if (currentTabIndex === 1) {
-            return ["2D FFT", "Image Smoothing", "Gradient Filter", "Map Discretizer", "Map Processing"]
+            return ["Confinement Analysis", "Spectral Features", "2D FFT", "Image Smoothing", "Gradient Filter", "Map Discretizer", "Map Processing"]
         }
         return []
     }
@@ -569,6 +570,22 @@ ApplicationWindow {
             MenuItem {
                 text: "Curve Analysis"
                 visible: currentTabIndex === 0
+                height: visible ? implicitHeight : 0
+                onTriggered: openToolWindow(text)
+            }
+            MenuItem {
+                text: "Confinement Analysis"
+                // Also available on the Hyperspectral tab: it is the tool that
+                // turns a map's spectra into the peak-occupancy table.
+                visible: currentTabIndex === 0 || currentTabIndex === 1
+                height: visible ? implicitHeight : 0
+                onTriggered: openToolWindow(text)
+            }
+            MenuItem {
+                text: "Spectral Features"
+                // Also on the Hyperspectral tab: it turns a map's spectra
+                // into the table that classification runs on.
+                visible: currentTabIndex === 0 || currentTabIndex === 1
                 height: visible ? implicitHeight : 0
                 onTriggered: openToolWindow(text)
             }
@@ -1425,16 +1442,14 @@ ApplicationWindow {
             console.log("Data loaded:", datasetName)
             statusText.text = "Loaded: " + datasetName
 
-            // Refresh Map Editor datasets when new data is loaded
-            var mew = mapEditorLoader.item
-            if (mew) mew.linkDatasetsFromBackend(backend)
+            // Refresh Map Editor datasets when new data is loaded (coalesced)
+            mainWindow.scheduleMapEditorRelink()
         }
 
         function onToolCompleted(toolName, outputPath) {
             console.log("Tool completed:", toolName, "output:", outputPath)
             // Refresh Map Editor dataset links after tool completion
-            var mew = mapEditorLoader.item
-            if (mew) mew.linkDatasetsFromBackend(backend)
+            mainWindow.scheduleMapEditorRelink()
         }
 
         function onErrorOccurred(title, message) {
@@ -1571,17 +1586,47 @@ ApplicationWindow {
         }
     }
 
+    // Coalesced Map-Editor relink. Every import and every tool completion
+    // wants the editor's dataset links refreshed, and that refresh walks the
+    // whole dataset registry — so a queue of imports must not trigger one
+    // full relink per import (that is what made batch Matrix imports get
+    // slower and slower). Only runs if the editor has actually been loaded.
+    Timer {
+        id: mapEditorRelinkTimer
+        interval: 250
+        repeat: false
+        onTriggered: {
+            var mew = mapEditorLoader.item
+            if (mew) mew.linkDatasetsFromBackend(backend)
+        }
+    }
+
+    function scheduleMapEditorRelink() {
+        if (mapEditorLoader.item)
+            mapEditorRelinkTimer.restart()
+    }
+
     // Functions
     function getToolsForCurrentTab() {
         // Reuse the reactive currentTools property
         return currentTools
     }
 
+    // Tools usable from more than one tab must not yank the user back to
+    // Spectral, and a tool with a plot needs more room than a form does.
+    property var multiTabTools: ({ "Confinement Analysis": true, "Spectral Features": true })
+    property var toolWindowSizes: ({ "Confinement Analysis": { width: 1000, height: 700 },
+                                     "Spectral Features": { width: 1020, height: 720 } })
+
+    function toolWindowSize(toolName) {
+        return toolWindowSizes[toolName] || { width: 450, height: 550 }
+    }
+
     function openToolWindow(toolName) {
         console.log("Opening tool:", toolName)
 
         // Switch to spectral analysis tab if not already there
-        if (currentTabIndex !== 0) {
+        if (currentTabIndex !== 0 && !multiTabTools[toolName]) {
             tabBar.currentIndex = 0
         }
 
@@ -1601,6 +1646,8 @@ ApplicationWindow {
             "Map Processing": "../tools/MapProcessingTool.qml",
             "Curve Analysis": "../tools/CurveAnalysisTool.qml",
             "Truncate Data": "../tools/TruncateTool.qml",
+            "Confinement Analysis": "../tools/ConfinementAnalysisTool.qml",
+            "Spectral Features": "../tools/SpectralFeaturesTool.qml",
             "Peak Indexing": "../tools/PeakIndexingTool.qml",
             "Filter Bad Data": "../tools/FilterBadDataTool.qml",
             "Cosmic Ray Filter": "../tools/CosmicRayFilterTool.qml",
@@ -1615,9 +1662,10 @@ ApplicationWindow {
         var toolPath = toolMap[toolName] || "../tools/GenericToolUI.qml"
         var component = Qt.createComponent(toolPath)
         if (component.status === Component.Ready) {
+            var size = toolWindowSize(toolName)
             var windowId = toolWindowManager.createToolWindow(toolName, component, {
-                width: 450,
-                height: 550
+                width: size.width,
+                height: size.height
             })
             if (windowId) {
                 var tools = openTools.slice()
@@ -1630,9 +1678,10 @@ ApplicationWindow {
             // Component is still loading, wait for it
             component.statusChanged.connect(function() {
                 if (component.status === Component.Ready) {
+                    var size2 = toolWindowSize(toolName)
                     var wid = toolWindowManager.createToolWindow(toolName, component, {
-                        width: 450,
-                        height: 550
+                        width: size2.width,
+                        height: size2.height
                     })
                     if (wid) {
                         var t = openTools.slice()
@@ -1689,50 +1738,67 @@ ApplicationWindow {
     // Track open workflow windows
     property var openWorkflowWindows: []
 
-    function openWorkflowWindow(workflowName) {
-        console.log("Opening workflow:", workflowName)
-
-        // Create workflow window component
+    // Create, register and show a WorkflowWindow. All workflow windows MUST
+    // go through here so they are tracked in openWorkflowWindows (otherwise
+    // they outlive the main window on shutdown).
+    function _createWorkflowWindow(props) {
         var component = Qt.createComponent("../workflow/WorkflowWindow.qml")
-        if (component.status === Component.Ready) {
-            var window = component.createObject(mainWindow, {
-                workflowName: workflowName,
-                workflowManager: backend.workflowManager,
-                mainWin: mainWindow  // Pass main window for theme colors
-            })
+
+        function instantiate() {
+            var window = component.createObject(mainWindow, props)
             if (window) {
                 openWorkflowWindows.push(window)
                 window.closing.connect(function() {
                     var idx = openWorkflowWindows.indexOf(window)
                     if (idx >= 0) openWorkflowWindows.splice(idx, 1)
                 })
+                if (props.workflowId) {
+                    window.refreshWorkflow()
+                }
                 window.show()
                 console.log("Workflow window created successfully")
             } else {
                 console.error("Failed to create workflow window object")
             }
+            return window
+        }
+
+        if (component.status === Component.Ready) {
+            return instantiate()
         } else if (component.status === Component.Error) {
             console.error("Error creating workflow window:", component.errorString())
         } else {
             console.log("Component loading... status:", component.status)
             component.statusChanged.connect(function() {
                 if (component.status === Component.Ready) {
-                    var window = component.createObject(mainWindow, {
-                        workflowName: workflowName,
-                        workflowManager: backend.workflowManager,
-                        mainWin: mainWindow  // Pass main window for theme colors
-                    })
-                    if (window) {
-                        openWorkflowWindows.push(window)
-                        window.closing.connect(function() {
-                            var idx = openWorkflowWindows.indexOf(window)
-                            if (idx >= 0) openWorkflowWindows.splice(idx, 1)
-                        })
-                        window.show()
-                    }
+                    instantiate()
+                } else if (component.status === Component.Error) {
+                    console.error("Error creating workflow window:", component.errorString())
                 }
             })
         }
+        return null
+    }
+
+    function openWorkflowWindow(workflowName) {
+        console.log("Opening workflow:", workflowName)
+        return _createWorkflowWindow({
+            workflowName: workflowName,
+            workflowManager: backend.workflowManager,
+            mainWin: mainWindow  // Pass main window for theme colors
+        })
+    }
+
+    // Open an already-loaded workflow (e.g. from the Load Workflow dialog or
+    // the Project Workflows menu) in a tracked, themed window.
+    function openWorkflowWindowFromId(workflowId, workflowName) {
+        console.log("Opening loaded workflow:", workflowName, "id:", workflowId)
+        return _createWorkflowWindow({
+            workflowId: workflowId,
+            workflowName: workflowName,
+            workflowManager: backend.workflowManager,
+            mainWin: mainWindow  // Pass main window for theme colors
+        })
     }
 
     function refreshProjectWorkflows() {
@@ -1750,18 +1816,23 @@ ApplicationWindow {
 
     function closeAllWorkflowWindows() {
         console.log("Closing all workflow windows, count:", openWorkflowWindows.length)
-        for (var i = openWorkflowWindows.length - 1; i >= 0; i--) {
-            if (openWorkflowWindows[i]) {
-                try {
-                    openWorkflowWindows[i].visible = false
-                    openWorkflowWindows[i].close()
-                    openWorkflowWindows[i].destroy()
-                } catch (e) {
-                    console.log("Error closing workflow window:", e)
-                }
+        // Detach the list first: each close() fires the window's closing
+        // handler, which splices openWorkflowWindows — iterating the live
+        // array made openWorkflowWindows[i] undefined mid-loop and left
+        // windows alive after the main window closed.
+        var windows = openWorkflowWindows
+        openWorkflowWindows = []
+        for (var i = 0; i < windows.length; i++) {
+            var w = windows[i]
+            if (!w) continue
+            try {
+                w.visible = false
+                w.close()
+                w.destroy()
+            } catch (e) {
+                console.log("Error closing workflow window:", e)
             }
         }
-        openWorkflowWindows = []
     }
 
     // Dialogs — lazy loaded to reduce startup time
@@ -1916,6 +1987,13 @@ ApplicationWindow {
         function onProjectReadyChanged() {
             if (backend.projectReady && projectStartupDialog && projectStartupDialog.visible) {
                 projectStartupDialog.close()
+            }
+            // Editors from the previous project reference workflows that were
+            // just cleared in the backend — close them, then repopulate the
+            // Workflows menu from the (new) project's workflows dir
+            closeAllWorkflowWindows()
+            if (backend.projectReady) {
+                refreshProjectWorkflows()
             }
         }
     }

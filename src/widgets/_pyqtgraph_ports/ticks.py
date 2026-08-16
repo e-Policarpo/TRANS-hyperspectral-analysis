@@ -26,7 +26,7 @@ Originally: pyqtgraph, MIT-licensed (see ``LICENSE`` in this package).
 
 from __future__ import annotations
 
-from math import ceil, floor, frexp, log10, sqrt
+from math import ceil, floor, frexp, isfinite, log10, sqrt
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -77,6 +77,12 @@ def tick_spacing(
     """
     if explicit_spacing is not None:
         return list(explicit_spacing)
+
+    if not (isfinite(min_val) and isfinite(max_val)):
+        # An all-NaN curve (or one containing inf) propagates through the
+        # view range into here; ``ceil()`` on the resulting NaN/inf raises
+        # and kills the whole paint. No finite range means no ticks.
+        return []
 
     dif = abs(max_val - min_val)
     if dif == 0:
@@ -164,6 +170,12 @@ def tick_values(
 
     min_val *= scale
     max_val *= scale
+
+    # Bail before any ``ceil``/``floor``/``int`` if the range isn't finite
+    # — ``tick_spacing`` guards itself, but the log post-process below
+    # would still raise on NaN/inf endpoints.
+    if not (isfinite(min_val) and isfinite(max_val)):
+        return []
 
     ticks: List[TickLevel] = []
     levels = tick_spacing(

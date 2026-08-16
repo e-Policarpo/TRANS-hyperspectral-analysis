@@ -113,9 +113,11 @@ def test_create_dataset_dedups_names(backend):
     n1 = backend.createDatasetFromTable(m1, "Data")
     n2 = backend.createDatasetFromTable(m2, "Data")
 
+    # The collision counter is zero-padded, like every other dataset index,
+    # so repeated collisions still sort in order ("(02)" before "(10)").
     assert n1 == "Data"
-    assert n2 == "Data (1)"
-    assert {"Data", "Data (1)"} <= set(backend._datasets)
+    assert n2 == "Data (01)"
+    assert {"Data", "Data (01)"} <= set(backend._datasets)
 
 
 def test_create_dataset_blank_name_gets_default(backend):

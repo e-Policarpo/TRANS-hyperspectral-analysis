@@ -72,20 +72,53 @@ class TestAutosaveManager:
 
     def test_do_autosave_no_project(self, manager, mock_backend):
         """Autosave should do nothing when no project is open."""
+        manager._on_modified_changed(True)
         manager._do_autosave()
-        mock_backend.worker_manager.submit.assert_not_called()
+        mock_backend.worker_manager.submit_io.assert_not_called()
 
     def test_do_autosave_with_project(self, manager, mock_backend):
-        """Autosave should submit a save task when project is open."""
+        """Autosave should submit a save task when project is open and dirty."""
+        mock_backend._project_ready = True
+        mock_backend._project_path = Path("/tmp/test_project")
+        mock_backend._project_name = "test_project"
+        manager._on_modified_changed(True)
+
+        manager._do_autosave()
+
+        mock_backend.worker_manager.submit_io.assert_called_once()
+        call_kwargs = mock_backend.worker_manager.submit_io.call_args
+        assert call_kwargs[1]["name"] == "Autosave"
+        # Dirty flag cleared at submit time — the next clean tick is a no-op
+        assert manager._dirty is False
+
+    def test_do_autosave_skipped_when_clean(self, manager, mock_backend):
+        """Autosave must NOT re-serialize an unchanged project."""
         mock_backend._project_ready = True
         mock_backend._project_path = Path("/tmp/test_project")
         mock_backend._project_name = "test_project"
 
         manager._do_autosave()
 
-        mock_backend.worker_manager.submit.assert_called_once()
-        call_kwargs = mock_backend.worker_manager.submit.call_args
-        assert call_kwargs[1]["name"] == "Autosave"
+        mock_backend.worker_manager.submit_io.assert_not_called()
+
+    def test_do_autosave_keeps_dirty_when_submission_rejected(self, manager, mock_backend):
+        """If a previous autosave is still in flight (submit_io dedups and
+        returns False), the changes stay flagged for the next tick."""
+        mock_backend._project_ready = True
+        mock_backend._project_path = Path("/tmp/test_project")
+        mock_backend._project_name = "test_project"
+        mock_backend.worker_manager.submit_io.return_value = False
+        manager._on_modified_changed(True)
+
+        manager._do_autosave()
+
+        assert manager._dirty is True
+
+    def test_modified_signal_tracks_dirty(self, manager):
+        manager._on_modified_changed(True)
+        assert manager._dirty is True
+        manager._on_modified_changed(False)  # e.g. manual save completed
+        assert manager._dirty is False
 
     def test_check_recovery_no_autosave(self, manager, tmp_path):
         """No recovery if autosave file doesn't exist."""

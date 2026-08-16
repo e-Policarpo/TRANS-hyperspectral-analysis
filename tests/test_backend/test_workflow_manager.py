@@ -846,3 +846,137 @@ class TestWorkflowIntermediateCleanup:
         assert "STS_Data" in name
         assert "Smoothed" in name
         assert "My Workflow" in name  # underscores replaced with spaces
+
+
+class TestConfinementAnalysisExecution:
+    """The Confinement Analysis node running headlessly, which is how the
+    hyperspectral pipeline uses it."""
+
+    @pytest.fixture
+    def sts_data(self):
+        """STS-like spectra: band edges plus small in-gap states."""
+        x = np.linspace(-0.6, 0.6, 512)
+        band_edges = 3e-7 * np.exp((np.abs(x) - 0.6) / 0.055)
+        columns = {}
+        for n in range(4):
+            y = band_edges.copy()
+            for c in (-0.25, -0.10, 0.08, 0.22):
+                y = y + 1.2e-8 * np.exp(-0.5 * ((x - c) / 0.008) ** 2)
+            columns[f"R{n + 1}"] = y
+        df = pd.DataFrame({"V": x, **columns})
+        metadata = SpectralMetadata(
+            source_type='sts', dimensions=(4, 1), scan_mode='line',
+            units={'x': 'V'}, additional_info={})
+        return SpectralData(data=df, metadata=metadata)
+
+    @pytest.fixture
+    def executor(self, tmp_path, sts_data):
+        """A real ToolImplementations behind a WorkflowExecutor."""
+        import re
+        from unittest.mock import Mock as _Mock
+        from src.backend.tool_implementations import ToolImplementations
+
+        class Backend(ToolImplementations):
+            def __init__(self):
+                self._datasets = {}
+                self._output_base_dir = tmp_path / "outputs"
+                self._output_base_dir.mkdir(exist_ok=True)
+                self.errorOccurred = _Mock()
+                self.dataLoaded = _Mock()
+                self._workflow_mode = True
+
+            def _ensure_output_dir(self, subdir):
+                path = self._output_base_dir / subdir
+                path.mkdir(parents=True, exist_ok=True)
+                return path
+
+            def _sanitize_filename(self, name):
+                return re.sub(r'\W+', '_', name) or "unnamed"
+
+            def _extract_clean_base_name(self, name):
+                return name
+
+            def _apply_naming_convention(self, dataset_name, operation="", preview=False):
+                return self._sanitize_filename(f"{dataset_name}_{operation}")
+
+        backend = Backend()
+        backend._datasets['Source'] = sts_data
+        return WorkflowExecutor(backend), backend
+
+    def _node(self, **params):
+        node = create_node_from_tool("ConfinementAnalysis", 0, 0)
+        node.parameters.update(params)
+        return node
+
+    def test_executes_and_fills_every_output_port(self, executor, sts_data):
+        ex, _ = executor
+        node = self._node(baseline='poly-iter', baseline_degree=5, height=5.0)
+
+        outputs = ex._execute_node(node, {'dataset': sts_data})
+
+        assert set(outputs) == {"peak_matrix", "peak_matrix_binned", "peak_matrix_offset",
+                                "peak_matrix_binned_offset", "peaks", "corrected",
+                                "baseline", "coefficients", "peak_count", "intervals"}
+        for port in ("peak_matrix", "peak_matrix_offset", "peaks", "corrected",
+                     "baseline", "coefficients", "peak_count"):
+            assert isinstance(outputs[port], SpectralData), port
+        # Only produced when a temperature is set.
+        assert outputs["peak_matrix_binned"] is None
+        assert outputs["peak_matrix_binned_offset"] is None
+        assert isinstance(outputs['intervals'], list)
+
+    def test_finds_the_in_gap_states(self, executor, sts_data):
+        ex, _ = executor
+        node = self._node(baseline='poly-iter', baseline_degree=5, height=5.0)
+        outputs = ex._execute_node(node, {'dataset': sts_data})
+
+        found = outputs['peaks'].data['position_value'].round(2).unique()
+        for center in (-0.25, -0.10, 0.08, 0.22):
+            assert round(center, 2) in found
+
+    def test_temperature_parameter_reaches_the_engine(self, executor, sts_data):
+        ex, _ = executor
+        ungrouped = ex._execute_node(self._node(baseline='poly-iter', baseline_degree=5),
+                                     {'dataset': sts_data})
+        grouped = ex._execute_node(self._node(baseline='poly-iter', baseline_degree=5,
+                                              temperature_k=94.0),
+                                   {'dataset': sts_data})
+
+        assert ungrouped['peak_matrix_binned'] is None
+        assert len(ungrouped['peak_matrix'].independent_var) == 512
+        # The binned table arrives alongside the full-resolution one.
+        assert len(grouped['peak_matrix'].independent_var) == 512
+        assert len(grouped['peak_matrix_binned'].independent_var) < 200
+        assert grouped['peak_matrix_binned'].metadata.additional_info['temperature_k'] == 94.0
+
+    def test_fwhm_multiplier_is_not_passed_as_a_detection_param(self, executor, sts_data):
+        """It is a tool argument; leaking it into Params would raise."""
+        ex, _ = executor
+        node = self._node(baseline='poly-iter', baseline_degree=5, fwhm_multiplier=3.0)
+        outputs = ex._execute_node(node, {'dataset': sts_data})
+
+        assert outputs['peaks'] is not None
+        widths = (outputs['peaks'].data['interval_end']
+                  - outputs['peaks'].data['interval_start'])
+        assert (widths > 0).all()
+
+    def test_workflow_mode_keeps_intermediates_out_of_the_browser(self, executor, sts_data):
+        ex, backend = executor
+        ex._execute_node(self._node(), {'dataset': sts_data})
+        backend.dataLoaded.emit.assert_not_called()
+
+    def test_string_input_is_rejected_rather_than_crashing(self, executor):
+        ex, _ = executor
+        assert ex._execute_node(self._node(), {'dataset': 'not a dataset'}) == {}
+
+    def test_missing_input_produces_no_outputs(self, executor):
+        ex, _ = executor
+        assert ex._execute_node(self._node(), {}) == {}
+
+    def test_defaults_alone_run_without_error(self, executor, sts_data):
+        """A node dropped on the canvas and executed untouched must work."""
+        ex, backend = executor
+        outputs = ex._execute_node(create_node_from_tool("ConfinementAnalysis", 0, 0),
+                                   {'dataset': sts_data})
+        assert outputs['peak_matrix'] is not None
+        backend.errorOccurred.emit.assert_not_called()

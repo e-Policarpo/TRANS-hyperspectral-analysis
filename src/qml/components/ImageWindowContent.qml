@@ -105,6 +105,25 @@ Item {
     property bool isSingleChannel: false
     property real imageNativeWidth: 0
     property real imageNativeHeight: 0
+
+    // ----- Named channels (multi-channel scans) -------------------------
+    // An STM scan carries Z and I, each in up to four trace directions
+    // (fwd/bwd × up/down). They are one image entity with a channel
+    // selector rather than N look-alike entries in the project browser.
+    // Empty for ordinary single-channel images — the selector hides.
+    property var channelNames: []
+    property string activeChannel: ""
+    property var channelUnits: ({})
+
+    // ----- Physical calibration -----------------------------------------
+    // (dy, dx) nanometres per image pixel, when the loader knew it. Drives
+    // the scale bar and the axis ticks; null falls back to pixel indices.
+    property var pixelSizeNm: null
+    property bool showScaleBar: true
+    property bool showTicks: true
+
+    // Whether the active channel has a pre-leveling backup to restore.
+    property bool canRevertLevel: false
     // Crop selection rectangle in *image-pixel* coordinates (independent
     // of the viewport's current zoom/pan).
     property bool cropActive: false
@@ -187,6 +206,11 @@ Item {
             minField.text = displayMin.toFixed(displayMin > 50 ? 1 : 4)
             maxField.text = displayMax.toFixed(displayMax > 50 ? 1 : 4)
         }
+        channelNames = info.channels || []
+        activeChannel = info.active_channel || ""
+        channelUnits = info.channel_units || ({})
+        pixelSizeNm = info.pixel_size_nm || null
+        canRevertLevel = backend.imageHasRawBackup(imageId)
         spatialCursors = info.spatial_cursors || []
         refreshDatasetOverlays()
         refreshZoomRegions()
@@ -347,6 +371,105 @@ Item {
         zoomRegionSelected = sel
     }
 
+    // Pixels can be replaced under a stable image id — a channel switch, a
+    // levelling pass, or a revert. The entity identity never changes, so the
+    // window stays put and only re-pulls the image:// URL and its readouts.
+    Connections {
+        target: backend
+        ignoreUnknownSignals: true
+        function onImagePixelsChanged(changedId) {
+            if (changedId === imageId) refreshInfo()
+        }
+    }
+
+    // ================= physical-scale helpers ==========================
+    // All of these work in "display units" — nm scaled into whichever of
+    // pm / nm / µm / mm keeps the numbers readable for the current image.
+
+    // Nanometres per image pixel along x. 0 when uncalibrated.
+    function nmPerPxX() {
+        return (pixelSizeNm && pixelSizeNm.length === 2) ? pixelSizeNm[1] : 0
+    }
+    function nmPerPxY() {
+        return (pixelSizeNm && pixelSizeNm.length === 2) ? pixelSizeNm[0] : 0
+    }
+    function isCalibrated() { return nmPerPxX() > 0 && nmPerPxY() > 0 }
+
+    // Pick the unit from the image's full extent so the axis reads e.g.
+    // "0 … 250 nm" rather than "0 … 0.25 µm".
+    function scaleUnit() {
+        if (!isCalibrated()) return { div: 1, label: "px" }
+        var totalNm = Math.max(imageNativeWidth * nmPerPxX(),
+                               imageNativeHeight * nmPerPxY())
+        if (totalNm >= 1e6) return { div: 1e6, label: "mm" }
+        if (totalNm >= 1e3) return { div: 1e3, label: "µm" }
+        if (totalNm < 1)    return { div: 1e-3, label: "pm" }
+        return { div: 1, label: "nm" }
+    }
+
+    // Display units per image pixel, for each axis.
+    function unitsPerPxX() {
+        return isCalibrated() ? nmPerPxX() / scaleUnit().div : 1
+    }
+    function unitsPerPxY() {
+        return isCalibrated() ? nmPerPxY() / scaleUnit().div : 1
+    }
+
+    // Round up to the nearest 1/2/5 × 10ⁿ so tick labels stay human.
+    function niceStep(raw) {
+        if (!(raw > 0) || !isFinite(raw)) return 1
+        var base = Math.pow(10, Math.floor(Math.log(raw) / Math.LN10))
+        var mults = [1, 2, 5, 10]
+        for (var i = 0; i < mults.length; ++i)
+            if (raw <= mults[i] * base) return mults[i] * base
+        return 10 * base
+    }
+
+    // Enough decimals to distinguish neighbouring ticks, no more.
+    function fmtTick(v, step) {
+        if (step >= 1) return Math.round(v).toString()
+        var d = Math.min(6, Math.max(0, -Math.floor(Math.log(step) / Math.LN10)))
+        return v.toFixed(d)
+    }
+
+    // Tick positions along one axis, in *viewport* pixels, recomputed from
+    // the live zoom/pan so they track the image as the user navigates.
+    // ``originPx``/``lengthPx`` describe where the image sits in the viewport.
+    function axisTicks(originPx, lengthPx, nativePx, unitsPerPx, viewportPx) {
+        var out = []
+        if (!(lengthPx > 0) || !(nativePx > 0)) return out
+        var scale = lengthPx / nativePx            // viewport px per image px
+        var step = niceStep(90 * unitsPerPx / scale)   // ~90 px between ticks
+        // Only label the part of the image actually on screen.
+        var vLo = Math.max(0, (0 - originPx) / scale * unitsPerPx)
+        var vHi = Math.min(nativePx * unitsPerPx,
+                           (viewportPx - originPx) / scale * unitsPerPx)
+        var k = Math.ceil(vLo / step - 1e-9)
+        var guard = 0
+        while (k * step <= vHi + 1e-9 && guard++ < 200) {
+            var v = k * step
+            out.push({ pos: originPx + (v / unitsPerPx) * scale,
+                       label: fmtTick(v, step) })
+            k += 1
+        }
+        return out
+    }
+
+    // Scale-bar length: a nice round physical length whose on-screen size is
+    // closest to ~1/5 of the viewport, clamped so it never overflows.
+    function scaleBarUnits() {
+        if (!isCalibrated()) return 0
+        var scale = viewport.effectiveScale        // viewport px per image px
+        if (!(scale > 0)) return 0
+        var targetPx = Math.max(60, viewport.width * 0.2)
+        return niceStep(targetPx * unitsPerPxX() / scale)
+    }
+    function scaleBarPixels() {
+        var u = scaleBarUnits()
+        if (!(u > 0)) return 0
+        return (u / unitsPerPxX()) * viewport.effectiveScale
+    }
+
     function buildSourceUrl() {
         if (!imageId) return ""
         var url = "image://trans/" + imageId
@@ -396,6 +519,29 @@ Item {
             // Switch this window to the new cropped image.
             imageId = newId
         }
+    }
+
+    function applyLevel() {
+        var ops = ["plane_level", "poly_level", "facet_level"]
+        var op = ops[levelMethodCombo.currentIndex]
+        var params = {}
+        if (op === "poly_level") params.order = levelOrderSpin.value
+        // Leveling now overwrites the image in place and returns the SAME id
+        // — there is no second "(plane)" entity to switch to. The backend
+        // emits imagePixelsChanged, which reloads the view.
+        backend.levelImage(imageId, op, params)
+    }
+
+    function revertLevel() {
+        if (backend && imageId) backend.revertImageToRaw(imageId)
+    }
+
+    // Switch which named channel of a multi-channel scan is displayed. The
+    // entity identity is unchanged, so this is a pixel refresh, not a
+    // window reload.
+    function selectChannel(name) {
+        if (!backend || !imageId || !name || name === activeChannel) return
+        backend.setImageChannel(imageId, name)
     }
 
     RowLayout {
@@ -473,6 +619,163 @@ Item {
                     y: viewport.renderY + (cropRect ? cropRect.y * viewport.effectiveScale : 0)
                     width: cropRect ? cropRect.w * viewport.effectiveScale : 0
                     height: cropRect ? cropRect.h * viewport.effectiveScale : 0
+                }
+
+                // ============ physical scale overlays ====================
+                // Ticks and the scale bar are derived from viewport.
+                // effectiveScale, so they re-space themselves on every zoom
+                // step and stay pinned to the image as it is panned. Values
+                // are real physical dimensions whenever the loader supplied a
+                // pixel size; otherwise they fall back to pixel indices.
+
+                // --- bottom axis (X) ---
+                Item {
+                    id: xAxis
+                    visible: showTicks && imageNativeWidth > 0
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.bottom: parent.bottom
+                    height: 18
+                    z: 20
+
+                    Rectangle {
+                        anchors.fill: parent
+                        color: "#000000"
+                        opacity: 0.45
+                    }
+                    Repeater {
+                        model: showTicks ? axisTicks(
+                                   viewport.renderX, viewport.renderWidth,
+                                   imageNativeWidth, unitsPerPxX(),
+                                   viewport.width) : []
+                        delegate: Item {
+                            x: modelData.pos
+                            height: xAxis.height
+                            Rectangle {
+                                width: 1; height: 5
+                                color: textLight
+                                opacity: 0.9
+                            }
+                            Text {
+                                y: 5
+                                x: -implicitWidth / 2
+                                text: modelData.label
+                                color: textLight
+                                font.pixelSize: 9
+                            }
+                        }
+                    }
+                    // Unit label, pinned to the right of the band.
+                    Text {
+                        anchors.right: parent.right
+                        anchors.rightMargin: 3
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: scaleUnit().label
+                        color: accentBlue
+                        font.pixelSize: 9
+                        font.bold: true
+                    }
+                }
+
+                // --- left axis (Y) ---
+                Item {
+                    id: yAxis
+                    visible: showTicks && imageNativeHeight > 0
+                    anchors.left: parent.left
+                    anchors.top: parent.top
+                    anchors.bottom: parent.bottom
+                    anchors.bottomMargin: xAxis.visible ? xAxis.height : 0
+                    width: 34
+                    z: 20
+
+                    Rectangle {
+                        anchors.fill: parent
+                        color: "#000000"
+                        opacity: 0.45
+                    }
+                    Repeater {
+                        model: showTicks ? axisTicks(
+                                   viewport.renderY, viewport.renderHeight,
+                                   imageNativeHeight, unitsPerPxY(),
+                                   viewport.height) : []
+                        delegate: Item {
+                            y: modelData.pos
+                            width: yAxis.width
+                            visible: y >= 0 && y <= yAxis.height
+                            Rectangle {
+                                width: 5; height: 1
+                                color: textLight
+                                opacity: 0.9
+                            }
+                            Text {
+                                x: 7
+                                y: -implicitHeight / 2
+                                text: modelData.label
+                                color: textLight
+                                font.pixelSize: 9
+                            }
+                        }
+                    }
+                }
+
+                // --- scale bar (bottom-right, above the X band) ---
+                Item {
+                    id: scaleBar
+                    visible: showScaleBar && isCalibrated() && scaleBarPixels() > 8
+                    z: 21
+                    anchors.right: parent.right
+                    anchors.rightMargin: 12
+                    anchors.bottom: parent.bottom
+                    anchors.bottomMargin: (xAxis.visible ? xAxis.height : 0) + 10
+                    width: barBg.width
+                    height: barBg.height
+
+                    Rectangle {
+                        id: barBg
+                        color: "#000000"
+                        opacity: 0.55
+                        radius: 3
+                        width: Math.max(scaleBarPixels(), barLabel.implicitWidth) + 16
+                        height: barLabel.implicitHeight + 16
+                    }
+                    // The bar itself: its on-screen length is exactly the
+                    // physical length quoted in the label.
+                    Rectangle {
+                        id: barRule
+                        color: "#ffffff"
+                        height: 4
+                        width: scaleBarPixels()
+                        anchors.horizontalCenter: barBg.horizontalCenter
+                        anchors.bottom: barBg.bottom
+                        anchors.bottomMargin: 6
+                    }
+                    // End caps, so the extent is unambiguous in a screenshot.
+                    Rectangle {
+                        color: "#ffffff"; width: 2; height: 10
+                        x: barRule.x
+                        anchors.bottom: barRule.bottom
+                    }
+                    Rectangle {
+                        color: "#ffffff"; width: 2; height: 10
+                        x: barRule.x + barRule.width - 2
+                        anchors.bottom: barRule.bottom
+                    }
+                    Text {
+                        id: barLabel
+                        anchors.horizontalCenter: barBg.horizontalCenter
+                        anchors.top: barBg.top
+                        anchors.topMargin: 4
+                        color: "#ffffff"
+                        font.pixelSize: 11
+                        font.bold: true
+                        text: {
+                            var u = scaleBarUnits()
+                            if (!(u > 0)) return ""
+                            var s = u >= 1 ? (u % 1 === 0 ? u.toString() : u.toFixed(1))
+                                           : u.toPrecision(2)
+                            return s + " " + scaleUnit().label
+                        }
+                    }
                 }
 
                 // Per-spectrum crosshair overlays (Feature B). One per
@@ -787,6 +1090,71 @@ Item {
                               ? imageNativeWidth + " × " + imageNativeHeight + " px"
                               : "No image loaded"
                         wrapMode: Text.WordWrap
+                    }
+
+                    // Physical extent, when the loader supplied a pixel size.
+                    Label {
+                        Layout.fillWidth: true
+                        visible: isCalibrated()
+                        color: textMuted
+                        font.pixelSize: 11
+                        wrapMode: Text.WordWrap
+                        text: {
+                            if (!isCalibrated()) return ""
+                            var u = scaleUnit()
+                            var w = imageNativeWidth * nmPerPxX() / u.div
+                            var h = imageNativeHeight * nmPerPxY() / u.div
+                            return w.toFixed(w < 10 ? 2 : 1) + " × "
+                                 + h.toFixed(h < 10 ? 2 : 1) + " " + u.label
+                        }
+                    }
+
+                    // -------- Channel selector ----------------------------
+                    // Only for multi-channel scans (Z / I × trace directions).
+                    Label {
+                        Layout.fillWidth: true
+                        visible: channelNames.length > 1
+                        text: "Channel"
+                        color: accentBlue
+                        font.pixelSize: 11
+                        font.bold: true
+                    }
+                    ComboBox {
+                        id: channelCombo
+                        Layout.fillWidth: true
+                        visible: channelNames.length > 1
+                        model: channelNames
+                        // Bind to the backend's notion of the active channel
+                        // so external switches (or a reload) keep the combo
+                        // honest, without feeding the change back in.
+                        currentIndex: Math.max(0, channelNames.indexOf(activeChannel))
+                        onActivated: selectChannel(channelNames[currentIndex])
+                    }
+                    Label {
+                        Layout.fillWidth: true
+                        visible: channelNames.length > 1 && activeChannel !== ""
+                                 && channelUnits[activeChannel] !== undefined
+                        color: textMuted
+                        font.pixelSize: 10
+                        text: "Unit: " + (channelUnits[activeChannel] || "")
+                    }
+
+                    // -------- Scale overlays ------------------------------
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 4
+                        CheckBox {
+                            text: "Scale bar"
+                            checked: showScaleBar
+                            font.pixelSize: 11
+                            onToggled: showScaleBar = checked
+                        }
+                        CheckBox {
+                            text: "Ticks"
+                            checked: showTicks
+                            font.pixelSize: 11
+                            onToggled: showTicks = checked
+                        }
                     }
 
                     // -------- View tools (Reset zoom / 1:1) ---------------
@@ -1384,6 +1752,66 @@ Item {
                                 "×" + Math.round(cropRect.h) + " px"
                               : "Drag on the image to define a rectangle."
                         wrapMode: Text.WordWrap
+                    }
+
+                    // -------- Level / Flatten -------------------------------
+                    Label {
+                        text: "Level / Flatten"
+                        color: textLight
+                        font.pixelSize: 11
+                        font.bold: true
+                    }
+                    ComboBox {
+                        id: levelMethodCombo
+                        Layout.fillWidth: true
+                        enabled: isSingleChannel
+                        model: [
+                            "Plane Level",
+                            "Polynomial Plane Correction",
+                            "Facet Reorientation"
+                        ]
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        visible: isSingleChannel && levelMethodCombo.currentIndex === 1
+                        Label { text: "Order:"; color: textMuted; font.pixelSize: 10 }
+                        SpinBox {
+                            id: levelOrderSpin
+                            from: 1; to: 6; value: 2
+                            Layout.preferredWidth: 90
+                        }
+                        Item { Layout.fillWidth: true }
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 4
+                        Button {
+                            Layout.fillWidth: true
+                            enabled: isSingleChannel
+                            text: "Apply Leveling"
+                            onClicked: applyLevel()
+                        }
+                        Button {
+                            Layout.fillWidth: true
+                            // Only meaningful once this channel has been
+                            // levelled — the raw backup is per (image, channel).
+                            enabled: isSingleChannel && canRevertLevel
+                            text: "Revert"
+                            onClicked: revertLevel()
+                        }
+                    }
+                    Label {
+                        Layout.fillWidth: true
+                        color: textMuted
+                        font.pixelSize: 10
+                        wrapMode: Text.WordWrap
+                        text: !isSingleChannel
+                              ? "Leveling applies to single-channel (height/current) images."
+                              : (levelMethodCombo.currentIndex === 2
+                                 ? "Levels the dominant facet flat; robust to steps/spikes."
+                                 : "Subtracts a fitted background, overwriting this image. "
+                                 + "Re-applying always re-fits the raw data, and Revert "
+                                 + "restores it until the project is saved and reopened.")
                     }
 
                     Item { Layout.fillHeight: true }  // spacer

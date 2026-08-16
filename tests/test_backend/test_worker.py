@@ -537,3 +537,97 @@ class TestSignals:
         assert hasattr(manager, 'worker_cancelled')
 
         manager.shutdown()
+
+
+class TestShutdownDoesNotKillWorkInFlight:
+    """Quitting right after a save used to crash.
+
+    The I/O worker was given 3s to stop; a real project save takes far longer,
+    so shutdown fell through to QThread.terminate() on a thread that was
+    mid-write -- undefined behaviour, and a truncated .hrt if it survived.
+    """
+
+    def test_in_flight_io_task_runs_to_completion(self, tmp_path):
+        manager = WorkerManager()
+        target = tmp_path / "project.hrt"
+        started = threading.Event()
+
+        def slow_save(task):
+            started.set()
+            # Deliberately longer than the old 3s budget: under the previous
+            # code this is exactly the task that got terminated mid-write.
+            time.sleep(4.0)
+            target.write_text("COMPLETE")
+            return str(target)
+
+        manager.submit_io("Save Project", slow_save)
+        assert started.wait(5), "task never started"
+
+        manager.shutdown()
+
+        # The write finished rather than being cut off half-way.
+        assert target.exists()
+        assert target.read_text() == "COMPLETE"
+        assert not manager.io_worker.isRunning()
+
+    def test_slow_task_is_never_terminated(self, tmp_path):
+        """Past the budget, the thread is left alone rather than killed."""
+        manager = WorkerManager()
+        manager.IO_DRAIN_MS = 200          # force the budget to expire
+        manager._DRAIN_LOG_INTERVAL_MS = 100
+        done = threading.Event()
+        started = threading.Event()
+
+        def slow_save(task):
+            started.set()
+            time.sleep(1.0)
+            done.set()
+
+        manager.submit_io("Save Project", slow_save)
+        assert started.wait(5)
+
+        with patch.object(manager.io_worker, 'terminate') as terminate:
+            manager.shutdown()
+            terminate.assert_not_called()
+
+        # Abandoned, not killed: it is still referenced so Qt cannot destroy
+        # a running QThread, and it finishes on its own.
+        assert manager.io_worker in manager._abandoned
+        assert done.wait(5), "the abandoned task should still complete"
+        manager.io_worker.wait(2000)
+
+    def test_idle_workers_still_stop_promptly(self):
+        manager = WorkerManager()
+        start = time.monotonic()
+        manager.shutdown()
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 3.0, f"idle shutdown took {elapsed:.1f}s"
+        assert not manager.worker.isRunning()
+        assert not manager.io_worker.isRunning()
+        assert manager._abandoned == []
+
+    def test_shutdown_is_idempotent(self):
+        manager = WorkerManager()
+        manager.shutdown()
+        manager.shutdown()          # must not raise or re-enter
+        assert manager._shutdown_done is True
+
+    def test_has_pending_io_reports_queued_and_running_work(self):
+        manager = WorkerManager()
+        assert manager.has_pending_io() is False
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking(task):
+            started.set()
+            release.wait(5)
+
+        manager.submit_io("Save Project", blocking)
+        assert started.wait(5)
+        assert manager.has_pending_io() is True
+
+        release.set()
+        manager.io_worker.wait(3000)
+        manager.shutdown()

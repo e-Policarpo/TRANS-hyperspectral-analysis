@@ -192,6 +192,41 @@ Dialog {
             Layout.fillWidth: true
         }
 
+        // ---- Gwyddion extraction -------------------------------------
+        // On by default: Gwyddion is the analysis tool for this SPM data, and
+        // a .gwy carries every channel of a scan with real physical
+        // dimensions. Unchecked, the import writes no image files to disk.
+        CheckBox {
+            id: extractGwyCheck
+            Layout.fillWidth: true
+            text: "Extract images as .gwy (Gwyddion readable)"
+            font.pixelSize: 12
+            enabled: backend ? backend.isGwyExportAvailable() : true
+            checked: backend ? backend.extractGwyOnImport : true
+        }
+
+        Label {
+            Layout.fillWidth: true
+            Layout.leftMargin: 28
+            visible: !extractGwyCheck.enabled
+            text: "Unavailable — install the 'gwyfile' package to enable."
+            font.pixelSize: 10
+            color: textMuted
+            wrapMode: Text.WordWrap
+        }
+
+        Label {
+            Layout.fillWidth: true
+            Layout.leftMargin: 28
+            visible: extractGwyCheck.enabled
+            text: extractGwyCheck.checked
+                  ? "One .gwy per scan, all channels, with real scan dimensions."
+                  : "No image files will be written; export later from the browser."
+            font.pixelSize: 10
+            color: textMuted
+            wrapMode: Text.WordWrap
+        }
+
         Button {
             text: "Browse..."
             Layout.preferredHeight: 40
@@ -358,7 +393,9 @@ Dialog {
         } else if (dialog.isFolderMode) {
             selectionInfo.text = dialog.selectedItems[0]
             selectionInfo.color = textLight
-            countLabel.text = "Folder: Will import all supported measurement files"
+            countLabel.text = "Folder: imports all supported files — or, if the "
+                            + "folder only holds subfolders of measurements, "
+                            + "queues each subfolder as its own import"
         } else {
             selectionInfo.text = dialog.selectedItems.join("\n")
             selectionInfo.color = textLight
@@ -373,6 +410,9 @@ Dialog {
         }
 
         if (backend) {
+            // Apply the extraction choice before kicking off the import — the
+            // backend reads it when the loader hands back its images.
+            backend.extractGwyOnImport = extractGwyCheck.checked
             if (dialog.isSmartMode) {
                 backend.importSmartMap(dialog.selectedItems[0])
             } else if (dialog.isFolderMode) {
