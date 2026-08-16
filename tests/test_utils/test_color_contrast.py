@@ -25,33 +25,24 @@ from src.utils.color_contrast import (AA_LARGE_TEXT, AA_NORMAL_TEXT,
                                       relative_luminance)
 
 # (scheme, foreground key, background key) -> ratio measured 2026-08-16.
-# Every entry is a palette that would benefit from a design pass; none is
-# asserted to be acceptable, only to be no worse than it already was.
+#
+# Every remaining entry is an ACCENT against a background — the pride-flag
+# colours themselves (kitchen_table's #0000FF is the bi-flag blue), which are
+# deliberate and not ours to mute. The *text* shortfalls that were here have
+# all been fixed by adjusting each palette's ``textMuted`` in place; text now
+# meets AA in all 22 schemes.
+#
+# None of these is asserted to be acceptable, only to be no worse than it was.
 KNOWN_SHORTFALLS = {
     ("blahaj_light", "bgDark", "accentPrimary"): 3.64,
-    ("blahaj_light", "textMuted", "bgLight"): 4.12,
     ("fruity_rainbow", "bgDark", "accentPrimary"): 4.36,
-    ("garlic_bread", "textMuted", "bgDark"): 4.41,
-    ("garlic_bread", "textMuted", "bgLight"): 2.88,
-    ("garlic_bread", "textMuted", "bgMedium"): 3.63,
-    ("gender_who", "textMuted", "bgLight"): 3.56,
-    ("gender_who", "textMuted", "bgMedium"): 4.5,
-    ("just_dark", "textMuted", "bgLight"): 3.21,
-    ("just_dark", "textMuted", "bgMedium"): 4.05,
-    ("just_light", "textMuted", "bgLight"): 4.11,
     ("kitchen_table", "accentPrimary", "bgDark"): 2.24,
     ("kitchen_table", "accentPrimary", "bgMedium"): 1.99,
     ("kitchen_table", "bgDark", "accentPrimary"): 2.24,
     ("sitting_weird", "bgDark", "accentPrimary"): 3.67,
     ("straight_dark", "accentSecondary", "bgDark"): 2.98,
     ("straight_dark", "bgDark", "accentPrimary"): 3.78,
-    ("straight_dark", "textMuted", "bgDark"): 2.72,
-    ("straight_dark", "textMuted", "bgLight"): 2.19,
-    ("straight_dark", "textMuted", "bgMedium"): 2.47,
     ("straight_light", "bgDark", "accentPrimary"): 4.35,
-    ("straight_light", "textMuted", "bgDark"): 3.03,
-    ("straight_light", "textMuted", "bgLight"): 2.52,
-    ("straight_light", "textMuted", "bgMedium"): 2.77,
     ("sunshine_valid", "accentPrimary", "bgDark"): 2.5,
     ("sunshine_valid", "accentPrimary", "bgMedium"): 2.38,
     ("sunshine_valid", "bgDark", "accentPrimary"): 2.5,
@@ -147,6 +138,22 @@ class TestShippedSchemes:
         severe = {k: v for k, v in _failures().items() if v <= SEVERE}
         untracked = set(severe) - set(KNOWN_SHORTFALLS)
         assert not untracked, f"Untracked severe contrast failures: {untracked}"
+
+    @pytest.mark.parametrize("scheme", sorted(PRESET_COLOR_SCHEMES))
+    def test_text_meets_aa_in_every_scheme(self, scheme):
+        """Text is held to AA unconditionally, with no allowlist.
+
+        The accent colours are pride-flag palettes and deliberately not ours to
+        mute, but *readability of text* is not a design preference — every
+        ``textPrimary``/``textMuted`` pairing must pass in every scheme. This
+        deliberately does not consult KNOWN_SHORTFALLS: a text failure is a bug
+        to fix in the palette, not to record.
+        """
+        colors = PRESET_COLOR_SCHEMES[scheme]["colors"]
+        text_pairings = [p for p in UI_PAIRINGS
+                         if p.fg in ("textPrimary", "textMuted")]
+        failures = check_scheme(scheme, colors, text_pairings)
+        assert not failures, "\n".join(str(f) for f in failures)
 
     def test_default_scheme_is_fully_accessible(self):
         """Whatever ships as the default must pass outright."""

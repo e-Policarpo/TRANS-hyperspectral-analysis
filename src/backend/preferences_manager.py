@@ -203,7 +203,7 @@ PRESET_COLOR_SCHEMES = {
             "accentTertiary": "#800080",    # Purple
             "textPrimary": "#FFFFFF",
             "textSecondary": "#A3A3A3",
-            "textMuted": "#808080",
+            "textMuted": "#A3A3A3",
             "borderColor": "#800080",
             "success": "#66ff99",
             "warning": "#A3A3A3",
@@ -290,7 +290,7 @@ PRESET_COLOR_SCHEMES = {
             "accentTertiary": "#84B082",    # Green
             "textPrimary": "#FFFFFF",
             "textSecondary": "#B9B9B9",
-            "textMuted": "#909090",
+            "textMuted": "#A3A3A3",
             "borderColor": "#84B082",
             "success": "#84B082",
             "warning": "#B9B9B9",
@@ -377,7 +377,7 @@ PRESET_COLOR_SCHEMES = {
             "accentTertiary": "#66FF99",
             "textPrimary": "#FFFFFF",
             "textSecondary": "#66B3FF",
-            "textMuted": "#888888",
+            "textMuted": "#A3A3A3",
             "borderColor": "#555555",
             "success": "#66ff99",
             "warning": "#FFAA66",
@@ -406,7 +406,7 @@ PRESET_COLOR_SCHEMES = {
             "accentTertiary": "#505050",    # Even more muted
             "textPrimary": "#c8c8c8",       # Soft white (not pure white)
             "textSecondary": "#888888",     # Muted grey text
-            "textMuted": "#5a5a5a",         # Very muted
+            "textMuted": "#8C8C8C",         # Very muted
             "borderColor": "#333333",       # Subtle border
             "success": "#6a6a6a",           # Muted success (grey-green tint)
             "warning": "#787878",           # Muted warning (grey)
@@ -437,7 +437,7 @@ PRESET_COLOR_SCHEMES = {
             "accentTertiary": "#404050",    # Dark gray
             "textPrimary": "#1a1a2e",
             "textSecondary": "#D05080",
-            "textMuted": "#606070",
+            "textMuted": "#595968",
             "borderColor": "#B0A0C0",
             "success": "#2E8B57",
             "warning": "#D05080",
@@ -582,7 +582,7 @@ PRESET_COLOR_SCHEMES = {
             "accentTertiary": "#33AA66",
             "textPrimary": "#1a1a1a",
             "textSecondary": "#0066CC",
-            "textMuted": "#666666",
+            "textMuted": "#5E5E5E",
             "borderColor": "#BBBBBB",
             "success": "#33AA66",
             "warning": "#CC8800",
@@ -611,7 +611,7 @@ PRESET_COLOR_SCHEMES = {
             "accentTertiary": "#909090",     # Even lighter
             "textPrimary": "#2a2a2a",        # Soft black (not pure black)
             "textSecondary": "#5a5a5a",      # Muted grey text
-            "textMuted": "#8a8a8a",          # Light muted
+            "textMuted": "#616161",          # Light muted
             "borderColor": "#c8c8c8",        # Subtle border
             "success": "#6a6a6a",            # Muted success (grey)
             "warning": "#787878",            # Muted warning (grey)
