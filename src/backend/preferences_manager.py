@@ -111,16 +111,16 @@ PRESET_COLOR_SCHEMES = {
             "bgDarker": "#0d0d0d",
             "bgMedium": "#2a2a2a",
             "bgLight": "#3a3a3a",
-            "accentPrimary": "#FF0018",     # Red
+            "accentPrimary": "#D14754",     # Red
             "accentSecondary": "#FFA52C",   # Orange
             "accentTertiary": "#008018",    # Green
             "textPrimary": "#FFFFFF",
             "textSecondary": "#FFFF41",     # Yellow
             "textMuted": "#B0B0B0",
-            "borderColor": "#0000F9",       # Blue
+            "borderColor": "#6666D9",       # Blue
             "success": "#008018",
             "warning": "#FFA52C",
-            "error": "#FF0018"
+            "error": "#D14754"
         },
         "font": {
             "family": ".AppleSystemUIFont",
@@ -170,14 +170,14 @@ PRESET_COLOR_SCHEMES = {
             "bgMedium": "#2a1a2a",
             "bgLight": "#3a2a3a",
             "accentPrimary": "#FF1B8D",     # Magenta/pink
-            "accentSecondary": "#FFDA00",   # Yellow
+            "accentSecondary": "#E4D058",   # Yellow
             "accentTertiary": "#1BB3FF",    # Cyan
             "textPrimary": "#FFFFFF",
             "textSecondary": "#FFDA00",
             "textMuted": "#B090B0",
             "borderColor": "#FF1B8D",
             "success": "#66ff99",
-            "warning": "#FFDA00",
+            "warning": "#E4D058",
             "error": "#FF1B8D"
         },
         "font": {
@@ -199,7 +199,7 @@ PRESET_COLOR_SCHEMES = {
             "bgMedium": "#2a2a2a",
             "bgLight": "#3a3a3a",
             "accentPrimary": "#A3A3A3",     # Gray
-            "accentSecondary": "#FFFFFF",   # White
+            "accentSecondary": "#C0C0C0",   # White
             "accentTertiary": "#800080",    # Purple
             "textPrimary": "#FFFFFF",
             "textSecondary": "#A3A3A3",
@@ -223,10 +223,10 @@ PRESET_COLOR_SCHEMES = {
         "name": "No Romo",
         "description": "Aromantic pride - friendship is the real magic",
         "colors": {
-            "bgDark": "#0d1a0d",
-            "bgDarker": "#060d06",
-            "bgMedium": "#1a2a1a",
-            "bgLight": "#2a3a2a",
+            "bgDark": "#161616",
+            "bgDarker": "#0D0D0D",
+            "bgMedium": "#242424",
+            "bgLight": "#333333",
             "accentPrimary": "#3DA542",     # Green
             "accentSecondary": "#A7D379",   # Light green
             "accentTertiary": "#A3A3A3",    # Gray
@@ -257,7 +257,7 @@ PRESET_COLOR_SCHEMES = {
             "bgMedium": "#2a1a2a",
             "bgLight": "#3a2a3a",
             "accentPrimary": "#B57EDC",     # Lavender
-            "accentSecondary": "#FFFFFF",   # White
+            "accentSecondary": "#C0C0C0",   # White
             "accentTertiary": "#4A8123",    # Green
             "textPrimary": "#FFFFFF",
             "textSecondary": "#B57EDC",
@@ -286,7 +286,7 @@ PRESET_COLOR_SCHEMES = {
             "bgMedium": "#2a2a2a",
             "bgLight": "#3a3a3a",
             "accentPrimary": "#B9B9B9",     # Gray
-            "accentSecondary": "#FFFFFF",   # White
+            "accentSecondary": "#C0C0C0",   # White
             "accentTertiary": "#84B082",    # Green
             "textPrimary": "#FFFFFF",
             "textSecondary": "#B9B9B9",
@@ -343,16 +343,16 @@ PRESET_COLOR_SCHEMES = {
             "bgDarker": "#06060d",
             "bgMedium": "#1a1a2a",
             "bgLight": "#2a2a3a",
-            "accentPrimary": "#0000FF",     # Blue
-            "accentSecondary": "#FF0000",   # Red
+            "accentPrimary": "#5959CF",     # Blue
+            "accentSecondary": "#CB4D4D",   # Red
             "accentTertiary": "#000000",    # Black
             "textPrimary": "#FFFFFF",
             "textSecondary": "#FFD700",     # Gold (infinity heart)
             "textMuted": "#9090B0",
-            "borderColor": "#FF0000",
+            "borderColor": "#CB4D4D",
             "success": "#66ff99",
             "warning": "#FFD700",
-            "error": "#FF0000"
+            "error": "#CB4D4D"
         },
         "font": {
             "family": ".AppleSystemUIFont",

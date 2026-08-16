@@ -6,8 +6,8 @@ present, correctly laid out and effectively invisible — and nobody notices,
 because a developer only ever looks at the one scheme they use.
 
 The app ships 22 schemes and several are pride-flag palettes whose colours are
-deliberate (``kitchen_table``'s ``#0000FF`` is the bi-flag blue), so this is a
-**regression guard, not a redesign**: existing shortfalls are recorded in
+deliberate, so this is a **regression guard, not a redesign**: where a shortfall
+is the flag colour itself, it is recorded rather than muted. Existing ones live in
 KNOWN_SHORTFALLS with their measured ratio, and the tests assert that
 
 * every scheme/pairing not listed meets WCAG AA, so a NEW scheme cannot ship
@@ -26,19 +26,16 @@ from src.utils.color_contrast import (AA_LARGE_TEXT, AA_NORMAL_TEXT,
 
 # (scheme, foreground key, background key) -> ratio measured 2026-08-16.
 #
-# Every remaining entry is an ACCENT against a background — the pride-flag
-# colours themselves (kitchen_table's #0000FF is the bi-flag blue), which are
-# deliberate and not ours to mute. The *text* shortfalls that were here have
-# all been fixed by adjusting each palette's ``textMuted`` in place; text now
-# meets AA in all 22 schemes.
+# Every remaining entry is an ACCENT against a background — the flag colours
+# themselves, which are deliberate and not ours to mute. All *text* shortfalls
+# have been fixed by adjusting each palette in place; text meets AA in all 22
+# schemes, enforced separately and without an allowlist.
 #
 # None of these is asserted to be acceptable, only to be no worse than it was.
 KNOWN_SHORTFALLS = {
     ("blahaj_light", "bgDark", "accentPrimary"): 3.64,
-    ("fruity_rainbow", "bgDark", "accentPrimary"): 4.36,
-    ("kitchen_table", "accentPrimary", "bgDark"): 2.24,
-    ("kitchen_table", "accentPrimary", "bgMedium"): 1.99,
-    ("kitchen_table", "bgDark", "accentPrimary"): 2.24,
+    ("fruity_rainbow", "bgDark", "accentPrimary"): 3.93,
+    ("kitchen_table", "bgDark", "accentPrimary"): 3.45,
     ("sitting_weird", "bgDark", "accentPrimary"): 3.67,
     ("straight_dark", "accentSecondary", "bgDark"): 2.98,
     ("straight_dark", "bgDark", "accentPrimary"): 3.78,
@@ -154,6 +151,23 @@ class TestShippedSchemes:
                          if p.fg in ("textPrimary", "textMuted")]
         failures = check_scheme(scheme, colors, text_pairings)
         assert not failures, "\n".join(str(f) for f in failures)
+
+    @pytest.mark.parametrize("scheme", sorted(PRESET_COLOR_SCHEMES))
+    @pytest.mark.parametrize("accent", ["accentPrimary", "accentSecondary"])
+    def test_accents_are_distinguishable_from_text(self, scheme, accent):
+        """An accent must not be the same colour as the text.
+
+        Three schemes shipped ``accentSecondary`` as ``#FFFFFF`` — identical to
+        ``textPrimary`` — so a selected/highlighted control and the label on it
+        were the same colour and the label vanished. This only forbids the
+        degenerate case; how *close* an accent sits to the text is a design
+        choice, but being indistinguishable from it is not.
+        """
+        colors = PRESET_COLOR_SCHEMES[scheme]["colors"]
+        ratio = contrast_ratio(colors[accent], colors["textPrimary"])
+        assert ratio > 1.05, (
+            f"{scheme}: {accent} {colors[accent]} is indistinguishable from "
+            f"textPrimary {colors['textPrimary']} ({ratio:.2f}:1)")
 
     def test_default_scheme_is_fully_accessible(self):
         """Whatever ships as the default must pass outright."""

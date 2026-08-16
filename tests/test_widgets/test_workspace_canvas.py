@@ -699,7 +699,7 @@ class TestToolPalettePanelBehavior:
     def test_tool_list_populated(self):
         """Test tool palette contains expected tools."""
         tools = [
-            "1D FFT", "2D FFT", "Curve Smoothing", "Image Smoothing",
+            "1D FFT", "Curve Smoothing", "Image Smoothing",
             "Derivative Calculator", "Curve Fitting", "Gradient Filter",
             "Integration Utility", "Map Generator", "Spatial Average",
             "Truncate Data", "Curve Analysis", "Peak Indexing",
@@ -707,7 +707,7 @@ class TestToolPalettePanelBehavior:
             "Dirac Point Estimator", "Detect Bandgap & Doping"
         ]
 
-        assert len(tools) == 17
+        assert len(tools) == 16
         assert "Peak Indexing" in tools
         assert "Filter Bad Data" in tools
         assert "Dirac Point Estimator" in tools
@@ -716,7 +716,7 @@ class TestToolPalettePanelBehavior:
     def test_tool_search_filter(self):
         """Test search functionality filters tool list."""
         tools = [
-            "1D FFT", "2D FFT", "Curve Smoothing", "Curve Fitting",
+            "1D FFT", "Curve Smoothing", "Curve Fitting",
             "Derivative Calculator", "Peak Indexing", "Filter Bad Data"
         ]
 
@@ -762,7 +762,7 @@ class TestToolPalettePanelBehavior:
     def test_tool_palette_for_spectral_tab(self):
         """Test tool palette has correct tools for spectral analysis tab."""
         spectral_tools = [
-            "1D FFT", "2D FFT", "Curve Smoothing", "Image Smoothing",
+            "1D FFT", "Curve Smoothing", "Image Smoothing",
             "Derivative Calculator", "Curve Fitting", "Gradient Filter",
             "Integration Utility", "Map Generator", "Spatial Average",
             "Truncate Data", "Curve Analysis", "Peak Indexing",

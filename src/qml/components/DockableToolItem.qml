@@ -104,8 +104,6 @@ Rectangle {
                             return "../tools/SpatialAverageTool.qml"
                         case "1D FFT":
                             return "../tools/FFT1DTool.qml"
-                        case "2D FFT":
-                            return "../tools/FFT2DTool.qml"
                         case "Curve Smoothing":
                             return "../tools/CurveSmoothingTool.qml"
                         case "Image Smoothing":

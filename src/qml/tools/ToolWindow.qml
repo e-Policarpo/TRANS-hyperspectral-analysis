@@ -39,7 +39,6 @@ DraggableWindow {
     function getToolPath(name) {
         var toolMap = {
             "1D FFT": "FFT1DTool.qml",
-            "2D FFT": "FFT2DTool.qml",
             "Curve Smoothing": "CurveSmoothingTool.qml",
             "Image Smoothing": "ImageSmoothingTool.qml",
             "Derivative Calculator": "DerivativeTool.qml",

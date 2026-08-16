@@ -66,6 +66,39 @@ Window {
     // Window appearance
     color: bgDark
 
+    // A tool window is its own top-level Window, so it does NOT inherit the
+    // application window's palette. Without this, its unstyled controls
+    // (TextField, ComboBox, GroupBox titles …) follow the system appearance —
+    // black text fields inside a light TRANS theme. Mirrors Main.qml.
+    palette.window: bgDark
+    palette.windowText: textLight
+    palette.base: bgDarker
+    palette.alternateBase: bgMedium
+    palette.text: textLight
+    palette.button: bgLight
+    palette.buttonText: textLight
+    palette.highlight: accentPink
+    palette.highlightedText: bgDark
+    palette.placeholderText: textMuted
+    palette.mid: borderColor
+    palette.dark: bgDarker
+    palette.light: bgLight
+    palette.toolTipBase: bgMedium
+    palette.toolTipText: textLight
+
+    // Edge outline. In dark schemes the window fill is close to the canvas
+    // behind it, so without this the tool has no visible boundary.
+    Rectangle {
+        anchors.fill: parent
+        color: "transparent"
+        border.color: borderColor
+        border.width: 1
+        radius: 0
+        z: 200
+        // Chrome only — must never swallow clicks meant for the content.
+        enabled: false
+    }
+
     // Title bar
     Rectangle {
         id: titleBar

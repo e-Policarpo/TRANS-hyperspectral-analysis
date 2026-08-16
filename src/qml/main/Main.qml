@@ -82,7 +82,7 @@ ApplicationWindow {
     property var currentTools: {
         if (currentTabIndex === 0) {
             return [
-                "1D FFT", "2D FFT", "Curve Smoothing", "Image Smoothing",
+                "1D FFT", "Curve Smoothing", "Image Smoothing",
                 "Derivative Calculator", "Curve Fitting", "Gradient Filter",
                 "Integration Utility", "Map Generator", "Spatial Average",
                 "Truncate Data", "Curve Analysis", "Confinement Analysis",
@@ -93,7 +93,7 @@ ApplicationWindow {
                 "Spectral Axis Converter", "Multi-Peak Fitting"
             ]
         } else if (currentTabIndex === 1) {
-            return ["Confinement Analysis", "Spectral Features", "2D FFT", "Image Smoothing", "Gradient Filter", "Map Discretizer", "Map Processing"]
+            return ["Confinement Analysis", "Spectral Features", "Image Smoothing", "Gradient Filter", "Map Discretizer", "Map Processing"]
         }
         return []
     }
@@ -113,6 +113,30 @@ ApplicationWindow {
     property color textLight: "#ffffff"       // textPrimary
     property color textMuted: "#cccccc"       // textMuted
     property color borderColor: "#9B4F96"     // borderColor
+
+    // ========== CONTROL PALETTE ==========
+    // Qt Quick Controls that aren't explicitly styled (plain TextField,
+    // ComboBox, Button, GroupBox titles …) fall back to Qt's default palette,
+    // which follows the *system* appearance. On macOS in dark mode that paints
+    // black text fields and dark buttons inside a light TRANS theme. Setting
+    // the window palette makes the Basic style follow the scheme instead; it
+    // propagates to every child item, so tools inherit it without each one
+    // having to restyle its controls.
+    palette.window: bgDark
+    palette.windowText: textLight
+    palette.base: bgDarker            // editable field background
+    palette.alternateBase: bgMedium
+    palette.text: textLight
+    palette.button: bgLight
+    palette.buttonText: textLight
+    palette.highlight: accentPink     // selection
+    palette.highlightedText: bgDark
+    palette.placeholderText: textMuted
+    palette.mid: borderColor
+    palette.dark: bgDarker
+    palette.light: bgLight
+    palette.toolTipBase: bgMedium
+    palette.toolTipText: textLight
 
     // ========== FONT SCALING ==========
     // Global font sizes - components should reference these for consistent scaling
@@ -492,12 +516,6 @@ ApplicationWindow {
             MenuItem {
                 text: "1D FFT"
                 visible: currentTabIndex === 0
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-            MenuItem {
-                text: "2D FFT"
-                visible: currentTabIndex === 0 || currentTabIndex === 1
                 height: visible ? implicitHeight : 0
                 onTriggered: openToolWindow(text)
             }
@@ -1633,7 +1651,6 @@ ApplicationWindow {
         // Map tool names to QML file paths
         var toolMap = {
             "1D FFT": "../tools/FFT1DTool.qml",
-            "2D FFT": "../tools/FFT2DTool.qml",
             "Curve Smoothing": "../tools/CurveSmoothingTool.qml",
             "Image Smoothing": "../tools/ImageSmoothingTool.qml",
             "Derivative Calculator": "../tools/DerivativeTool.qml",
