@@ -18,7 +18,9 @@ import logging
 from PySide6.QtCore import (
     Qt, Signal, Slot, Property, QPointF, QRectF, QObject, QTimer
 )
-from PySide6.QtGui import QImage, QPainter, QColor, QPen, QBrush, QCursor, QFontMetricsF
+from PySide6.QtGui import (
+    QImage, QPainter, QColor, QPen, QBrush, QCursor, QFontMetricsF, QPolygonF
+)
 from PySide6.QtQuick import QQuickPaintedItem
 
 from matplotlib.figure import Figure
@@ -160,7 +162,16 @@ class QMLMapCanvas(QQuickPaintedItem):
         self._colormap: str = 'viridis'
         self._vmin: Optional[float] = None
         self._vmax: Optional[float] = None
-        self._percentile_clip: Tuple[float, float] = (2, 98)
+        # Percentile clip for auto-scaling; (0, 100) shows the full range.
+        #
+        # It used to default to 2-98, which throws away the tails — and in a
+        # computed map the tails ARE the signal. On a bias-versus-position
+        # LDOS map that kept 13% of the value range and drove 4% of the
+        # pixels to a solid end colour: a thresholded-looking image where the
+        # states should stand out. Auto-scale now spans the data; clipping is
+        # available through setPercentileClip for scans where a railed pixel
+        # would otherwise flatten everything.
+        self._percentile_clip: Tuple[float, float] = (0.0, 100.0)
         self._image_handle = None
 
         # Tool state
@@ -213,6 +224,13 @@ class QMLMapCanvas(QQuickPaintedItem):
         # the map data grid (col = STS pixel x, row = STS pixel y).
         self._sts_markers: list = []
         self._show_sts_markers: bool = True
+        # Line-scan outlines: each {'label': str, 'path': [{'row','col'}, …]}.
+        # Drawn under the dots so a line reads as one acquisition instead of a
+        # row of unrelated points.
+        self._sts_lines: list = []
+        # Optional per-axis description for the cursor read-out (a kymograph's
+        # axes are different quantities). None → fall back to _phys_extent.
+        self._axis_meta: Optional[dict] = None
         # Indices of currently-selected STS markers (their spectra are plotted).
         self._sts_selected: set = set()
         # ``index`` of the STS marker currently under the cursor (hover popup),
@@ -337,6 +355,25 @@ class QMLMapCanvas(QQuickPaintedItem):
         """Auto-scale using percentile clipping"""
         self._vmin = None
         self._vmax = None
+        self._needs_redraw = True
+        self.update()
+
+    @Slot(float, float)
+    def setPercentileClip(self, low: float, high: float):
+        """Set the auto-scale clip, in percent (0, 100 = the full range).
+
+        Out-of-order or out-of-range values are ignored rather than producing
+        an inverted colour scale.
+        """
+        try:
+            low, high = float(low), float(high)
+        except (TypeError, ValueError):
+            return
+        if not (0.0 <= low < high <= 100.0):
+            logger.warning("Ignoring percentile clip (%s, %s): expected "
+                           "0 <= low < high <= 100", low, high)
+            return
+        self._percentile_clip = (low, high)
         self._needs_redraw = True
         self.update()
 
@@ -701,6 +738,92 @@ class QMLMapCanvas(QQuickPaintedItem):
         self._needs_redraw = True
         self.update()
 
+    def _sts_marker_obstacles(self, fm) -> list:
+        """Rectangles the line tags must stay off: every dot and its number.
+
+        A tag parked on the points hides the very data it names, so the dots
+        and their labels are treated as occupied space when a chip is placed.
+        """
+        if not (self._show_sts_markers and self._sts_markers
+                and self._data_to_pixel is not None):
+            return []
+        rects, th = [], fm.height()
+        for mk in self._sts_markers:
+            x, y = self._dataToPixel(mk['row'], mk['col'])
+            r = 9.0                        # the largest dot radius drawn
+            rects.append(QRectF(x - r, y - r, 2 * r, 2 * r))
+            label = mk.get('label', '')
+            if label:
+                rects.append(QRectF(x + r, y - r - 2 - th,
+                                    fm.horizontalAdvance(label) + 2, th))
+        return rects
+
+    @staticmethod
+    def _chip_candidates(pts, width, height, canvas_w, canvas_h) -> list:
+        """Places a line's tag could sit, best first.
+
+        Anchored beside the line's start, end and middle — above and below —
+        so a horizontal line's tag has somewhere to go that is not on top of
+        the line itself.
+        """
+        gap = 12.0
+        anchors = [pts[0], pts[-1], pts[len(pts) // 2]]
+        candidates = []
+        for ax, ay in anchors:
+            for dy in (-(height + gap), gap, -(height + gap) * 2, gap * 2 + height):
+                for dx in (gap, -(width + gap)):
+                    x = min(max(0.0, ax + dx), max(0.0, canvas_w - width))
+                    y = min(max(0.0, ay + dy), max(0.0, canvas_h - height))
+                    candidates.append(QRectF(x, y, width, height))
+        return candidates
+
+    @staticmethod
+    def _place_chip(candidates, blockers) -> QRectF:
+        """First candidate that hits nothing; failing that, the least-covered.
+
+        Never returns None: with a crowded canvas a tag still has to be
+        drawn, so the least-bad spot wins rather than the label vanishing.
+        """
+        if not candidates:
+            return QRectF()
+        if not blockers:
+            return candidates[0]
+
+        best, best_overlap = None, None
+        for chip in candidates:
+            overlap = 0.0
+            for other in blockers:
+                hit = chip.intersected(other)
+                if not hit.isEmpty():
+                    overlap += hit.width() * hit.height()
+            if overlap == 0.0:
+                return chip
+            if best_overlap is None or overlap < best_overlap:
+                best, best_overlap = chip, overlap
+        return best
+
+    @Slot("QVariantList")
+    def setStsLines(self, lines):
+        """Set the line-scan outlines drawn over this scan image.
+
+        ``lines`` is a list of ``{'label': str, 'path': [{'row','col'}, …]}``
+        in map-grid coordinates. Pass an empty list to clear.
+        """
+        cleaned = []
+        for ln in lines or []:
+            path = []
+            for pt in (ln.get('path') or []):
+                try:
+                    path.append((int(pt['row']), int(pt['col'])))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            if len(path) < 2:
+                continue
+            cleaned.append({'label': str(ln.get('label', '')), 'path': path})
+        self._sts_lines = cleaned
+        self._needs_redraw = True
+        self.update()
+
     @Slot("QVariantList")
     def setSelectedStsMarkers(self, indices):
         """Highlight the given STS marker indices as selected (spectra plotted)."""
@@ -908,6 +1031,67 @@ class QMLMapCanvas(QQuickPaintedItem):
             self._phys_extent = None
         self._needs_redraw = True
         self.update()
+
+    @Slot('QVariantMap')
+    def setAxisMetadata(self, meta):
+        """Describe the axes for the cursor read-out.
+
+        ``{'x_size', 'x_unit', 'x_offset', 'y_size', 'y_unit', 'y_offset'}``,
+        any subset. This exists because the two axes of a kymograph are
+        different quantities — position across, bias up — which
+        :meth:`setPhysicalExtent` cannot express (it carries one unit for
+        both, and the tick labels still use it). Pass an empty map to clear.
+        """
+        if not meta:
+            self._axis_meta = None
+        else:
+            self._axis_meta = {k: meta.get(k) for k in
+                               ('x_size', 'x_unit', 'x_offset',
+                                'y_size', 'y_unit', 'y_offset')}
+        self._needs_redraw = True
+        self.update()
+
+    @Slot(int, int, result='QVariantMap')
+    def physicalAt(self, row: int, col: int):
+        """Where a pixel sits on the physical axes.
+
+        Returns ``{'valid', 'x', 'y', 'unit'}``; ``valid`` is False when the
+        map has no physical extent (an uncalibrated import), so callers show
+        pixel indices instead of inventing a position. Coordinates are taken
+        at the CENTRE of the pixel — a pixel covers a span, and its edge is
+        not where the measurement was made.
+        """
+        empty = {'valid': False, 'x': 0.0, 'y': 0.0,
+                 'x_unit': '', 'y_unit': '', 'unit': ''}
+        if self._map_data is None:
+            return empty
+        rows, cols = self._map_data.shape
+        if not (0 <= row < rows and 0 <= col < cols):
+            return empty
+
+        meta = self._axis_meta
+        if meta:
+            x_size = float(meta.get('x_size') or cols)
+            y_size = float(meta.get('y_size') or rows)
+            x_unit = str(meta.get('x_unit') or '')
+            y_unit = str(meta.get('y_unit') or '')
+            x_offset = float(meta.get('x_offset') or 0.0)
+            y_offset = float(meta.get('y_offset') or 0.0)
+        elif self._phys_extent is not None:
+            x_size, y_size, unit = self._phys_extent
+            x_unit = y_unit = unit
+            x_offset = y_offset = 0.0
+        else:
+            return empty
+
+        return {
+            'valid': True,
+            'x': x_offset + (col + 0.5) * float(x_size) / cols,
+            'y': y_offset + (row + 0.5) * float(y_size) / rows,
+            'x_unit': x_unit,
+            'y_unit': y_unit,
+            'unit': x_unit,          # kept for callers that assume one unit
+        }
 
     @Slot()
     def clearPhysicalExtent(self):
@@ -1360,6 +1544,60 @@ class QMLMapCanvas(QQuickPaintedItem):
                 int(px_left), int(px_top),
                 int(px_right - px_left), int(px_bottom - px_top)
             )
+
+        # Outline each line scan first, so the dots sit on top of it: a wide
+        # translucent band along the acquisition path, a thin bright edge, and
+        # a tag naming the line ("line1 · 57pts ×3 · pt20→pt76").
+        if (self._show_sts_markers and self._sts_lines
+                and self._data_to_pixel is not None):
+            # A tag must clear the points it names, their index labels, and
+            # any tag already placed — two acquisitions can share one path,
+            # so their tags would otherwise land on each other.
+            placed_chips = list(self._sts_marker_obstacles(painter.fontMetrics()))
+            for ln in self._sts_lines:
+                pts = [self._dataToPixel(r, c) for r, c in ln['path']]
+                poly = QPolygonF([QPointF(x, y) for x, y in pts])
+
+                band = QPen(QColor(91, 206, 250, 70))     # accent blue, soft
+                band.setWidth(14)
+                band.setCapStyle(Qt.RoundCap)
+                band.setJoinStyle(Qt.RoundJoin)
+                painter.setBrush(Qt.NoBrush)
+                painter.setPen(band)
+                painter.drawPolyline(poly)
+
+                edge = QPen(QColor(91, 206, 250, 220))
+                edge.setWidth(2)
+                edge.setCapStyle(Qt.RoundCap)
+                painter.setPen(edge)
+                painter.drawPolyline(poly)
+
+                # End caps mark where the line starts and stops.
+                for x, y in (pts[0], pts[-1]):
+                    painter.drawEllipse(QRectF(x - 7, y - 7, 14, 14))
+
+                label = ln.get('label', '')
+                if not label:
+                    continue
+                # Tag beside the start of the line, in a chip so it stays
+                # readable over bright topography.
+                font = painter.font()
+                font.setBold(True)
+                painter.setFont(font)
+                fm = painter.fontMetrics()
+                tw = fm.horizontalAdvance(label)
+                th = fm.height()
+                pad = 4
+                chip = self._place_chip(
+                    self._chip_candidates(pts, tw + 2 * pad, th + 2 * pad,
+                                          self.width(), self.height()),
+                    placed_chips)
+                placed_chips.append(chip)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(QColor(20, 20, 30, 225)))
+                painter.drawRoundedRect(chip, 4, 4)
+                painter.setPen(QPen(QColor(91, 206, 250, 255)))
+                painter.drawText(chip, Qt.AlignCenter, label)
 
         # Draw STS point markers — where spectra were taken on this scan image.
         # Selected dots (whose spectrum is on the plot) are drawn bigger with a

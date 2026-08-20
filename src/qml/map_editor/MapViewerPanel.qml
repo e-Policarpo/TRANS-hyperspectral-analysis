@@ -168,11 +168,11 @@ Rectangle {
 
                     onPointClicked: function(x, y, row, col, value) {
                         mapViewerPanel.mapClicked(row, col, value)
-                        coordLabel.text = "(" + row + ", " + col + ") = " + value.toFixed(6)
+                        coordLabel.text = mapViewerPanel.formatCursor(row, col, value)
                     }
 
                     onCursorMoved: function(x, y, row, col, value) {
-                        coordLabel.text = "(" + row + ", " + col + ") = " + value.toFixed(6)
+                        coordLabel.text = mapViewerPanel.formatCursor(row, col, value)
                     }
                 }
 
@@ -685,6 +685,47 @@ Rectangle {
     }
 
     // Functions
+    // Cursor read-out. Physical coordinates when the map carries a scale —
+    // a position on the sample means something, a pixel index does not — with
+    // the pixel indices kept alongside so a point can still be identified in
+    // the data. Falls back to indices for an uncalibrated map rather than
+    // implying a scale that is not there.
+    function formatCursor(row, col, value) {
+        var phys = mapCanvas.physicalAt(row, col)
+        var head = "(" + row + ", " + col + ")"
+        if (phys && phys.valid) {
+            // Each axis with its own unit: a kymograph is distance across and
+            // bias up, not two lengths.
+            head = formatAxis(phys.x, phys.x_unit) + ", " +
+                   formatAxis(phys.y, phys.y_unit) +
+                   "  [" + row + ", " + col + "]"
+        }
+        return head + " = " + formatValue(value)
+    }
+
+    // One axis value. Lengths are shown in the unit that keeps the number
+    // readable (nm for a scan, µm for a large window) rather than 3.05e-07 m;
+    // anything else (a bias axis, say) keeps its own unit.
+    function formatAxis(value, unit) {
+        if (unit === "V" || unit === "mV" || unit === "eV" || unit === "meV")
+            return value.toFixed(4) + " " + unit
+        if (unit !== "m")
+            return value.toFixed(2) + (unit ? " " + unit : "")
+        var abs = Math.abs(value)
+        if (abs >= 1e-3) return (value * 1e3).toFixed(3) + " mm"
+        if (abs >= 1e-6) return (value * 1e6).toFixed(3) + " µm"
+        if (abs >= 1e-9) return (value * 1e9).toFixed(2) + " nm"
+        if (abs === 0) return "0 nm"
+        return (value * 1e12).toFixed(1) + " pm"
+    }
+
+    function formatValue(value) {
+        var abs = Math.abs(value)
+        if (abs !== 0 && (abs < 1e-3 || abs >= 1e5))
+            return value.toExponential(3)
+        return value.toFixed(6)
+    }
+
     function loadMapData(data, name, path) {
         mapName = name || "Untitled"
         sourcePath = path || ""

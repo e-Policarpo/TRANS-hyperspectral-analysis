@@ -25,6 +25,7 @@ from src.processing.spectral_features import (
 )
 from src.processing.peak_detection import (
     Analysis,
+    noise_sigma,
     POLYNOMIAL_BASES,
     als_baseline,
     analyze_many,
@@ -62,8 +63,53 @@ logger = logging.getLogger(__name__)
 #: Must stay in step with the ConfinementAnalysis node definition; a test
 #: asserts they agree.
 CONFINEMENT_DEFAULTS = {
-    'baseline': 'poly-iter',
+    # Measured against planted states (synthetic STS, 15 runs x 4 states) at
+    # the amplitude that matters — a state ~1% of the band-edge height:
+    #
+    #   poly-iter d5, any threshold      0% of states found, 2.0 invented
+    #   arpls + noise 2 sigma          100% of states found, 0.0 invented
+    #   arpls + noise 3 sigma           92% of states found, 0.0 invented
+    #
+    # ModPoly cannot follow an exponential band edge, so it either sits far
+    # off it (burying weak states in residual) or absorbs them. arPLS fits in
+    # log space, where that edge is nearly straight. It costs ~9 ms/spectrum
+    # against ModPoly's 3.8 ms.
+    'baseline': 'arpls',
+    'height': 2.0,
     'smooth_points': 2,
+    # Measured against planted states (synthetic STS, 15 runs x 4 states) and
+    # on real 4.5 K line-scan data:
+    #
+    # 'range' and 'prominence' both scale their threshold by the corrected
+    # curve's SPAN, which the band edges set — so on a real spectrum 5% of it
+    # rejects genuine in-gap states. 'noise' compares each peak's prominence
+    # with the spectrum's own noise instead: scale-free, so weak states in a
+    # quiet spectrum survive. `height` is then a multiple of sigma, not a
+    # percentage.
+    'height_mode': 'noise',
+}
+
+
+#: Map Generator defaults, on top of CONFINEMENT_DEFAULTS. Measured on
+#: synthetic dI/dV line scans with planted states (3 states, known spatial
+#: profiles) and checked against real 4.5 K data.
+#:
+#: ``height`` 3σ rather than the 2σ used for peak analysis: both find states
+#: down to an amplitude of 2σ, but 3σ carries 40% more of the map's weight in
+#: the real states and reports 2.6x fewer bins (20 vs 53 on isolated states);
+#: 5σ starts missing the weakest ones. On dense real data the three are within
+#: a few percent, so the stricter one costs nothing there.
+#:
+#: ``noise_floor`` 1σ: it zeroes the 39% of cells that were pure noise while
+#: keeping 99.4% of the signal weight. Higher floors buy little and start
+#: eating real weight (96.3% at 3σ).
+#:
+#: ``min_spectra_per_bin`` stays 1: a state living at a single position along
+#: the line is exactly what these maps are for, and 2 would hide it.
+MAP_DEFAULTS = {
+    'height': 3.0,
+    'noise_floor': 1.0,
+    'min_spectra_per_bin': 1,
 }
 
 
@@ -291,6 +337,7 @@ class ToolImplementations:
                 scan_mode=spectral_data.metadata.scan_mode,
                 units=spectral_data.metadata.units.copy(),
                 additional_info={
+                    **self._carry_spatial_info(spectral_data.metadata),
                     'smoothing': smoothing_type,
                     'window_size': window_size,
                     'original': dataset_name
@@ -720,6 +767,7 @@ class ToolImplementations:
                 units={'independent': spectral_data.metadata.units.get('independent', 'V'),
                       'dependent': 'a.u.'},
                 additional_info={
+                    **self._carry_spatial_info(spectral_data.metadata),
                     'derivative_order': order,
                     'original': dataset_name
                 }
@@ -1188,6 +1236,7 @@ class ToolImplementations:
                 scan_mode=spectral_data.metadata.scan_mode,
                 units=spectral_data.metadata.units.copy(),
                 additional_info={
+                    **self._carry_spatial_info(spectral_data.metadata),
                     'baseline_correction': fit_type,
                     'original': dataset_name
                 }
@@ -1212,7 +1261,75 @@ class ToolImplementations:
     # Map Generator
     # ========================================================================
 
-    def generate_map(self, task, flat_dataset_name: str, value_index: int = 0) -> str:
+    #: Scan paths the map builder understands. "auto" reads the dataset's
+    #: own scan_mode, which is what every pre-existing caller relied on.
+    SCAN_TYPES = ('auto', 'map_meander', 'map_raster', 'line')
+
+    def _resolve_scan_type(self, scan_type: str, metadata) -> str:
+        """Turn 'auto' into the concrete path this dataset was acquired on.
+
+        A line scan has no second spatial axis, so folding it into rows would
+        silently produce nonsense; it is recognised here and mapped to a
+        single-row strip instead.
+        """
+        scan_type = (scan_type or 'auto').strip().lower()
+        if scan_type in self.SCAN_TYPES and scan_type != 'auto':
+            return scan_type
+
+        info = getattr(metadata, 'additional_info', None) or {}
+        dims = tuple(getattr(metadata, 'dimensions', ()) or ())
+        layout = str(info.get('spatial_layout', '')).lower()
+        mode = str(getattr(metadata, 'scan_mode', '') or '').lower()
+
+        if layout == 'line' or mode == 'line' or (len(dims) == 2 and 1 in dims):
+            return 'line'
+        if mode == 'meander' and not info.get('meander_corrected', False):
+            return 'map_meander'
+        return 'map_raster'
+
+    @staticmethod
+    def _reshape_map_values(values: np.ndarray, dims, scan_type: str) -> np.ndarray:
+        """Lay a per-spectrum value array out as a 2-D field.
+
+        ``dims`` is (width, height) as carried on the metadata. Rows are
+        flipped so the first acquired row ends up at the bottom, matching the
+        orientation the maps have always been exported in.
+
+        - ``map_meander``: odd rows were acquired right-to-left, so they are
+          reversed — without this every other row is mirrored.
+        - ``map_raster``: straight row-major fill.
+        - ``line``: a single row, whatever ``dims`` claims.
+        """
+        values = np.asarray(values, dtype=np.float64).ravel()
+
+        if scan_type == 'line':
+            return values.reshape(1, values.size)
+
+        dim_h, dim_v = int(dims[0]), int(dims[1])
+        expected = dim_h * dim_v
+        if values.size != expected:
+            if expected and values.size % expected == 0:
+                # Multi-channel payload (e.g. SNOM amplitude+phase): map the
+                # first channel rather than refusing outright.
+                n_channels = values.size // expected
+                logger.warning("Map values are %dx the %dx%d grid; using the "
+                               "first channel", n_channels, dim_h, dim_v)
+                values = values[:expected]
+            else:
+                raise ValueError(
+                    f"Data length {values.size} doesn't match dimensions "
+                    f"{dim_h}x{dim_v}={expected} and is not a clean multiple")
+
+        map_data = np.zeros((dim_v, dim_h), dtype=np.float64)
+        for row in range(dim_v):
+            chunk = values[row * dim_h:(row + 1) * dim_h]
+            if scan_type == 'map_meander' and row % 2 == 1:
+                chunk = chunk[::-1]
+            map_data[dim_v - row - 1, :] = chunk
+        return map_data
+
+    def generate_map(self, task, flat_dataset_name: str, value_index: int = 0,
+                     scan_type: str = 'auto') -> str:
         """
         Generate spatial map from flat data for a single value column.
 
@@ -1259,50 +1376,9 @@ class ToolImplementations:
 
             logger.info(f"Got {len(flat_values)} flat values for value index {value_index}")
 
-            # Verify data length matches dimensions
-            expected_len = dim_h * dim_v
-            actual_len = len(flat_values)
-
-            # Handle multi-channel SNOM data: if data length is a multiple of expected,
-            # it might contain multiple channels concatenated
-            if actual_len != expected_len:
-                # Check if it's a clean multiple (e.g., 2x for amplitude+phase)
-                if actual_len % expected_len == 0:
-                    n_channels = actual_len // expected_len
-                    logger.warning(f"Data length {actual_len} is {n_channels}x expected {expected_len}. "
-                                 f"Using first channel only (may indicate multi-channel data)")
-                    # Take only first channel's worth of data
-                    flat_values = flat_values[:expected_len]
-                else:
-                    raise ValueError(f"Data length {actual_len} doesn't match "
-                                   f"dimensions {dim_h}x{dim_v}={expected_len} and is not a clean multiple")
-
-            # Reconstruct map with proper meander correction (matching old TRANS_v3 behavior)
-            # The old code manually reversed odd rows during map creation
-            map_data = np.zeros((dim_v, dim_h))
-            index = 0
-
-            for row in range(dim_v):
-                # Flip vertically: bottom row becomes top row
-                real_row = dim_v - row - 1
-
-                # Check if original data had meander pattern
-                # If data was already meander-corrected, use straight indexing
-                # If not, reverse odd rows
-                scan_mode = spectral_data.metadata.scan_mode
-                was_corrected = spectral_data.metadata.additional_info.get('meander_corrected', False)
-
-                if scan_mode == 'meander' and not was_corrected:
-                    # Reverse odd rows for uncorrected meander data
-                    if row % 2 == 1:
-                        map_data[real_row, :] = flat_values[index:index + dim_h][::-1]
-                    else:
-                        map_data[real_row, :] = flat_values[index:index + dim_h]
-                else:
-                    # Data already corrected or not meander - use straight indexing
-                    map_data[real_row, :] = flat_values[index:index + dim_h]
-
-                index += dim_h
+            path = self._resolve_scan_type(scan_type, spectral_data.metadata)
+            map_data = self._reshape_map_values(flat_values, (dim_h, dim_v), path)
+            logger.info("Map laid out as %s -> shape %s", path, map_data.shape)
 
             # Create output path base with clean name
             base_name = self._extract_clean_base_name(flat_dataset_name)
@@ -1322,13 +1398,12 @@ class ToolImplementations:
             map_basename = f"{file_safe_name}_Map_{value_str}"
             output_base = self._ensure_output_dir('maps') / map_basename
 
-            # Save as images
+            # Writes the calibrated TIFF/GSF and the CSV. (This used to be
+            # followed by a second, pandas CSV write to the same path, which
+            # overwrote the first with a header row; both map paths now leave
+            # the same headerless grid.)
             self._save_map_images(map_data, output_base,
                                   source_metadata=spectral_data.metadata)
-
-            # Save numerical data as CSV
-            csv_path = output_base.with_suffix('.csv')
-            pd.DataFrame(map_data).to_csv(csv_path, index=False)
 
             logger.info(f"Map saved with base name: {output_base}")
             return str(output_base)
@@ -1337,8 +1412,673 @@ class ToolImplementations:
             logger.error(f"Map generation error: {e}", exc_info=True)
             raise
 
+    # -- intervals -----------------------------------------------------------
+
+    #: Metadata keys under which a dataset may carry integration intervals.
+    #: ``integration_intervals`` is what Confinement Analysis writes;
+    #: ``intervals`` is what the Integration tool has always written.
+    INTERVAL_KEYS = ('integration_intervals', 'intervals')
+
+    def dataset_intervals(self, dataset_name: str) -> list:
+        """Integration intervals carried by a dataset, as ``[[lo, hi], …]``.
+
+        This is how the Map Generator picks up the intervals a Confinement
+        Analysis run already found, instead of the user exporting a JSON file
+        and loading it back.
+        """
+        dataset = self._datasets.get(dataset_name)
+        if dataset is None:
+            return []
+        info = getattr(dataset.metadata, 'additional_info', None) or {}
+        for key in self.INTERVAL_KEYS:
+            raw = info.get(key)
+            if not raw:
+                continue
+            out = []
+            for item in raw:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    try:
+                        out.append([float(item[0]), float(item[1])])
+                    except (TypeError, ValueError):
+                        continue
+                elif isinstance(item, str) and '_' in item:
+                    # Legacy "0.100_0.200" strings from older projects.
+                    lo, _, hi = item.partition('_')
+                    try:
+                        out.append([float(lo), float(hi)])
+                    except ValueError:
+                        continue
+            if out:
+                return out
+        return []
+
+    def detect_map_intervals(self, task, dataset_name: str,
+                             params: Optional[dict] = None) -> list:
+        """Find the integration intervals for a dataset by peak detection.
+
+        Runs exactly the Confinement Analysis pass — same background
+        correction, same peak search — and then, with a temperature set,
+        **takes the occupied k_B*T/2 bins as the intervals**, which is the
+        grid Confinement Analysis reports its occupancy table on. The two
+        tools therefore agree on where the confined states are, and each map
+        covers one state at the resolution the temperature justifies.
+
+        Without a temperature there are no bins, so it falls back to merging
+        the peaks' FWHM bands. That fallback is lossy — overlapping bands fuse
+        into a few wide ones (on 4.5 K line-scan data: 206 occupied bins
+        against 3 merged bands, one of them a quarter of the sweep) — which is
+        why binning is preferred.
+
+        Returns ``[[lo, hi], …]``.
+        """
+        if dataset_name not in self._datasets:
+            self.errorOccurred.emit("Error", "Dataset not found")
+            return []
+
+        spectral_data = self._datasets[dataset_name]
+        independent_var = np.asarray(spectral_data.independent_var, dtype=np.float64)
+        spectra = np.asarray(spectral_data.spectra.values, dtype=np.float64)
+
+        params = {**MAP_DEFAULTS, **(params or {})}
+        detect_params = params_from_dict({**CONFINEMENT_DEFAULTS, **params})
+        detect_params.validate()
+        if detect_params.thermal_width > 0 and not detect_params.min_distance:
+            detect_params.min_distance = detect_params.thermal_width
+
+        results = analyze_many(
+            independent_var, spectra, detect_params,
+            should_cancel=lambda: bool(getattr(task, 'cancelled', False)),
+        )
+        if len(results) < spectra.shape[1]:
+            logger.info("Map interval detection cancelled after %d/%d spectra",
+                        len(results), spectra.shape[1])
+            return []
+
+        # -- one interval per occupied bin ---------------------------------
+        #
+        # The bin is the coarser of the two resolutions in play: k_B*T/2 (what
+        # the temperature justifies) and the sweep's own step (what the
+        # measurement actually resolves). Going finer than the step produces
+        # neighbouring bins that integrate the same two samples — duplicate
+        # maps that only look like extra information.
+        step = float(np.median(np.abs(np.diff(independent_var)))) if independent_var.size > 1 else 0.0
+        width = detect_params.bin_width
+        if width <= 0:
+            width, why = step, "no temperature set — using the sweep's own step"
+        elif step > 0 and width < step:
+            width, why = step, "k_B*T/2 is finer than the sweep step"
+        else:
+            why = "k_B*T/2"
+
+        if width <= 0:
+            logger.warning("Map Generator: cannot bin %s — no usable bias axis",
+                           dataset_name)
+            return []
+
+        edges, _centers = energy_bins(independent_var, width)
+        # How many spectra have a peak in each bin, so thinly-populated bins
+        # can be dropped without touching the energy grid.
+        spectra_per_bin: Dict[int, int] = {}
+        for result in results:
+            for bin_index, _peak, _merged in group_peaks_by_bin(result.peaks, edges):
+                spectra_per_bin[int(bin_index)] = spectra_per_bin.get(int(bin_index), 0) + 1
+
+        min_spectra = max(1, int(float((params or {}).get('min_spectra_per_bin', 1) or 1)))
+        occupied = sorted(b for b, n in spectra_per_bin.items() if n >= min_spectra)
+        intervals = [[float(edges[b]), float(edges[b + 1])] for b in occupied]
+        logger.info("Map Generator: %d peak(s) over %d spectra -> %d occupied bin(s) "
+                    "of %.4g (%s), %d kept at >=%d spectra",
+                    sum(len(r.peaks) for r in results), spectra.shape[1],
+                    len(spectra_per_bin), width, why, len(intervals), min_spectra)
+        return intervals
+
+    def _resolve_map_intervals(self, task, dataset_name: str,
+                               params: dict) -> list:
+        """Intervals for a map run, from whichever source the user picked."""
+        source = str(params.get('interval_source', 'detect')).lower()
+
+        if source in ('manual', 'given', 'list'):
+            return self._clean_intervals(params.get('intervals'))
+
+        if source in ('dataset', 'analysis', 'confinement'):
+            name = params.get('intervals_from') or dataset_name
+            found = self.dataset_intervals(name)
+            if not found:
+                # Fall back to whatever the caller passed, so a stale pick
+                # doesn't silently produce zero maps.
+                found = self._clean_intervals(params.get('intervals'))
+            return found
+
+        return self.detect_map_intervals(task, dataset_name, params)
+
+    @staticmethod
+    def _interval_grid(bounds: list, tol: float = 0.02):
+        """``(bin_width, on_a_grid)`` for a sorted list of ``[lo, hi]``.
+
+        True when every interval has the same width and every start sits a
+        whole number of widths from the first — i.e. they are bins of one
+        grid, which is what the detected intervals always are. Hand-entered
+        intervals usually are not, and must not be forced onto one.
+        """
+        if len(bounds) < 2:
+            return (float(bounds[0][1] - bounds[0][0]) if bounds else 0.0, False)
+        widths = np.array([hi - lo for lo, hi in bounds], dtype=np.float64)
+        width = float(np.median(widths))
+        if width <= 0:
+            return 0.0, False
+        if np.any(np.abs(widths - width) > tol * width):
+            return width, False
+        starts = np.array([lo for lo, _hi in bounds], dtype=np.float64)
+        steps = (starts - starts[0]) / width
+        if np.any(np.abs(steps - np.round(steps)) > tol):
+            return width, False
+        return width, True
+
+    @staticmethod
+    def _clean_intervals(raw) -> list:
+        out = []
+        for item in raw or []:
+            if isinstance(item, dict):
+                lo, hi = item.get('lower', item.get('start')), item.get('upper', item.get('end'))
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                lo, hi = item[0], item[1]
+            else:
+                continue
+            try:
+                lo, hi = float(lo), float(hi)
+            except (TypeError, ValueError):
+                continue
+            if hi < lo:
+                lo, hi = hi, lo
+            if hi > lo:
+                out.append([lo, hi])
+        return out
+
+    def generate_maps_from_spectra(self, task, dataset_name: str,
+                                   params: Optional[dict] = None) -> dict:
+        """Background-correct, integrate over V intervals, and map the result.
+
+        One pass over the spectra replaces the old three-step detour (export
+        peak intervals to JSON → background-correct by hand → integrate →
+        map): the background comes off with the same polynomial/ALS machinery
+        Confinement Analysis uses, the intervals come from that same peak
+        search (or from a previous run's results), and each interval's
+        integral becomes one map.
+
+        Outputs are unchanged: one calibrated ``.tiff`` (+ ``.gsf``/``.csv``)
+        per interval, via the usual export path.
+        """
+        params = {**MAP_DEFAULTS, **(params or {})}
+        empty = {'map_paths': [], 'intervals': [], 'values_dataset': '',
+                 'interval_map': '', 'interval_map_path': '', 'output_folder': '',
+                 'scan_type': '', 'n_maps': 0}
+        try:
+            if dataset_name not in self._datasets:
+                self.errorOccurred.emit("Error", "Dataset not found")
+                return empty
+
+            spectral_data = self._datasets[dataset_name]
+            independent_var = np.asarray(spectral_data.independent_var, dtype=np.float64)
+            spectra = np.asarray(spectral_data.spectra.values, dtype=np.float64)
+            n_samples, n_spectra = spectra.shape
+
+            scan_type = self._resolve_scan_type(params.get('scan_type', 'auto'),
+                                                spectral_data.metadata)
+            dims = params.get('dimensions') or spectral_data.metadata.dimensions
+            dims = (int(dims[0]), int(dims[1])) if len(dims) >= 2 else (n_spectra, 1)
+
+            intervals = self._resolve_map_intervals(task, dataset_name, params)
+            if task.cancelled:
+                return empty
+            if not intervals:
+                self.errorOccurred.emit(
+                    "Map Generator",
+                    "No integration intervals — detect peaks, pick an analysis "
+                    "result, or enter intervals by hand.")
+                return empty
+
+            logger.info("Map Generator: %s — %d spectra, %s layout %s, %d interval(s)",
+                        dataset_name, n_spectra, scan_type, dims, len(intervals))
+
+            # Background correction: the integral must measure the state, not
+            # the band edge under it, so the same correction the peak search
+            # ran on is what gets integrated.
+            detect_params = params_from_dict({**CONFINEMENT_DEFAULTS, **params})
+            detect_params.validate()
+            corrected = spectra
+            spectrum_sigma = np.zeros(n_spectra)
+            if detect_params.baseline != 'none':
+                results = analyze_many(
+                    independent_var, spectra, detect_params,
+                    should_cancel=lambda: bool(getattr(task, 'cancelled', False)),
+                )
+                if len(results) < n_spectra:
+                    logger.info("Map Generator cancelled during background correction")
+                    return empty
+                corrected = np.array([
+                    _expand(r.y_raw - r.baseline, r.idx, n_samples)
+                    if r.baseline.size == r.y_raw.size
+                    else _expand(r.y_raw, r.idx, n_samples)
+                    for r in results]).T
+                spectrum_sigma = np.array([
+                    noise_sigma(r.y_raw - r.baseline)
+                    if r.baseline.size == r.y_raw.size else noise_sigma(r.y_raw)
+                    for r in results])
+            else:
+                spectrum_sigma = np.array([noise_sigma(spectra[:, i])
+                                           for i in range(n_spectra)])
+
+            base_name = self._extract_clean_base_name(dataset_name)
+            file_safe_name = self._sanitize_filename(base_name)
+            columns = list(spectral_data.spectra.columns)
+
+            # An interval narrower than the sweep's own step holds one sample
+            # or none, and integrating that returns exactly zero — every map
+            # came out blank. Thermal bins are routinely finer than the bias
+            # resolution (0.19 mV bins on a 4.7 mV grid at 4.5 K), so the
+            # window is widened to the measurement's resolution while the
+            # interval keeps naming the state it belongs to.
+            steps = np.abs(np.diff(independent_var))
+            steps = steps[steps > 0]
+            dx = float(np.median(steps)) if steps.size else 0.0
+            min_width = 2.0 * dx
+            widened = 0
+
+            folders = self._map_output_folders(dataset_name)
+
+            # Noise floor, in multiples of each spectrum's own sigma. Only
+            # what stands above it is integrated.
+            #
+            # Without one, a bin holding no state integrates pure noise, which
+            # is negative half the time — on real dI/dV line scans 41% of the
+            # map's cells came out negative, carrying |weight| comparable to
+            # the real states. That is not a background that can be fitted
+            # better: the row medians sit 6x below the within-row scatter, so
+            # there is no systematic overshoot to remove. At 1 sigma the
+            # negatives vanish, the states keep their weight, and the empty
+            # bins collapse to ~0 — the map shows spectral weight instead of
+            # the noise floor. 0 restores the raw signed integral.
+            noise_floor = max(0.0, float(params.get('noise_floor', 1.0) or 0.0))
+
+            # Real positions along the line, so a map's x axis is distance
+            # rather than a column index. Left unset for area scans, whose
+            # geometry the metadata already describes.
+            positions = (self._line_positions_m(spectral_data)
+                         if scan_type == 'line' else None)
+            position_step = (self._line_step_m(spectral_data)
+                             if scan_type == 'line' else None)
+            value_unit = (spectral_data.metadata.units or {}).get('dependent')
+
+            map_scale = None
+            if position_step:
+                map_scale = {'dx': position_step, 'dy': position_step,
+                             'unit': 'm', 'value_unit': value_unit,
+                             'x_offset': float(positions[0]) if positions is not None else 0.0,
+                             'axis_note': 'x=position (m)'}
+            elif scan_type == 'line':
+                # The loader did not record positions (a dataset re-imported
+                # from CSV, say). The column INDEX is still a real axis, so it
+                # is written as one rather than leaving the file dimensionless
+                # — what must never happen is claiming metres we do not have.
+                map_scale = {'dx': 1.0, 'dy': 1.0, 'unit': None,
+                             'value_unit': value_unit, 'mixed_axes': True,
+                             'axis_note': 'x=position (point index)'}
+
+            map_paths, value_columns = [], {}
+            for i, (lo, hi) in enumerate(intervals):
+                if task.cancelled:
+                    return empty
+                task.progress = i / len(intervals)
+
+                lo_w, hi_w = lo, hi
+                if dx > 0 and (hi_w - lo_w) < min_width:
+                    centre = (lo + hi) / 2.0
+                    lo_w, hi_w = centre - dx, centre + dx
+                    widened += 1
+
+                mask = (independent_var >= lo_w) & (independent_var <= hi_w)
+                if np.count_nonzero(mask) < 2:
+                    # Still too narrow to integrate (an edge bin, or a single
+                    # sample): take the nearest two samples so the map carries
+                    # the same quantity as every other map in the run.
+                    nearest = int(np.argmin(np.abs(independent_var - (lo + hi) / 2.0)))
+                    lo_idx = max(0, min(nearest, independent_var.size - 2))
+                    mask = np.zeros(independent_var.size, dtype=bool)
+                    mask[lo_idx:lo_idx + 2] = True
+                if not np.any(mask):
+                    logger.warning("Map Generator: no samples in interval [%g, %g]", lo, hi)
+                    continue
+
+                # NaN-tolerant: a railed sample must not wipe out the integral
+                # of the whole spectrum.
+                block = np.nan_to_num(corrected[mask, :], nan=0.0)
+                if noise_floor > 0:
+                    # Only the part standing above each spectrum's own noise
+                    # counts as spectral weight; the rest is not measurement.
+                    block = np.maximum(block - noise_floor * spectrum_sigma[None, :], 0.0)
+                # np.trapezoid is the NumPy 2 name; this project still runs
+                # on 1.26, where only np.trapz exists.
+                _trapz = getattr(np, 'trapezoid', None) or np.trapz
+                values = _trapz(block, x=independent_var[mask], axis=0)
+
+                label = f"{lo:.3f}_{hi:.3f}"
+                value_columns[label] = values
+
+                map_data = self._reshape_map_values(values, dims, scan_type)
+                output_base = folders['root'] / f"{file_safe_name}_Map_{label}"
+                self._save_map_images(map_data, output_base,
+                                      source_metadata=spectral_data.metadata,
+                                      folders=folders, scale=map_scale)
+                map_paths.append(str(folders['tiff'] / f"{output_base.name}.tiff"))
+
+            # One map joining every interval: x is the position along the
+            # line, y is the interval, indexed by its midpoint. Reading a
+            # column gives that position's spectrum over the states found —
+            # what the per-interval maps cannot show side by side. (A 2-D
+            # grid would need a third axis; not built here.)
+            interval_map_name = ""
+            interval_map_path = ""
+            if len(value_columns) > 1:
+                ordered = sorted(zip(intervals, value_columns.values()),
+                                 key=lambda pair: (pair[0][0] + pair[0][1]) / 2.0)
+
+                # Detected intervals are bins on one uniform grid, and the
+                # occupied ones need not be adjacent. A file's energy axis is
+                # linear, so those rows are laid out on the FULL grid with
+                # ZERO rows where no spectrum had a peak — packing only the
+                # occupied rows together would put every state at the wrong
+                # bias. Hand-entered intervals are usually neither uniform nor
+                # aligned, and then one row per interval is all that can
+                # honestly be claimed.
+                #
+                # Empty bins are written as 0, not NaN: no peak means no
+                # spectral weight at that bias, which is a value. NaN means
+                # "not measured", and viewers render it as a masked or
+                # interpolated region — reading as though something were
+                # there.
+                bounds = [iv for iv, _ in ordered]
+                bin_width, on_a_grid = self._interval_grid(bounds)
+                first_low = float(bounds[0][0])
+
+                if on_a_grid:
+                    def _row_of(interval):
+                        return int(round((interval[0] - first_low) / bin_width))
+
+                    n_rows = _row_of(bounds[-1]) + 1
+                    stack = np.zeros((n_rows, n_spectra), dtype=np.float64)
+                    filled = np.zeros(n_rows, dtype=bool)
+                    for interval, values_for_bin in ordered:
+                        row = _row_of(interval)
+                        stack[row, :] = np.asarray(values_for_bin, dtype=np.float64)
+                        filled[row] = True
+                    empty_rows = int((~filled).sum())
+                    midpoints = first_low + (np.arange(n_rows) + 0.5) * bin_width
+                else:
+                    stack = np.vstack([np.asarray(v, dtype=np.float64)
+                                       for _, v in ordered])
+                    midpoints = np.array([(lo + hi) / 2.0 for lo, hi in bounds])
+                    n_rows = stack.shape[0]
+                    empty_rows = 0
+
+                if empty_rows:
+                    logger.info("Interval map: %d of %d rows are empty bins, "
+                                "written as zero (kept so the energy axis "
+                                "stays linear)", empty_rows, n_rows)
+
+                joined_base = folders['root'] / f"{file_safe_name}_IntervalMap"
+                # x is distance along the line, y is the interval's energy —
+                # two different quantities, so the export records both rather
+                # than labelling them with one unit (see export_field's
+                # ``mixed_axes``).
+                # The energy axis spans the intervals themselves — from the
+                # bottom of the lowest to the top of the highest — so a
+                # reader lands on real bias values, not row numbers. dy is
+                # that span divided by the rows, and the offset is where it
+                # starts; ``np.median`` of the midpoint spacing would be
+                # wrong the moment the occupied bins are not contiguous.
+                energy_low = float(min(lo for lo, _hi in bounds))
+                energy_high = (energy_low + n_rows * bin_width if on_a_grid
+                               else float(max(hi for _lo, hi in bounds)))
+                energy_span = energy_high - energy_low
+                x_unit = (spectral_data.metadata.units or {}).get('independent', 'V')
+
+                joined_scale = {
+                    'dx': position_step if position_step else 1.0,
+                    'dy': (energy_span / stack.shape[0]) if energy_span > 0 else 1.0,
+                    'unit': None,          # the two axes do not share one
+                    'value_unit': value_unit,
+                    'mixed_axes': True,
+                    'x_offset': float(positions[0]) if positions is not None else 0.0,
+                    'y_offset': energy_low,
+                    'axis_note': (
+                        f"x=position ({'m' if position_step else 'point index'}) "
+                        f"{'%.4g..%.4g' % (positions[0], positions[-1]) if positions is not None else '0..%d' % (stack.shape[1] - 1)}, "
+                        f"y=energy ({x_unit}) {energy_low:.4g}..{energy_high:.4g}"),
+                }
+                # Low bias at the bottom, matching the per-interval maps.
+                self._save_map_images(np.flipud(stack), joined_base,
+                                      source_metadata=None, folders=folders,
+                                      scale=joined_scale)
+                interval_map_path = str(folders['tiff'] / f"{joined_base.name}.tiff")
+
+                # Registered as a spectral dataset — bias on the independent
+                # axis, one column per position — so it opens in the
+                # Hyperspectral tab as a kymograph like any line scan.
+                joined = pd.DataFrame(stack, columns=columns)
+                joined.insert(0, spectral_data.independent_var_name, midpoints)
+                interval_map_name = f"{base_name} - Interval Map"
+                self._datasets[interval_map_name] = SpectralData(
+                    joined,
+                    SpectralMetadata(
+                        source_type=spectral_data.metadata.source_type,
+                        # (positions, 1): the Hyperspectral tab reads that as
+                        # a line scan and draws the kymograph.
+                        dimensions=(len(columns), 1),
+                        scan_mode='line',
+                        units=dict(spectral_data.metadata.units or {}),
+                        additional_info={
+                            'created_from': 'map_generator',
+                            'source_dataset': dataset_name,
+                            # NOT 'intervals': that key marks a dataset as
+                            # integrated values, which the Hyperspectral tab
+                            # skips. These bounds are documentation only.
+                            'interval_bounds': [list(iv) for iv, _ in ordered],
+                            'interval_midpoints': midpoints.tolist(),
+                            'bin_width': bin_width,
+                            'empty_bins': empty_rows,
+                            # Column positions in metres, so the kymograph's
+                            # x axis is distance and not a column number.
+                            'position_m': (self._line_positions_m(spectral_data).tolist()
+                                           if self._line_positions_m(spectral_data) is not None
+                                           else None),
+                            'position_step_m': position_step,
+                            'scan_type': scan_type,
+                            'spatial_layout': 'line',
+                        },
+                    ))
+                if not self._workflow_mode:
+                    self.dataLoaded.emit(interval_map_name)
+                logger.info("Interval map: %d intervals x %d positions -> %s",
+                            stack.shape[0], stack.shape[1], interval_map_name)
+
+            # The per-interval integrals as a flat dataset, so the numbers
+            # behind the maps stay inspectable (and re-mappable) instead of
+            # living only inside the image files.
+            values_name = ""
+            if value_columns:
+                frame = pd.DataFrame({'Spectrum_Index': np.arange(n_spectra),
+                                      **value_columns})
+                metadata = SpectralMetadata(
+                    source_type='map_values',
+                    dimensions=spectral_data.metadata.dimensions,
+                    scan_mode=spectral_data.metadata.scan_mode,
+                    units=dict(spectral_data.metadata.units or {}),
+                    additional_info={
+                        'created_from': 'map_generator',
+                        'source_dataset': dataset_name,
+                        'intervals': [list(iv) for iv in intervals],
+                        'integration_intervals': [list(iv) for iv in intervals],
+                        'scan_type': scan_type,
+                        'background': detect_params.baseline,
+                        'bias_step': dx,
+                        'noise_floor': noise_floor,
+                        'noise_sigma_median': float(np.median(spectrum_sigma))
+                        if spectrum_sigma.size else 0.0,
+                        'integration_window': max(min_width, 0.0),
+                        'windows_widened': widened,
+                        'spectrum_columns': columns,
+                    },
+                    data_type='flat',
+                )
+                values_name = f"{base_name} - Map Values"
+                self._datasets[values_name] = SpectralData(frame, metadata)
+                if not self._workflow_mode:
+                    self.dataLoaded.emit(values_name)
+
+            if noise_floor > 0:
+                logger.info("Map Generator: integrating above a %.1f-sigma noise "
+                            "floor (median sigma %.3g)", noise_floor,
+                            float(np.median(spectrum_sigma)) if spectrum_sigma.size else 0.0)
+            if widened:
+                logger.info("Map Generator: %d of %d interval(s) were narrower than "
+                            "the %.4g V bias step and were integrated over %.4g V "
+                            "instead — the sweep cannot resolve finer than that",
+                            widened, len(intervals), dx, min_width)
+
+            task.progress = 1.0
+            return {'map_paths': map_paths,
+                    'intervals': [list(iv) for iv in intervals],
+                    'values_dataset': values_name,
+                    'interval_map': interval_map_name,
+                    'interval_map_path': interval_map_path,
+                    'output_folder': str(folders['root']),
+                    'scan_type': scan_type,
+                    'n_maps': len(map_paths)}
+
+        except Exception as e:
+            logger.error(f"Map generation error: {e}", exc_info=True)
+            self.errorOccurred.emit("Map Generator Error", str(e))
+            return empty
+
+    #: Metadata that describes WHERE each spectrum was taken. A tool that
+    #: returns one output column per input spectrum must carry these across,
+    #: or the result can no longer be mapped onto the sample — a derivative of
+    #: a line scan is still that line scan's spectra.
+    SPATIAL_KEYS = ('spectrum_meta', 'position_m', 'position_step_m',
+                    'spatial_layout')
+
+    @classmethod
+    def _carry_spatial_info(cls, metadata, columns=None) -> dict:
+        """The spatial keys of ``metadata``, for a derived dataset.
+
+        ``columns`` names the subset of spectra the derived dataset keeps; the
+        per-spectrum entries are filtered to match so position i still refers
+        to column i.
+        """
+        info = getattr(metadata, 'additional_info', None) or {}
+        carried = {key: info[key] for key in cls.SPATIAL_KEYS if info.get(key) is not None}
+
+        if columns is not None and carried.get('spectrum_meta'):
+            wanted = list(columns)
+            by_column = {entry.get('column'): entry
+                         for entry in carried['spectrum_meta']
+                         if isinstance(entry, dict)}
+            if all(name in by_column for name in wanted):
+                carried['spectrum_meta'] = [by_column[name] for name in wanted]
+                # A subset invalidates a whole-line position list.
+                carried.pop('position_m', None)
+            else:
+                carried.pop('spectrum_meta', None)
+                carried.pop('position_m', None)
+        return carried
+
+    def _line_positions_m(self, spectral_data, _depth: int = 0) -> Optional[np.ndarray]:
+        """Distance along a line scan, in metres, one entry per spectrum.
+
+        Read from the per-spectrum locations a loader recorded
+        (``spectrum_meta[i]['location_m']``), or a ``position_m`` list. When
+        the dataset carries neither — a result whose tool predates the
+        metadata being carried across — the search follows its recorded
+        source dataset, so a derivative of a line scan still maps onto the
+        sample. Returns None when nothing upstream knows either.
+        """
+        info = getattr(getattr(spectral_data, 'metadata', None),
+                       'additional_info', None) or {}
+
+        stored = info.get('position_m')
+        if stored and len(stored) > 1:
+            try:
+                return np.asarray(stored, dtype=np.float64)
+            except (TypeError, ValueError):
+                pass
+        meta = info.get('spectrum_meta') or []
+        points = []
+        for entry in meta:
+            loc = (entry or {}).get('location_m')
+            if not loc or len(loc) < 2:
+                return self._positions_from_source(spectral_data, _depth)
+            try:
+                points.append((float(loc[0]), float(loc[1])))
+            except (TypeError, ValueError):
+                return None
+        if len(points) < 2:
+            return self._positions_from_source(spectral_data, _depth)
+
+        arr = np.asarray(points, dtype=np.float64)
+        steps = np.hypot(np.diff(arr[:, 0]), np.diff(arr[:, 1]))
+        return np.concatenate([[0.0], np.cumsum(steps)])
+
+    def _positions_from_source(self, spectral_data, depth: int = 0):
+        """Follow a derived dataset back to whatever recorded the positions.
+
+        Bounded so a metadata loop cannot hang the run.
+        """
+        if depth > 4:
+            return None
+        info = getattr(getattr(spectral_data, 'metadata', None),
+                       'additional_info', None) or {}
+        for key in ('original', 'source_dataset'):
+            parent_name = info.get(key)
+            parent = self._datasets.get(parent_name) if parent_name else None
+            if parent is None or parent is spectral_data:
+                continue
+            if getattr(parent, 'num_spectra', None) != getattr(spectral_data,
+                                                               'num_spectra', None):
+                continue     # a different set of spectra: its positions are not ours
+            found = self._line_positions_m(parent, depth + 1)
+            if found is not None:
+                logger.info("Positions for the map taken from the source dataset %r",
+                            parent_name)
+                return found
+        return None
+
+    def _line_step_m(self, spectral_data) -> Optional[float]:
+        """Mean spacing between line-scan positions, in metres."""
+        positions = self._line_positions_m(spectral_data)
+        if positions is None or positions[-1] <= 0:
+            return None
+        return float(positions[-1] / max(1, len(positions) - 1))
+
+    def _map_output_folders(self, dataset_name: str) -> dict:
+        """``maps/<dataset>/<format>/`` — one folder per dataset, one per format.
+
+        A run over many intervals writes three files each; dropping 200 maps
+        x 3 formats into one flat folder made the results unusable. Grouping
+        by dataset keeps one experiment's output together, and by format keeps
+        the Gwyddion files apart from the rasters and the raw numbers.
+        """
+        safe = self._sanitize_filename(self._extract_clean_base_name(dataset_name))
+        root = self._ensure_output_dir('maps') / safe
+        folders = {'root': root}
+        for kind in ('gsf', 'tiff', 'csv'):
+            folder = root / kind
+            folder.mkdir(parents=True, exist_ok=True)
+            folders[kind] = folder
+        return folders
+
     def _save_map_images(self, map_data: np.ndarray, output_base: Path,
-                         source_metadata=None):
+                         source_metadata=None, folders: Optional[dict] = None,
+                         scale: Optional[dict] = None):
         """Save map data as TIFF and CSV only (no PNG outputs).
 
         The TIFF keeps the **real float32 values** and carries the physical
@@ -1353,14 +2093,46 @@ class ToolImplementations:
         # Units live on the metadata object, not inside additional_info.
         if getattr(source_metadata, 'units', None) and 'units' not in info:
             info = {**info, 'units': source_metadata.units}
-        written = export_field_from_metadata(
-            output_base, np.asarray(map_data), info=info,
-            title=output_base.name,
-            context=f"generated map {output_base.name}")
+
+        name = output_base.name
+        written = {}
+
+        if scale:
+            # An explicit scale (a line scan's real positions, or a
+            # bias-versus-position field) beats anything derivable from the
+            # source's scan geometry, which describes the spectra rather than
+            # the map being written.
+            from src.utils.field_export import export_field
+
+            targets = ([(kind, folders[kind] / name) for kind in ('gsf', 'tiff')]
+                       if folders else [(None, output_base)])
+            for kind, base in targets:
+                written.update(export_field(
+                    base, np.asarray(map_data),
+                    dx=scale.get('dx'), dy=scale.get('dy'),
+                    unit=scale.get('unit'), value_unit=scale.get('value_unit'),
+                    title=name, axis_note=scale.get('axis_note'),
+                    mixed_axes=bool(scale.get('mixed_axes')),
+                    x_offset=float(scale.get('x_offset') or 0.0),
+                    y_offset=float(scale.get('y_offset') or 0.0),
+                    formats=(kind,) if kind else ('gsf', 'tiff'),
+                    context=f"generated map {name}"))
+        elif folders:
+            # One call per format so each lands in its own folder.
+            for kind in ('gsf', 'tiff'):
+                written.update(export_field_from_metadata(
+                    folders[kind] / name, np.asarray(map_data), info=info,
+                    formats=(kind,), title=name,
+                    context=f"generated map {name}"))
+        else:
+            written = export_field_from_metadata(
+                output_base, np.asarray(map_data), info=info,
+                title=name, context=f"generated map {name}")
         logger.info("Map exported: %s", ", ".join(sorted(written.values())))
 
         # Save as CSV for raw data
-        csv_path = Path(str(output_base) + '.csv')
+        csv_base = (folders['csv'] / name) if folders else output_base
+        csv_path = Path(str(csv_base) + '.csv')
         np.savetxt(str(csv_path), map_data, delimiter=',', fmt='%.6e')
         logger.info(f"CSV saved to: {csv_path}")
 
@@ -1371,7 +2143,8 @@ class ToolImplementations:
         if not csv_path.exists():
             logger.error(f"CSV file was not created at: {csv_path}")
 
-    def generate_all_maps(self, task, flat_dataset_name: str) -> list:
+    def generate_all_maps(self, task, flat_dataset_name: str,
+                          scan_type: str = 'auto') -> list:
         """
         Generate spatial maps for ALL value columns in a flat dataset.
         Returns a list of paths to generated maps.
@@ -1410,7 +2183,8 @@ class ToolImplementations:
                 logger.info(f"Generating map {idx+1}/{len(value_columns)} for column: {col}")
 
                 # Generate map for this value index
-                map_path = self.generate_map(task, flat_dataset_name, value_index=idx)
+                map_path = self.generate_map(task, flat_dataset_name, value_index=idx,
+                                             scan_type=scan_type)
                 if map_path:
                     # The path is a base without extension - TIFF is what we want
                     tiff_path = f"{map_path}.tiff"
@@ -1691,9 +2465,11 @@ class ToolImplementations:
             # needed. Binning alone would leave a pair 3 meV apart reported
             # separately whenever they straddle a bin edge, so k_B*T also
             # becomes the minimum separation: peaks closer than that are one
-            # feature and only the most prominent survives.
-            if detect_params.bin_width > 0 and not detect_params.min_distance:
-                detect_params.min_distance = detect_params.bin_width
+            # feature and only the most prominent survives. This one is the
+            # FULL k_B*T — it is the physical resolution limit, unlike the
+            # reporting bins, which are half that wide.
+            if detect_params.thermal_width > 0 and not detect_params.min_distance:
+                detect_params.min_distance = detect_params.thermal_width
 
             logger.info(
                 "ConfinementAnalysis: %s — %d spectra x %d points, background=%s(deg %d), "
@@ -1735,6 +2511,10 @@ class ToolImplementations:
             def _meta(source_type, extra, *, overlay=False, flat=False):
                 info = {'created_from': 'confinement_analysis',
                         'source_dataset': dataset_name, **extra}
+                if not flat:
+                    # Per-spectrum outputs keep the source's positions, so a
+                    # corrected line scan can still be mapped onto the sample.
+                    info = {**self._carry_spatial_info(spectral_data.metadata), **info}
                 if overlay:
                     # Routes the result onto the source's graph window.
                     info['original'] = dataset_name
@@ -1747,15 +2527,19 @@ class ToolImplementations:
                     data_type='flat' if flat else spectral_data.metadata.data_type,
                 )
 
-            # Thermal grouping: k_B*T is both the position error bar and the
-            # bin width, so peaks the experiment cannot tell apart are not
-            # reported apart.
+            # Thermal grouping: k_B*T is the position error bar and the
+            # minimum separation, so peaks the experiment cannot tell apart
+            # are not reported apart. The reporting bins are half that wide,
+            # so peaks that *are* resolvable keep their own bin.
+            thermal_width = detect_params.thermal_width
             bin_width = detect_params.bin_width
             edges, bin_centers = (energy_bins(independent_var, bin_width)
                                   if bin_width > 0 else (None, None))
             if bin_width > 0:
-                logger.info("ConfinementAnalysis: grouping at T=%.6g K -> kBT=%.6g %s, %d bins",
-                            detect_params.temperature_k, bin_width,
+                logger.info("ConfinementAnalysis: grouping at T=%.6g K -> kBT=%.6g %s, "
+                            "bin width=%.6g %s, %d bins",
+                            detect_params.temperature_k, thermal_width,
+                            detect_params.x_energy_unit, bin_width,
                             detect_params.x_energy_unit, len(bin_centers))
 
             settings = {'background': detect_params.baseline,
@@ -1765,7 +2549,8 @@ class ToolImplementations:
                         'height_mode': detect_params.height_mode,
                         'direction': detect_params.direction,
                         'temperature_k': detect_params.temperature_k,
-                        'kbt': bin_width,
+                        'kbt': thermal_width,
+                        'bin_width': bin_width,
                         'x_energy_unit': detect_params.x_energy_unit}
 
             # -- 1. peak list -------------------------------------------------
@@ -1807,6 +2592,12 @@ class ToolImplementations:
             peaks_df = pd.DataFrame(rows)
             peaks_path = peaks_dir / f"{convention_name}.csv"
             peaks_df.to_csv(peaks_path, index=False)
+
+            # Merged now (not at the end) so every dataset this run registers
+            # carries them: that is how the Map Generator reads the intervals
+            # of a previous analysis straight out of the project.
+            merged_intervals = self._merge_peak_intervals(raw_intervals, independent_var)
+            settings['integration_intervals'] = [list(iv) for iv in merged_intervals]
 
             if not peaks_df.empty:
                 ordered = ['position_value'] + [c for c in peaks_df.columns
@@ -1925,7 +2716,6 @@ class ToolImplementations:
             _register('Peak Count', counts_df,
                       _meta('peak_count', settings, flat=True))
 
-            merged_intervals = self._merge_peak_intervals(raw_intervals, independent_var)
             logger.info("ConfinementAnalysis: %d peaks over %d spectra, %d intervals; created %s",
                         len(peaks_df), n_spectra, len(merged_intervals),
                         ", ".join(created.values()) or "nothing")
@@ -2478,8 +3268,12 @@ class ToolImplementations:
         """
         Filter bad spectra based on saturation, noise, linear artifact, and periodic noise heuristics.
 
-        Returns path to the text report. Creates three new datasets:
-        '{base} - Good Data', '{base} - Bad Data', and '{base} - FFT Spectra'.
+        Creates three new datasets — '{base} - Good Data', '{base} - Bad
+        Data' and '{base} - FFT Spectra' — and exports every output of the run
+        into one folder, ``curves/{base}_Filtered/``: the three datasets as
+        CSV plus the text report.
+
+        Returns the path to the text report.
         """
         from src.backend.sts_algorithms import (
             detect_saturation, detect_noise, detect_linear_artifact,
@@ -2595,6 +3389,28 @@ class ToolImplementations:
             base_name = self._extract_clean_base_name(dataset_name)
             file_safe_name = self._sanitize_filename(base_name)
 
+            # Every output of one run lands in its own folder, so a filtered
+            # dataset's good/bad/FFT curves and its report stay together:
+            #   curves/<dataset>_Filtered/{Good_Data,Bad_Data,FFT_Spectra}.csv
+            #                             + <dataset>_filter_report.txt
+            output_dir = self._ensure_output_dir('curves') / f"{file_safe_name}_Filtered"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            written_files = []
+
+            def _write_dataset(dataset, suffix):
+                """Write one result dataset into the run folder as CSV.
+
+                A failed export must not lose the filtering result, so it is
+                logged and the tool carries on.
+                """
+                path = output_dir / f"{file_safe_name}_{suffix}.csv"
+                try:
+                    dataset.save(str(path))
+                except Exception as exc:
+                    logger.warning("Filter Bad Data: could not write %s: %s", path, exc)
+                    return
+                written_files.append(path)
+
             # Build good dataset (with optional periodic correction).
             # Carry the original spectrum captions across so downstream
             # processing can still identify each column by name.
@@ -2626,13 +3442,16 @@ class ToolImplementations:
                     scan_mode=spectral_data.metadata.scan_mode,
                     units=spectral_data.metadata.units.copy(),
                     additional_info={
+                        **self._carry_spatial_info(spectral_data.metadata, good_cols),
                         'original': dataset_name,
                         'filter': 'good',
                         'count': len(good_indices),
                         'periodic_corrected': correct_periodic
                     }
                 )
-                self._datasets[good_name] = SpectralData(good_df, good_metadata)
+                good_dataset = SpectralData(good_df, good_metadata)
+                self._datasets[good_name] = good_dataset
+                _write_dataset(good_dataset, 'Good_Data')
                 if not self._workflow_mode:
                     self.dataLoaded.emit(good_name)
             else:
@@ -2654,12 +3473,15 @@ class ToolImplementations:
                     scan_mode=spectral_data.metadata.scan_mode,
                     units=spectral_data.metadata.units.copy(),
                     additional_info={
+                        **self._carry_spatial_info(spectral_data.metadata, bad_cols),
                         'original': dataset_name,
                         'filter': 'bad',
                         'count': len(bad_indices)
                     }
                 )
-                self._datasets[bad_name] = SpectralData(bad_df, bad_metadata)
+                bad_dataset = SpectralData(bad_df, bad_metadata)
+                self._datasets[bad_name] = bad_dataset
+                _write_dataset(bad_dataset, 'Bad_Data')
                 if not self._workflow_mode:
                     self.dataLoaded.emit(bad_name)
             else:
@@ -2699,13 +3521,20 @@ class ToolImplementations:
                         }
                     )
                     fft_name = f"{base_name} - FFT Spectra"
-                    self._datasets[fft_name] = SpectralData(fft_df, fft_metadata)
+                    fft_dataset = SpectralData(fft_df, fft_metadata)
+                    self._datasets[fft_name] = fft_dataset
+                    _write_dataset(fft_dataset, 'FFT_Spectra')
                     if not self._workflow_mode:
                         self.dataLoaded.emit(fft_name)
 
-            # Save report
+            # Save report alongside the exported curves
+            report_lines.append("")
+            report_lines.append(f"Output folder: {output_dir}")
+            for path in written_files:
+                report_lines.append(f"  {path.name}")
+
             report_text = "\n".join(report_lines)
-            output_path = self._ensure_output_dir('curves') / f"{file_safe_name}_filter_report.txt"
+            output_path = output_dir / f"{file_safe_name}_filter_report.txt"
             output_path.write_text(report_text)
 
             logger.info(f"Filter complete: {len(good_indices)} good, {len(bad_indices)} bad")

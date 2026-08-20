@@ -73,7 +73,43 @@ Item {
     }
 
     component FieldBox: SpinBox {
+        id: fieldBoxRoot
         editable: true
+
+        // Decimal support. SpinBox's default validator is an IntValidator,
+        // which drops the decimal point: typing "4.5" became "45", i.e. a
+        // tenth of the intended value once scaled back by `realValue`.
+        property int decimals: 0
+        readonly property real factor: Math.pow(10, fieldBoxRoot.decimals)
+        readonly property real realValue: fieldBoxRoot.value / fieldBoxRoot.factor
+
+        validator: fieldBoxRoot.decimals > 0 ? fieldDouble : fieldInt
+
+        property var fieldDouble: DoubleValidator {
+            bottom: Math.min(fieldBoxRoot.from, fieldBoxRoot.to) / fieldBoxRoot.factor
+            top: Math.max(fieldBoxRoot.from, fieldBoxRoot.to) / fieldBoxRoot.factor
+            decimals: fieldBoxRoot.decimals
+            notation: DoubleValidator.StandardNotation
+            locale: "C"     // matches what textFromValue writes
+        }
+
+        property var fieldInt: IntValidator {
+            bottom: Math.min(fieldBoxRoot.from, fieldBoxRoot.to)
+            top: Math.max(fieldBoxRoot.from, fieldBoxRoot.to)
+        }
+
+        textFromValue: function(value, locale) {
+            return fieldBoxRoot.decimals > 0
+                    ? Number(value / fieldBoxRoot.factor).toFixed(fieldBoxRoot.decimals)
+                    : String(value)
+        }
+
+        valueFromText: function(text, locale) {
+            var parsed = Number(String(text).replace(",", "."))
+            return isNaN(parsed) ? fieldBoxRoot.value
+                                 : Math.round(parsed * fieldBoxRoot.factor)
+        }
+
         contentItem: TextInput {
             leftPadding: 26
             rightPadding: 26
@@ -224,7 +260,8 @@ Item {
         return p
     }
 
-    // k_B*T shown back to the user so the bin width is never a mystery.
+    // k_B*T and the bin width shown back to the user, so neither is a
+    // mystery — the bins are half k_B*T, not the whole of it.
     function kbtLabel() {
         var t = temperatureSpin.realValue
         if (t <= 0) return "off — peaks stay on the raw energy axis"
@@ -232,7 +269,7 @@ Item {
         var unit = energyUnitCombo.currentText
         var inAxis = (unit === "meV") ? meV : meV / 1000.0
         return "kʙT = " + meV.toFixed(2) + " meV  (bin width " +
-               inAxis.toPrecision(3) + " " + unit + ")"
+               (inAxis / 2).toPrecision(3) + " " + unit + " = kʙT/2)"
     }
 
     Timer {
@@ -392,7 +429,11 @@ Item {
                         FieldCombo {
                             id: backgroundCombo
                             Layout.fillWidth: true
-                            model: ["poly-iter", "poly", "als", "rubberband", "endpoints", "none"]
+                            model: ["poly-iter", "poly", "arpls", "snip", "als", "rubberband", "endpoints", "none"]
+                            // arPLS fits in log space, where a tunnelling band
+                            // edge is nearly straight; ModPoly cannot follow it
+                            // and loses states well below the edges.
+                            currentIndex: 2
                             onCurrentTextChanged: queuePreview()
                         }
 
@@ -459,9 +500,7 @@ Item {
                             value: 0
                             stepSize: 100
                             editable: true
-                            property real realValue: value / 100.0
-                            textFromValue: function(v) { return (v / 100.0).toFixed(2) }
-                            valueFromText: function(t) { return Math.round(parseFloat(t) * 100) }
+                            decimals: 2
                             onValueChanged: queuePreview()
                         }
 
@@ -486,9 +525,10 @@ Item {
                         Label {
                             Layout.columnSpan: 2
                             Layout.fillWidth: true
-                            text: "kʙT is the error bar on a peak position. Peaks closer " +
-                                  "together than this are one feature, and the output energy " +
-                                  "axis is binned at the same width."
+                            text: "kʙT is the error bar on a peak position: peaks closer " +
+                                  "together than this are one feature. The output energy " +
+                                  "axis is binned at half kʙT, so peaks the measurement " +
+                                  "can still resolve keep separate bins."
                             font.pixelSize: 10
                             color: textMuted
                             wrapMode: Text.Wrap
@@ -520,9 +560,7 @@ Item {
                             from: -1000000; to: 1000000; value: -300
                             enabled: limitRangeCheck.checked
                             editable: true
-                            property real realValue: value / 1000.0
-                            textFromValue: function(v) { return (v / 1000.0).toFixed(3) }
-                            valueFromText: function(t) { return Math.round(parseFloat(t) * 1000) }
+                            decimals: 3
                             onValueChanged: queuePreview()
                         }
 
@@ -535,9 +573,7 @@ Item {
                             from: -1000000; to: 1000000; value: 300
                             enabled: limitRangeCheck.checked
                             editable: true
-                            property real realValue: value / 1000.0
-                            textFromValue: function(v) { return (v / 1000.0).toFixed(3) }
-                            valueFromText: function(t) { return Math.round(parseFloat(t) * 1000) }
+                            decimals: 3
                             onValueChanged: queuePreview()
                         }
                     }
@@ -559,15 +595,17 @@ Item {
                             onCurrentTextChanged: queuePreview()
                         }
 
-                        Label { text: "Height (%):"; color: textLight }
+                        Label {
+                            text: heightModeCombo.currentText === "noise"
+                                  ? "Threshold (× noise σ):" : "Height (%):"
+                            color: textLight
+                        }
                         FieldBox {
                             id: heightSpin
-                            from: 0; to: 10000; value: 500
+                            from: 0; to: 10000; value: 200
                             stepSize: 50
                             editable: true
-                            property real realValue: value / 100.0
-                            textFromValue: function(v) { return (v / 100.0).toFixed(2) }
-                            valueFromText: function(t) { return Math.round(parseFloat(t) * 100) }
+                            decimals: 2
                             onValueChanged: queuePreview()
                         }
 
@@ -575,7 +613,13 @@ Item {
                         FieldCombo {
                             id: heightModeCombo
                             Layout.fillWidth: true
-                            model: ["range", "prominence", "max"]
+                            model: ["range", "prominence", "max", "noise"]
+                            // 'noise' compares each peak with the spectrum's
+                            // own noise, so the threshold means the same thing
+                            // on every spectrum. 'range' and 'prominence'
+                            // scale with the curve's span, which the band
+                            // edges set — 5% of that rejects real states.
+                            currentIndex: 3
                             onCurrentTextChanged: queuePreview()
                         }
 
@@ -658,9 +702,7 @@ Item {
                             id: minDistanceSpin
                             from: 0; to: 1000000; value: 0
                             editable: true
-                            property real realValue: value / 1000.0
-                            textFromValue: function(v) { return (v / 1000.0).toFixed(3) }
-                            valueFromText: function(t) { return Math.round(parseFloat(t) * 1000) }
+                            decimals: 3
                             onValueChanged: queuePreview()
                         }
 

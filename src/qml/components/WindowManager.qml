@@ -207,6 +207,76 @@ Item {
         return windowId
     }
 
+    // -- Dataset drops from the project browser ----------------------------
+    // Datasets are dropped by hit-testing the release point against the open
+    // windows (the same no-DropArea approach the browser tree uses), so a
+    // tool only has to declare `acceptDatasetDrop(names)` to receive them.
+
+    property var _dropHighlightItem: null
+
+    // Content item of the topmost visible window under a global point.
+    function windowContentAt(globalX, globalY) {
+        var best = null
+        var bestZ = -1
+        for (var i = 0; i < windows.length; i++) {
+            var w = windows[i].window
+            if (!w || !w.visible)
+                continue
+            var p = w.mapFromGlobal(globalX, globalY)
+            if (p.x < 0 || p.y < 0 || p.x > w.width || p.y > w.height)
+                continue
+            if (w.z >= bestZ) {
+                bestZ = w.z
+                best = w
+            }
+        }
+        return best ? best.contentItem : null
+    }
+
+    function _dropTargetAt(globalX, globalY) {
+        var content = windowContentAt(globalX, globalY)
+        return (content && typeof content.acceptDatasetDrop === "function") ? content : null
+    }
+
+    // Hand the dropped datasets to the tool under the cursor.
+    // Returns true when a tool took them.
+    function deliverDatasetDrop(names, globalX, globalY) {
+        clearDatasetDropHighlight()
+        var target = _dropTargetAt(globalX, globalY)
+        if (!target)
+            return false
+        target.acceptDatasetDrop(names)
+        activateWindowOfItem(target)
+        return true
+    }
+
+    // Light up the tool a drop would land in, so the drag has a visible target.
+    function highlightDatasetDrop(names, globalX, globalY) {
+        var target = _dropTargetAt(globalX, globalY)
+        if (target === _dropHighlightItem)
+            return
+        clearDatasetDropHighlight()
+        if (target && target.datasetDropActive !== undefined) {
+            target.datasetDropActive = true
+            _dropHighlightItem = target
+        }
+    }
+
+    function clearDatasetDropHighlight() {
+        if (_dropHighlightItem && _dropHighlightItem.datasetDropActive !== undefined)
+            _dropHighlightItem.datasetDropActive = false
+        _dropHighlightItem = null
+    }
+
+    function activateWindowOfItem(item) {
+        for (var i = 0; i < windows.length; i++) {
+            if (windows[i].window && windows[i].window.contentItem === item) {
+                activateWindow(windows[i].id)
+                return
+            }
+        }
+    }
+
     function createToolWindow(toolName, contentComponent, config) {
         return createWindow("tool", toolName, contentComponent, config)
     }

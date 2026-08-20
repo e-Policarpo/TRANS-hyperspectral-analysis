@@ -35,6 +35,68 @@ class WorkflowExecutor:
         self.cancelled = False
         self.workflow_name = ""
         self.original_dataset_name = ""  # Track source dataset for naming outputs
+        # Names actually handed out to output nodes this run. Collected as
+        # they are produced rather than recomputed at cleanup time, because
+        # a naming convention carrying [index] yields a different name on a
+        # second call — which used to delete the very datasets it named.
+        self.produced_output_names: set = set()
+        # One pass per selected dataset when a DatasetInput holds several:
+        # {node_id: dataset_name} for the pass being executed.
+        self.dataset_overrides: Dict[str, str] = {}
+        self._pass_count = 1
+        self._pass_index = 0
+
+    def _dataset_batches(self, workflow: Workflow) -> List[Dict[str, str]]:
+        """Plan the passes to run, one per selected dataset.
+
+        A ``DatasetInput`` node may hold several datasets (``dataset_names``).
+        The whole workflow is then executed once per dataset **in sequence**,
+        so each run has exactly one source and its outputs can be named after
+        that source — no ambiguity about which input produced which output.
+
+        Returns a list of ``{node_id: dataset_name}`` assignments, one per
+        pass. A single-dataset workflow yields one pass, i.e. the behaviour
+        the executor has always had.
+        """
+        per_node: Dict[str, List[str]] = {}
+        for node in workflow.nodes:
+            if node.tool_name != "DatasetInput":
+                continue
+            raw = node.parameters.get('dataset_names') or []
+            if hasattr(raw, 'toVariant'):      # QJSValue array from QML
+                raw = raw.toVariant() or []
+            names = [str(n) for n in raw if n]
+            if not names:
+                single = node.parameters.get('dataset_name')
+                names = [single] if single else []
+            if names:
+                per_node[node.id] = names
+
+        if not per_node:
+            return [{}]
+
+        passes = max(len(v) for v in per_node.values())
+        if passes == 1:
+            return [{nid: v[0] for nid, v in per_node.items()}]
+
+        multi = {nid: v for nid, v in per_node.items() if len(v) > 1}
+        if len({len(v) for v in multi.values()}) > 1:
+            # Nothing sensible to pair up — say so instead of silently
+            # inventing combinations the user never asked for.
+            logger.warning(
+                "Workflow has dataset inputs with different selection counts "
+                "(%s); the shorter ones repeat their last dataset.",
+                {nid: len(v) for nid, v in multi.items()})
+
+        plan = []
+        for k in range(passes):
+            assignment = {}
+            for nid, v in per_node.items():
+                # A single-dataset input feeds every pass unchanged; a shorter
+                # multi-selection holds its last entry.
+                assignment[nid] = v[k] if k < len(v) else v[-1]
+            plan.append(assignment)
+        return plan
 
     def execute(self, workflow: Workflow, progress_callback: Callable = None) -> Dict[str, Any]:
         """
@@ -48,6 +110,8 @@ class WorkflowExecutor:
         self.cancelled = False
         self.workflow_name = workflow.name.replace(" ", "_")
         self.original_dataset_name = ""
+        self.produced_output_names = set()
+        self.dataset_overrides = {}
         errors = []
         results = {}
 
@@ -64,68 +128,105 @@ class WorkflowExecutor:
         execution_order = workflow.get_execution_order()
         total_nodes = len(execution_order)
 
-        logger.info(f"Executing workflow '{workflow.name}' with {total_nodes} nodes")
+        # One pass per selected dataset — run in sequence, never interleaved.
+        batches = self._dataset_batches(workflow)
+        self._pass_count = len(batches)
+        total_steps = total_nodes * self._pass_count
+
+        logger.info(f"Executing workflow '{workflow.name}' with {total_nodes} nodes"
+                    + (f" over {self._pass_count} datasets" if self._pass_count > 1 else ""))
 
         # Enable workflow mode to suppress intermediate dataset additions to project browser
         self.app_backend._workflow_mode = True
+
+        # A run over several datasets produces a full set of outputs per pass;
+        # opening every one of them would bury the workspace, so output nodes
+        # register their results without displaying them.
+        multi_dataset = len(batches) > 1
+        if multi_dataset:
+            self.app_backend._suppress_auto_open = True
 
         # Snapshot datasets before execution for cleanup
         datasets_before = set(self.app_backend._datasets.keys())
 
         try:
-            for i, node_id in enumerate(execution_order):
+            for pass_index, assignment in enumerate(batches):
                 if self.cancelled:
+                    # Cancelled between passes: the remaining datasets never
+                    # ran, so this is not a successful execution.
                     errors.append("Workflow execution cancelled")
                     break
 
-                node = workflow.get_node(node_id)
-                if not node:
-                    continue
+                # Fresh state per pass: node outputs from the previous dataset
+                # must never leak into this one.
+                self._pass_index = pass_index
+                self.dataset_overrides = assignment
+                self.node_outputs.clear()
+                self.original_dataset_name = ""
 
-                # Skip comment nodes - they are just for annotations
-                if node.tool_name == "CommentNode":
-                    logger.debug(f"Skipping comment node: {node.display_name}")
-                    continue
+                pass_label = ""
+                if self._pass_count > 1:
+                    pass_dataset = next(iter(assignment.values()), "")
+                    pass_label = f" [{pass_index + 1}/{self._pass_count}: {pass_dataset}]"
+                    logger.info(f"Workflow pass {pass_index + 1}/{self._pass_count} "
+                                f"over datasets: {list(assignment.values())}")
 
-                if progress_callback:
-                    progress_callback(i + 1, total_nodes, f"Executing: {node.display_name}")
+                for i, node_id in enumerate(execution_order):
+                    if self.cancelled:
+                        errors.append("Workflow execution cancelled")
+                        break
 
-                try:
-                    # Gather inputs for this node
-                    node_inputs = self._gather_inputs(node, workflow)
+                    node = workflow.get_node(node_id)
+                    if not node:
+                        continue
 
-                    # Execute the node
-                    node_result = self._execute_node(node, node_inputs)
+                    # Skip comment nodes - they are just for annotations
+                    if node.tool_name == "CommentNode":
+                        logger.debug(f"Skipping comment node: {node.display_name}")
+                        continue
 
-                    # Store outputs
-                    self.node_outputs[node_id] = node_result
+                    if progress_callback:
+                        progress_callback(pass_index * total_nodes + i + 1, total_steps,
+                                          f"Executing: {node.display_name}{pass_label}")
 
-                    # If this is an output node, add to results
-                    if node.tool_name in ['DatasetOutput', 'MapOutput', 'ImageOutput', 'TableOutput', 'FlatDataOutput', 'TextOutput', 'IntervalOutput']:
-                        output_name = node.parameters.get('output_name', f'output_{node_id}')
-                        results[output_name] = node_result
+                    try:
+                        # Gather inputs for this node
+                        node_inputs = self._gather_inputs(node, workflow)
 
-                    logger.info(f"Node '{node.display_name}' executed successfully")
+                        # Execute the node
+                        node_result = self._execute_node(node, node_inputs)
 
-                except Exception as e:
-                    error_msg = f"Error executing '{node.display_name}': {str(e)}"
-                    logger.error(error_msg, exc_info=True)
-                    errors.append(error_msg)
+                        # Store outputs
+                        self.node_outputs[node_id] = node_result
+
+                        # If this is an output node, add to results. With
+                        # several datasets the key carries the source, so one
+                        # pass can't overwrite another's result.
+                        if node.tool_name in ['DatasetOutput', 'MapOutput', 'ImageOutput', 'TableOutput', 'FlatDataOutput', 'TextOutput', 'IntervalOutput']:
+                            output_name = node.parameters.get('output_name', f'output_{node_id}')
+                            if self._pass_count > 1:
+                                output_name = f"{output_name} [{self.original_dataset_name}]"
+                            results[output_name] = node_result
+
+                        logger.info(f"Node '{node.display_name}' executed successfully")
+
+                    except Exception as e:
+                        error_msg = f"Error executing '{node.display_name}'{pass_label}: {str(e)}"
+                        logger.error(error_msg, exc_info=True)
+                        errors.append(error_msg)
         finally:
             # Always disable workflow mode when done
             self.app_backend._workflow_mode = False
+            if multi_dataset:
+                self.app_backend._suppress_auto_open = False
 
             # Clean up intermediate datasets added during workflow
             datasets_after = set(self.app_backend._datasets.keys())
             intermediate_datasets = datasets_after - datasets_before
 
-            # Collect output node dataset names to preserve
-            output_names = set()
-            for node_id in execution_order:
-                node = workflow.get_node(node_id)
-                if node and node.tool_name in ['DatasetOutput', 'FlatDataOutput', 'TextOutput']:
-                    user_output_name = node.parameters.get('output_name', f'output_{node_id}')
-                    output_names.add(self._format_output_name(user_output_name))
+            # Names the output nodes actually stored under, across every
+            # pass — recomputing them here would drift from what was stored.
+            output_names = set(self.produced_output_names)
 
             # Remove intermediate datasets that aren't final outputs
             for name in intermediate_datasets:
@@ -205,8 +306,9 @@ class WorkflowExecutor:
 
         # Route to appropriate tool implementation
         if tool_name == "DatasetInput":
-            # Get dataset from backend
-            dataset_name = params.get('dataset_name')
+            # This pass's dataset when several were selected, otherwise the
+            # node's single dataset.
+            dataset_name = self.dataset_overrides.get(node.id) or params.get('dataset_name')
             if dataset_name and dataset_name in self.app_backend._datasets:
                 outputs['dataset'] = self.app_backend._datasets[dataset_name]
                 # Track original dataset name for output naming
@@ -437,7 +539,9 @@ class WorkflowExecutor:
                     progress = 0
 
                 # Generate all maps (one per value column/interval)
-                map_paths = self.app_backend.generate_all_maps(MockTask(), dataset_name)
+                map_paths = self.app_backend.generate_all_maps(
+                    MockTask(), dataset_name,
+                    scan_type=params.get('scan_type', 'auto'))
                 outputs['maps'] = map_paths
                 logger.info(f"MapGenerator created {len(map_paths)} TIFF maps")
 
@@ -1184,16 +1288,42 @@ class WorkflowExecutor:
         """
         source = self.original_dataset_name if self.original_dataset_name else "Data"
 
+        name = ""
         # Try to use the naming convention from the backend
         if hasattr(self.app_backend, '_apply_naming_convention'):
             try:
-                return self.app_backend._apply_naming_convention(source, operation=output_label)
+                name = self.app_backend._apply_naming_convention(source, operation=output_label)
             except Exception as e:
                 logger.warning(f"Could not apply naming convention: {e}")
 
-        # Fallback to simple format
-        workflow = self.workflow_name.replace("_", " ") if self.workflow_name else "Workflow"
-        return f"{source} - {output_label} ({workflow})"
+        if not name:
+            # Fallback to simple format
+            workflow = self.workflow_name.replace("_", " ") if self.workflow_name else "Workflow"
+            name = f"{source} - {output_label} ({workflow})"
+
+        name = self._unique_output_name(name, source)
+        self.produced_output_names.add(name)
+        return name
+
+    def _unique_output_name(self, name: str, source: str) -> str:
+        """Keep one pass's outputs from overwriting another's.
+
+        With a naming convention that doesn't include [dataset_name] every
+        pass would otherwise land on the same name and only the last dataset
+        would survive. Only batched runs are touched, so single-dataset
+        naming is exactly as before.
+        """
+        if self._pass_count <= 1 or name not in self.produced_output_names:
+            return name
+
+        try:
+            suffix = self.app_backend._extract_clean_base_name(source)
+        except Exception:
+            suffix = source
+        candidate = f"{name}_{suffix}" if suffix else name
+        if candidate in self.produced_output_names:
+            candidate = f"{candidate}_{self._pass_index + 1}"
+        return candidate
 
     def _get_temp_dataset_name(self, dataset, operation: str = "") -> str:
         """Generate a temporary dataset name for internal workflow processing.

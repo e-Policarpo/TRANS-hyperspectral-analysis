@@ -303,6 +303,7 @@ class MapEditorBackend(QObject):
         # previously-shown map, and MultiChannelMap pins a single shape).
         self._multi_channel_map = None
         self.setMapDataFromArray(arr, name)  # emits map/channel signals + sets canvas
+        self._push_line_scan_axes(spectral_data, view)
         self.lineScanModeChanged.emit()
         logger.info(
             f"Loaded line scan '{name}' as {view}: "
@@ -325,6 +326,7 @@ class MapEditorBackend(QObject):
         # Kymograph (P×N) and strip (1×N) differ in shape — rebuild the map.
         self._multi_channel_map = None
         self.setMapDataFromArray(arr, self._line_scan_dataset)
+        self._push_line_scan_axes(spectral_data, view)
         self.lineScanModeChanged.emit()
 
     def _exit_line_scan_mode(self):
@@ -614,10 +616,16 @@ class MapEditorBackend(QObject):
             locs = extra.get('sts_locations', []) or []
         except Exception:
             locs = []
-        markers = []
+        grid = getattr(mcm, 'shape', None)
+        markers, off_grid = [], 0
         for i, L in enumerate(locs):
             px = L.get('px')
             if not px:
+                continue
+            if not self._px_on_grid(px, grid):
+                # Recorded against a differently sized scan: drawing it would
+                # put a dot off the edge of this image.
+                off_grid += 1
                 continue
             # ``index`` is the position in sts_locations, so a click on the dot
             # maps back to this location (and its avg_spectrum) in
@@ -626,8 +634,130 @@ class MapEditorBackend(QObject):
                 'col': int(px[0]), 'row': int(px[1]),
                 'label': str(L.get('point_index', '')), 'index': i,
             })
+        if off_grid:
+            logger.warning("%d STS point(s) fall outside this %s map and were "
+                           "not drawn", off_grid, "x".join(map(str, grid or ())))
         self._canvas.setStsMarkers(markers)
+        self._push_sts_lines(mcm)
         self.stsAverageUpdated.emit({})   # new map → clear the inline panel
+
+    def _push_line_scan_axes(self, spectral_data, view: str):
+        """Give a kymograph real axes: distance across, bias up.
+
+        The columns are positions along the line — in metres when the loader
+        recorded them — and the rows are the spectral axis. Without this the
+        cursor read-out can only report column and row numbers, which say
+        nothing about where on the sample the spectrum was taken.
+        """
+        if self._canvas is None or not hasattr(self._canvas, 'setAxisMetadata'):
+            return
+
+        info = getattr(getattr(spectral_data, 'metadata', None),
+                       'additional_info', None) or {}
+        units = getattr(getattr(spectral_data, 'metadata', None), 'units', None) or {}
+        meta = {}
+
+        positions = info.get('position_m')
+        if not positions:
+            # The per-spectrum locations a loader records, cumulative along
+            # the line (the same source the map exports use).
+            entries = info.get('spectrum_meta') or []
+            points = [e.get('location_m') for e in entries if (e or {}).get('location_m')]
+            if len(points) == len(entries) and len(points) > 1:
+                arr = np.asarray(points, dtype=float)
+                steps = np.hypot(np.diff(arr[:, 0]), np.diff(arr[:, 1]))
+                positions = np.concatenate([[0.0], np.cumsum(steps)]).tolist()
+
+        if positions and len(positions) > 1 and positions[-1] > 0:
+            span = float(positions[-1]) - float(positions[0])
+            n = len(positions)
+            meta.update({'x_size': span * n / max(1, n - 1),
+                         'x_unit': 'm', 'x_offset': float(positions[0])})
+
+        if view == 'kymograph':
+            axis = np.asarray(spectral_data.independent_var, dtype=float)
+            if axis.size > 1:
+                step = (axis[-1] - axis[0]) / (axis.size - 1)
+                meta.update({'y_size': float(axis[-1] - axis[0] + step),
+                             'y_unit': str(units.get('independent') or 'V'),
+                             'y_offset': float(axis[0] - step / 2.0)})
+
+        self._canvas.setAxisMetadata(meta)
+
+    def _push_sts_lines(self, mcm):
+        """Outline and tag each line scan taken on this scan image.
+
+        A line scan is dozens of dots that look no different from isolated
+        points; the outline plus its tag ('line1 · 57pts ×3 · pt20→pt76') is
+        what makes 'which line was taken where' readable off the map.
+        """
+        if self._canvas is None or not hasattr(self._canvas, 'setStsLines'):
+            return
+        try:
+            extra = getattr(mcm.metadata, 'extra', None) or {}
+            lines = extra.get('sts_line_scans', []) or []
+        except Exception:
+            lines = []
+
+        grid = getattr(mcm, 'shape', None)
+        overlays = []
+        for ls in lines:
+            path = [pt for pt in (ls.get('px_path') or []) if pt]
+            on_grid = [pt for pt in path if self._px_on_grid(pt, grid)]
+            if len(on_grid) < len(path):
+                logger.warning("%s: %d of %d points fall outside this map; "
+                               "outlining only the part that is on it",
+                               ls.get('label', 'line'),
+                               len(path) - len(on_grid), len(path))
+            if len(on_grid) < 2:
+                # Nothing (or a single point) of this line is on this scan —
+                # an outline would be a stray mark at the edge.
+                continue
+            overlays.append({
+                'label': self._line_scan_tag(ls),
+                # Canvas markers are (col, row) = (pixel x, pixel y).
+                'path': [{'col': int(p[0]), 'row': int(p[1])} for p in on_grid],
+            })
+        self._canvas.setStsLines(overlays)
+
+    @staticmethod
+    def _px_on_grid(px, grid) -> bool:
+        """Is this (x, y) pixel inside a (rows, cols) map?
+
+        Half a pixel of tolerance, so a point measured on the boundary is not
+        thrown away by rounding. Without a known grid nothing is rejected.
+        """
+        if not grid or len(grid) < 2:
+            return True
+        try:
+            rows, cols = int(grid[0]), int(grid[1])
+            x, y = float(px[0]), float(px[1])
+        except (TypeError, ValueError, IndexError):
+            return True
+        if rows <= 0 or cols <= 0:
+            return True
+        return -0.5 <= x <= cols - 0.5 and -0.5 <= y <= rows - 0.5
+
+    @staticmethod
+    def _line_scan_tag(ls: dict) -> str:
+        """Short label for a line outline, matching the dataset name."""
+        parts = [str(ls.get('label') or f"line{ls.get('id', '?')}")]
+        n = ls.get('n_points')
+        if n:
+            parts.append(f"{n}pts")
+        reps = ls.get('reps')
+        if reps:
+            parts.append(f"×{reps}")
+        first, last = ls.get('point_first'), ls.get('point_last')
+        if first is not None and last is not None:
+            parts.append(f"pt{first}→pt{last}")
+        tag = " · ".join(parts)
+        # A single-sweep pass over the same path is hidden rather than drawn
+        # twice; say it is there so it isn't mistaken for missing data.
+        presweeps = int(ls.get('presweeps') or 0)
+        if presweeps:
+            tag += f"  (+{presweeps} single sweep{'s' if presweeps > 1 else ''})"
+        return tag
 
     @staticmethod
     def _loc_avg_spectra(loc: dict):
@@ -681,20 +811,33 @@ class MapEditorBackend(QObject):
         else:
             sel[pi] = avg                     # {'V', 'Mixed', 'Forward', 'Backward'}
 
-        # One plot window per sweep direction, each overlaying every selected
-        # point's average for that direction (Forward / Backward / Mixed).
-        for sweep in ('Mixed', 'Forward', 'Backward'):
-            spectra = []
-            for p_i, a in sel.items():
-                y = a.get(sweep)
-                if y is None:
-                    continue
+        # ONE window holding both sweep directions: forward and backward of
+        # the same point belong side by side — that comparison is the whole
+        # reason both are kept — and three windows per click buried the
+        # workspace. Mixed is plotted only when the directions were not
+        # recorded separately, otherwise it is just their mean redrawn.
+        spectra = []
+        for p_i, a in sel.items():
+            directions = [(d, a.get(d)) for d in ('Forward', 'Backward')]
+            directions = [(d, y) for d, y in directions if y is not None]
+            if not directions:
+                directions = [('Mixed', a.get('Mixed'))] if a.get('Mixed') else []
+            for label, y in directions:
                 spectra.append({
-                    'x': a.get('V'), 'y': y, 'title': f"Point {p_i}",
+                    'x': a.get('V'), 'y': y,
+                    'title': f"Point {p_i} · {label}",
                     'x_name': 'V', 'y_name': 'Current',
                 })
-            if spectra:
-                self.openPlotWindowRequested.emit(f"STS points · {sweep}", spectra)
+        if spectra:
+            self.openPlotWindowRequested.emit("STS points", spectra)
+
+        # STM/STS data is read as dI/dV, so the derivative of each selected
+        # point's averaged sweep is shown alongside — in its own window,
+        # because nA and nA/V do not share an axis.
+        if self._is_stm_source(mcm):
+            didv = self._didv_spectra(sel)
+            if didv:
+                self.openPlotWindowRequested.emit("STS points · dI/dV", didv)
 
         # Highlight the selected dots on the canvas (instant click feedback).
         if self._canvas is not None:
@@ -704,6 +847,56 @@ class MapEditorBackend(QObject):
 
         # Push the average (mixed) of every selected dot to the inline panel.
         self.stsAverageUpdated.emit(self._sts_average_result(sel))
+
+    @staticmethod
+    def _is_stm_source(mcm) -> bool:
+        """True when this map came from an STM/STS loader.
+
+        Projects saved before the marker was stamped fall back to the
+        instrument name, so they keep the dI/dV plot.
+        """
+        try:
+            extra = getattr(mcm.metadata, 'extra', None) or {}
+        except Exception:
+            extra = {}
+        if str(extra.get('sts_technique', '')).upper() == 'STM':
+            return True
+        instrument = str(getattr(getattr(mcm, 'metadata', None),
+                                 'instrument', '') or '').lower()
+        return any(key in instrument for key in ('matrix', 'omicron', 'stm'))
+
+    @staticmethod
+    def _didv_spectra(sel: dict) -> list:
+        """dI/dV of each selected point's averaged sweep.
+
+        Averaged over the directions that exist, then differentiated — the
+        average of many repetitions is what the derivative should be taken
+        of, not one noisy sweep.
+        """
+        out = []
+        for p_i, a in sel.items():
+            v = a.get('V')
+            if not v:
+                continue
+            x = np.asarray(v, dtype=float)
+            stack = [np.asarray(a[d], dtype=float)
+                     for d in ('Forward', 'Backward', 'Mixed')
+                     if a.get(d) is not None
+                     and len(a[d]) == x.size]
+            # Prefer the two directions; fall back to Mixed alone.
+            directional = stack[:2] if len(stack) > 2 else stack
+            if not directional or x.size < 2:
+                continue
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                mean_i = np.nanmean(np.vstack(directional), axis=0)
+                didv = np.gradient(mean_i, x)
+            out.append({
+                'x': x.tolist(), 'y': np.nan_to_num(didv, nan=0.0).tolist(),
+                'title': f"Point {p_i} · dI/dV",
+                'x_name': 'V', 'y_name': 'dI/dV',
+            })
+        return out
 
     def _sts_average_result(self, sel: dict) -> Dict:
         """Build the inline-panel payload: NaN-aware mean of the selected dots'

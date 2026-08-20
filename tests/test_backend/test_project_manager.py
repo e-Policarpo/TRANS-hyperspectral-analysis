@@ -645,3 +645,186 @@ class TestInMemoryMapPersistence:
             'workspace': {}})
         loaded = pm.load_project(tmp_path / "e.hrt")
         assert loaded['maps_inmem'] == {}
+
+
+# =============================================================================
+# Truncated projects: an interrupted save must not cost the whole project
+# =============================================================================
+
+class TestTruncatedProjectRecovery:
+    """A .hrt cut short mid-write (crash, kill, full disk) still opens."""
+
+    @staticmethod
+    def _project(n_datasets=3, n_points=64):
+        import numpy as np
+        import pandas as pd
+        from src.models.spectral_data import SpectralData, SpectralMetadata
+
+        datasets = {}
+        for i in range(n_datasets):
+            x = np.linspace(-1, 1, n_points)
+            df = pd.DataFrame({'V': x, 'S0': np.sin(x * (i + 1)), 'S1': np.cos(x)})
+            datasets[f"Data{i}"] = SpectralData(df, SpectralMetadata(
+                source_type='sts', dimensions=(2, 1), scan_mode='point',
+                units={'independent': 'V'}, additional_info={'idx': i}))
+        return {'datasets': datasets, 'metadata': {'name': 'Trunc'}}
+
+    @staticmethod
+    def _truncate(path, keep_fraction=0.6):
+        data = path.read_bytes()
+        path.write_bytes(data[:int(len(data) * keep_fraction)])
+
+    def test_a_truncated_project_still_loads_its_written_datasets(self, tmp_path):
+        from src.backend.project_manager import ProjectManager
+
+        manager = ProjectManager()
+        path = tmp_path / "p.hrt"
+        assert manager.save_project(path, self._project(n_datasets=12))
+
+        # No backup on disk: this is the first save, so recovery must come
+        # from the damaged file itself.
+        (tmp_path / "p.hrt.bak").unlink(missing_ok=True)
+        self._truncate(path)
+
+        loaded = manager.load_project(path)
+        assert loaded is not None, "a truncated project lost everything"
+        assert loaded['recovered']['source'] == 'partial'
+        assert len(loaded['datasets']) > 0
+
+    def test_recovered_datasets_keep_their_real_values(self, tmp_path):
+        import numpy as np
+        from src.backend.project_manager import ProjectManager
+
+        manager = ProjectManager()
+        path = tmp_path / "p.hrt"
+        original = self._project(n_datasets=12)
+        manager.save_project(path, original)
+        (tmp_path / "p.hrt.bak").unlink(missing_ok=True)
+        self._truncate(path)
+
+        loaded = manager.load_project(path)
+        for name, dataset in loaded['datasets'].items():
+            np.testing.assert_allclose(
+                dataset.data['S0'].values,
+                original['datasets'][name].data['S0'].values)
+
+    def test_an_intact_project_is_not_flagged_as_recovered(self, tmp_path):
+        from src.backend.project_manager import ProjectManager
+
+        manager = ProjectManager()
+        path = tmp_path / "p.hrt"
+        manager.save_project(path, self._project())
+        loaded = manager.load_project(path)
+        assert 'recovered' not in loaded
+
+    def test_the_backup_is_preferred_over_a_partial_recovery(self, tmp_path):
+        from src.backend.project_manager import ProjectManager
+
+        manager = ProjectManager()
+        path = tmp_path / "p.hrt"
+        manager.save_project(path, self._project(n_datasets=4))   # v1
+        manager.save_project(path, self._project(n_datasets=4))   # v2, keeps v1 as .bak
+        assert manager.backup_path(path).exists()
+
+        self._truncate(path, keep_fraction=0.3)
+        loaded = manager.load_project(path)
+        assert loaded['recovered']['source'] == 'backup'
+        assert len(loaded['datasets']) == 4
+
+    def test_the_autosave_rescues_a_damaged_project(self, tmp_path):
+        """The case that actually happened: the save died mid-write, so the
+        .hrt is fresher than the autosave but holds nothing loadable."""
+        import os, time
+        from src.backend.project_manager import ProjectManager
+
+        manager = ProjectManager()
+        path = tmp_path / "p.hrt"
+        manager.save_project(manager.autosave_path(path), self._project(n_datasets=5))
+        manager.save_project(path, self._project(n_datasets=5))
+        manager.backup_path(path).unlink(missing_ok=True)
+
+        self._truncate(path, keep_fraction=0.4)
+        # The damaged file is the newer one — mtime must not decide this.
+        os.utime(path, (time.time() + 60, time.time() + 60))
+
+        loaded = manager.load_project(path)
+        assert loaded['recovered']['source'] == 'autosave'
+        assert len(loaded['datasets']) == 5
+
+    def test_a_damaged_autosave_is_skipped_for_the_partial_recovery(self, tmp_path):
+        from src.backend.project_manager import ProjectManager
+
+        manager = ProjectManager()
+        path = tmp_path / "p.hrt"
+        manager.save_project(manager.autosave_path(path), self._project(n_datasets=5))
+        manager.save_project(path, self._project(n_datasets=12))
+        manager.backup_path(path).unlink(missing_ok=True)
+
+        self._truncate(manager.autosave_path(path), keep_fraction=0.3)
+        self._truncate(path)
+
+        loaded = manager.load_project(path)
+        assert loaded['recovered']['source'] == 'partial'
+        assert len(loaded['datasets']) > 0
+
+    def test_a_hopeless_file_reports_failure_rather_than_pretending(self, tmp_path):
+        from src.backend.project_manager import ProjectManager
+
+        path = tmp_path / "p.hrt"
+        path.write_bytes(b'HRT2' + b'\x1f\x8b' + b'\x00' * 8)   # header only
+        assert ProjectManager().load_project(path) is None
+
+
+class TestAtomicSave:
+    """The project on disk is never the half-written one."""
+
+    @staticmethod
+    def _project():
+        import numpy as np
+        import pandas as pd
+        from src.models.spectral_data import SpectralData, SpectralMetadata
+
+        df = pd.DataFrame({'V': np.linspace(-1, 1, 32), 'S0': np.zeros(32)})
+        return {'datasets': {'D': SpectralData(df, SpectralMetadata(
+            source_type='sts', dimensions=(1, 1), scan_mode='point',
+            units={}, additional_info={}))}, 'metadata': {'name': 'Atomic'}}
+
+    def test_a_failed_save_leaves_the_previous_project_intact(self, tmp_path, monkeypatch):
+        import json
+        from src.backend.project_manager import ProjectManager
+
+        manager = ProjectManager()
+        path = tmp_path / "p.hrt"
+        assert manager.save_project(path, self._project())
+        good_bytes = path.read_bytes()
+
+        # Simulate the save dying part-way through writing.
+        real_dump = json.dump
+
+        def explode(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(json, 'dump', explode)
+        assert manager.save_project(path, self._project()) is False
+        monkeypatch.setattr(json, 'dump', real_dump)
+
+        assert path.read_bytes() == good_bytes, "the failed save clobbered the project"
+        assert manager.load_project(path) is not None
+
+    def test_no_temp_file_is_left_behind(self, tmp_path):
+        from src.backend.project_manager import ProjectManager
+
+        path = tmp_path / "p.hrt"
+        ProjectManager().save_project(path, self._project())
+        assert not (tmp_path / "p.hrt.tmp").exists()
+
+    def test_the_previous_version_is_kept_as_a_backup(self, tmp_path):
+        from src.backend.project_manager import ProjectManager
+
+        manager = ProjectManager()
+        path = tmp_path / "p.hrt"
+        manager.save_project(path, self._project())
+        first = path.read_bytes()
+        manager.save_project(path, self._project())
+
+        assert manager.backup_path(path).read_bytes() == first

@@ -270,7 +270,8 @@ class TestConfinementAnalysisPersistence:
         raw = restored['STS - Peak Matrix']
         binned = restored['STS - Peak Matrix (binned)']
         assert len(raw.independent_var) == 512
-        assert len(binned.independent_var) < 200
+        # Bins are kBT/2 wide, so ~300 of them across the sweep.
+        assert len(binned.independent_var) < 400
         assert raw.metadata.additional_info['binned'] is False
         assert binned.metadata.additional_info['binned'] is True
 

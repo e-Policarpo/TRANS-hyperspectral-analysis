@@ -56,6 +56,10 @@ def export_field(base_path: Union[str, Path],
                  value_unit: Optional[str] = None,
                  title: Optional[str] = None,
                  formats: Sequence[str] = DEFAULT_FORMATS,
+                 axis_note: Optional[str] = None,
+                 mixed_axes: bool = False,
+                 x_offset: float = 0.0,
+                 y_offset: float = 0.0,
                  context: str = "") -> Dict[str, str]:
     """Write ``data`` as a calibrated field. Returns ``{format: path}``.
 
@@ -67,6 +71,18 @@ def export_field(base_path: Union[str, Path],
     When the scale is unknown the files are still written — an uncalibrated
     export beats none — but a warning naming ``context`` is logged so the gap
     surfaces instead of silently producing a pixel-only file.
+
+    ``x_offset`` / ``y_offset`` place the field on its axes — the bias of the
+    first row, the position of the first column — so a reader sees real
+    coordinates instead of a grid starting at zero. GSF records them; TIFF has
+    nowhere to put them.
+
+    ``mixed_axes`` is for fields whose two axes are different quantities — a
+    bias-versus-position map, say. Neither format can label two axes
+    separately (GSF has one ``XYUnits``, ImageJ one ``unit=``), so the extents
+    are written as real numbers with **no** unit and ``axis_note`` records
+    what each axis is. That beats the alternatives: labelling both axes with
+    one unit would be false, and dropping the extents would leave bare pixels.
     """
     arr = np.asarray(data)
     if arr.ndim != 2:
@@ -79,7 +95,7 @@ def export_field(base_path: Union[str, Path],
     def _out(ext: str) -> Path:
         return Path(str(base) + ext)
 
-    calibrated = bool(dx and dy and dx > 0 and dy > 0 and unit)
+    calibrated = bool(dx and dy and dx > 0 and dy > 0 and (unit or mixed_axes))
     if not calibrated:
         logger.warning(
             "Exporting UNCALIBRATED field %s%s — no physical pixel size "
@@ -92,7 +108,8 @@ def export_field(base_path: Union[str, Path],
     if "tiff" in formats:
         written["tiff"] = write_calibrated_tiff(
             _out(".tiff"), float_data,
-            dx=dx, dy=dy, unit=unit, value_unit=value_unit, context=context)
+            dx=dx, dy=dy, unit=unit, value_unit=value_unit,
+            axis_note=axis_note, context=context)
 
     if "gsf" in formats:
         # GSF wants the total extent in SI base units. Lengths convert through
@@ -101,7 +118,11 @@ def export_field(base_path: Union[str, Path],
         # than being told something false.
         x_real = y_real = None
         xy_units = ""
-        if calibrated:
+        if mixed_axes and dx and dy:
+            # Each axis keeps its own extent; the unit stays empty because the
+            # two axes do not share one. ``axis_note`` says what they are.
+            x_real, y_real = dx * arr.shape[1], dy * arr.shape[0]
+        elif calibrated:
             dx_nm, dy_nm = to_nm(dx, unit), to_nm(dy, unit)
             if dx_nm and dy_nm:
                 x_real = dx_nm * arr.shape[1] * 1e-9   # nm → m
@@ -111,10 +132,14 @@ def export_field(base_path: Union[str, Path],
                 logger.debug(
                     "export_field: %r is not a length unit; GSF written "
                     "without lateral calibration", unit)
+        gsf_title = title or base.name
+        if axis_note:
+            gsf_title = f"{gsf_title} [{axis_note}]"
         written["gsf"] = write_gsf(
             _out(".gsf"), float_data,
             x_real=x_real, y_real=y_real, xy_units=xy_units,
-            z_units=_si_base_unit(value_unit), title=title or base.name)
+            x_offset=x_offset, y_offset=y_offset,
+            z_units=_si_base_unit(value_unit), title=gsf_title)
 
     return written
 
@@ -132,6 +157,8 @@ def export_field_from_metadata(base_path: Union[str, Path],
                                data: np.ndarray,
                                info: Optional[Dict[str, Any]] = None,
                                title: Optional[str] = None,
+                               formats: Sequence[str] = DEFAULT_FORMATS,
+                               axis_note: Optional[str] = None,
                                context: str = "") -> Dict[str, str]:
     """:func:`export_field` with the scale derived from loader metadata.
 
@@ -147,4 +174,5 @@ def export_field_from_metadata(base_path: Union[str, Path],
     if isinstance(units, dict):
         value_unit = units.get("dependent") or units.get("z")
     return export_field(base_path, data, dx=dx, dy=dy, unit=unit,
-                        value_unit=value_unit, title=title, context=context)
+                        value_unit=value_unit, title=title, formats=formats,
+                        axis_note=axis_note, context=context)

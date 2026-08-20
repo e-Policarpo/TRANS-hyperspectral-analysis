@@ -31,6 +31,7 @@ images lives in ``SpectralData.metadata.additional_info`` under the keys
 """
 
 import logging
+import math
 import re
 import warnings
 from datetime import datetime
@@ -241,9 +242,18 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
         load aborts and ``(None, None)`` is returned.
         """
         directory = Path(directory)
-        bases = self._discover_session_bases(directory)
-        if not bases:
+        found = self._scan_session_bases(directory)
+        if not found:
             raise ValueError(f"No Omicron MATRIX data files in {directory}")
+        # Image-only sessions (aborted runs) carry no spectra and are dropped.
+        # They must be dropped *before* labelling, not just before loading: a
+        # stub sharing its date with a real session would otherwise count as a
+        # clash and force the real one to keep its acquisition time — leaving
+        # one folder named "2026Jun24-124501" with nothing to disambiguate
+        # against, while single-session days read plainly as "2026Jun16".
+        bases = sorted(b for b, has_spectra in found.items() if has_spectra)
+        if not bases:
+            raise ValueError(f"No spectroscopy data found in {directory}")
 
         sessions: List[dict] = []
         images: List[Tuple[str, Any]] = []
@@ -343,18 +353,36 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
         m = re.match(r'(.*?)_\d{4}\.mtrx$', name)
         return m.group(1) if m else name
 
-    def _discover_session_bases(self, directory: Path) -> List[str]:
-        """Distinct session base names present as data files in ``directory``."""
-        exts = tuple(self.SPECTROSCOPY_EXTENSIONS) + tuple(self.IMAGE_EXTENSIONS)
-        bases = set()
+    def _scan_session_bases(self, directory: Path) -> Dict[str, bool]:
+        """Map each session base in ``directory`` to whether it has spectra.
+
+        ``True`` means the session has at least one spectroscopy file; ``False``
+        that it holds nothing but scan images — typically an aborted run that
+        got a topography frame and was stopped before any curve. Such sessions
+        yield no data, so callers filter them out.
+
+        One directory pass answers both questions: a session folder can hold
+        hundreds of thousands of files, so re-scanning is not free.
+        """
+        spec_exts = tuple(self.SPECTROSCOPY_EXTENSIONS)
+        img_exts = tuple(self.IMAGE_EXTENSIONS)
+        found: Dict[str, bool] = {}
         try:
             for f in directory.iterdir():
                 n = f.name
-                if '--' in n and n.endswith(exts) and f.is_file():
-                    bases.add(n.rsplit('--', 1)[0])
+                if '--' not in n or not f.is_file():
+                    continue
+                if n.endswith(spec_exts):
+                    found[n.rsplit('--', 1)[0]] = True
+                elif n.endswith(img_exts):
+                    found.setdefault(n.rsplit('--', 1)[0], False)
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug("Could not scan %s for sessions: %s", directory, exc)
-        return sorted(bases)
+        return found
+
+    def _discover_session_bases(self, directory: Path) -> List[str]:
+        """Distinct session base names present as data files in ``directory``."""
+        return sorted(self._scan_session_bases(directory))
 
     @staticmethod
     def _first_header_in(directory: Path) -> Optional[Path]:
@@ -670,6 +698,122 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
 
         line_scans.sort(key=lambda d: d['point_indices'][0])
         return line_scans
+
+    @staticmethod
+    def _line_overlays(locations: List[dict]) -> List[dict]:
+        """Group a scan's STS locations into per-line-scan outlines.
+
+        One entry per line scan present on this image, ordered along the line,
+        carrying the pixel path plus the numbers that identify it in the map
+        view (``line1 · 57pts ×3 · pt20→pt76``).
+        """
+        by_line: Dict[int, List[dict]] = {}
+        for loc in locations:
+            lid = loc.get('line_scan_id')
+            if lid is None or not loc.get('px'):
+                continue
+            by_line.setdefault(int(lid), []).append(loc)
+
+        overlays = []
+        for lid in sorted(by_line):
+            pts = sorted(by_line[lid], key=lambda d: (d.get('line_pos') if d.get('line_pos') is not None else 0))
+            indices = [int(p['point_index']) for p in pts]
+            overlays.append({
+                'id': lid,
+                'label': f"line{lid}",
+                'n_points': len(pts),
+                'reps': int(pts[0].get('reps') or 0),
+                'presweeps': 0,
+                'point_indices': indices,
+                'point_first': indices[0],
+                'point_last': indices[-1],
+                'px_path': [[int(p['px'][0]), int(p['px'][1])] for p in pts],
+                'px_start': [int(pts[0]['px'][0]), int(pts[0]['px'][1])],
+                'px_end': [int(pts[-1]['px'][0]), int(pts[-1]['px'][1])],
+            })
+
+        return OmicronMatrixSTSLoader._hide_presweeps(overlays)
+
+    @staticmethod
+    def _locations_on_grid(locations: List[dict], grid, title: str = '') -> List[dict]:
+        """Keep only the STS points that fall inside this scan's pixel grid.
+
+        A point outside it belongs to another scan (MATRIX records the pixel
+        coordinate relative to the image the spectrum was taken on), and
+        drawing it anyway puts dots and line outlines off the edge of the
+        map. Half a pixel of tolerance is allowed so a point measured exactly
+        on the boundary survives rounding.
+        """
+        if not grid or len(grid) < 2:
+            return locations
+        rows, cols = int(grid[0]), int(grid[1])
+        if rows <= 0 or cols <= 0:
+            return locations
+
+        kept, dropped = [], 0
+        for loc in locations:
+            px = loc.get('px')
+            if not px:
+                kept.append(loc)          # no position: nothing to validate
+                continue
+            x, y = float(px[0]), float(px[1])
+            if -0.5 <= x <= cols - 0.5 and -0.5 <= y <= rows - 0.5:
+                kept.append(loc)
+            else:
+                dropped += 1
+
+        if dropped:
+            logger.warning("%s: %d of %d STS point(s) fall outside the %dx%d "
+                           "scan grid and were not placed on it",
+                           title or 'scan', dropped, len(locations), cols, rows)
+        return kept
+
+    @staticmethod
+    def _paths_coincide(a: dict, b: dict) -> bool:
+        """Do two line scans run over the same path?
+
+        Endpoints are compared with a tolerance of one point spacing: an
+        interleaved single sweep sits between the multi-rep points, so its
+        ends land up to a spacing away rather than exactly on top.
+        """
+        def _spacing(ov):
+            (x0, y0), (x1, y1) = ov['px_start'], ov['px_end']
+            steps = max(1, ov['n_points'] - 1)
+            return math.hypot(x1 - x0, y1 - y0) / steps
+
+        tol = max(3.0, _spacing(a), _spacing(b))
+
+        def _near(p, q):
+            return math.hypot(p[0] - q[0], p[1] - q[1]) <= tol
+
+        return ((_near(a['px_start'], b['px_start']) and _near(a['px_end'], b['px_end']))
+                or (_near(a['px_start'], b['px_end']) and _near(a['px_end'], b['px_start'])))
+
+    @staticmethod
+    def _hide_presweeps(overlays: List[dict]) -> List[dict]:
+        """Drop single-sweep lines that shadow a multi-rep line's path.
+
+        MATRIX interleaves a one-sweep pass with the real, many-times-averaged
+        measurement over the same positions. Both are kept as datasets, but
+        outlining both puts two tags on one line for what is, to the eye, a
+        single acquisition — so the pre-sweep is left off the map and counted
+        on the line it belongs to.
+        """
+        visible = []
+        for overlay in overlays:
+            if overlay['reps'] <= 1:
+                host = next((other for other in overlays
+                             if other is not overlay and other['reps'] > 1
+                             and OmicronMatrixSTSLoader._paths_coincide(other, overlay)),
+                            None)
+                if host is not None:
+                    host['presweeps'] += 1
+                    logger.info("line%s is a single sweep over line%s's path — "
+                                "kept as data, hidden on the map",
+                                overlay['id'], host['id'])
+                    continue
+            visible.append(overlay)
+        return visible
 
     def _is_line(self, pxs: List) -> bool:
         """True if pixel locations ``pxs`` form a straight, monotone,
@@ -1051,23 +1195,44 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
             s['area'] = aid
             area_of_rs[s['rs']] = aid
 
-        # Each spectrum → area of the most-recent scan taken at or before it
-        # (spectra taken before the very first scan attach to the first area).
-        # A spectrum with no timestamp falls back to matching its Run Cycle.
+        # Each spectrum → the area of the scan it was actually taken on.
+        #
+        # The Run Cycle the file records (``referenced_by``) is that scan,
+        # stated by MATRIX itself, so it is used whenever it is available.
+        # The timestamp heuristic below is only a fallback, because it is
+        # wrong whenever a spectrum was taken *during* a scan: an image is
+        # stamped when it FINISHES, so "the last scan starting before this
+        # spectrum" resolves to the previous scan. That put line scans on the
+        # preceding image — often a 6-row strip they could not fit on.
+        area_by_run: Dict[int, Any] = {}
+        for s in scans:
+            area_by_run.setdefault(int(s['rs'][0]), s['area'])
+
         scan_ts = [s['ts'] for s in scans]
+        unmatched_runs = set()
         for b in batches:
+            run = b.get('parent_run')
+            if run is not None:
+                try:
+                    area = area_by_run.get(int(run))
+                except (TypeError, ValueError):
+                    area = None
+                if area is not None:
+                    by_area.setdefault(area, []).append(b)
+                    continue
+                unmatched_runs.add(run)
+
             ts = b.get('first_timestamp')
             if ts is not None:
                 i = max(bisect_right(scan_ts, ts) - 1, 0)
                 by_area.setdefault(scans[i]['area'], []).append(b)
-                continue
-            run = b.get('parent_run')
-            if run is None:
-                continue
-            for s in scans:
-                if s['rs'][0] == int(run):
-                    by_area.setdefault(s['area'], []).append(b)
-                    break
+
+        if unmatched_runs:
+            # The referenced scan is not in this session (e.g. its image files
+            # were not exported); those spectra fell back to the timestamp.
+            logger.info("Spectra reference run cycle(s) %s with no scan in this "
+                        "session; placed by timestamp instead",
+                        sorted(unmatched_runs))
         return area_of_rs, by_area
 
     def _build_images(self, md, image_files: List[Path], label: str,
@@ -1145,6 +1310,12 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
                     'px': list(b['location_px']) if b['location_px'] else None,
                     'm': list(b['location_m']) if b['location_m'] else None,
                     'reps': len(b['mixed']),
+                    # Which line scan this point belongs to (None = isolated),
+                    # and its position along that line. Lets the map view
+                    # outline and tag each line instead of showing a fog of
+                    # identical dots.
+                    'line_scan_id': b.get('line_scan_id'),
+                    'line_pos': b.get('line_pos'),
                     'avg_spectra': avg_spectra,
                 })
             locations.sort(key=lambda d: d['point_index'])
@@ -1163,6 +1334,17 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
                     channels[name] = data
                     channel_units[name] = info['unit']
 
+            # STS_LOCATION is a pixel coordinate in the scan the spectrum was
+            # taken on, so a spectrum bound to a *differently sized* scan can
+            # land outside this grid. Those points are not on this image and
+            # are dropped before anything is drawn from them.
+            grid = next(iter(channels.values())).shape if channels else None
+            locations = self._locations_on_grid(locations, grid, title)
+
+            # Per-line descriptors for the points that actually landed on this
+            # scan — a line acquired on another area must not be outlined here.
+            map_lines = self._line_overlays(locations)
+
             ts = geom['timestamp']
             maps.append({
                 'title': title,
@@ -1177,6 +1359,7 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
                 'timestamp': ts.isoformat() if ts else None,
                 'source_files': sorted(parent_files),
                 'locations': locations,
+                'line_scans': map_lines,
             })
 
             # ONE browsable picture per physical scan, carrying every channel ×

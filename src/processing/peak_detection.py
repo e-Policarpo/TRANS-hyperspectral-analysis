@@ -79,7 +79,8 @@ def smooth(y: np.ndarray, kind: str, half_width: int) -> np.ndarray:
 # Background estimation
 # =============================================================================
 
-BASELINE_KINDS = ("none", "poly", "poly-iter", "als", "rubberband", "endpoints")
+BASELINE_KINDS = ("none", "poly", "poly-iter", "arpls", "snip", "als",
+                  "rubberband", "endpoints")
 
 #: Methods that ignore ``degree``/``iterations`` and take their own parameters.
 BASELINE_DESCRIPTIONS = {
@@ -192,6 +193,127 @@ def als_baseline(y: np.ndarray, lam: float = 1e5, p: float = 0.01, niter: int = 
         w = p * (y > z) + (1 - p) * (y < z)
 
     return z
+
+
+def noise_sigma(y: np.ndarray) -> float:
+    """Robust noise level of a spectrum, from its own second difference.
+
+    The second difference of white noise has variance 6*sigma^2, and a median
+    absolute deviation ignores the peaks entirely (they are a small minority
+    of the samples), so this measures the noise without needing a peak-free
+    stretch to measure it on.
+    """
+    y = np.asarray(y, dtype=np.float64)
+    finite = y[np.isfinite(y)]
+    if finite.size < 5:
+        return 0.0
+    d2 = np.diff(finite, n=2)
+    if d2.size == 0:
+        return 0.0
+    mad = float(np.median(np.abs(d2 - np.median(d2))))
+    return float(1.4826 * mad / math.sqrt(6.0))
+
+
+def arpls_baseline(y: np.ndarray, lam: float = 1e4, ratio: float = 0.05,
+                   niter: int = 50, log_space: Optional[bool] = None) -> np.ndarray:
+    """Asymmetrically Reweighted Penalized Least Squares baseline.
+
+    ALS needs its asymmetry ``p`` guessed in advance and gets it wrong when
+    the peak density varies along the spectrum: too small and the background
+    still cuts through the peaks, too large and it climbs into them. arPLS
+    (Baek et al., *Analyst* 2015) derives the weights from the residual's own
+    negative-side statistics on each iteration, so it adapts to the data and
+    needs only a smoothness parameter.
+
+    Iteration stops once the weights settle to within ``ratio``.
+
+    ``log_space`` fits the logarithm of the data instead, which is what makes
+    this usable on STS: a tunnelling band edge rises by orders of magnitude,
+    and no smoothness penalty can follow that in linear space — the curve
+    flattens near zero and leaves the whole edge behind as residual. In log
+    space the edge is nearly a straight line. Left as None it is chosen
+    automatically: log space for strictly positive data spanning more than two
+    decades.
+    """
+    from scipy import sparse
+    from scipy.sparse.linalg import spsolve
+
+    y = np.asarray(y, dtype=np.float64)
+    L = y.size
+    if L < 3:
+        return np.zeros_like(y)
+
+    if log_space is None:
+        finite = y[np.isfinite(y)]
+        positive = finite[finite > 0]
+        log_space = bool(positive.size == finite.size and positive.size > 0
+                         and positive.max() / positive.min() > 100.0)
+
+    if log_space:
+        floor = float(np.min(y[y > 0])) * 1e-3 if np.any(y > 0) else 1e-300
+        fitted = arpls_baseline(np.log(np.clip(y, floor, None)), lam=lam,
+                                ratio=ratio, niter=niter, log_space=False)
+        return np.exp(fitted)
+
+    D = sparse.diags([1, -2, 1], [0, -1, -2], shape=(L, L - 2))
+    H = lam * D.dot(D.T)
+    w = np.ones(L)
+    z = y.copy()
+
+    for _ in range(max(1, int(niter))):
+        W = sparse.spdiags(w, 0, L, L)
+        z = spsolve(sparse.csc_matrix(W + H), w * y)
+        d = y - z
+        negative = d[d < 0]
+        if negative.size == 0:
+            break
+        mean, std = float(negative.mean()), float(negative.std())
+        if std == 0:
+            break
+        # Logistic weights: points well above the curve are peaks and get no
+        # say in the fit; points near or below it define the background.
+        with np.errstate(over='ignore'):
+            w_new = 1.0 / (1.0 + np.exp(2.0 * (d - (2.0 * std - mean)) / std))
+        norm = np.linalg.norm(w)
+        settled = bool(norm) and np.linalg.norm(w - w_new) / norm < ratio
+        w = w_new
+        if settled:
+            break
+
+    return np.asarray(z, dtype=np.float64)
+
+
+def snip_baseline(y: np.ndarray, iterations: int = 40) -> np.ndarray:
+    """SNIP (Statistics-sensitive Non-linear Iterative Peak-clipping).
+
+    Repeatedly replaces each point by the smaller of itself and the mean of
+    two neighbours a window apart, over a growing then shrinking window. It
+    assumes nothing about the background's shape, which is what makes it
+    useful where a polynomial either misses the band edges or eats the states.
+
+    Runs in log-log space so the wide dynamic range of an STS band edge does
+    not swamp the small in-gap features.
+    """
+    y = np.asarray(y, dtype=np.float64)
+    if y.size < 3:
+        return np.zeros_like(y)
+
+    offset = 0.0
+    finite = y[np.isfinite(y)]
+    if finite.size and float(finite.min()) <= 0:
+        offset = abs(float(finite.min())) + 1.0
+    work = np.log(np.log(np.sqrt(np.clip(y + offset, 1e-300, None)) + 1.0) + 1.0)
+
+    span = max(2, int(iterations))
+    for w in list(range(1, span + 1)) + list(range(span, 0, -1)):
+        left = np.roll(work, w)
+        right = np.roll(work, -w)
+        left[:w] = work[:w]
+        right[-w:] = work[-w:]
+        work = np.minimum(work, (left + right) / 2.0)
+
+    baseline = (np.exp(np.exp(work) - 1.0) - 1.0) ** 2 - offset
+    return np.asarray(baseline, dtype=np.float64)
 
 
 def rubberband_baseline(x: np.ndarray, y: np.ndarray) -> np.ndarray:
@@ -368,6 +490,14 @@ def estimate_baseline(
         return polynomial_baseline(x, y, kind, degree, iterations, direction, basis=basis)
     if kind == "als":
         return np.asarray(als_baseline(y, lam=als_lambda, p=als_p), dtype=np.float64)
+    if kind == "arpls":
+        # als_lambda is shared with ALS, whose useful range is far higher; a
+        # log-space arPLS wants ~1e4. Rescale rather than add another knob.
+        lam = als_lambda if als_lambda and als_lambda < 1e6 else 1e4
+        return np.asarray(arpls_baseline(y, lam=lam), dtype=np.float64)
+    if kind == "snip":
+        return np.asarray(snip_baseline(y, iterations=max(2, int(iterations))),
+                          dtype=np.float64)
     if kind == "rubberband":
         return np.asarray(rubberband_baseline(x, y), dtype=np.float64)
     if kind == "endpoints":
@@ -382,7 +512,7 @@ def estimate_baseline(
 # =============================================================================
 
 DIRECTIONS = ("positive", "negative", "both")
-HEIGHT_MODES = ("range", "prominence", "max")
+HEIGHT_MODES = ("range", "prominence", "max", "noise")
 
 #: Boltzmann constant in eV/K. An STS bias axis in volts is an energy axis in
 #: eV, so k_B * T lands directly in x-axis units.
@@ -484,9 +614,24 @@ class Params:
     x_energy_unit: str = "eV"
 
     @property
-    def bin_width(self) -> float:
-        """k_B * T in x-axis units; 0.0 when thermal grouping is off."""
+    def thermal_width(self) -> float:
+        """k_B * T in x-axis units — the resolution limit, and so the smallest
+        separation at which two peaks are still distinct features. 0.0 when
+        thermal grouping is off."""
         return thermal_broadening(self.temperature_k, self.x_energy_unit)
+
+    @property
+    def bin_width(self) -> float:
+        """Width of the output energy bins: **half** of k_B * T.
+
+        Binning at the full k_B * T threw away resolution the measurement
+        still has — a bin is a reporting grid, not the resolution limit, and
+        a grid as coarse as the error bar smears peaks that are separately
+        resolvable. Half k_B * T keeps peaks that survived the k_B * T
+        minimum-separation filter (see ``thermal_width``) in bins of their
+        own. 0.0 when thermal grouping is off.
+        """
+        return self.thermal_width / 2.0
 
     def validate(self) -> None:
         """Raise ValueError on any out-of-domain choice, naming the parameter."""
@@ -666,6 +811,17 @@ def analyze(x: np.ndarray, y: np.ndarray, params: Optional[Params] = None) -> An
                         baseline=baseline, y_corrected=corrected, peaks=[])
 
     threshold = (p.height / 100.0) * span
+    if p.height_mode == "noise":
+        # A prominence measured against the curve's SPAN is meaningless on a
+        # spectrum whose span is set by the band edges: 5% of that rejects
+        # every in-gap state. Against the spectrum's own noise it is
+        # scale-free, so weak states in a quiet spectrum survive while noise
+        # in a noisy one does not. Here `height` is a multiple of sigma.
+        # Measured on the RAW curve, not the smoothed one: smoothing
+        # correlates neighbouring samples, so a second-difference estimate of
+        # the smoothed curve reads well below the real measurement noise and
+        # the threshold lets every wiggle through.
+        threshold = p.height * noise_sigma(yw_raw - baseline)
     # Same dust, but on a flat stretch of an otherwise varying curve: those
     # candidates come back with a prominence of exactly 0 from scipy, while a
     # real peak is orders of magnitude above this floor.
@@ -694,6 +850,9 @@ def analyze(x: np.ndarray, y: np.ndarray, params: Optional[Params] = None) -> An
                     continue
             elif p.height_mode == "max":
                 if peak_max <= 0 or ys[i] < (p.height / 100.0) * peak_max:
+                    continue
+            elif p.height_mode == "noise":
+                if prom < threshold:
                     continue
 
             full_i = int(idx[i])

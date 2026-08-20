@@ -946,7 +946,8 @@ class TestConfinementAnalysisExecution:
         assert len(ungrouped['peak_matrix'].independent_var) == 512
         # The binned table arrives alongside the full-resolution one.
         assert len(grouped['peak_matrix'].independent_var) == 512
-        assert len(grouped['peak_matrix_binned'].independent_var) < 200
+        # Bins are kBT/2 wide, so ~300 of them across this sweep.
+        assert len(grouped['peak_matrix_binned'].independent_var) < 400
         assert grouped['peak_matrix_binned'].metadata.additional_info['temperature_k'] == 94.0
 
     def test_fwhm_multiplier_is_not_passed_as_a_detection_param(self, executor, sts_data):

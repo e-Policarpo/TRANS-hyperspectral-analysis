@@ -103,7 +103,9 @@ Rectangle {
 
         // Output name always shown first if present
         if (params.output_name) parts.push(params.output_name)
-        if (params.dataset_name) parts.push(params.dataset_name)
+        if (params.dataset_names && params.dataset_names.length > 1)
+            parts.push(params.dataset_names.length + " datasets (run in turn)")
+        else if (params.dataset_name) parts.push(params.dataset_name)
 
         // Tool-specific parameter display
         if (nodeData.tool_name === "TruncateData") {

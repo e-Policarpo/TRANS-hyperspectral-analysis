@@ -862,7 +862,10 @@ class TestOmicronAreaBinding:
         assert by_area.get(area_of_rs[(12, 1)]) == [b]
         assert by_area.get(area_of_rs[(12, 6)]) is None
 
-    def test_spectrum_attaches_to_most_recent_prior_scan(self, sts_loader):
+    def test_the_recorded_run_cycle_beats_the_timestamp(self, sts_loader):
+        """MATRIX states which scan a spectrum belongs to; the timestamp is
+        only a guess, and a wrong one whenever the spectrum was taken during
+        a scan (see test_spectra_taken_during_a_scan_stay_on_it)."""
         t = datetime(2026, 6, 15, 20, 0, 0)
         groups = self._groups(
             (1, 1, self._geom(x=0.0, ts=t)),
@@ -870,9 +873,49 @@ class TestOmicronAreaBinding:
         )
         late = self._batch(1, ts=t + timedelta(minutes=20), run=1)
         area_of_rs, by_area = sts_loader._assign_spectra_to_areas(groups, [late])
-        # Taken after the second scan → belongs to the second area, even though
-        # its Run Cycle says 1.
-        assert by_area[area_of_rs[(2, 1)]] == [late]
+        assert by_area[area_of_rs[(1, 1)]] == [late]
+        assert area_of_rs[(2, 1)] not in by_area
+
+    def test_spectra_taken_during_a_scan_stay_on_it(self, sts_loader):
+        """The 21-Jul bug, in miniature.
+
+        A scan image is stamped when it FINISHES, so a line scan measured
+        while run 3 was in progress is timestamped before run 3's image and
+        after run 2's. Binding by "the last scan before this spectrum" put it
+        on run 2 — often a 6-row strip its pixel coordinates could not fit on.
+        """
+        t = datetime(2026, 7, 21, 14, 47, 32)
+        groups = self._groups(
+            (2, 1, self._geom(w=4e-6, h=7.1e-7, ts=t)),
+            (3, 1, self._geom(w=4e-6, h=6.1e-7, x=4e-8,
+                              ts=t + timedelta(minutes=35))),
+        )
+        # Measured during run 3, i.e. before run 3's image was written.
+        line = [self._batch(i, ts=t + timedelta(minutes=20), run=3)
+                for i in range(26)]
+        area_of_rs, by_area = sts_loader._assign_spectra_to_areas(groups, line)
+
+        assert by_area[area_of_rs[(3, 1)]] == line
+        assert area_of_rs[(2, 1)] not in by_area
+
+    def test_a_reference_to_a_missing_scan_falls_back_to_the_timestamp(self, sts_loader):
+        """The referenced scan's images may not have been exported; the
+        spectrum still has to land somewhere."""
+        t = datetime(2026, 6, 15, 20, 0, 0)
+        groups = self._groups((1, 1, self._geom(ts=t)))
+        orphan = self._batch(1, ts=t + timedelta(minutes=5), run=99)
+        area_of_rs, by_area = sts_loader._assign_spectra_to_areas(groups, [orphan])
+        assert by_area[area_of_rs[(1, 1)]] == [orphan]
+
+    def test_a_spectrum_is_never_placed_twice(self, sts_loader):
+        t = datetime(2026, 6, 15, 20, 0, 0)
+        groups = self._groups(
+            (1, 1, self._geom(ts=t)),
+            (2, 1, self._geom(x=5e-7, ts=t + timedelta(minutes=10))),
+        )
+        b = self._batch(1, ts=t + timedelta(minutes=20), run=1)
+        _, by_area = sts_loader._assign_spectra_to_areas(groups, [b])
+        assert sum(len(v) for v in by_area.values()) == 1
 
     def test_spectrum_before_any_scan_attaches_to_the_first(self, sts_loader):
         t = datetime(2026, 6, 15, 20, 0, 0)
@@ -957,6 +1000,23 @@ class TestOmicronHeaderResolution:
             (tmp_path / n).write_bytes(b"")
         assert sts_loader._discover_session_bases(tmp_path) == [
             "A_STM-STM_Spectroscopy", "B_STM-STM_Spectroscopy"]
+
+    def test_image_only_sessions_are_flagged(self, sts_loader, tmp_path):
+        """An aborted run leaves a session with scan images but no curves. It
+        must be told apart from a real one so it can be dropped *before* the
+        labels are chosen — see
+        :meth:`test_a_stub_session_does_not_force_its_neighbour_to_keep_time`.
+        """
+        for n in ["A_STM-STM_Spectroscopy--1_1.I(V)_mtrx",
+                  "A_STM-STM_Spectroscopy--1_1.Z_mtrx",
+                  "B_STM-STM_Spectroscopy--1_1.Z_mtrx",
+                  "B_STM-STM_Spectroscopy--1_1.I_mtrx",
+                  "B_STM-STM_Spectroscopy_0001.mtrx"]:
+            (tmp_path / n).write_bytes(b"")
+        assert sts_loader._scan_session_bases(tmp_path) == {
+            "A_STM-STM_Spectroscopy": True,
+            "B_STM-STM_Spectroscopy": False,
+        }
 
     def test_own_header_is_preferred(self, sts_loader, tmp_path):
         (tmp_path / "A_0001.mtrx").write_bytes(b"")
@@ -1087,6 +1147,22 @@ class TestOmicronSessionLabels:
 
     def test_unconventional_base_falls_back_to_itself(self):
         assert _session_label('random_name') == 'random_name'
+
+    def test_a_stub_session_does_not_force_its_neighbour_to_keep_time(
+            self, sts_loader, tmp_path):
+        """Real regression: a same-day session holding only scan images made
+        the day's real session keep its acquisition time, so the browser showed
+        "2026Jun24-124501" next to plain "2026Jun16" — a clash with a folder
+        that is never created, because the stub carries no data to file."""
+        stub = 'default_2026Jun24-115533_STM-STM_Spectroscopy'
+        real = 'default_2026Jun24-124501_STM-STM_Spectroscopy'
+        for n in [f"{stub}--1_1.Z_mtrx", f"{stub}--1_1.I_mtrx",
+                  f"{real}--1_1.I(V)_mtrx", f"{real}--1_1.Z_mtrx"]:
+            (tmp_path / n).write_bytes(b"")
+        found = sts_loader._scan_session_bases(tmp_path)
+        bases = sorted(b for b, has_spectra in found.items() if has_spectra)
+        assert bases == [real]
+        assert _session_labels(bases) == {real: '2026Jun24'}
 
 
 class TestOmicronScanImages:
@@ -1267,3 +1343,193 @@ class TestOmicronLoaderRealFiles:
         topo = flat_loader.load_topography(_REAL_FLAT)
         assert isinstance(topo, TopographyData)
         assert topo.data.min() < topo.data.max()
+
+
+class TestOmicronLineOverlays:
+    """Per-map line-scan outlines, used to tag lines on the scan image."""
+
+    @staticmethod
+    def _loc(idx, px, lid, pos, reps=3):
+        return {'point_index': idx, 'px': list(px), 'reps': reps,
+                'line_scan_id': lid, 'line_pos': pos}
+
+    def test_groups_points_into_one_outline_per_line(self, sts_loader):
+        locs = ([self._loc(20 + i, (10 + i * 5, 30), 1, i) for i in range(4)]
+                + [self._loc(40 + i, (12, 60 + i * 4), 2, i) for i in range(5)])
+        overlays = sts_loader._line_overlays(locs)
+
+        assert [o['id'] for o in overlays] == [1, 2]
+        assert overlays[0]['n_points'] == 4 and overlays[1]['n_points'] == 5
+        assert overlays[0]['point_first'] == 20 and overlays[0]['point_last'] == 23
+
+    def test_path_follows_the_acquisition_order(self, sts_loader):
+        # Given out of order; the outline must still run pos 0 → pos 3.
+        locs = [self._loc(23, (25, 30), 1, 3), self._loc(20, (10, 30), 1, 0),
+                self._loc(22, (20, 30), 1, 2), self._loc(21, (15, 30), 1, 1)]
+        overlay = sts_loader._line_overlays(locs)[0]
+
+        assert overlay['px_path'] == [[10, 30], [15, 30], [20, 30], [25, 30]]
+        assert overlay['px_start'] == [10, 30] and overlay['px_end'] == [25, 30]
+
+    def test_isolated_points_are_not_outlined(self, sts_loader):
+        locs = [{'point_index': 1, 'px': [3, 3], 'line_scan_id': None,
+                 'line_pos': None, 'reps': 1}]
+        assert sts_loader._line_overlays(locs) == []
+
+    def test_points_without_pixels_are_skipped(self, sts_loader):
+        locs = [self._loc(1, (0, 0), 1, 0), {'point_index': 2, 'px': None,
+                                             'line_scan_id': 1, 'line_pos': 1}]
+        # Only one usable point left → nothing to outline, but no crash.
+        overlays = sts_loader._line_overlays(locs)
+        assert overlays[0]['n_points'] == 1
+
+    def test_reps_are_carried_for_the_tag(self, sts_loader):
+        locs = [self._loc(5 + i, (i, 0), 1, i, reps=7) for i in range(4)]
+        assert sts_loader._line_overlays(locs)[0]['reps'] == 7
+
+
+class TestLineScanDatasetNaming:
+    """A line scan's dataset name says how many positions it holds, how many
+    repetitions each, and which point indices it spans."""
+
+    @staticmethod
+    def _expand(sessions):
+        """Run the real expansion with a stub loader and backend."""
+        from types import SimpleNamespace
+        from src.backend.app_backend import AppBackend
+
+        def _ds():
+            return SimpleNamespace(metadata=SimpleNamespace(additional_info={}))
+
+        loader = SimpleNamespace(
+            build_line_scan_dataset=lambda session, ls, name, sweep: _ds(),
+            build_point_dataset=lambda session, batch, name: _ds(),
+            build_overview_dataset=lambda session, name: _ds(),
+        )
+        backend = SimpleNamespace(omicron_sts_loader=loader)
+        spectral = SimpleNamespace(
+            metadata=SimpleNamespace(additional_info={'sessions': sessions}))
+        return AppBackend._matrix_result_from_spectral(backend, spectral)
+
+    @staticmethod
+    def _session(line_scans):
+        return {'label': 'dia30', 'batches': [], 'maps': [], 'images': [],
+                'line_scans': line_scans}
+
+    def test_name_carries_points_reps_and_span(self):
+        result = self._expand([self._session([
+            {'id': 1, 'n_points': 57, 'reps': 3,
+             'point_indices': list(range(20, 77))}])])
+
+        names = list(result['datasets'])
+        assert any("line1 (57pts_3reps_pt20->pt76)" in n for n in names), names
+        # One dataset per sweep direction, all sharing the same base name.
+        assert len([n for n in names if "line1" in n]) == 3
+
+    def test_each_line_gets_its_own_span(self):
+        result = self._expand([self._session([
+            {'id': 1, 'n_points': 4, 'reps': 2, 'point_indices': [1, 2, 3, 4]},
+            {'id': 2, 'n_points': 6, 'reps': 5, 'point_indices': [9, 10, 11, 12, 13, 14]},
+        ])])
+
+        names = " ".join(result['datasets'])
+        assert "line1 (4pts_2reps_pt1->pt4)" in names
+        assert "line2 (6pts_5reps_pt9->pt14)" in names
+
+    def test_a_session_without_lines_still_yields_an_overview(self):
+        result = self._expand([self._session([])])
+        assert any("overview" in n for n in result['datasets'])
+
+
+class TestPresweepLinesHidden:
+    """MATRIX interleaves a one-sweep pass with the real averaged measurement
+    over the same positions; only the real one is outlined on the map."""
+
+    @staticmethod
+    def _loc(idx, px, lid, pos, reps):
+        return {'point_index': idx, 'px': list(px), 'reps': reps,
+                'line_scan_id': lid, 'line_pos': pos}
+
+    def _interleaved(self, reps_a=511, reps_b=1, n=8):
+        """Two lines over the same path, acquired point-for-point together."""
+        locs = []
+        for i in range(n):
+            locs.append(self._loc(2 * i + 1, (10 + i * 5, 30), 1, i, reps_a))
+            locs.append(self._loc(2 * i + 2, (10 + i * 5, 30), 2, i, reps_b))
+        return locs
+
+    def test_the_single_sweep_line_is_not_outlined(self, sts_loader):
+        overlays = sts_loader._line_overlays(self._interleaved())
+        assert [o['id'] for o in overlays] == [1]
+
+    def test_the_surviving_line_counts_the_hidden_sweep(self, sts_loader):
+        overlays = sts_loader._line_overlays(self._interleaved())
+        assert overlays[0]['presweeps'] == 1
+        assert overlays[0]['reps'] == 511
+
+    def test_a_lone_single_sweep_line_is_still_shown(self, sts_loader):
+        """Nothing to hide behind — it is the only measurement there."""
+        locs = [self._loc(i + 1, (10 + i * 5, 80), 3, i, 1) for i in range(6)]
+        overlays = sts_loader._line_overlays(locs)
+        assert [o['id'] for o in overlays] == [3]
+
+    def test_a_single_sweep_elsewhere_is_kept(self, sts_loader):
+        locs = self._interleaved()
+        locs += [self._loc(100 + i, (200, 10 + i * 5), 3, i, 1) for i in range(6)]
+        overlays = sts_loader._line_overlays(locs)
+        assert sorted(o['id'] for o in overlays) == [1, 3]
+
+    def test_two_multi_rep_lines_on_one_path_both_stay(self, sts_loader):
+        """Only a *single* sweep is treated as a pre-sweep; two real
+        measurements over the same path are both real."""
+        overlays = sts_loader._line_overlays(self._interleaved(reps_a=511, reps_b=64))
+        assert sorted(o['id'] for o in overlays) == [1, 2]
+
+    def test_the_hidden_sweep_keeps_its_datasets(self, sts_loader):
+        """Hiding is a map-view decision: detection still reports both lines,
+        which is what the datasets are built from."""
+        pts = []
+        for i in range(8):
+            pts.append({'point_index': 2 * i + 1, 'location_px': (10 + i * 5, 30),
+                        'location_m': [0.0, 0.0], 'mixed': [None] * 5})
+            pts.append({'point_index': 2 * i + 2, 'location_px': (10 + i * 5, 30),
+                        'location_m': [0.0, 0.0], 'mixed': [None]})
+        lines = sts_loader._detect_line_scans(pts)
+        assert len(lines) == 2
+
+
+class TestLocationsOnGrid:
+    """Loader-side validation: a spectrum recorded against a different scan
+    must not place a point outside this one."""
+
+    @staticmethod
+    def _loc(idx, px):
+        return {'point_index': idx, 'px': list(px) if px else None}
+
+    def test_points_outside_the_grid_are_dropped(self, sts_loader):
+        kept = sts_loader._locations_on_grid(
+            [self._loc(1, (10, 10)), self._loc(2, (300, 10)),
+             self._loc(3, (10, -5))], (64, 64), 'scan')
+        assert [k['point_index'] for k in kept] == [1]
+
+    def test_the_boundary_pixels_are_inside(self, sts_loader):
+        kept = sts_loader._locations_on_grid(
+            [self._loc(1, (0, 0)), self._loc(2, (63, 63))], (64, 64))
+        assert len(kept) == 2
+
+    def test_a_rectangular_grid_uses_the_right_axis_for_each_coordinate(self, sts_loader):
+        # 100 rows x 20 cols: x is the column, y is the row.
+        kept = sts_loader._locations_on_grid(
+            [self._loc(1, (19, 99)),      # inside
+             self._loc(2, (99, 19))],     # x past the 20 columns
+            (100, 20))
+        assert [k['point_index'] for k in kept] == [1]
+
+    def test_points_without_a_position_are_kept(self, sts_loader):
+        kept = sts_loader._locations_on_grid([self._loc(1, None)], (64, 64))
+        assert len(kept) == 1
+
+    def test_an_unknown_grid_drops_nothing(self, sts_loader):
+        locs = [self._loc(1, (500, 500))]
+        assert sts_loader._locations_on_grid(locs, None) == locs
+        assert sts_loader._locations_on_grid(locs, (0, 0)) == locs

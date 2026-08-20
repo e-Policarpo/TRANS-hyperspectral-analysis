@@ -888,19 +888,72 @@ class TestStsMarkerClick:
         ]}
         return mcm, V
 
-    def test_clicking_dot_plots_all_three_sweeps_in_own_windows(self, backend):
+    def test_clicking_dot_plots_both_sweeps_in_one_window(self, backend):
+        """Forward and backward belong side by side — that comparison is why
+        both are kept — so one window carries them, not one window each."""
         mcm, V = self._map_with_locations()
         backend._multi_channel_map = mcm
         by_name = {}
         backend.openPlotWindowRequested.connect(
             lambda name, spectra: by_name.__setitem__(name, spectra))
         backend._on_sts_marker_clicked(1)          # point 7
-        assert set(by_name) == {"STS points · Mixed", "STS points · Forward",
-                                "STS points · Backward"}
-        assert by_name["STS points · Mixed"][0]['y'] == [1.0, 2.0, 3.0]
-        assert by_name["STS points · Forward"][0]['y'] == [4.0, 5.0, 6.0]
-        assert by_name["STS points · Backward"][0]['y'] == [7.0, 8.0, 9.0]
-        assert by_name["STS points · Mixed"][0]['title'] == "Point 7"
+
+        assert "STS points" in by_name
+        curves = {c['title']: c['y'] for c in by_name["STS points"]}
+        assert curves["Point 7 · Forward"] == [4.0, 5.0, 6.0]
+        assert curves["Point 7 · Backward"] == [7.0, 8.0, 9.0]
+        # Mixed is their mean redrawn, so it is not plotted a third time.
+        assert not any("Mixed" in title for title in curves)
+
+    def test_mixed_is_plotted_when_the_directions_were_not_recorded(self, backend):
+        mcm = MultiChannelMap()
+        mcm.add_channel("Z", np.zeros((8, 8)), ChannelType.HEIGHT, "m")
+        mcm.metadata.extra = {'sts_locations': [
+            {'point_index': 2, 'px': [1, 1], 'avg_spectra': {
+                'V': [-1.0, 0.0, 1.0], 'Mixed': [0.5, 0.6, 0.7],
+                'Forward': None, 'Backward': None}}]}
+        backend._multi_channel_map = mcm
+        by_name = {}
+        backend.openPlotWindowRequested.connect(
+            lambda name, spectra: by_name.__setitem__(name, spectra))
+        backend._on_sts_marker_clicked(0)
+
+        curves = {c['title']: c['y'] for c in by_name["STS points"]}
+        assert curves["Point 2 · Mixed"] == [0.5, 0.6, 0.7]
+
+    def test_stm_data_also_gets_a_didv_window(self, backend):
+        mcm, V = self._map_with_locations()
+        mcm.metadata.extra['sts_technique'] = 'STM'
+        backend._multi_channel_map = mcm
+        by_name = {}
+        backend.openPlotWindowRequested.connect(
+            lambda name, spectra: by_name.__setitem__(name, spectra))
+        backend._on_sts_marker_clicked(1)
+
+        assert "STS points · dI/dV" in by_name
+        curve = by_name["STS points · dI/dV"][0]
+        assert curve['y_name'] == 'dI/dV'
+        # The mean of Forward [4,5,6] and Backward [7,8,9] is [5.5, 6.5, 7.5];
+        # over V = [-1, 0, 1] its derivative is a constant 1.
+        np.testing.assert_allclose(curve['y'], [1.0, 1.0, 1.0])
+
+    def test_non_stm_data_gets_no_didv_window(self, backend):
+        mcm, V = self._map_with_locations()
+        mcm.metadata.extra['sts_technique'] = 'AFM'
+        mcm.metadata.instrument = 'Park NX7'
+        backend._multi_channel_map = mcm
+        by_name = {}
+        backend.openPlotWindowRequested.connect(
+            lambda name, spectra: by_name.__setitem__(name, spectra))
+        backend._on_sts_marker_clicked(1)
+
+        assert "STS points · dI/dV" not in by_name
+
+    def test_an_older_project_is_recognised_by_its_instrument(self, backend):
+        """Projects saved before the marker existed must keep the dI/dV plot."""
+        mcm, V = self._map_with_locations()
+        mcm.metadata.instrument = 'Omicron Matrix'
+        assert backend._is_stm_source(mcm) is True
 
     def test_clicking_dots_overlays_then_toggles_off(self, backend):
         mcm, _ = self._map_with_locations()
@@ -908,12 +961,13 @@ class TestStsMarkerClick:
         mixed = []
         backend.openPlotWindowRequested.connect(
             lambda name, spectra: mixed.append([s['title'] for s in spectra])
-            if name == "STS points · Mixed" else None)
+            if name == "STS points" else None)
         backend._on_sts_marker_clicked(0)          # Point 3
         backend._on_sts_marker_clicked(1)          # + Point 7 (overlay)
-        assert mixed[-1] == ["Point 3", "Point 7"]
+        assert mixed[-1] == ["Point 3 · Forward", "Point 3 · Backward",
+                             "Point 7 · Forward", "Point 7 · Backward"]
         backend._on_sts_marker_clicked(0)          # toggle Point 3 off
-        assert mixed[-1] == ["Point 7"]
+        assert mixed[-1] == ["Point 7 · Forward", "Point 7 · Backward"]
 
     def test_marker_click_is_safe_without_spectrum_or_out_of_range(self, backend):
         mcm = MultiChannelMap()
@@ -981,9 +1035,12 @@ class TestStsMarkerClick:
         backend.openPlotWindowRequested.connect(
             lambda name, spectra: by_name.__setitem__(name, spectra))
         backend._on_sts_marker_clicked(0)
-        # Only the Mixed window opens (no Forward/Backward in the old schema).
-        assert set(by_name) == {"STS points · Mixed"}
-        assert by_name["STS points · Mixed"][0]['y'] == [1e-8, 2e-8, 3e-8]
+        # The old schema has no directions, so Mixed is what gets plotted —
+        # in the one spectra window (dI/dV rides alongside for STM data).
+        assert "STS points" in by_name
+        curve = by_name["STS points"][0]
+        assert curve['title'] == "Point 1 · Mixed"
+        assert curve['y'] == [1e-8, 2e-8, 3e-8]
         # Metadata reads the legacy spectrum too.
         info = backend.getMapSpectraInfo()
         assert info['sts_point_count'] == 1
@@ -995,3 +1052,264 @@ class TestStsMarkerClick:
                'avg_spectrum': {'V': [0], 'y': [1]}}
         assert backend._loc_avg_spectra(loc)['Mixed'] == [9]
         assert backend._loc_avg_spectra({}) is None
+
+
+# =============================================================================
+# Line-scan outlines on the map view
+# =============================================================================
+
+class TestLineScanOutlines:
+    """A line scan is tagged and outlined, so 'which line went where' is
+    readable off the scan image instead of being a fog of identical dots."""
+
+    class FakeCanvas:
+        def __init__(self):
+            self.markers = None
+            self.lines = None
+
+        def setStsMarkers(self, markers):
+            self.markers = markers
+
+        def setStsLines(self, lines):
+            self.lines = lines
+
+    @staticmethod
+    def _map_with_line():
+        mcm = MultiChannelMap()
+        mcm.add_channel("Z", np.zeros((64, 64)), ChannelType.HEIGHT, "m")
+        mcm.metadata.extra = {
+            'sts_locations': [
+                {'point_index': 20 + i, 'px': [10 + i * 5, 30],
+                 'line_scan_id': 1, 'line_pos': i, 'reps': 3}
+                for i in range(4)
+            ],
+            'sts_line_scans': [{
+                'id': 1, 'label': 'line1', 'n_points': 4, 'reps': 3,
+                'point_indices': [20, 21, 22, 23],
+                'point_first': 20, 'point_last': 23,
+                'px_path': [[10, 30], [15, 30], [20, 30], [25, 30]],
+                'px_start': [10, 30], 'px_end': [25, 30],
+            }],
+        }
+        return mcm
+
+    def test_line_is_pushed_to_the_canvas_as_a_path(self, backend):
+        canvas = self.FakeCanvas()
+        backend._canvas = canvas
+        backend._push_sts_markers(self._map_with_line())
+
+        assert len(canvas.lines) == 1
+        path = canvas.lines[0]['path']
+        assert len(path) == 4
+        # Canvas coordinates are (col, row) = (pixel x, pixel y).
+        assert path[0] == {'col': 10, 'row': 30}
+        assert path[-1] == {'col': 25, 'row': 30}
+
+    def test_tag_names_the_line_its_points_and_its_span(self, backend):
+        tag = backend._line_scan_tag({
+            'label': 'line1', 'n_points': 57, 'reps': 3,
+            'point_first': 20, 'point_last': 76})
+        assert 'line1' in tag
+        assert '57pts' in tag
+        assert '×3' in tag
+        assert 'pt20→pt76' in tag
+
+    def test_dots_are_still_pushed_alongside_the_outline(self, backend):
+        canvas = self.FakeCanvas()
+        backend._canvas = canvas
+        backend._push_sts_markers(self._map_with_line())
+        assert len(canvas.markers) == 4
+
+    def test_map_without_line_scans_clears_the_outlines(self, backend):
+        canvas = self.FakeCanvas()
+        backend._canvas = canvas
+        backend._push_sts_markers(self._map_with_line())
+        assert canvas.lines
+
+        plain = MultiChannelMap()
+        plain.add_channel("Z", np.zeros((8, 8)), ChannelType.HEIGHT, "m")
+        plain.metadata.extra = {'sts_locations': [
+            {'point_index': 1, 'px': [2, 2]}]}
+        backend._push_sts_markers(plain)
+        assert canvas.lines == []
+
+    def test_a_canvas_without_the_slot_is_tolerated(self, backend):
+        class OldCanvas:
+            def __init__(self): self.markers = None
+            def setStsMarkers(self, markers): self.markers = markers
+
+        backend._canvas = OldCanvas()
+        backend._push_sts_markers(self._map_with_line())   # must not raise
+        assert backend._canvas.markers is not None
+
+    def test_tag_notes_a_hidden_single_sweep(self, backend):
+        """The pre-sweep is off the map, so the tag says it exists — otherwise
+        it looks like data went missing."""
+        tag = backend._line_scan_tag({
+            'label': 'line1', 'n_points': 57, 'reps': 511,
+            'point_first': 73, 'point_last': 193, 'presweeps': 1})
+        assert 'line1' in tag and '×511' in tag
+        assert '+1 single sweep' in tag
+
+    def test_tag_is_unchanged_without_a_hidden_sweep(self, backend):
+        tag = backend._line_scan_tag({
+            'label': 'line2', 'n_points': 57, 'reps': 1,
+            'point_first': 74, 'point_last': 194, 'presweeps': 0})
+        assert 'single sweep' not in tag
+
+
+class TestOutOfBoundsLocations:
+    """STS_LOCATION is a pixel in the scan the spectrum was taken on, so a
+    spectrum bound to a differently sized scan can point off this image."""
+
+    class FakeCanvas:
+        def __init__(self):
+            self.markers = None
+            self.lines = None
+
+        def setStsMarkers(self, markers):
+            self.markers = markers
+
+        def setStsLines(self, lines):
+            self.lines = lines
+
+    @staticmethod
+    def _map(locations, lines=None, size=(32, 32)):
+        mcm = MultiChannelMap()
+        mcm.add_channel("Z", np.zeros(size), ChannelType.HEIGHT, "m")
+        mcm.metadata.extra = {'sts_locations': locations,
+                              'sts_line_scans': lines or []}
+        return mcm
+
+    def test_a_dot_outside_the_map_is_not_drawn(self, backend):
+        canvas = self.FakeCanvas()
+        backend._canvas = canvas
+        backend._push_sts_markers(self._map([
+            {'point_index': 1, 'px': [5, 5]},        # inside
+            {'point_index': 2, 'px': [40, 5]},       # past the right edge
+            {'point_index': 3, 'px': [5, -3]},       # above the top
+        ]))
+
+        assert [m['label'] for m in canvas.markers] == ['1']
+
+    def test_a_point_on_the_boundary_survives_rounding(self, backend):
+        canvas = self.FakeCanvas()
+        backend._canvas = canvas
+        backend._push_sts_markers(self._map([
+            {'point_index': 1, 'px': [0, 0]},
+            {'point_index': 2, 'px': [31, 31]},      # last valid pixel
+        ]))
+
+        assert len(canvas.markers) == 2
+
+    def test_a_line_running_off_the_image_is_clipped_to_it(self, backend):
+        canvas = self.FakeCanvas()
+        backend._canvas = canvas
+        backend._push_sts_markers(self._map(
+            [], [{'id': 3, 'label': 'line3', 'n_points': 4, 'reps': 63,
+                  'point_first': 203, 'point_last': 326,
+                  'px_path': [[4, 4], [8, 8], [40, 40], [60, 60]]}]))
+
+        assert len(canvas.lines) == 1
+        assert canvas.lines[0]['path'] == [{'col': 4, 'row': 4},
+                                           {'col': 8, 'row': 8}]
+
+    def test_a_line_entirely_off_the_image_is_not_outlined(self, backend):
+        canvas = self.FakeCanvas()
+        backend._canvas = canvas
+        backend._push_sts_markers(self._map(
+            [], [{'id': 3, 'label': 'line3', 'n_points': 3, 'reps': 1,
+                  'point_first': 1, 'point_last': 3,
+                  'px_path': [[80, 80], [90, 90], [100, 100]]}]))
+
+        assert canvas.lines == []
+
+    def test_a_map_of_unknown_size_rejects_nothing(self, backend):
+        assert backend._px_on_grid([999, 999], None) is True
+        assert backend._px_on_grid([999, 999], ()) is True
+
+    def test_malformed_coordinates_are_not_rejected_on_a_guess(self, backend):
+        assert backend._px_on_grid(['x', None], (32, 32)) is True
+
+
+class TestLineScanAxes:
+    """A kymograph opened in the Hyperspectral tab gets real axes."""
+
+    class FakeCanvas:
+        def __init__(self):
+            self.axes = None
+        def setAxisMetadata(self, meta):
+            self.axes = dict(meta) if meta else {}
+        # The rest of the canvas API the load path touches.
+        def __getattr__(self, name):
+            return lambda *a, **k: None
+
+    @staticmethod
+    def _dataset(n_positions=8, n_points=64, step_m=5e-9, with_positions=True):
+        import pandas as pd
+        from src.models.spectral_data import SpectralData, SpectralMetadata
+
+        x = np.linspace(-0.6, 0.6, n_points)
+        columns = {f"P{i + 1}": np.sin(x * (i + 1)) for i in range(n_positions)}
+        info = {}
+        if with_positions:
+            info['spectrum_meta'] = [{'location_m': [i * step_m, 0.0]}
+                                     for i in range(n_positions)]
+        return SpectralData(pd.DataFrame({"V": x, **columns}), SpectralMetadata(
+            source_type='sts', dimensions=(n_positions, 1), scan_mode='line',
+            units={'independent': 'V', 'dependent': 'A'}, additional_info=info))
+
+    def test_positions_become_the_x_axis(self, backend):
+        canvas = self.FakeCanvas()
+        backend._canvas = canvas
+        backend._push_line_scan_axes(self._dataset(), 'kymograph')
+
+        assert canvas.axes['x_unit'] == 'm'
+        # 8 positions, 5 nm apart -> the map spans 8 pixels of 5 nm.
+        assert canvas.axes['x_size'] == pytest.approx(8 * 5e-9)
+        assert canvas.axes['x_offset'] == pytest.approx(0.0)
+
+    def test_the_spectral_axis_becomes_the_y_axis(self, backend):
+        canvas = self.FakeCanvas()
+        backend._canvas = canvas
+        backend._push_line_scan_axes(self._dataset(), 'kymograph')
+
+        assert canvas.axes['y_unit'] == 'V'
+        assert canvas.axes['y_size'] == pytest.approx(1.2, rel=0.05)
+        assert canvas.axes['y_offset'] == pytest.approx(-0.6, abs=0.02)
+
+    def test_a_strip_view_has_no_spectral_axis(self, backend):
+        canvas = self.FakeCanvas()
+        backend._canvas = canvas
+        backend._push_line_scan_axes(self._dataset(), 'strip')
+
+        assert 'y_unit' not in canvas.axes
+        assert canvas.axes['x_unit'] == 'm'
+
+    def test_positions_are_not_invented(self, backend):
+        canvas = self.FakeCanvas()
+        backend._canvas = canvas
+        backend._push_line_scan_axes(self._dataset(with_positions=False),
+                                     'kymograph')
+
+        assert 'x_unit' not in canvas.axes      # no metres claimed
+        assert canvas.axes['y_unit'] == 'V'     # the bias axis is still known
+
+    def test_a_stored_position_list_is_used(self, backend):
+        """The interval map carries its positions directly."""
+        canvas = self.FakeCanvas()
+        backend._canvas = canvas
+        dataset = self._dataset(with_positions=False)
+        dataset.metadata.additional_info['position_m'] = [0.0, 1e-9, 2e-9, 3e-9,
+                                                          4e-9, 5e-9, 6e-9, 7e-9]
+        backend._push_line_scan_axes(dataset, 'kymograph')
+
+        assert canvas.axes['x_unit'] == 'm'
+        assert canvas.axes['x_size'] == pytest.approx(8e-9)
+
+    def test_an_old_canvas_without_the_slot_is_tolerated(self, backend):
+        class OldCanvas:
+            pass
+
+        backend._canvas = OldCanvas()
+        backend._push_line_scan_axes(self._dataset(), 'kymograph')   # no raise

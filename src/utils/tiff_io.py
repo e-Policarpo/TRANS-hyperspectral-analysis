@@ -131,6 +131,7 @@ def write_calibrated_tiff(path: Union[str, Path],
                           unit: Optional[str] = None,
                           value_unit: Optional[str] = None,
                           clip_percentile: float = 1.0,
+                          axis_note: Optional[str] = None,
                           context: str = "") -> str:
     """Write ``data`` to ``path`` as a calibrated TIFF. **Use this everywhere.**
 
@@ -154,12 +155,15 @@ def write_calibrated_tiff(path: Union[str, Path],
             "available, so it will open as bare pixels in Gwyddion/Fiji.",
             Path(path).name, f" ({context})" if context else "",
         )
-    tifffile.imwrite(
-        str(path), arr,
-        **imagej_tiff_kwargs(arr, dx=dx, dy=dy, unit=unit,
-                             value_unit=value_unit,
-                             clip_percentile=clip_percentile),
-    )
+    kwargs = imagej_tiff_kwargs(arr, dx=dx, dy=dy, unit=unit,
+                                value_unit=value_unit,
+                                clip_percentile=clip_percentile)
+    if axis_note:
+        # ImageJ has a single unit= for both axes, so a field whose axes are
+        # different quantities records them here instead of mislabelling one.
+        kwargs["description"] = (kwargs.get("description", "")
+                                 + f"axes={axis_note}\n")
+    tifffile.imwrite(str(path), arr, **kwargs)
     return str(path)
 
 

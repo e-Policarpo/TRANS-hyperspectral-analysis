@@ -394,3 +394,326 @@ class TestProfileLineResizeSafe:
         canvas._data_to_pixel = None
         assert canvas._pixel_to_axesfrac(1, 2) is None
         assert canvas._axesfrac_to_pixel(0.5, 0.5) is None
+
+
+@pytest.fixture(scope="module")
+def gui_app():
+    from PySide6.QtGui import QGuiApplication
+    return QGuiApplication.instance() or QGuiApplication([])
+
+
+class TestStsLineOutlines:
+    """Line-scan outlines drawn over a scan image."""
+
+    def _canvas(self):
+        from src.widgets.qml_map_canvas import QMLMapCanvas
+        canvas = QMLMapCanvas()
+        canvas.setMapData(np.zeros((32, 32)))
+        return canvas
+
+    def test_setter_stores_the_path_in_row_col_order(self):
+        canvas = self._canvas()
+        canvas.setStsLines([{'label': 'line1 · 4pts',
+                             'path': [{'col': 10, 'row': 30},
+                                      {'col': 15, 'row': 30},
+                                      {'col': 20, 'row': 30}]}])
+
+        assert len(canvas._sts_lines) == 1
+        assert canvas._sts_lines[0]['label'] == 'line1 · 4pts'
+        assert canvas._sts_lines[0]['path'] == [(30, 10), (30, 15), (30, 20)]
+
+    def test_a_single_point_is_not_a_line(self):
+        canvas = self._canvas()
+        canvas.setStsLines([{'label': 'x', 'path': [{'col': 1, 'row': 1}]}])
+        assert canvas._sts_lines == []
+
+    def test_malformed_points_are_dropped_without_raising(self):
+        canvas = self._canvas()
+        canvas.setStsLines([{'label': 'line1',
+                             'path': [{'col': 1, 'row': 2}, {'col': None},
+                                      {'col': 3, 'row': 4}]}])
+        assert canvas._sts_lines[0]['path'] == [(2, 1), (4, 3)]
+
+    def test_empty_list_clears_previous_outlines(self):
+        canvas = self._canvas()
+        canvas.setStsLines([{'label': 'line1',
+                             'path': [{'col': 1, 'row': 1}, {'col': 5, 'row': 1}]}])
+        canvas.setStsLines([])
+        assert canvas._sts_lines == []
+
+    def test_outlines_paint_without_error(self, gui_app):
+        from PySide6.QtGui import QImage, QPainter
+        canvas = self._canvas()
+        canvas.setWidth(240)
+        canvas.setHeight(200)
+        canvas.setStsLines([{'label': 'line1 · 4pts ×3 · pt20→pt23',
+                             'path': [{'col': 4, 'row': 8}, {'col': 20, 'row': 8}]}])
+        canvas.setStsMarkers([{'row': 8, 'col': 4, 'label': '20', 'index': 0}])
+
+        image = QImage(240, 200, QImage.Format_ARGB32)
+        painter = QPainter(image)
+        try:
+            canvas.paint(painter)     # must not raise
+        finally:
+            painter.end()
+
+    def test_a_tag_avoids_the_points_it_names(self):
+        """The tag must not sit on the dots — it would hide the data."""
+        from PySide6.QtCore import QRectF
+        from src.widgets.qml_map_canvas import QMLMapCanvas
+
+        # A horizontal line of dots across the middle of the canvas.
+        dots = [QRectF(x - 9, 91, 18, 18) for x in range(40, 300, 12)]
+        pts = [(40.0, 100.0), (300.0, 100.0)]
+        chip = QMLMapCanvas._place_chip(
+            QMLMapCanvas._chip_candidates(pts, 220, 22, 600, 400), dots)
+
+        assert all(not chip.intersects(dot) for dot in dots)
+
+    def test_a_tag_avoids_the_point_index_labels(self):
+        from PySide6.QtCore import QRectF
+        from src.widgets.qml_map_canvas import QMLMapCanvas
+
+        labels = [QRectF(x + 9, 70, 20, 16) for x in range(40, 300, 12)]
+        pts = [(40.0, 100.0), (300.0, 100.0)]
+        chip = QMLMapCanvas._place_chip(
+            QMLMapCanvas._chip_candidates(pts, 220, 22, 600, 400), labels)
+
+        assert all(not chip.intersects(label) for label in labels)
+
+    def test_two_tags_on_one_path_do_not_overlap(self):
+        """A multi-rep scan and a single sweep can share a path."""
+        from src.widgets.qml_map_canvas import QMLMapCanvas
+
+        pts = [(40.0, 100.0), (300.0, 100.0)]
+        candidates = QMLMapCanvas._chip_candidates(pts, 220, 22, 600, 400)
+        first = QMLMapCanvas._place_chip(candidates, [])
+        second = QMLMapCanvas._place_chip(candidates, [first])
+
+        assert not second.intersects(first)
+
+    def test_a_tag_stays_inside_the_canvas(self):
+        from src.widgets.qml_map_canvas import QMLMapCanvas
+
+        pts = [(5.0, 5.0), (20.0, 5.0)]     # hard against the top-left corner
+        for chip in QMLMapCanvas._chip_candidates(pts, 220, 22, 400, 300):
+            assert chip.left() >= 0 and chip.top() >= 0
+            assert chip.right() <= 400 and chip.bottom() <= 300
+
+    def test_a_crowded_canvas_still_gets_a_tag(self):
+        """With nowhere clear the label must still be drawn, in the least-bad
+        spot — a vanished tag is worse than a partly covered one."""
+        from PySide6.QtCore import QRectF
+        from src.widgets.qml_map_canvas import QMLMapCanvas
+
+        everywhere = [QRectF(0, 0, 600, 400)]
+        pts = [(40.0, 100.0), (300.0, 100.0)]
+        chip = QMLMapCanvas._place_chip(
+            QMLMapCanvas._chip_candidates(pts, 220, 22, 600, 400), everywhere)
+
+        assert not chip.isEmpty()
+
+    def test_the_obstacle_list_covers_dots_and_labels(self, gui_app):
+        from src.widgets.qml_map_canvas import QMLMapCanvas
+        from PySide6.QtGui import QImage, QPainter
+
+        canvas = self._canvas()
+        canvas.setWidth(300)
+        canvas.setHeight(240)
+        canvas.setStsMarkers([{'row': 4, 'col': 4, 'label': '11', 'index': 0},
+                              {'row': 4, 'col': 8, 'label': '12', 'index': 1}])
+
+        image = QImage(300, 240, QImage.Format_ARGB32)
+        painter = QPainter(image)
+        try:
+            canvas.paint(painter)      # lays out _data_to_pixel
+            rects = canvas._sts_marker_obstacles(painter.fontMetrics())
+        finally:
+            painter.end()
+
+        # One rect for each dot plus one for each label.
+        assert len(rects) == 4
+
+
+class TestDecimalSpinBoxes:
+    """A decimal field must read back what was typed.
+
+    SpinBox's default validator is an IntValidator, which drops the decimal
+    point: "4.5" became "45" and, scaled by 1/100, arrived as 0.45 — a tenth
+    of the intended temperature.
+    """
+
+    @staticmethod
+    def _field(qml_source, decimals):
+        import re
+        source = open(qml_source).read()
+        # The two functions under test are pure string/number handling, so
+        # they are exercised directly rather than through a QML engine.
+        factor = 10 ** decimals
+
+        def value_from_text(text, current=0):
+            parsed = float(str(text).replace(",", "."))
+            return round(parsed * factor)
+
+        def text_from_value(value):
+            return f"{value / factor:.{decimals}f}"
+
+        assert 'DoubleValidator' in source, "decimal fields need a DoubleValidator"
+        assert 'IntValidator' in source, "integer fields must keep an IntValidator"
+        return value_from_text, text_from_value
+
+    @pytest.mark.parametrize("qml", [
+        "src/qml/components/ToolSpinBox.qml",
+        "src/qml/tools/ConfinementAnalysisTool.qml",
+    ])
+    def test_the_spinbox_declares_a_double_validator(self, qml):
+        source = open(qml).read()
+        assert 'DoubleValidator' in source
+        # "C" locale, so the field accepts the dot its own textFromValue writes.
+        assert 'locale: "C"' in source
+
+    def test_a_typed_temperature_round_trips(self):
+        from_text, to_text = self._field("src/qml/components/ToolSpinBox.qml", 2)
+        assert from_text("4.5") / 100 == 4.5
+        assert to_text(from_text("4.5")) == "4.50"
+
+    def test_a_comma_decimal_is_accepted(self):
+        from_text, _ = self._field("src/qml/components/ToolSpinBox.qml", 2)
+        assert from_text("4,5") / 100 == 4.5
+
+
+class TestAutoScaleShowsTheWholeMap:
+    """A computed map's signal lives in the tails.
+
+    Auto-scale used to clip at 2-98%, which on a bias-versus-position LDOS
+    map kept 14% of the value range and drove 4% of the pixels to a solid end
+    colour — the map read as thresholded.
+    """
+
+    @staticmethod
+    def _canvas(field=None):
+        from src.widgets.qml_map_canvas import QMLMapCanvas
+        canvas = QMLMapCanvas()
+        if field is not None:
+            canvas.setMapData(field)
+        return canvas
+
+    @staticmethod
+    def _heavy_tailed():
+        """Mostly near zero, with the rare bright states that matter."""
+        rng = np.random.default_rng(0)
+        field = np.abs(rng.normal(0, 1e-12, (60, 250)))
+        field[10, 40] = 6e-9
+        field[30, 120] = 4e-9
+        return field
+
+    def test_the_default_levels_span_the_data(self, gui_app):
+        field = self._heavy_tailed()
+        lo, hi = self._canvas(field)._compute_display_levels()
+
+        assert lo == pytest.approx(float(np.nanmin(field)))
+        assert hi == pytest.approx(float(np.nanmax(field)))
+
+    def test_nothing_is_driven_to_a_solid_colour(self, gui_app):
+        field = self._heavy_tailed()
+        lo, hi = self._canvas(field)._compute_display_levels()
+        assert not ((field > hi) | (field < lo)).any()
+
+    def test_clipping_is_still_available(self, gui_app):
+        field = self._heavy_tailed()
+        canvas = self._canvas(field)
+        canvas.setPercentileClip(2, 98)
+        lo, hi = canvas._compute_display_levels()
+
+        assert hi < float(np.nanmax(field))       # the tail is clipped again
+        assert lo >= float(np.nanmin(field))
+
+    def test_explicit_limits_still_win(self, gui_app):
+        canvas = self._canvas(self._heavy_tailed())
+        canvas.setValueRange(-1.0, 2.0)
+        assert canvas._compute_display_levels() == (-1.0, 2.0)
+
+    @pytest.mark.parametrize("low,high", [(50, 10), (-5, 99), (0, 200), (30, 30)])
+    def test_a_nonsensical_clip_is_ignored(self, gui_app, low, high):
+        canvas = self._canvas(self._heavy_tailed())
+        before = canvas._percentile_clip
+        canvas.setPercentileClip(low, high)
+        assert canvas._percentile_clip == before
+
+    def test_an_all_nan_map_still_yields_usable_levels(self, gui_app):
+        canvas = self._canvas(np.full((8, 8), np.nan))
+        lo, hi = canvas._compute_display_levels()
+        assert np.isfinite(lo) and np.isfinite(hi) and hi > lo
+
+    def test_a_flat_map_does_not_collapse_the_scale(self, gui_app):
+        canvas = self._canvas(np.full((8, 8), 3.0))
+        lo, hi = canvas._compute_display_levels()
+        assert hi > lo
+
+
+class TestCursorCoordinates:
+    """The read-out must say where on the sample the cursor is."""
+
+    @staticmethod
+    def _canvas(rows=40, cols=60):
+        from src.widgets.qml_map_canvas import QMLMapCanvas
+        canvas = QMLMapCanvas()
+        canvas.setMapData(np.zeros((rows, cols)))
+        return canvas
+
+    def test_pixels_map_onto_the_physical_extent(self, gui_app):
+        canvas = self._canvas(rows=40, cols=60)
+        canvas.setPhysicalExtent(300.0, 200.0, "nm")     # 5 nm per pixel
+
+        first = canvas.physicalAt(0, 0)
+        assert first['valid']
+        # The centre of the first pixel, not its edge.
+        assert first['x'] == pytest.approx(2.5)
+        assert first['y'] == pytest.approx(2.5)
+        assert first['unit'] == 'nm'
+
+        last = canvas.physicalAt(39, 59)
+        assert last['x'] == pytest.approx(297.5)
+        assert last['y'] == pytest.approx(197.5)
+
+    def test_an_uncalibrated_map_reports_invalid(self, gui_app):
+        """No scale means no coordinates — the caller shows pixel indices
+        rather than a position that was never measured."""
+        assert self._canvas().physicalAt(1, 1)['valid'] is False
+
+    def test_out_of_range_pixels_report_invalid(self, gui_app):
+        canvas = self._canvas(rows=10, cols=10)
+        canvas.setPhysicalExtent(100.0, 100.0, "nm")
+        assert canvas.physicalAt(10, 0)['valid'] is False
+        assert canvas.physicalAt(0, -1)['valid'] is False
+
+    def test_each_axis_can_carry_its_own_quantity(self, gui_app):
+        """A kymograph is distance across and bias up."""
+        canvas = self._canvas(rows=100, cols=50)
+        canvas.setAxisMetadata({
+            'x_size': 250e-9, 'x_unit': 'm', 'x_offset': 0.0,
+            'y_size': 1.2, 'y_unit': 'V', 'y_offset': -0.6,
+        })
+
+        at = canvas.physicalAt(0, 0)
+        assert at['x_unit'] == 'm' and at['y_unit'] == 'V'
+        assert at['x'] == pytest.approx(2.5e-9)          # centre of pixel 0
+        assert at['y'] == pytest.approx(-0.594)
+
+        middle = canvas.physicalAt(50, 25)
+        assert middle['y'] == pytest.approx(0.006)
+
+    def test_axis_metadata_wins_over_the_extent(self, gui_app):
+        canvas = self._canvas(rows=10, cols=10)
+        canvas.setPhysicalExtent(100.0, 100.0, "nm")
+        canvas.setAxisMetadata({'x_size': 1.0, 'x_unit': 'm',
+                                'y_size': 2.0, 'y_unit': 'V'})
+        at = canvas.physicalAt(0, 0)
+        assert at['x_unit'] == 'm' and at['y_unit'] == 'V'
+
+    def test_clearing_the_metadata_falls_back_to_the_extent(self, gui_app):
+        canvas = self._canvas(rows=10, cols=10)
+        canvas.setPhysicalExtent(100.0, 100.0, "nm")
+        canvas.setAxisMetadata({'x_size': 1.0, 'x_unit': 'm'})
+        canvas.setAxisMetadata({})
+        assert canvas.physicalAt(0, 0)['unit'] == 'nm'

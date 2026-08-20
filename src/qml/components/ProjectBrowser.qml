@@ -42,6 +42,38 @@ Rectangle {
     property string selectedRef: ""
     property string selectedDataset: ""
 
+    // Every selected item ref, in click order. Ctrl/Cmd-click toggles one,
+    // Shift-click extends from the last click. Dragging any member of the
+    // selection drags the whole set — that is how several datasets are
+    // dropped on a tool at once.
+    property var selectedRefs: []
+    property int selectionAnchorRow: -1
+
+    // Dataset names carried by the drag in progress (empty for a plain
+    // move-into-folder drag of a non-dataset item).
+    property var draggingDatasets: []
+
+    // Emitted when a drag is released outside the tree: the workspace
+    // decides whether a tool window is under (sceneX, sceneY).
+    signal datasetsDropped(var names, real sceneX, real sceneY)
+    signal datasetsDragMoved(var names, real sceneX, real sceneY)
+
+    function isRefSelected(ref) {
+        return ref !== "" && browserRoot.selectedRefs.indexOf(ref) >= 0
+    }
+
+    // Dataset names among the current selection, in selection order. Used as
+    // the drag payload, so a tool receives them in the order they were picked.
+    function selectedDatasetNames() {
+        var names = []
+        for (var i = 0; i < browserRoot.selectedRefs.length; i++) {
+            var ref = browserRoot.selectedRefs[i]
+            if (ref.indexOf("dataset:") === 0)
+                names.push(ref.substring("dataset:".length))
+        }
+        return names
+    }
+
     // Ref ("<type>:<id>") of the row currently being dragged. Set when a drag
     // starts; the release hit-test reads it to file the item.
     property string draggingRef: ""
@@ -272,7 +304,7 @@ Rectangle {
                                 return bgLight
                             return "transparent"
                         }
-                        if (rowItem.itemRef === browserRoot.selectedRef)
+                        if (browserRoot.isRefSelected(rowItem.itemRef))
                             return Qt.rgba(1, 0.7, 0.85, 0.3)   // selected
                         if (rowMouseArea.containsMouse)
                             return Qt.rgba(1, 0.7, 0.85, 0.2)   // hover
@@ -376,6 +408,17 @@ Rectangle {
                                 browserRoot.draggingRef = rowItem.itemRef
                                 browserRoot.dropHandled = false
                                 browserRoot.dropTargetFolder = ""
+                                // Dragging a row that is part of the selection
+                                // drags the whole selection; dragging anything
+                                // else drags just that row.
+                                if (browserRoot.isRefSelected(rowItem.itemRef)) {
+                                    browserRoot.draggingDatasets = browserRoot.selectedDatasetNames()
+                                } else if (rowItem.itemRef.indexOf("dataset:") === 0) {
+                                    browserRoot.draggingDatasets =
+                                        [rowItem.itemRef.substring("dataset:".length)]
+                                } else {
+                                    browserRoot.draggingDatasets = []
+                                }
                             } else if (!browserRoot.dropHandled) {
                                 // Released outside the list → nothing moved and the
                                 // tree wasn't rebuilt; snap the displaced row back.
@@ -390,6 +433,13 @@ Rectangle {
                             if (rowMouseArea.drag.active) {
                                 var cp = rowItem.mapToItem(treeView.contentItem, mouse.x, mouse.y)
                                 browserRoot.dropTargetFolder = browserRoot.folderAtContentY(cp.y)
+                                // Outside the tree the drag may be heading for
+                                // a tool window; let the workspace highlight it.
+                                if (browserRoot.draggingDatasets.length > 0) {
+                                    var sp = rowItem.mapToGlobal(mouse.x, mouse.y)
+                                    browserRoot.datasetsDragMoved(browserRoot.draggingDatasets,
+                                                                  sp.x, sp.y)
+                                }
                             }
                         }
 
@@ -406,7 +456,8 @@ Rectangle {
                             } else if (rowItem.isFolder) {
                                 browserRoot.toggleFolder(model.folderId)
                             } else {
-                                browserRoot.selectItem(rowItem.rowData())
+                                browserRoot.selectItem(rowItem.rowData(),
+                                                       mouse.modifiers, index)
                             }
                         }
 
@@ -433,7 +484,17 @@ Rectangle {
                                 var target = browserRoot.folderAtContentY(cp.y)
                                 browserRoot.dropHandled = true
                                 browserRoot.requestMove(browserRoot.draggingRef, target)
+                            } else if (browserRoot.draggingDatasets.length > 0) {
+                                // Released outside the tree: a tool window may
+                                // be under the cursor. The row still snaps back
+                                // (nothing moved in the tree) — the tool takes
+                                // a copy of the names, it does not consume the
+                                // dataset.
+                                var sp = rowItem.mapToGlobal(mouse.x, mouse.y)
+                                browserRoot.datasetsDropped(browserRoot.draggingDatasets,
+                                                            sp.x, sp.y)
                             }
+                            browserRoot.draggingDatasets = []
                             browserRoot.dropTargetFolder = ""
                         }
                     }
@@ -1262,9 +1323,37 @@ Rectangle {
 
     // -- Selection, opening & metadata -------------------------------------
 
-    function selectItem(row) {
+    function selectItem(row, modifiers, rowIndex) {
         if (!row) return
-        browserRoot.selectedRef = row.ref || ""
+        var ref = row.ref || ""
+        modifiers = modifiers || 0
+
+        if (modifiers & (Qt.ControlModifier | Qt.MetaModifier)) {
+            var refs = browserRoot.selectedRefs.slice()
+            var at = refs.indexOf(ref)
+            if (at >= 0) refs.splice(at, 1)
+            else refs.push(ref)
+            browserRoot.selectedRefs = refs
+            browserRoot.selectionAnchorRow = rowIndex !== undefined ? rowIndex : -1
+        } else if ((modifiers & Qt.ShiftModifier)
+                   && browserRoot.selectionAnchorRow >= 0 && rowIndex !== undefined) {
+            // Extend over the rows between the anchor and this one, skipping
+            // folders — only items can be selected.
+            var extended = browserRoot.selectedRefs.slice()
+            var lo = Math.min(browserRoot.selectionAnchorRow, rowIndex)
+            var hi = Math.max(browserRoot.selectionAnchorRow, rowIndex)
+            for (var i = lo; i <= hi && i < treeModel.count; i++) {
+                var entry = treeModel.get(i)
+                if (entry.isFolder || !entry.ref) continue
+                if (extended.indexOf(entry.ref) < 0) extended.push(entry.ref)
+            }
+            browserRoot.selectedRefs = extended
+        } else {
+            browserRoot.selectedRefs = ref ? [ref] : []
+            browserRoot.selectionAnchorRow = rowIndex !== undefined ? rowIndex : -1
+        }
+
+        browserRoot.selectedRef = ref
         browserRoot.selectedDataset = (row.type === "dataset") ? row.id : ""
         if (row.type === "dataset" && backend)
             backend.setActiveDataset(row.id)

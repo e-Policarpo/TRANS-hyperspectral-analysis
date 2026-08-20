@@ -1066,9 +1066,13 @@ class TestConfinementAnalysisNode:
         assert set(params) - {"fwhm_multiplier"} <= engine_fields
 
     def test_defaults_are_the_recommended_starting_point(self):
+        """arPLS + a noise-relative threshold: measured to find every planted
+        state an order of magnitude below the band edges, where ModPoly with
+        a span-relative threshold found none."""
         params = TOOL_DEFINITIONS["ConfinementAnalysis"]["parameters"]
-        assert params["baseline"]["default"] == "poly-iter"
-        assert params["height"]["default"] == 5.0
+        assert params["baseline"]["default"] == "arpls"
+        assert params["height_mode"]["default"] == "noise"
+        assert params["height"]["default"] == 2.0         # sigma, not percent
         assert params["temperature_k"]["default"] == 0.0  # grouping off unless asked
         assert params["max_peaks"]["default"] == 0        # 0 means "all"
 
@@ -1079,7 +1083,7 @@ class TestConfinementAnalysisNode:
 
     def test_created_node_carries_the_defaults(self):
         node = create_node_from_tool("ConfinementAnalysis", 0, 0)
-        assert node.parameters["baseline"] == "poly-iter"
+        assert node.parameters["baseline"] == "arpls"
         assert node.parameters["temperature_k"] == 0.0
 
     def test_outputs_connect_to_the_matching_output_nodes(self):

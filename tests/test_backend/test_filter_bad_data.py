@@ -518,3 +518,66 @@ class TestFilterBadDataEdgeCases(TestFilterBadDataSetup):
         assert result != ""
         # Should not crash and report should exist
         assert Path(result).exists()
+
+
+class TestFilterBadDataExports(TestFilterBadDataSetup):
+    """Every output of a run is written into one folder per filtered dataset."""
+
+    def test_all_outputs_written_to_one_folder(self, tool_impl, normal_dataset):
+        """Good, bad, FFT and report land in curves/<dataset>_Filtered/."""
+        tool_impl._datasets['TestData'] = normal_dataset
+        task = MockTask()
+
+        result = tool_impl.filter_bad_data(task, 'TestData', threshold=0.3)
+
+        assert result != ""
+        folder = Path(result).parent
+        assert folder.name == 'TestData_Filtered'
+        assert folder.parent.name == 'curves'
+
+        names = sorted(p.name for p in folder.iterdir())
+        assert 'TestData_filter_report.txt' in names
+        assert 'TestData_Good_Data.csv' in names
+        assert 'TestData_Bad_Data.csv' in names
+        assert 'TestData_FFT_Spectra.csv' in names
+
+    def test_exported_csv_matches_dataset(self, tool_impl, normal_dataset):
+        """The exported CSV holds the same curves as the in-memory dataset."""
+        tool_impl._datasets['TestData'] = normal_dataset
+        task = MockTask()
+
+        result = tool_impl.filter_bad_data(task, 'TestData', threshold=0.3)
+        good = tool_impl._datasets['TestData - Good Data']
+
+        exported = pd.read_csv(Path(result).parent / 'TestData_Good_Data.csv')
+        assert list(exported.columns) == list(good.data.columns)
+        np.testing.assert_allclose(exported.values, good.data.values,
+                                   rtol=1e-6, equal_nan=True)
+
+    def test_report_lists_exported_files(self, tool_impl, normal_dataset):
+        """The report names the folder and the files written next to it."""
+        tool_impl._datasets['TestData'] = normal_dataset
+        task = MockTask()
+
+        result = tool_impl.filter_bad_data(task, 'TestData', threshold=0.3)
+        content = Path(result).read_text()
+
+        assert "Output folder:" in content
+        assert "TestData_Good_Data.csv" in content
+
+    def test_missing_side_is_not_exported(self, tool_impl, all_bad_dataset):
+        """No Good Data dataset means no Good Data CSV."""
+        tool_impl._datasets['BadData'] = all_bad_dataset
+        task = MockTask()
+
+        result = tool_impl.filter_bad_data(
+            task, 'BadData',
+            weight_linear=1.0, weight_saturation=0.0, weight_noise=0.0,
+            weight_periodic=0.0, weight_partial_noise=0.0,
+            threshold=0.01
+        )
+
+        folder = Path(result).parent
+        names = sorted(p.name for p in folder.iterdir())
+        assert 'BadData_Bad_Data.csv' in names
+        assert 'BadData_Good_Data.csv' not in names

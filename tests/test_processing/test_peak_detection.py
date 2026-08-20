@@ -545,8 +545,12 @@ def test_thermal_broadening_rejects_unknown_unit():
 
 
 def test_params_exposes_bin_width():
+    """Bins are half k_B*T: the error bar is the resolution limit, the bin
+    grid must be finer than it or resolvable peaks get smeared together."""
     assert Params().bin_width == 0.0
-    assert Params(temperature_k=94.0).bin_width == pytest.approx(8.1e-3, rel=1e-3)
+    assert Params().thermal_width == 0.0
+    assert Params(temperature_k=94.0).thermal_width == pytest.approx(8.1e-3, rel=1e-3)
+    assert Params(temperature_k=94.0).bin_width == pytest.approx(4.05e-3, rel=1e-3)
 
 
 def test_params_validate_rejects_bad_temperature_settings():
@@ -784,3 +788,178 @@ def test_fit_polynomial_rejects_an_unknown_basis():
 def test_params_validate_rejects_an_unknown_basis():
     with pytest.raises(ValueError, match="baseline_basis must be one of"):
         Params(baseline_basis="bernstein").validate()
+
+
+# =============================================================================
+# arPLS and SNIP backgrounds
+# =============================================================================
+
+def _sts_spectrum(n=256, amp=1.2e-8):
+    """Steep band edges with small in-gap states, as STS data looks."""
+    x = np.linspace(-0.6, 0.6, n)
+    y = 3e-7 * np.exp((np.abs(x) - 0.6) / 0.055)
+    for c in (-0.25, -0.10, 0.08, 0.22):
+        y = y + amp * np.exp(-0.5 * ((x - c) / 0.012) ** 2)
+    return x, y
+
+
+def test_arpls_returns_a_background_of_the_right_magnitude():
+    """It is fitted in log space, so it tracks the data over decades rather
+    than staying under every point: what matters is that it stays the same
+    size as the data and leaves the states standing."""
+    from src.processing.peak_detection import arpls_baseline
+
+    x, y = _sts_spectrum()
+    baseline = arpls_baseline(y)
+
+    assert baseline.shape == y.shape
+    assert np.all(np.isfinite(baseline))
+    assert np.all(baseline > 0)
+    # Never more than a factor of two above the data anywhere.
+    assert np.max(baseline / y) < 2.0
+
+
+def test_arpls_uses_log_space_only_for_wide_dynamic_range():
+    from src.processing.peak_detection import arpls_baseline
+
+    # Two decades or less: fitted directly, so it stays under the data.
+    y = 10.0 + np.sin(np.linspace(0, 6, 128))
+    baseline = arpls_baseline(y)
+    assert np.mean(baseline <= y * 1.05) > 0.8
+
+
+def test_arpls_follows_the_band_edges():
+    from src.processing.peak_detection import arpls_baseline
+
+    x, y = _sts_spectrum()
+    baseline = arpls_baseline(y)
+    edge = np.abs(x) > 0.5
+    # Within a factor of two of the data where there are no states at all.
+    assert np.median(baseline[edge] / y[edge]) > 0.5
+
+
+def test_arpls_leaves_the_states_behind():
+    from src.processing.peak_detection import arpls_baseline
+
+    x, y = _sts_spectrum()
+    corrected = y - arpls_baseline(y)
+    for c in (-0.25, 0.22):
+        near = np.abs(x - c) < 0.02
+        assert corrected[near].max() > 0.3 * 1.2e-8
+
+
+def test_snip_returns_a_curve_under_the_data():
+    from src.processing.peak_detection import snip_baseline
+
+    x, y = _sts_spectrum()
+    baseline = snip_baseline(y)
+
+    assert baseline.shape == y.shape
+    assert np.all(np.isfinite(baseline))
+    assert np.mean(baseline <= y * 1.001) > 0.9
+
+
+def test_snip_handles_negative_data():
+    from src.processing.peak_detection import snip_baseline
+
+    y = np.linspace(-5.0, 5.0, 64)
+    baseline = snip_baseline(y)
+    assert np.all(np.isfinite(baseline))
+
+
+def test_short_inputs_do_not_raise():
+    from src.processing.peak_detection import arpls_baseline, snip_baseline
+
+    for fn in (arpls_baseline, snip_baseline):
+        assert fn(np.array([1.0, 2.0])).shape == (2,)
+
+
+@pytest.mark.parametrize("kind", ["arpls", "snip"])
+def test_estimate_baseline_dispatches_the_new_kinds(kind):
+    from src.processing.peak_detection import estimate_baseline, BASELINE_KINDS
+
+    assert kind in BASELINE_KINDS
+    x, y = _sts_spectrum()
+    baseline = estimate_baseline(x, y, kind=kind)
+    assert baseline.shape == y.shape
+    assert np.all(np.isfinite(baseline))
+
+
+def test_the_threshold_is_measured_against_the_noise():
+    """'range' and 'prominence' both scale with the corrected curve's SPAN,
+    which the band edges set — so a 5% threshold rejects genuine in-gap
+    states. The default compares each peak with the spectrum's own noise."""
+    from src.backend.tool_implementations import CONFINEMENT_DEFAULTS
+
+    assert CONFINEMENT_DEFAULTS['height_mode'] == 'noise'
+
+
+def test_noise_sigma_measures_the_noise_not_the_peaks():
+    from src.processing.peak_detection import noise_sigma
+
+    rng = np.random.default_rng(5)
+    x = np.linspace(-1, 1, 2048)
+    sigma = 0.01
+    y = rng.normal(0, sigma, x.size)
+    assert noise_sigma(y) == pytest.approx(sigma, rel=0.15)
+
+    # Tall peaks must not move the estimate: they are a small minority of the
+    # samples and the median ignores them.
+    with_peaks = y + 5.0 * np.exp(-0.5 * ((x - 0.3) / 0.01) ** 2)
+    assert noise_sigma(with_peaks) == pytest.approx(sigma, rel=0.25)
+
+
+def test_noise_sigma_is_safe_on_degenerate_input():
+    from src.processing.peak_detection import noise_sigma
+
+    assert noise_sigma(np.array([1.0, 2.0])) == 0.0
+    assert noise_sigma(np.zeros(50)) == 0.0
+
+
+def test_the_default_background_keeps_a_weak_state_on_a_huge_band_edge():
+    """The reason states were being missed.
+
+    A state a hundredth of the band-edge height survives arPLS (fitted in log
+    space, where the edge is nearly straight) but not ModPoly, which cannot
+    follow that edge and buries the state in what it leaves behind. No
+    threshold rescues it: the state is gone before the search runs.
+    """
+    from src.processing.peak_detection import analyze, params_from_dict
+
+    x = np.linspace(-0.6, 0.6, 512)
+    rng = np.random.default_rng(7)
+    y = 3e-7 * np.exp((np.abs(x) - 0.6) / 0.055)
+    y = y + 2.5e-9 * np.exp(-0.5 * ((x - 0.15) / 0.012) ** 2)
+    y = y + rng.normal(0, 2e-11, x.size)
+
+    def found(**kw):
+        params = params_from_dict({'baseline_degree': 5, 'smooth_points': 2, **kw})
+        params.validate()
+        peaks = [pk.x for pk in analyze(x, y, params).peaks]
+        return any(abs(px - 0.15) < 0.02 for px in peaks)
+
+    assert found(baseline='arpls', height_mode='noise', height=2.0)
+    for mode, height in (('noise', 2.0), ('prominence', 5.0), ('range', 5.0)):
+        assert not found(baseline='poly-iter', height_mode=mode, height=height), (
+            f"poly-iter unexpectedly kept the state with {mode} {height} — "
+            "this test no longer demonstrates why the default changed")
+
+
+def test_prominence_finds_the_states_without_inventing_any():
+    from src.processing.peak_detection import analyze, params_from_dict
+
+    x, y = _sts_spectrum()
+    rng = np.random.default_rng(3)
+    y = y + rng.normal(0, 0.02 * np.abs(y).mean(), y.size)
+    centers = np.array([-0.25, -0.10, 0.08, 0.22])
+
+    params = params_from_dict({'baseline': 'poly-iter', 'baseline_degree': 5,
+                               'height': 5.0, 'height_mode': 'prominence',
+                               'smooth_points': 2})
+    params.validate()
+    found = np.array([pk.x for pk in analyze(x, y, params).peaks])
+
+    for c in centers:
+        assert found.size and np.min(np.abs(found - c)) < 0.02, c
+    for px in found:
+        assert np.min(np.abs(centers - px)) < 0.02, f"invented a peak at {px}"

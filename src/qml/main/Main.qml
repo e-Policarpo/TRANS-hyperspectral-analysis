@@ -934,6 +934,17 @@ ApplicationWindow {
             ProjectBrowser {
                 id: projectBrowser
                 anchors.fill: parent
+
+                // Datasets dragged out of the browser are offered to whatever
+                // tool window sits under the cursor (hit-tested in global
+                // coordinates, the same no-DropArea approach the tree uses).
+                onDatasetsDragMoved: function(names, sceneX, sceneY) {
+                    toolWindowManager.highlightDatasetDrop(names, sceneX, sceneY)
+                }
+                onDatasetsDropped: function(names, sceneX, sceneY) {
+                    if (toolWindowManager.deliverDatasetDrop(names, sceneX, sceneY))
+                        console.log("Dropped", names.length, "dataset(s) on a tool")
+                }
             }
         }
 

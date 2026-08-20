@@ -17,6 +17,8 @@ import json
 import logging
 import gzip
 import io
+import os
+import zlib
 from pathlib import Path
 from typing import Dict, Optional, Any, List
 from datetime import datetime
@@ -27,6 +29,110 @@ logger = logging.getLogger(__name__)
 
 # File format version
 FORMAT_VERSION = "2.0"
+
+
+def _inflate_as_far_as_possible(compressed: bytes) -> str:
+    """Decompress a gzip stream that stops early, keeping what did arrive.
+
+    ``gzip.decompress`` throws away every byte it already inflated when the
+    end-of-stream marker is missing, so a save cut short takes the whole
+    project with it. Feeding the same bytes through a raw decompressobj keeps
+    the prefix, which is usually most of the file.
+    """
+    inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    chunks, step = [], 1 << 20
+    for start in range(0, len(compressed), step):
+        try:
+            chunks.append(inflater.decompress(compressed[start:start + step]))
+        except zlib.error as exc:
+            logger.warning("Project stream is damaged at byte %d: %s", start, exc)
+            break
+    try:
+        chunks.append(inflater.flush())
+    except zlib.error:
+        pass
+    return b"".join(chunks).decode('utf-8', errors='ignore')
+
+
+def _close_truncated_json(text: str) -> Optional[str]:
+    """Turn a JSON document that just stops into a parseable one.
+
+    Walks the text tracking string/escape state and the open-container stack,
+    remembering the last point at which a complete element had just ended.
+    Everything after that point is a half-written value, so it is dropped and
+    the still-open containers are closed. Entries written before the cut
+    survive intact; only the one being written when the save died is lost.
+    """
+    stack, safe_cut, safe_stack = [], -1, 0
+    in_string = escaped = False
+
+    for i, ch in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == '\\':
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+        elif ch in '{[':
+            stack.append('}' if ch == '{' else ']')
+        elif ch in '}]':
+            if not stack or stack[-1] != ch:
+                break
+            stack.pop()
+            safe_cut, safe_stack = i + 1, len(stack)
+        elif ch == ',':
+            safe_cut, safe_stack = i, len(stack)
+
+    if not stack:
+        return text          # nothing to repair
+    if safe_cut < 0:
+        return None          # nothing complete was written
+
+    repaired = text[:safe_cut]
+    # Close whatever was open at the cut, innermost first.
+    closers = []
+    depth, in_string, escaped = [], False, False
+    for ch in repaired:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == '\\':
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in '{[':
+            depth.append('}' if ch == '{' else ']')
+        elif ch in '}]' and depth:
+            depth.pop()
+    closers = list(reversed(depth))
+    return repaired + "".join(closers)
+
+
+def salvage_project_json(compressed: bytes) -> Optional[Dict[str, Any]]:
+    """Best-effort parse of a truncated .hrt payload. None if nothing survives."""
+    text = _inflate_as_far_as_possible(compressed)
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    repaired = _close_truncated_json(text)
+    if not repaired:
+        return None
+    try:
+        return json.loads(repaired)
+    except json.JSONDecodeError as exc:
+        logger.error("Could not repair the truncated project JSON: %s", exc)
+        return None
 
 
 class ProjectManager:
@@ -141,13 +247,40 @@ class ProjectManager:
             # only burns minutes of CPU for zero size gain (this froze the
             # app on GB-scale projects). Level 1 + streaming keeps peak
             # memory flat and the byte format identical for the load path.
-            with open(project_path, 'wb') as f:
-                # Write magic header for format detection
-                f.write(b'HRT2')  # Magic bytes for v2.0
-                with gzip.GzipFile(fileobj=f, mode='wb',
-                                   compresslevel=self._save_compresslevel) as gz:
-                    with io.TextIOWrapper(gz, encoding='utf-8') as text_stream:
-                        json.dump(project_json, text_stream, ensure_ascii=False)
+            #
+            # Written to a temporary file in the same directory and moved into
+            # place only once it is complete and on disk. Writing straight to
+            # the project truncated it the instant the save began, so anything
+            # that interrupted the write — a crash, a kill, a full disk, a
+            # sync client — destroyed the project outright.
+            temp_path = project_path.with_name(project_path.name + '.tmp')
+            try:
+                with open(temp_path, 'wb') as f:
+                    # Write magic header for format detection
+                    f.write(b'HRT2')  # Magic bytes for v2.0
+                    with gzip.GzipFile(fileobj=f, mode='wb',
+                                       compresslevel=self._save_compresslevel) as gz:
+                        with io.TextIOWrapper(gz, encoding='utf-8') as text_stream:
+                            json.dump(project_json, text_stream, ensure_ascii=False)
+                    f.flush()
+                    os.fsync(f.fileno())   # the bytes must be durable BEFORE the swap
+
+                # Keep the version being replaced: if the new file later turns
+                # out to be unreadable, load_project falls back to this.
+                if project_path.exists():
+                    try:
+                        os.replace(project_path, self.backup_path(project_path))
+                    except OSError as exc:
+                        logger.warning("Could not keep a backup of %s: %s",
+                                       project_path, exc)
+
+                os.replace(temp_path, project_path)   # atomic on POSIX and Windows
+            finally:
+                if temp_path.exists():
+                    try:
+                        temp_path.unlink()
+                    except OSError:
+                        pass
 
             self.current_project_path = project_path
             self.project_modified = False
@@ -181,15 +314,35 @@ class ProjectManager:
                 logger.error(f"Project file not found: {project_path}")
                 return None
 
+            recovered_from = ''
             with open(project_path, 'rb') as f:
                 # Check magic header
                 magic = f.read(4)
 
                 if magic == b'HRT2':
-                    # v2.0 format - compressed
-                    compressed = f.read()
-                    json_str = gzip.decompress(compressed).decode('utf-8')
-                    project_json = json.loads(json_str)
+                    # v2.0 format - compressed. Decoded as a stream: these
+                    # projects reach several GB, and holding the compressed
+                    # bytes and the decompressed text at once doubled the
+                    # peak memory for no reason.
+                    try:
+                        with gzip.GzipFile(fileobj=f, mode='rb') as gz:
+                            project_json = json.load(
+                                io.TextIOWrapper(gz, encoding='utf-8'))
+                    except (EOFError, OSError, zlib.error, UnicodeDecodeError,
+                            json.JSONDecodeError) as exc:
+                        # The save was cut short (killed mid-write, full disk,
+                        # a sync client pulling the file away). Prefer an
+                        # intact companion file; only if there is none do we
+                        # salvage the prefix of the damaged one.
+                        logger.error("Project file is truncated or damaged (%s); "
+                                     "attempting recovery", exc)
+                        project_json, recovered_from = self._load_fallback(project_path)
+                        if project_json is None:
+                            f.seek(4)
+                            project_json = salvage_project_json(f.read())
+                            if project_json is None:
+                                raise
+                            recovered_from = 'partial'
                 else:
                     # Legacy v1.0 format - plain JSON
                     f.seek(0)
@@ -226,6 +379,20 @@ class ProjectManager:
                 'browser_tree': project_json.get('browser_tree', {}),
             }
 
+            if recovered_from:
+                # The caller warns the user: a recovered project is missing
+                # whatever was still unwritten, and saving over the original
+                # would make that loss permanent without them knowing.
+                project_data['recovered'] = {
+                    'source': recovered_from,
+                    'datasets': len(datasets),
+                    'path': str(project_path),
+                }
+                logger.warning("Project recovered from a %s: %d dataset(s), "
+                               "%d map(s), %d image(s)", recovered_from,
+                               len(datasets), len(project_data['maps']),
+                               len(images))
+
             self.current_project_path = project_path
             self.project_modified = False
             logger.info(f"Project loaded successfully: {project_path}")
@@ -234,6 +401,47 @@ class ProjectManager:
         except Exception as e:
             logger.error(f"Error loading project: {e}", exc_info=True)
             return None
+
+    @staticmethod
+    def backup_path(project_path: Path) -> Path:
+        """Where the previous good version of a project is kept."""
+        return project_path.with_name(project_path.name + '.bak')
+
+    @staticmethod
+    def autosave_path(project_path: Path) -> Path:
+        """The periodic autosave kept beside the project."""
+        return project_path.with_name(project_path.stem + '.autosave.hrt')
+
+    def _read_project_json(self, path: Path) -> Optional[Dict[str, Any]]:
+        """Read one .hrt completely, or None if it is missing/damaged."""
+        if not path.exists():
+            return None
+        try:
+            with open(path, 'rb') as f:
+                if f.read(4) != b'HRT2':
+                    f.seek(0)
+                    return json.load(f)
+                with gzip.GzipFile(fileobj=f, mode='rb') as gz:
+                    return json.load(io.TextIOWrapper(gz, encoding='utf-8'))
+        except Exception as exc:
+            logger.warning("%s is unusable (%s)", path.name, exc)
+            return None
+
+    def _load_fallback(self, project_path: Path):
+        """An intact companion of a damaged project: (data, source) or (None, '').
+
+        The autosave counts even when it is *older* than the project file —
+        an interrupted save leaves a fresh mtime on a file that holds nothing
+        loadable, so "newer" says nothing about which one is usable.
+        """
+        for path, source in ((self.backup_path(project_path), 'backup'),
+                             (self.autosave_path(project_path), 'autosave')):
+            data = self._read_project_json(path)
+            if data is not None:
+                logger.warning("Recovered the project from %s instead of the "
+                               "damaged %s", path.name, project_path.name)
+                return data, source
+        return None, ''
 
     def _serialize_datasets(self, datasets: Dict) -> Dict:
         """

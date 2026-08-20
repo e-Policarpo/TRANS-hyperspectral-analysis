@@ -771,10 +771,17 @@ class TestConfinementAnalysis(TestToolImplementationsSetup):
             params={'baseline': 'poly-iter', 'baseline_degree': 5, 'height': 5.0, **params},
         )
 
-    def test_finds_in_gap_states_the_old_tool_missed(self, tool_impl, sts_dataset):
-        """The point of the tool: over the full sweep, no background means no peaks."""
+    def test_finds_every_in_gap_state(self, tool_impl, sts_dataset):
+        """Small states on huge band edges must all be reported.
+
+        This used to also assert that no background meant no peaks at all —
+        true only while the threshold scaled with the curve's span, which the
+        band edges set. The threshold is now measured against the spectrum's
+        own noise, so the states are found either way; what background removal
+        buys is a corrected height that means something.
+        """
         without = self._run(tool_impl, sts_dataset, baseline='none')
-        assert without['peaks'] is None
+        assert without['peaks'] is not None
 
         result = self._run(tool_impl, sts_dataset)
         found = result['peaks'].data['position_value'].round(2).unique()
@@ -826,15 +833,19 @@ class TestConfinementAnalysis(TestToolImplementationsSetup):
 
     # -- thermal grouping ---------------------------------------------------
 
-    def test_temperature_bins_the_axis_at_kbt(self, tool_impl, sts_dataset):
-        """94 K -> kBT = 8.1 meV, which is the column spacing in the by-hand sheet."""
+    def test_temperature_bins_the_axis_at_half_kbt(self, tool_impl, sts_dataset):
+        """94 K -> kBT = 8.1 meV, so the bins are 4.05 meV wide.
+
+        Binning at the full kBT was too coarse: kBT is the error bar, and a
+        grid that coarse merges peaks the measurement can still resolve.
+        """
         result = self._run(tool_impl, sts_dataset, temperature_k=94.0)
         axis = result['peak_matrix_binned'].independent_var
 
         step = np.diff(axis)
-        np.testing.assert_allclose(step, 8.617333262e-5 * 94.0, rtol=1e-6)
-        # 1.2 V of sweep at 8.1 meV is ~150 bins, far fewer than 512 samples.
-        assert 100 < len(axis) < 200
+        np.testing.assert_allclose(step, 8.617333262e-5 * 94.0 / 2, rtol=1e-6)
+        # 1.2 V of sweep at 4.05 meV is ~300 bins, still well under 512 samples.
+        assert 200 < len(axis) < 400
 
     def test_temperature_grouping_is_off_by_default(self, tool_impl, sts_dataset):
         result = self._run(tool_impl, sts_dataset)
@@ -863,24 +874,37 @@ class TestConfinementAnalysis(TestToolImplementationsSetup):
             units={"x": "V"}, additional_info={}))
         tool_impl._datasets['sts'] = dataset
 
-        ungrouped = tool_impl.analyze_confinement(MockTask(), 'sts', params={'height': 1.0})
-        assert len(ungrouped['peaks'].data) == 3
+        # Ungrouped: the pair at 0.000 and 0.003 is reported separately.
+        ungrouped = tool_impl.analyze_confinement(MockTask(), 'sts', params={'height': 5.0})
+        near_zero = [v for v in ungrouped['peaks'].data['position_value']
+                     if abs(v) < 0.01]
+        assert len(near_zero) == 2
 
         grouped = tool_impl.analyze_confinement(
-            MockTask(), 'sts', params={'height': 1.0, 'temperature_k': 94.0})
+            MockTask(), 'sts', params={'height': 5.0, 'temperature_k': 94.0})
         rows = grouped['peaks'].data
-        assert len(rows) == 2
-        # The pair collapses to one entry near 0; the distant peak is untouched.
-        positions = sorted(rows['position_value'].tolist())
-        assert positions[0] == pytest.approx(0.0, abs=0.004)
-        assert positions[1] == pytest.approx(0.2, abs=0.004)
+        # Grouped at kBT: the pair becomes one entry, the distant peak stays.
+        collapsed = [v for v in rows['position_value'] if abs(v) < 0.01]
+        assert len(collapsed) == 1
+        assert collapsed[0] == pytest.approx(0.0, abs=0.004)
+        assert any(abs(v - 0.2) < 0.01 for v in rows['position_value'])
         # And the binned matrix agrees with the list.
-        assert np.nansum(grouped['peak_matrix_binned'].spectra.values) == 2
+        assert (np.nansum(grouped['peak_matrix_binned'].spectra.values)
+                == len(rows))
 
     def test_explicit_min_distance_overrides_the_thermal_default(self, tool_impl, sts_dataset):
         result = self._run(tool_impl, sts_dataset, temperature_k=94.0, min_distance=0.5)
         # 0.5 V apart is far coarser than kBT, so few peaks survive.
         assert len(result['peaks'].data.query('spectrum_index == 0')) <= 3
+
+    def test_minimum_separation_stays_the_full_kbt(self, tool_impl, sts_dataset):
+        """Halving the bins must not halve the resolution limit: peaks are
+        still merged at kBT, only reported on a finer grid."""
+        from src.processing.peak_detection import Params
+
+        params = Params(temperature_k=94.0)
+        assert params.thermal_width == pytest.approx(8.1e-3, rel=1e-2)
+        assert params.bin_width == pytest.approx(params.thermal_width / 2)
 
     def test_metadata_records_the_temperature(self, tool_impl, sts_dataset):
         result = self._run(tool_impl, sts_dataset, temperature_k=94.0)
@@ -889,6 +913,8 @@ class TestConfinementAnalysis(TestToolImplementationsSetup):
             info = result[key].metadata.additional_info
             assert info['temperature_k'] == 94.0, key
             assert info['kbt'] == pytest.approx(8.1e-3, rel=1e-2), key
+            # kbt is the resolution limit; the bins are half of it.
+            assert info['bin_width'] == pytest.approx(4.05e-3, rel=1e-2), key
 
         binned_info = result['peak_matrix_binned'].metadata.additional_info
         assert binned_info['binned'] is True
@@ -1041,7 +1067,10 @@ class TestConfinementAnalysis(TestToolImplementationsSetup):
             MockTask(), 'noisy', params={'height': 4.0, 'smooth_points': 0})
 
         assert len(defaulted['peaks'].data) == len(planted)
-        assert len(unsmoothed['peaks'].data) > 3 * len(planted)
+        # Without smoothing the noise still over-detects. The margin is
+        # narrower than it was: the prominence threshold (now the default)
+        # already rejects most noise bumps on its own.
+        assert len(unsmoothed['peaks'].data) > 2 * len(planted)
 
     def test_caller_params_override_the_product_defaults(self, tool_impl, sts_dataset):
         tool_impl._datasets['sts'] = sts_dataset
@@ -1059,9 +1088,11 @@ class TestConfinementAnalysis(TestToolImplementationsSetup):
         assert 'Peak Matrix' in result['dataset_names']
         assert 'Peak Matrix (binned)' in result['dataset_names']
 
-        # Raw keeps the measured axis; binned is far coarser.
+        # Raw keeps the measured axis; binned is coarser (half kBT per bin).
         np.testing.assert_array_equal(raw.independent_var, sts_dataset.independent_var)
-        assert len(binned.independent_var) < len(raw.independent_var) / 3
+        assert len(binned.independent_var) < len(raw.independent_var)
+        assert (np.diff(binned.independent_var)[0]
+                > np.diff(raw.independent_var)[0])
         assert raw.metadata.additional_info['binned'] is False
         assert binned.metadata.additional_info['binned'] is True
 
@@ -1095,7 +1126,7 @@ class TestConfinementAnalysis(TestToolImplementationsSetup):
         result = self._run(tool_impl, sts_dataset, temperature_k=94.0)
         axis = result['peak_matrix_binned'].independent_var
         kbt = 8.617333262e-5 * 94.0
-        np.testing.assert_allclose(np.diff(axis), kbt, rtol=1e-6)
+        np.testing.assert_allclose(np.diff(axis), kbt / 2, rtol=1e-6)
         # Every marked bin holds at least one reported peak.
         marked = axis[result['peak_matrix_binned'].spectra.values[:, 0] == 1]
         centres = result['peaks'].data.query('spectrum_index == 0')['bin_center']
@@ -1382,3 +1413,1240 @@ class TestSpectralFeatures(TestToolImplementationsSetup):
         result = self._run(tool_impl, sts_dataset, normalize='quantile')
         assert result['features'] is None
         tool_impl.errorOccurred.emit.assert_called()
+
+
+# =============================================================================
+# Map Generator — spectra → background-corrected integrals → maps
+# =============================================================================
+
+class TestMapLayout(TestToolImplementationsSetup):
+    """The scan path decides how a per-spectrum value array becomes a field."""
+
+    def test_meander_reverses_every_other_row(self, tool_impl):
+        values = np.arange(6.0)          # 3 wide, 2 tall
+        out = tool_impl._reshape_map_values(values, (3, 2), 'map_meander')
+        # Rows are flipped bottom-to-top, and the second (odd) row is reversed
+        # because it was acquired right-to-left.
+        np.testing.assert_array_equal(out, [[5, 4, 3], [0, 1, 2]])
+
+    def test_raster_fills_rows_straight(self, tool_impl):
+        values = np.arange(6.0)
+        out = tool_impl._reshape_map_values(values, (3, 2), 'map_raster')
+        np.testing.assert_array_equal(out, [[3, 4, 5], [0, 1, 2]])
+
+    def test_line_scan_is_a_single_row_whatever_the_dimensions_say(self, tool_impl):
+        values = np.arange(5.0)
+        out = tool_impl._reshape_map_values(values, (5, 1), 'line')
+        assert out.shape == (1, 5)
+        np.testing.assert_array_equal(out[0], values)
+
+    def test_line_scan_ignores_a_misleading_grid(self, tool_impl):
+        """A line's metadata may claim a 2-D grid; the line path must not
+        fold it into rows."""
+        values = np.arange(7.0)
+        out = tool_impl._reshape_map_values(values, (3, 2), 'line')
+        assert out.shape == (1, 7)
+
+    def test_length_mismatch_is_refused(self, tool_impl):
+        with pytest.raises(ValueError):
+            tool_impl._reshape_map_values(np.arange(5.0), (3, 2), 'map_raster')
+
+    def test_clean_multiple_uses_the_first_channel(self, tool_impl):
+        values = np.concatenate([np.arange(6.0), np.full(6, 99.0)])
+        out = tool_impl._reshape_map_values(values, (3, 2), 'map_raster')
+        assert 99.0 not in out
+
+    @staticmethod
+    def _meta(**kwargs):
+        return SpectralMetadata(source_type='sts', dimensions=kwargs.pop('dimensions', (4, 4)),
+                                scan_mode=kwargs.pop('scan_mode', 'point'),
+                                units={}, additional_info=kwargs.pop('info', {}))
+
+    def test_auto_recognises_a_meander_scan(self, tool_impl):
+        meta = self._meta(scan_mode='meander')
+        assert tool_impl._resolve_scan_type('auto', meta) == 'map_meander'
+
+    def test_auto_does_not_re_correct_corrected_data(self, tool_impl):
+        meta = self._meta(scan_mode='meander', info={'meander_corrected': True})
+        assert tool_impl._resolve_scan_type('auto', meta) == 'map_raster'
+
+    def test_auto_recognises_a_line_scan(self, tool_impl):
+        meta = self._meta(dimensions=(16, 1), scan_mode='line')
+        assert tool_impl._resolve_scan_type('auto', meta) == 'line'
+
+    def test_an_explicit_choice_overrides_the_metadata(self, tool_impl):
+        meta = self._meta(scan_mode='meander')
+        assert tool_impl._resolve_scan_type('line', meta) == 'line'
+        assert tool_impl._resolve_scan_type('map_raster', meta) == 'map_raster'
+
+
+class TestMapGeneratorFromSpectra(TestToolImplementationsSetup):
+    """Background correction + interval integration + export, in one pass."""
+
+    CENTERS = (-0.25, 0.20)
+
+    def _dataset(self, n_spectra=16, dimensions=(4, 4), scan_mode='point',
+                 info=None, weights=None):
+        x = np.linspace(-0.6, 0.6, 256)
+        band_edges = 3e-7 * np.exp((np.abs(x) - 0.6) / 0.055)
+        weights = weights if weights is not None else np.ones(n_spectra)
+        columns = {}
+        for n in range(n_spectra):
+            y = band_edges.copy()
+            for c in self.CENTERS:
+                y = y + weights[n] * 1.2e-8 * np.exp(-0.5 * ((x - c) / 0.008) ** 2)
+            columns[f"P{n + 1}"] = y
+        df = pd.DataFrame({"V": x, **columns})
+        return SpectralData(df, SpectralMetadata(
+            source_type='sts', dimensions=dimensions, scan_mode=scan_mode,
+            units={'independent': 'V', 'dependent': 'A'},
+            additional_info=info or {}))
+
+    @staticmethod
+    def _csv_of(tiff_path):
+        """The CSV beside a map, in the run's csv/ folder."""
+        tiff = Path(tiff_path)
+        return tiff.parent.parent / 'csv' / (tiff.stem + '.csv')
+
+    def _run(self, tool_impl, dataset=None, name='sts', **params):
+        tool_impl._datasets[name] = dataset if dataset is not None else self._dataset()
+        return tool_impl.generate_maps_from_spectra(
+            MockTask(), name,
+            params={'baseline': 'poly-iter', 'baseline_degree': 5,
+                    'height': 5.0, **params})
+
+    def test_detects_intervals_and_writes_one_tiff_per_interval(self, tool_impl):
+        result = self._run(tool_impl)
+
+        assert result['n_maps'] == len(result['intervals']) > 0
+        for path in result['map_paths']:
+            assert path.endswith('.tiff')
+            assert Path(path).exists()
+
+    def test_csv_and_gsf_ride_along_as_before(self, tool_impl):
+        """The export contract is unchanged: calibrated TIFF + GSF + CSV —
+        now filed per dataset and per format."""
+        result = self._run(tool_impl)
+        tiff = Path(result['map_paths'][0])
+        assert tiff.parent.name == 'tiff'
+        root = tiff.parent.parent
+        assert (root / 'gsf' / (tiff.stem + '.gsf')).exists()
+        assert (root / 'csv' / (tiff.stem + '.csv')).exists()
+
+    def test_outputs_are_filed_under_their_dataset(self, tool_impl):
+        result = self._run(tool_impl, name='STS line 7')
+        root = Path(result['output_folder'])
+        assert root.name == 'STS_line_7'
+        assert root.parent.name == 'maps'
+        assert {p.name for p in root.iterdir() if p.is_dir()} == {'gsf', 'tiff', 'csv'}
+
+    def test_two_datasets_do_not_share_a_folder(self, tool_impl):
+        first = self._run(tool_impl, name='line A')
+        second = self._run(tool_impl, name='line B')
+        assert first['output_folder'] != second['output_folder']
+
+    def test_maps_are_the_grid_shape(self, tool_impl):
+        result = self._run(tool_impl)
+        grid = np.loadtxt(self._csv_of(result['map_paths'][0]), delimiter=',')
+        assert grid.shape == (4, 4)
+
+    def test_a_line_scan_produces_a_single_row(self, tool_impl):
+        dataset = self._dataset(n_spectra=12, dimensions=(12, 1), scan_mode='line')
+        result = self._run(tool_impl, dataset, scan_type='line')
+
+        assert result['scan_type'] == 'line'
+        grid = np.loadtxt(self._csv_of(result['map_paths'][0]), delimiter=',')
+        assert grid.shape == (12,)          # one row, written flat by savetxt
+
+    def test_scan_type_combo_picks_the_path(self, tool_impl):
+        meander = self._run(tool_impl, scan_type='map_meander')
+        raster = self._run(tool_impl, scan_type='map_raster')
+        assert meander['scan_type'] == 'map_meander'
+        assert raster['scan_type'] == 'map_raster'
+
+    def test_values_follow_the_spectra(self, tool_impl):
+        """A brighter state must give a larger integral, so the map carries
+        the physical contrast rather than a normalisation."""
+        weights = np.linspace(1.0, 4.0, 16)
+        result = self._run(tool_impl, self._dataset(weights=weights),
+                           interval_source='manual', intervals=[[0.15, 0.25]])
+
+        values = tool_impl._datasets[result['values_dataset']].data
+        column = [c for c in values.columns if c != 'Spectrum_Index'][0]
+        assert values[column].iloc[-1] > values[column].iloc[0]
+        assert values[column].is_monotonic_increasing
+
+    def test_integrals_are_published_as_a_flat_dataset(self, tool_impl):
+        result = self._run(tool_impl)
+        values = tool_impl._datasets[result['values_dataset']]
+
+        assert values.metadata.data_type == 'flat'
+        assert 'Spectrum_Index' in values.data.columns
+        assert len(values.data.columns) == 1 + len(result['intervals'])
+        # The intervals travel with them, so the numbers can be re-mapped.
+        assert values.metadata.additional_info['integration_intervals']
+
+    def test_manual_intervals_skip_detection(self, tool_impl):
+        result = self._run(tool_impl, interval_source='manual',
+                           intervals=[[-0.3, -0.2], [0.15, 0.25]])
+        assert result['intervals'] == [[-0.3, -0.2], [0.15, 0.25]]
+        assert result['n_maps'] == 2
+
+    def test_intervals_come_from_a_previous_analysis(self, tool_impl):
+        """The whole point of the rewrite: no JSON export/import detour."""
+        dataset = self._dataset()
+        tool_impl._datasets['sts'] = dataset
+        analysis = tool_impl.analyze_confinement(
+            MockTask(), 'sts',
+            params={'baseline': 'poly-iter', 'baseline_degree': 5, 'height': 5.0})
+
+        source = analysis['dataset_names']['Peaks']
+        assert tool_impl.dataset_intervals(source), "analysis published no intervals"
+
+        result = self._run(tool_impl, dataset, interval_source='dataset',
+                           intervals_from=source)
+        assert result['intervals'] == tool_impl.dataset_intervals(source)
+        assert result['n_maps'] == len(result['intervals'])
+
+    def test_background_correction_is_applied_before_integrating(self, tool_impl):
+        """Without it the band edge dominates and every point looks alike."""
+        # An interval sitting on the band edge, with no state in it: raw, it
+        # integrates the edge; corrected, there is almost nothing left.
+        # Distinct names because both runs publish "<base> - Map Values".
+        window = [[0.45, 0.55]]
+        corrected = self._run(tool_impl, name='corrected',
+                              interval_source='manual', intervals=window)
+        raw = self._run(tool_impl, name='raw', baseline='none',
+                        interval_source='manual', intervals=window)
+
+        c_values = tool_impl._datasets[corrected['values_dataset']].data.iloc[:, 1]
+        r_values = tool_impl._datasets[raw['values_dataset']].data.iloc[:, 1]
+        assert abs(c_values.mean()) < 0.2 * abs(r_values.mean())
+
+    def test_no_intervals_reports_instead_of_writing_nothing(self, tool_impl):
+        result = self._run(tool_impl, interval_source='manual', intervals=[])
+        assert result['n_maps'] == 0
+        tool_impl.errorOccurred.emit.assert_called()
+
+    def test_missing_dataset_is_reported(self, tool_impl):
+        result = tool_impl.generate_maps_from_spectra(MockTask(), 'nope', {})
+        assert result['n_maps'] == 0
+        tool_impl.errorOccurred.emit.assert_called()
+
+    def test_cancellation_stops_before_writing(self, tool_impl):
+        class Cancelled(MockTask):
+            cancelled = True
+
+        tool_impl._datasets['sts'] = self._dataset()
+        result = tool_impl.generate_maps_from_spectra(
+            Cancelled(), 'sts', {'interval_source': 'manual',
+                                 'intervals': [[0.1, 0.2]]})
+        assert result['map_paths'] == []
+
+    def test_legacy_interval_strings_are_understood(self, tool_impl):
+        dataset = self._dataset()
+        dataset.metadata.additional_info['intervals'] = ['0.100_0.200']
+        tool_impl._datasets['old'] = dataset
+        assert tool_impl.dataset_intervals('old') == [[0.1, 0.2]]
+
+    def test_a_dataset_without_intervals_lists_none(self, tool_impl):
+        tool_impl._datasets['plain'] = self._dataset()
+        assert tool_impl.dataset_intervals('plain') == []
+
+    def test_scan_type_reaches_the_flat_map_path(self, tool_impl):
+        """The workflow node's scan-type choice must drive the layout too."""
+        frame = pd.DataFrame({'Spectrum_Index': np.arange(6),
+                              'value': np.arange(6.0)})
+        tool_impl._datasets['flat'] = SpectralData(frame, SpectralMetadata(
+            source_type='flat', dimensions=(3, 2), scan_mode='point',
+            units={}, additional_info={}, data_type='flat'))
+
+        meander = tool_impl.generate_map(MockTask(), 'flat', 0, scan_type='map_meander')
+        grid = np.loadtxt(str(meander) + '.csv', delimiter=',')
+        np.testing.assert_array_equal(grid, [[5, 4, 3], [0, 1, 2]])
+
+        line = tool_impl.generate_map(MockTask(), 'flat', 0, scan_type='line')
+        assert np.loadtxt(str(line) + '.csv', delimiter=',').shape == (6,)
+
+
+class TestMapIntervalsFromThermalBins(TestToolImplementationsSetup):
+    """The Map Generator must find the same states Confinement Analysis does.
+
+    Merging peaks' FWHM bands lost almost all of them — on real 4.5 K
+    line-scan data, 206 occupied bins collapsed to 3 bands, one a quarter of
+    the sweep wide. The intervals are the occupied k_B*T/2 bins instead.
+    """
+
+    CENTERS = (-0.25, -0.10, 0.08, 0.22)
+
+    def _dataset(self, n_spectra=6, present=None):
+        """Spectra with sharp in-gap states on a steep band-edge background.
+
+        ``present`` picks which centres each spectrum carries, so bins can be
+        occupied by different numbers of spectra.
+        """
+        x = np.linspace(-0.6, 0.6, 1024)
+        band_edges = 3e-7 * np.exp((np.abs(x) - 0.6) / 0.055)
+        columns = {}
+        for n in range(n_spectra):
+            y = band_edges.copy()
+            centers = self.CENTERS if present is None else present(n)
+            for c in centers:
+                y = y + 1.2e-8 * np.exp(-0.5 * ((x - c) / 0.004) ** 2)
+            columns[f"P{n + 1}"] = y
+        df = pd.DataFrame({"V": x, **columns})
+        return SpectralData(df, SpectralMetadata(
+            source_type='sts', dimensions=(n_spectra, 1), scan_mode='point',
+            units={'independent': 'V'}, additional_info={}))
+
+    def _intervals(self, tool_impl, dataset=None, **params):
+        tool_impl._datasets['sts'] = dataset if dataset is not None else self._dataset()
+        return tool_impl.detect_map_intervals(
+            MockTask(), 'sts',
+            {'baseline': 'poly-iter', 'baseline_degree': 5, 'height': 5.0,
+             **params})
+
+    def test_intervals_are_exactly_one_bin_wide(self, tool_impl):
+        from src.processing.peak_detection import thermal_broadening
+
+        intervals = self._intervals(tool_impl, temperature_k=94.0)
+        expected = thermal_broadening(94.0, 'eV') / 2
+
+        assert intervals, "no intervals found"
+        for lo, hi in intervals:
+            assert hi - lo == pytest.approx(expected, rel=1e-9)
+
+    def test_the_states_confinement_finds_are_all_covered(self, tool_impl):
+        """Every planted state must fall inside one of the intervals."""
+        dataset = self._dataset()
+        intervals = self._intervals(tool_impl, dataset, temperature_k=94.0)
+        for center in self.CENTERS:
+            assert any(lo <= center <= hi for lo, hi in intervals), center
+
+    def test_bins_agree_with_the_confinement_table(self, tool_impl):
+        """Both tools must report on the same grid."""
+        dataset = self._dataset()
+        tool_impl._datasets['sts'] = dataset
+        analysis = tool_impl.analyze_confinement(
+            MockTask(), 'sts',
+            params={'baseline': 'poly-iter', 'baseline_degree': 5,
+                    'height': 5.0, 'temperature_k': 94.0})
+        occupied_bins = analysis['peaks'].data['bin_index'].nunique()
+
+        intervals = self._intervals(tool_impl, dataset, temperature_k=94.0)
+        assert len(intervals) == occupied_bins
+
+    def test_the_occupancy_filter_drops_bins_without_widening_them(self, tool_impl):
+        """Raising the minimum must cost states, never resolution — the old
+        behaviour was the opposite."""
+        def present(n):
+            # Every spectrum has the first state; only one has the last.
+            return self.CENTERS if n == 0 else self.CENTERS[:-1]
+
+        dataset = self._dataset(n_spectra=6, present=present)
+        loose = self._intervals(tool_impl, dataset, temperature_k=94.0,
+                                min_spectra_per_bin=1)
+        strict = self._intervals(tool_impl, dataset, temperature_k=94.0,
+                                 min_spectra_per_bin=3)
+
+        assert len(strict) < len(loose)
+        widths = {round(hi - lo, 12) for lo, hi in loose + strict}
+        assert len(widths) == 1, "bin width changed with the threshold"
+
+    def test_a_singleton_bin_survives_at_the_default(self, tool_impl):
+        def present(n):
+            return self.CENTERS if n == 0 else self.CENTERS[:-1]
+
+        dataset = self._dataset(n_spectra=6, present=present)
+        intervals = self._intervals(tool_impl, dataset, temperature_k=94.0)
+        assert any(lo <= self.CENTERS[-1] <= hi for lo, hi in intervals)
+
+    def test_without_a_temperature_the_bins_are_the_sweep_step(self, tool_impl):
+        """No temperature must not mean coarse intervals.
+
+        This used to merge the peaks' FWHM bands, which fused everything into
+        two or three bands tens of mV wide — on real dI/dV line scans the tool
+        reported 2 intervals where 216 states were detected. The bins are now
+        the sweep's own step, the finest grid the measurement resolves.
+        """
+        dataset = self._dataset()
+        step = float(np.median(np.diff(dataset.independent_var)))
+        intervals = self._intervals(tool_impl, dataset)
+
+        assert len(intervals) > 3
+        for lo, hi in intervals:
+            assert hi - lo == pytest.approx(step, rel=1e-6)
+
+    def test_bins_are_never_finer_than_the_sweep_can_resolve(self, tool_impl):
+        """k_B*T/2 at 4.5 K is 0.19 mV against a 4.7 mV sweep step: finer bins
+        would only produce neighbouring maps integrating the same samples."""
+        dataset = self._dataset()
+        step = float(np.median(np.diff(dataset.independent_var)))
+        intervals = self._intervals(tool_impl, dataset, temperature_k=4.5)
+
+        assert intervals
+        for lo, hi in intervals:
+            assert hi - lo == pytest.approx(step, rel=1e-6)
+
+    def test_a_coarse_temperature_still_widens_the_bins(self, tool_impl):
+        """When k_B*T/2 is the coarser of the two, it wins."""
+        from src.processing.peak_detection import thermal_broadening
+
+        dataset = self._dataset()
+        intervals = self._intervals(tool_impl, dataset, temperature_k=2000.0)
+        expected = thermal_broadening(2000.0, 'eV') / 2
+
+        assert intervals
+        for lo, hi in intervals:
+            assert hi - lo == pytest.approx(expected, rel=1e-6)
+
+    def test_generation_uses_the_binned_intervals(self, tool_impl):
+        """End to end: one map per occupied bin."""
+        tool_impl._datasets['sts'] = self._dataset()
+        result = tool_impl.generate_maps_from_spectra(
+            MockTask(), 'sts',
+            {'baseline': 'poly-iter', 'baseline_degree': 5, 'height': 5.0,
+             'temperature_k': 94.0, 'dimensions': (6, 1), 'scan_type': 'line'})
+
+        assert result['n_maps'] == len(result['intervals']) >= len(self.CENTERS)
+
+
+class TestSubResolutionIntervals(TestToolImplementationsSetup):
+    """Thermal bins are routinely finer than the bias step.
+
+    At 4.5 K a k_B*T/2 bin is 0.19 mV while a 256-point sweep over 1.2 V
+    steps every 4.7 mV, so the bin held 0.04 samples and np.trapz returned
+    exactly 0 — every map came out blank.
+    """
+
+    def _dataset(self, n_spectra=8, n_points=256):
+        x = np.linspace(-0.6, 0.6, n_points)
+        columns = {}
+        for n in range(n_spectra):
+            # A state whose height varies across the line, so a correct map
+            # has contrast rather than one flat value.
+            columns[f"P{n + 1}"] = (1e-10 * (n + 1)
+                                    * np.exp(-0.5 * ((x - 0.2) / 0.01) ** 2)
+                                    + 1e-12)
+        df = pd.DataFrame({"V": x, **columns})
+        return SpectralData(df, SpectralMetadata(
+            source_type='sts', dimensions=(n_spectra, 1), scan_mode='line',
+            units={'independent': 'V', 'dependent': 'A'}, additional_info={}))
+
+    def _run(self, tool_impl, intervals, **params):
+        tool_impl._datasets['sts'] = self._dataset()
+        return tool_impl.generate_maps_from_spectra(
+            MockTask(), 'sts',
+            {'baseline': 'none', 'interval_source': 'manual',
+             'intervals': intervals, 'scan_type': 'line', **params})
+
+    def test_a_bin_narrower_than_the_bias_step_still_produces_values(self, tool_impl):
+        # 0.19 mV window on a 4.7 mV grid — the case that came out blank.
+        result = self._run(tool_impl, [[0.1999, 0.2001]])
+        values = tool_impl._datasets[result['values_dataset']].data.iloc[:, 1]
+
+        assert result['n_maps'] == 1
+        assert (values != 0).all(), "the map is blank"
+
+    def test_the_map_keeps_the_contrast_of_the_spectra(self, tool_impl):
+        result = self._run(tool_impl, [[0.1999, 0.2001]])
+        values = tool_impl._datasets[result['values_dataset']].data.iloc[:, 1]
+        # The planted state grows along the line, so the map must too.
+        assert values.iloc[-1] > values.iloc[0] * 2
+
+    def test_values_are_the_real_physical_integrals(self, tool_impl):
+        """No normalisation: a 1e-10 A state over a few mV really is ~1e-13."""
+        result = self._run(tool_impl, [[0.1999, 0.2001]])
+        values = tool_impl._datasets[result['values_dataset']].data.iloc[:, 1]
+        assert 1e-16 < abs(values.max()) < 1e-10
+
+    def test_the_widening_is_recorded(self, tool_impl):
+        result = self._run(tool_impl, [[0.1999, 0.2001]])
+        info = tool_impl._datasets[result['values_dataset']].metadata.additional_info
+        assert info['windows_widened'] == 1
+        assert info['integration_window'] == pytest.approx(2 * info['bias_step'])
+
+    def test_a_wide_interval_is_left_alone(self, tool_impl):
+        result = self._run(tool_impl, [[0.15, 0.25]])
+        info = tool_impl._datasets[result['values_dataset']].metadata.additional_info
+        assert info['windows_widened'] == 0
+
+    def test_an_interval_at_the_very_edge_still_integrates(self, tool_impl):
+        result = self._run(tool_impl, [[-0.6001, -0.5999], [0.5999, 0.6001]])
+        frame = tool_impl._datasets[result['values_dataset']].data
+        assert result['n_maps'] == 2
+        for column in frame.columns[1:]:
+            assert (frame[column] != 0).any()
+
+    def test_the_exported_tiff_holds_those_values(self, tool_impl):
+        import tifffile
+        result = self._run(tool_impl, [[0.1999, 0.2001]])
+        arr = tifffile.imread(result['map_paths'][0])
+        values = tool_impl._datasets[result['values_dataset']].data.iloc[:, 1]
+
+        assert arr.dtype == np.float32
+        np.testing.assert_allclose(np.ravel(arr), values.to_numpy(), rtol=1e-6)
+
+    def test_the_tiff_carries_a_display_range_so_it_is_not_black(self, tool_impl):
+        import tifffile
+        result = self._run(tool_impl, [[0.1999, 0.2001]])
+        with tifffile.TiffFile(result['map_paths'][0]) as tf:
+            description = tf.pages[0].description
+
+        assert 'min=' in description and 'max=' in description
+        lo = float(description.split('min=')[1].split('\n')[0])
+        hi = float(description.split('max=')[1].split('\n')[0])
+        assert hi > lo
+
+
+class TestJoinedIntervalMap(TestToolImplementationsSetup):
+    """One map over all intervals: x = position along the line, y = interval
+    (indexed by its midpoint)."""
+
+    def _dataset(self, n_spectra=10, n_points=256):
+        x = np.linspace(-0.6, 0.6, n_points)
+        columns = {}
+        for n in range(n_spectra):
+            y = 1e-12 * np.ones_like(x)
+            # Two states whose weight swaps along the line, so the joined map
+            # must show structure in both axes.
+            y = y + (n + 1) * 1e-11 * np.exp(-0.5 * ((x + 0.25) / 0.01) ** 2)
+            y = y + (n_spectra - n) * 1e-11 * np.exp(-0.5 * ((x - 0.20) / 0.01) ** 2)
+            columns[f"P{n + 1}"] = y
+        df = pd.DataFrame({"V": x, **columns})
+        return SpectralData(df, SpectralMetadata(
+            source_type='sts', dimensions=(n_spectra, 1), scan_mode='line',
+            units={'independent': 'V', 'dependent': 'A'}, additional_info={}))
+
+    def _run(self, tool_impl, intervals=((-0.30, -0.20), (0.15, 0.25)), **params):
+        tool_impl._datasets['line'] = self._dataset()
+        return tool_impl.generate_maps_from_spectra(
+            MockTask(), 'line',
+            {'baseline': 'none', 'interval_source': 'manual',
+             'intervals': [list(iv) for iv in intervals],
+             'scan_type': 'line', **params})
+
+    def test_the_joined_map_is_written(self, tool_impl):
+        result = self._run(tool_impl)
+        assert result['interval_map_path'].endswith('_IntervalMap.tiff')
+        assert Path(result['interval_map_path']).exists()
+
+    def test_its_shape_is_intervals_by_positions(self, tool_impl):
+        result = self._run(tool_impl)
+        grid = np.loadtxt(
+            Path(result['interval_map_path']).parent.parent / 'csv'
+            / (Path(result['interval_map_path']).stem + '.csv'), delimiter=',')
+        assert grid.shape == (2, 10)        # 2 intervals x 10 positions
+
+    def test_rows_are_ordered_by_midpoint(self, tool_impl):
+        result = self._run(tool_impl, intervals=((0.15, 0.25), (-0.30, -0.20)))
+        dataset = tool_impl._datasets[result['interval_map']]
+        midpoints = dataset.independent_var
+        assert list(midpoints) == sorted(midpoints)
+        assert midpoints[0] == pytest.approx(-0.25)
+
+    def test_it_is_a_dataset_the_hyperspectral_tab_accepts(self, tool_impl):
+        """It must classify as a line scan, or the tab will not open it."""
+        from src.backend.app_backend import AppBackend
+
+        result = self._run(tool_impl)
+        dataset = tool_impl._datasets[result['interval_map']]
+
+        class Stub:
+            _POINT_SCAN_MODES = AppBackend._POINT_SCAN_MODES
+        assert AppBackend._spatial_layout(Stub(), dataset) == 'line'
+
+    def test_the_integrated_marker_is_not_set(self, tool_impl):
+        """'intervals' in additional_info marks a dataset as integrated
+        values, which the Hyperspectral tab skips — the joined map must not
+        carry it."""
+        result = self._run(tool_impl)
+        info = tool_impl._datasets[result['interval_map']].metadata.additional_info
+        assert 'intervals' not in info
+        assert info['interval_bounds'] and info['interval_midpoints']
+
+    def test_each_column_is_one_position(self, tool_impl):
+        result = self._run(tool_impl)
+        dataset = tool_impl._datasets[result['interval_map']]
+        source = tool_impl._datasets['line']
+        assert list(dataset.spectra.columns) == list(source.spectra.columns)
+
+    def test_it_carries_the_contrast_of_both_axes(self, tool_impl):
+        result = self._run(tool_impl)
+        values = tool_impl._datasets[result['interval_map']].spectra.to_numpy()
+        # One state grows along the line, the other fades: the two rows must
+        # trend in opposite directions.
+        assert values[0][-1] > values[0][0]
+        assert values[1][-1] < values[1][0]
+
+    def test_a_single_interval_produces_no_joined_map(self, tool_impl):
+        result = self._run(tool_impl, intervals=((0.15, 0.25),))
+        assert result['interval_map'] == ''
+        assert result['interval_map_path'] == ''
+
+    def test_the_browser_is_told_about_it(self, tool_impl):
+        result = self._run(tool_impl)
+        emitted = [c.args[0] for c in tool_impl.dataLoaded.emit.call_args_list]
+        assert result['interval_map'] in emitted
+
+
+class TestMapAxesAreRealCoordinates(TestToolImplementationsSetup):
+    """x is the position along the line, y is the interval's energy."""
+
+    STEP_M = 5e-9      # 5 nm between positions
+
+    def _dataset(self, n_spectra=8, n_points=256):
+        x = np.linspace(-0.6, 0.6, n_points)
+        columns = {f"P{n + 1}": 1e-11 * (n + 1) * np.exp(-0.5 * ((x - 0.2) / 0.01) ** 2)
+                              + 1e-12
+                   for n in range(n_spectra)}
+        df = pd.DataFrame({"V": x, **columns})
+        meta = [{'column': f"P{n + 1}", 'line_pos': n,
+                 'location_m': [n * self.STEP_M, 0.0]} for n in range(n_spectra)]
+        return SpectralData(df, SpectralMetadata(
+            source_type='sts', dimensions=(n_spectra, 1), scan_mode='line',
+            units={'independent': 'V', 'dependent': 'A'},
+            additional_info={'spectrum_meta': meta}))
+
+    def _run(self, tool_impl, intervals=((-0.30, -0.20), (0.15, 0.25))):
+        tool_impl._datasets['line'] = self._dataset()
+        return tool_impl.generate_maps_from_spectra(
+            MockTask(), 'line',
+            {'baseline': 'none', 'interval_source': 'manual',
+             'intervals': [list(iv) for iv in intervals], 'scan_type': 'line'})
+
+    def test_the_line_position_step_is_read_from_the_loader(self, tool_impl):
+        step = tool_impl._line_step_m(self._dataset())
+        assert step == pytest.approx(self.STEP_M)
+
+    def test_a_map_carries_the_real_position_scale(self, tool_impl):
+        from src.utils.tiff_io import read_tiff_calibration
+
+        result = self._run(tool_impl)
+        calibration = read_tiff_calibration(result['map_paths'][0])
+
+        assert calibration is not None, "the map was written uncalibrated"
+        # 5 nm per pixel, whatever unit the reader reports it in.
+        assert calibration['dx'] == pytest.approx(self.STEP_M, rel=1e-3)
+
+    def test_the_joined_map_records_both_axes(self, tool_impl):
+        import tifffile
+
+        result = self._run(tool_impl)
+        with tifffile.TiffFile(result['interval_map_path']) as tf:
+            description = tf.pages[0].description
+
+        assert 'axes=' in description
+        assert 'x=position' in description and 'y=energy' in description
+
+    def test_the_joined_dataset_carries_the_positions(self, tool_impl):
+        result = self._run(tool_impl)
+        info = tool_impl._datasets[result['interval_map']].metadata.additional_info
+
+        assert info['position_step_m'] == pytest.approx(self.STEP_M)
+        assert len(info['position_m']) == 8
+        assert info['position_m'][-1] == pytest.approx(7 * self.STEP_M)
+
+    def test_the_joined_maps_y_axis_is_the_interval_energy(self, tool_impl):
+        result = self._run(tool_impl)
+        dataset = tool_impl._datasets[result['interval_map']]
+        # The independent variable IS the energy of each interval.
+        np.testing.assert_allclose(dataset.independent_var, [-0.25, 0.20])
+
+    def test_positions_are_not_invented_when_unrecorded(self, tool_impl):
+        dataset = self._dataset()
+        dataset.metadata.additional_info.pop('spectrum_meta')
+        assert tool_impl._line_step_m(dataset) is None
+
+    def test_several_datasets_each_get_their_own_folder(self, tool_impl):
+        """A batch run must not have one dataset's maps overwrite another's."""
+        from src.backend.batch_tools import run_dataset_batch
+
+        class Task(MockTask):
+            pass
+
+        for name in ('line A', 'line B'):
+            tool_impl._datasets[name] = self._dataset()
+
+        results = run_dataset_batch(
+            tool_impl, Task(), 'map_generator', ['line A', 'line B'],
+            {'baseline': 'none', 'interval_source': 'manual',
+             'intervals': [[0.15, 0.25]], 'scan_type': 'line'})
+
+        folders = [Path(r['output']['output_folder']) for r in results]
+        assert folders[0] != folders[1]
+        assert {f.name for f in folders} == {'line_A', 'line_B'}
+        for folder in folders:
+            assert list((folder / 'tiff').glob('*.tiff'))
+
+
+class TestGsfCarriesTheAxes(TestToolImplementationsSetup):
+    """The .gsf must state its dimensions: position across, energy up.
+
+    Gwyddion reads real dimensions from GSF and nothing else, so a file
+    without XReal/YReal opens as bare pixels — which is what these maps were
+    doing.
+    """
+
+    STEP_M = 5e-9
+
+    def _dataset(self, n_spectra=8, n_points=256, with_positions=True):
+        x = np.linspace(-0.6, 0.6, n_points)
+        columns = {f"P{n + 1}": 1e-11 * (n + 1) * np.exp(-0.5 * ((x - 0.2) / 0.01) ** 2)
+                              + 1e-12
+                   for n in range(n_spectra)}
+        info = {}
+        if with_positions:
+            info['spectrum_meta'] = [{'location_m': [n * self.STEP_M, 0.0]}
+                                     for n in range(n_spectra)]
+        return SpectralData(pd.DataFrame({"V": x, **columns}), SpectralMetadata(
+            source_type='sts', dimensions=(n_spectra, 1), scan_mode='line',
+            units={'independent': 'V', 'dependent': 'A/V'}, additional_info=info))
+
+    def _run(self, tool_impl, dataset=None, **params):
+        tool_impl._datasets['line'] = dataset if dataset is not None else self._dataset()
+        return tool_impl.generate_maps_from_spectra(
+            MockTask(), 'line',
+            {'baseline': 'none', 'interval_source': 'manual', 'scan_type': 'line',
+             'intervals': [[-0.30, -0.20], [0.15, 0.25]], **params})
+
+    @staticmethod
+    def _gsf(tiff_path):
+        from src.utils.gsf_io import read_gsf
+        path = Path(tiff_path)
+        gsf = path.parent.parent / 'gsf' / (path.stem + '.gsf')
+        return read_gsf(gsf)[1]
+
+    def test_a_map_states_its_width_in_metres(self, tool_impl):
+        result = self._run(tool_impl)
+        header = self._gsf(result['map_paths'][0])
+
+        assert header['XYUnits'] == 'm'
+        assert header['XReal'] == pytest.approx(8 * self.STEP_M)
+
+    def test_the_joined_map_states_the_energy_axis(self, tool_impl):
+        result = self._run(tool_impl)
+        header = self._gsf(result['interval_map_path'])
+
+        # The intervals run -0.30 V to 0.25 V.
+        assert header['YOffset'] == pytest.approx(-0.30)
+        assert header['YReal'] == pytest.approx(0.55)
+
+    def test_the_joined_map_states_the_position_axis(self, tool_impl):
+        result = self._run(tool_impl)
+        header = self._gsf(result['interval_map_path'])
+        assert header['XReal'] == pytest.approx(8 * self.STEP_M)
+
+    def test_the_title_names_both_axes(self, tool_impl):
+        result = self._run(tool_impl)
+        header = self._gsf(result['interval_map_path'])
+        assert 'x=position' in header['Title'] and 'y=energy' in header['Title']
+
+    def test_a_dataset_without_positions_still_gets_an_x_axis(self, tool_impl):
+        """Re-imported from CSV: the point index is a real axis; metres are
+        not to be invented."""
+        result = self._run(tool_impl, self._dataset(with_positions=False))
+        header = self._gsf(result['map_paths'][0])
+
+        assert header['XReal'] == pytest.approx(8)          # points, not metres
+        assert header.get('XYUnits', '') == ''
+        assert 'point index' in header['Title']
+
+    def test_detected_bins_land_on_a_linear_energy_axis(self, tool_impl):
+        """Occupied bins are not adjacent; the rows must still sit at their
+        true bias, so gaps are kept as empty rows."""
+        dataset = self._dataset(n_spectra=8)
+        tool_impl._datasets['line'] = dataset
+        result = tool_impl.generate_maps_from_spectra(
+            MockTask(), 'line', {'scan_type': 'line'})
+
+        info = tool_impl._datasets[result['interval_map']].metadata.additional_info
+        midpoints = np.asarray(info['interval_midpoints'])
+        assert len(midpoints) > len(result['intervals'])     # gaps kept
+        assert info['empty_bins'] > 0
+        spacing = np.diff(midpoints)
+        np.testing.assert_allclose(spacing, spacing[0], rtol=1e-6)
+
+        header = self._gsf(result['interval_map_path'])
+        assert header['YReal'] == pytest.approx(len(midpoints) * info['bin_width'])
+
+    def test_hand_picked_intervals_are_not_forced_onto_a_grid(self, tool_impl):
+        """Two arbitrary intervals are two rows, not a padded grid."""
+        result = self._run(tool_impl, intervals=[[-0.30, -0.20], [0.15, 0.25]])
+        dataset = tool_impl._datasets[result['interval_map']]
+        assert dataset.num_points == 2
+
+
+class TestNoiseFloorAtIntegration(TestToolImplementationsSetup):
+    """A bin with no state integrates pure noise — negative half the time and
+    the same size as the real states, which made the maps read as a diagnostic
+    of the fit. Only what stands above each spectrum's own noise is counted.
+    """
+
+    def _dataset(self, n_spectra=8, n_points=256, seed=3):
+        rng = np.random.default_rng(seed)
+        x = np.linspace(-0.6, 0.6, n_points)
+        columns = {}
+        for n in range(n_spectra):
+            y = rng.normal(0, 2e-12, n_points)                    # noise floor
+            y = y + (n + 1) * 4e-11 * np.exp(-0.5 * ((x - 0.20) / 0.02) ** 2)
+            columns[f"P{n + 1}"] = y
+        return SpectralData(pd.DataFrame({"V": x, **columns}), SpectralMetadata(
+            source_type='sts', dimensions=(n_spectra, 1), scan_mode='line',
+            units={'independent': 'V', 'dependent': 'A/V'}, additional_info={}))
+
+    def _run(self, tool_impl, name, **params):
+        tool_impl._datasets[name] = self._dataset()
+        return tool_impl.generate_maps_from_spectra(
+            MockTask(), name,
+            {'baseline': 'none', 'interval_source': 'manual',
+             'intervals': [[-0.40, -0.30], [0.15, 0.25]],   # empty bin, state bin
+             'scan_type': 'line', **params})
+
+    def _columns(self, tool_impl, result):
+        frame = tool_impl._datasets[result['values_dataset']].data
+        return frame.iloc[:, 1].to_numpy(), frame.iloc[:, 2].to_numpy()
+
+    def test_the_default_floor_removes_the_negatives(self, tool_impl):
+        result = self._run(tool_impl, 'default')
+        empty, state = self._columns(tool_impl, result)
+        assert not (empty < 0).any() and not (state < 0).any()
+
+    def test_the_empty_bin_reads_as_no_weight(self, tool_impl):
+        result = self._run(tool_impl, 'empty')
+        empty, state = self._columns(tool_impl, result)
+        assert np.abs(empty).max() < 0.01 * np.abs(state).max()
+
+    def test_the_state_keeps_its_weight(self, tool_impl):
+        floored = self._run(tool_impl, 'floored')
+        raw = self._run(tool_impl, 'raw', noise_floor=0.0)
+        _, state_floored = self._columns(tool_impl, floored)
+        _, state_raw = self._columns(tool_impl, raw)
+        np.testing.assert_allclose(state_floored, state_raw, rtol=0.15)
+
+    def test_the_state_contrast_along_the_line_survives(self, tool_impl):
+        result = self._run(tool_impl, 'contrast')
+        _, state = self._columns(tool_impl, result)
+        assert state[-1] > 3 * state[0]        # planted 8x, kept well clear
+
+    def test_zero_restores_the_signed_integral(self, tool_impl):
+        result = self._run(tool_impl, 'signed', noise_floor=0.0)
+        empty, _ = self._columns(tool_impl, result)
+        assert (empty < 0).any(), "with no floor the noise must stay signed"
+
+    def test_the_floor_is_recorded_with_the_values(self, tool_impl):
+        result = self._run(tool_impl, 'recorded', noise_floor=2.0)
+        info = tool_impl._datasets[result['values_dataset']].metadata.additional_info
+        assert info['noise_floor'] == 2.0
+        assert info['noise_sigma_median'] > 0
+
+    def test_a_higher_floor_suppresses_more(self, tool_impl):
+        low = self._run(tool_impl, 'low', noise_floor=0.5)
+        high = self._run(tool_impl, 'high', noise_floor=3.0)
+        assert (np.abs(self._columns(tool_impl, high)[0]).sum()
+                <= np.abs(self._columns(tool_impl, low)[0]).sum())
+
+    def test_the_joined_map_and_the_exports_agree(self, tool_impl):
+        import tifffile
+        result = self._run(tool_impl, 'agree')
+        joined = tool_impl._datasets[result['interval_map']].spectra.to_numpy()
+        finite = joined[np.isfinite(joined)]
+        assert not (finite < 0).any()
+        for path in result['map_paths']:
+            assert not (tifffile.imread(path) < 0).any()
+
+
+class TestMapAxesAreRealCoordinates(TestToolImplementationsSetup):
+    """x is the position along the line, y is the interval's energy."""
+
+    STEP_M = 5e-9      # 5 nm between positions
+
+    def _dataset(self, n_spectra=8, n_points=256):
+        x = np.linspace(-0.6, 0.6, n_points)
+        columns = {f"P{n + 1}": 1e-11 * (n + 1) * np.exp(-0.5 * ((x - 0.2) / 0.01) ** 2)
+                              + 1e-12
+                   for n in range(n_spectra)}
+        df = pd.DataFrame({"V": x, **columns})
+        meta = [{'column': f"P{n + 1}", 'line_pos': n,
+                 'location_m': [n * self.STEP_M, 0.0]} for n in range(n_spectra)]
+        return SpectralData(df, SpectralMetadata(
+            source_type='sts', dimensions=(n_spectra, 1), scan_mode='line',
+            units={'independent': 'V', 'dependent': 'A'},
+            additional_info={'spectrum_meta': meta}))
+
+    def _run(self, tool_impl, intervals=((-0.30, -0.20), (0.15, 0.25))):
+        tool_impl._datasets['line'] = self._dataset()
+        return tool_impl.generate_maps_from_spectra(
+            MockTask(), 'line',
+            {'baseline': 'none', 'interval_source': 'manual',
+             'intervals': [list(iv) for iv in intervals], 'scan_type': 'line'})
+
+    def test_the_line_position_step_is_read_from_the_loader(self, tool_impl):
+        step = tool_impl._line_step_m(self._dataset())
+        assert step == pytest.approx(self.STEP_M)
+
+    def test_a_map_carries_the_real_position_scale(self, tool_impl):
+        from src.utils.tiff_io import read_tiff_calibration
+
+        result = self._run(tool_impl)
+        calibration = read_tiff_calibration(result['map_paths'][0])
+
+        assert calibration is not None, "the map was written uncalibrated"
+        # 5 nm per pixel, whatever unit the reader reports it in.
+        assert calibration['dx'] == pytest.approx(self.STEP_M, rel=1e-3)
+
+    def test_the_joined_map_records_both_axes(self, tool_impl):
+        import tifffile
+
+        result = self._run(tool_impl)
+        with tifffile.TiffFile(result['interval_map_path']) as tf:
+            description = tf.pages[0].description
+
+        assert 'axes=' in description
+        assert 'x=position' in description and 'y=energy' in description
+
+    def test_the_joined_dataset_carries_the_positions(self, tool_impl):
+        result = self._run(tool_impl)
+        info = tool_impl._datasets[result['interval_map']].metadata.additional_info
+
+        assert info['position_step_m'] == pytest.approx(self.STEP_M)
+        assert len(info['position_m']) == 8
+        assert info['position_m'][-1] == pytest.approx(7 * self.STEP_M)
+
+    def test_the_joined_maps_y_axis_is_the_interval_energy(self, tool_impl):
+        result = self._run(tool_impl)
+        dataset = tool_impl._datasets[result['interval_map']]
+        # The independent variable IS the energy of each interval.
+        np.testing.assert_allclose(dataset.independent_var, [-0.25, 0.20])
+
+    def test_positions_are_not_invented_when_unrecorded(self, tool_impl):
+        dataset = self._dataset()
+        dataset.metadata.additional_info.pop('spectrum_meta')
+        assert tool_impl._line_step_m(dataset) is None
+
+    def test_several_datasets_each_get_their_own_folder(self, tool_impl):
+        """A batch run must not have one dataset's maps overwrite another's."""
+        from src.backend.batch_tools import run_dataset_batch
+
+        class Task(MockTask):
+            pass
+
+        for name in ('line A', 'line B'):
+            tool_impl._datasets[name] = self._dataset()
+
+        results = run_dataset_batch(
+            tool_impl, Task(), 'map_generator', ['line A', 'line B'],
+            {'baseline': 'none', 'interval_source': 'manual',
+             'intervals': [[0.15, 0.25]], 'scan_type': 'line'})
+
+        folders = [Path(r['output']['output_folder']) for r in results]
+        assert folders[0] != folders[1]
+        assert {f.name for f in folders} == {'line_A', 'line_B'}
+        for folder in folders:
+            assert list((folder / 'tiff').glob('*.tiff'))
+
+
+class TestGsfCarriesTheAxes(TestToolImplementationsSetup):
+    """The .gsf must state its dimensions: position across, energy up.
+
+    Gwyddion reads real dimensions from GSF and nothing else, so a file
+    without XReal/YReal opens as bare pixels — which is what these maps were
+    doing.
+    """
+
+    STEP_M = 5e-9
+
+    def _dataset(self, n_spectra=8, n_points=256, with_positions=True):
+        x = np.linspace(-0.6, 0.6, n_points)
+        columns = {f"P{n + 1}": 1e-11 * (n + 1) * np.exp(-0.5 * ((x - 0.2) / 0.01) ** 2)
+                              + 1e-12
+                   for n in range(n_spectra)}
+        info = {}
+        if with_positions:
+            info['spectrum_meta'] = [{'location_m': [n * self.STEP_M, 0.0]}
+                                     for n in range(n_spectra)]
+        return SpectralData(pd.DataFrame({"V": x, **columns}), SpectralMetadata(
+            source_type='sts', dimensions=(n_spectra, 1), scan_mode='line',
+            units={'independent': 'V', 'dependent': 'A/V'}, additional_info=info))
+
+    def _run(self, tool_impl, dataset=None, **params):
+        tool_impl._datasets['line'] = dataset if dataset is not None else self._dataset()
+        return tool_impl.generate_maps_from_spectra(
+            MockTask(), 'line',
+            {'baseline': 'none', 'interval_source': 'manual', 'scan_type': 'line',
+             'intervals': [[-0.30, -0.20], [0.15, 0.25]], **params})
+
+    @staticmethod
+    def _gsf(tiff_path):
+        from src.utils.gsf_io import read_gsf
+        path = Path(tiff_path)
+        gsf = path.parent.parent / 'gsf' / (path.stem + '.gsf')
+        return read_gsf(gsf)[1]
+
+    def test_a_map_states_its_width_in_metres(self, tool_impl):
+        result = self._run(tool_impl)
+        header = self._gsf(result['map_paths'][0])
+
+        assert header['XYUnits'] == 'm'
+        assert header['XReal'] == pytest.approx(8 * self.STEP_M)
+
+    def test_the_joined_map_states_the_energy_axis(self, tool_impl):
+        result = self._run(tool_impl)
+        header = self._gsf(result['interval_map_path'])
+
+        # The intervals run -0.30 V to 0.25 V.
+        assert header['YOffset'] == pytest.approx(-0.30)
+        assert header['YReal'] == pytest.approx(0.55)
+
+    def test_the_joined_map_states_the_position_axis(self, tool_impl):
+        result = self._run(tool_impl)
+        header = self._gsf(result['interval_map_path'])
+        assert header['XReal'] == pytest.approx(8 * self.STEP_M)
+
+    def test_the_title_names_both_axes(self, tool_impl):
+        result = self._run(tool_impl)
+        header = self._gsf(result['interval_map_path'])
+        assert 'x=position' in header['Title'] and 'y=energy' in header['Title']
+
+    def test_a_dataset_without_positions_still_gets_an_x_axis(self, tool_impl):
+        """Re-imported from CSV: the point index is a real axis; metres are
+        not to be invented."""
+        result = self._run(tool_impl, self._dataset(with_positions=False))
+        header = self._gsf(result['map_paths'][0])
+
+        assert header['XReal'] == pytest.approx(8)          # points, not metres
+        assert header.get('XYUnits', '') == ''
+        assert 'point index' in header['Title']
+
+    def test_detected_bins_land_on_a_linear_energy_axis(self, tool_impl):
+        """Occupied bins are not adjacent; the rows must still sit at their
+        true bias, so gaps are kept as empty rows."""
+        dataset = self._dataset(n_spectra=8)
+        tool_impl._datasets['line'] = dataset
+        result = tool_impl.generate_maps_from_spectra(
+            MockTask(), 'line', {'scan_type': 'line'})
+
+        info = tool_impl._datasets[result['interval_map']].metadata.additional_info
+        midpoints = np.asarray(info['interval_midpoints'])
+        assert len(midpoints) > len(result['intervals'])     # gaps kept
+        assert info['empty_bins'] > 0
+        spacing = np.diff(midpoints)
+        np.testing.assert_allclose(spacing, spacing[0], rtol=1e-6)
+
+        header = self._gsf(result['interval_map_path'])
+        assert header['YReal'] == pytest.approx(len(midpoints) * info['bin_width'])
+
+    def test_hand_picked_intervals_are_not_forced_onto_a_grid(self, tool_impl):
+        """Two arbitrary intervals are two rows, not a padded grid."""
+        result = self._run(tool_impl, intervals=[[-0.30, -0.20], [0.15, 0.25]])
+        dataset = tool_impl._datasets[result['interval_map']]
+        assert dataset.num_points == 2
+
+
+class TestMapDefaults(TestToolImplementationsSetup):
+    """The Map Generator's defaults are measured, not guessed — these pin the
+    values so a change has to be deliberate."""
+
+    def test_the_defaults_are_what_the_benchmark_chose(self):
+        from src.backend.tool_implementations import MAP_DEFAULTS, CONFINEMENT_DEFAULTS
+
+        resolved = {**CONFINEMENT_DEFAULTS, **MAP_DEFAULTS}
+        assert resolved['baseline'] == 'arpls'
+        assert resolved['height_mode'] == 'noise'
+        assert resolved['height'] == 3.0            # sigma, not percent
+        assert resolved['noise_floor'] == 1.0
+        # A state at a single position is real; 2 would hide it.
+        assert resolved['min_spectra_per_bin'] == 1
+
+    def test_peak_analysis_keeps_its_own_threshold(self):
+        """Maps want contrast, peak analysis wants sensitivity — 3 sigma there
+        would cost 8% of the weak states."""
+        from src.backend.tool_implementations import MAP_DEFAULTS, CONFINEMENT_DEFAULTS
+
+        assert CONFINEMENT_DEFAULTS['height'] == 2.0
+        assert MAP_DEFAULTS['height'] > CONFINEMENT_DEFAULTS['height']
+
+    def _dataset(self, n_spectra=8, n_points=256, seed=5):
+        rng = np.random.default_rng(seed)
+        x = np.linspace(-0.6, 0.6, n_points)
+        columns = {}
+        for n in range(n_spectra):
+            y = rng.normal(0, 2e-12, n_points) + 2e-11
+            y = y + (n + 1) * 3e-11 * np.exp(-0.5 * ((x - 0.20) / 0.02) ** 2)
+            columns[f"P{n + 1}"] = y
+        return SpectralData(pd.DataFrame({"V": x, **columns}), SpectralMetadata(
+            source_type='sts', dimensions=(n_spectra, 1), scan_mode='line',
+            units={'independent': 'V', 'dependent': 'A/V'}, additional_info={}))
+
+    def test_a_run_with_no_parameters_uses_them(self, tool_impl):
+        tool_impl._datasets['line'] = self._dataset()
+        result = tool_impl.generate_maps_from_spectra(
+            MockTask(), 'line', {'scan_type': 'line'})
+
+        info = tool_impl._datasets[result['values_dataset']].metadata.additional_info
+        assert info['noise_floor'] == 1.0
+        assert info['background'] == 'arpls'
+
+    def test_the_defaults_produce_a_map_with_no_negatives(self, tool_impl):
+        tool_impl._datasets['line'] = self._dataset()
+        result = tool_impl.generate_maps_from_spectra(
+            MockTask(), 'line', {'scan_type': 'line'})
+
+        values = tool_impl._datasets[result['values_dataset']].data.iloc[:, 1:]
+        assert not (values.to_numpy() < 0).any()
+
+    def test_the_defaults_still_find_the_planted_state(self, tool_impl):
+        tool_impl._datasets['line'] = self._dataset()
+        result = tool_impl.generate_maps_from_spectra(
+            MockTask(), 'line', {'scan_type': 'line'})
+
+        assert any(lo <= 0.20 <= hi for lo, hi in result['intervals'])
+
+    def test_an_explicit_parameter_still_wins(self, tool_impl):
+        tool_impl._datasets['line'] = self._dataset()
+        result = tool_impl.generate_maps_from_spectra(
+            MockTask(), 'line', {'scan_type': 'line', 'noise_floor': 0.0})
+
+        info = tool_impl._datasets[result['values_dataset']].metadata.additional_info
+        assert info['noise_floor'] == 0.0
+
+    def _gapped_dataset(self, n_spectra=8, n_points=256, seed=6):
+        """Two well-separated states, so the bin grid has gaps between them."""
+        rng = np.random.default_rng(seed)
+        x = np.linspace(-0.6, 0.6, n_points)
+        columns = {}
+        for n in range(n_spectra):
+            y = rng.normal(0, 2e-12, n_points) + 2e-11
+            y = y + (n + 1) * 3e-11 * np.exp(-0.5 * ((x + 0.30) / 0.015) ** 2)
+            y = y + (n + 1) * 3e-11 * np.exp(-0.5 * ((x - 0.25) / 0.015) ** 2)
+            columns[f"P{n + 1}"] = y
+        return SpectralData(pd.DataFrame({"V": x, **columns}), SpectralMetadata(
+            source_type='sts', dimensions=(n_spectra, 1), scan_mode='line',
+            units={'independent': 'V', 'dependent': 'A/V'}, additional_info={}))
+
+    def test_empty_bins_are_zero_not_masked(self, tool_impl):
+        """A bin no spectrum had a peak in has no spectral weight — that is a
+        value. NaN would mean "not measured", and viewers draw it as a masked
+        or interpolated region, which reads as though something were there.
+        """
+        tool_impl._datasets['line'] = self._gapped_dataset()
+        result = tool_impl.generate_maps_from_spectra(
+            MockTask(), 'line', {'scan_type': 'line'})
+
+        dataset = tool_impl._datasets[result['interval_map']]
+        values = dataset.spectra.to_numpy()
+        info = dataset.metadata.additional_info
+
+        assert info['empty_bins'] > 0, "no gap in this run — test proves nothing"
+        assert not np.isnan(values).any()
+        assert int((values == 0).all(axis=1).sum()) == info['empty_bins']
+
+    def test_the_exported_files_have_no_masked_cells(self, tool_impl):
+        import tifffile
+        from src.utils.gsf_io import read_gsf
+
+        tool_impl._datasets['line'] = self._gapped_dataset()
+        result = tool_impl.generate_maps_from_spectra(
+            MockTask(), 'line', {'scan_type': 'line'})
+
+        tiff_path = Path(result['interval_map_path'])
+        assert not np.isnan(tifffile.imread(tiff_path)).any()
+
+        gsf = tiff_path.parent.parent / 'gsf' / (tiff_path.stem + '.gsf')
+        assert not np.isnan(read_gsf(gsf)[0]).any()
+
+        csv = tiff_path.parent.parent / 'csv' / (tiff_path.stem + '.csv')
+        assert not np.isnan(np.loadtxt(csv, delimiter=',')).any()
+
+
+class TestPositionsSurviveDerivedDatasets(TestToolImplementationsSetup):
+    """A derivative of a line scan is still that line scan's spectra.
+
+    The positions used to be dropped by every tool that rebuilt a dataset, so
+    maps of a derivative fell back to point indices — the map opened in
+    Gwyddion as pixels rather than nanometres.
+    """
+
+    STEP_M = 7e-9
+
+    def _line(self, n_spectra=8, n_points=128):
+        x = np.linspace(-0.6, 0.6, n_points)
+        columns = {f"P{n + 1}": np.exp(-0.5 * ((x - 0.2) / 0.05) ** 2) * (n + 1) * 1e-11
+                   for n in range(n_spectra)}
+        meta = [{'column': f"P{n + 1}", 'line_pos': n,
+                 'location_m': [n * self.STEP_M, 0.0]} for n in range(n_spectra)]
+        return SpectralData(pd.DataFrame({"V": x, **columns}), SpectralMetadata(
+            source_type='sts', dimensions=(n_spectra, 1), scan_mode='line',
+            units={'independent': 'V', 'dependent': 'A'},
+            additional_info={'spectrum_meta': meta, 'spatial_layout': 'line'}))
+
+    def test_the_derivative_keeps_them(self, tool_impl):
+        tool_impl._datasets['line'] = self._line()
+        tool_impl.calculate_derivative('line', order=1)
+
+        derived = [n for n in tool_impl._datasets if 'Derivative' in n][0]
+        assert tool_impl._line_step_m(tool_impl._datasets[derived]) == pytest.approx(self.STEP_M)
+
+    def test_smoothing_keeps_them(self, tool_impl):
+        tool_impl._datasets['line'] = self._line()
+        tool_impl.smooth_curves(MockTask(), 'line', window_size=5, poly_order=2)
+
+        derived = [n for n in tool_impl._datasets if 'Smoothed' in n][0]
+        assert tool_impl._line_step_m(tool_impl._datasets[derived]) == pytest.approx(self.STEP_M)
+
+    def test_a_map_of_a_derivative_is_in_metres(self, tool_impl):
+        from src.utils.gsf_io import read_gsf
+
+        tool_impl._datasets['line'] = self._line()
+        tool_impl.calculate_derivative('line', order=1)
+        derived = [n for n in tool_impl._datasets if 'Derivative' in n][0]
+
+        result = tool_impl.generate_maps_from_spectra(
+            MockTask(), derived,
+            {'baseline': 'none', 'interval_source': 'manual',
+             'intervals': [[0.15, 0.25]], 'scan_type': 'line'})
+
+        tiff = Path(result['map_paths'][0])
+        header = read_gsf(tiff.parent.parent / 'gsf' / (tiff.stem + '.gsf'))[1]
+        assert header['XYUnits'] == 'm'
+        assert header['XReal'] == pytest.approx(8 * self.STEP_M)
+
+    def test_a_dataset_that_only_names_its_source_still_finds_them(self, tool_impl):
+        """Results made before the metadata was carried across: the search
+        follows the recorded source dataset."""
+        tool_impl._datasets['line'] = self._line()
+        orphan = self._line()
+        orphan.metadata.additional_info = {'original': 'line'}
+        tool_impl._datasets['orphan'] = orphan
+
+        assert tool_impl._line_step_m(orphan) == pytest.approx(self.STEP_M)
+
+    def test_a_source_with_a_different_spectrum_count_is_not_used(self, tool_impl):
+        """An average of a line is one spectrum: the line's positions are not
+        its positions."""
+        tool_impl._datasets['line'] = self._line(n_spectra=8)
+        averaged = self._line(n_spectra=2)
+        averaged.metadata.additional_info = {'original': 'line'}
+
+        assert tool_impl._line_step_m(averaged) is None
+
+    def test_a_metadata_loop_terminates(self, tool_impl):
+        a = self._line()
+        a.metadata.additional_info = {'original': 'b'}
+        b = self._line()
+        b.metadata.additional_info = {'original': 'a'}
+        tool_impl._datasets.update({'a': a, 'b': b})
+
+        assert tool_impl._line_step_m(a) is None      # and does not hang
+
+    def test_filtering_keeps_the_positions_of_the_columns_it_kept(self, tool_impl):
+        tool_impl._datasets['line'] = self._line(n_spectra=8)
+        result = tool_impl.filter_bad_data(MockTask(), 'line', threshold=0.5)
+        assert result
+
+        for name, dataset in tool_impl._datasets.items():
+            if 'Good Data' not in name:
+                continue
+            info = dataset.metadata.additional_info
+            if 'spectrum_meta' in info:
+                assert len(info['spectrum_meta']) == dataset.num_spectra

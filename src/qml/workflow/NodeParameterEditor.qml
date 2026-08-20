@@ -89,6 +89,9 @@ Rectangle {
             case "dataset_select":
                 component = datasetSelectComponent
                 break
+            case "dataset_multi_select":
+                component = datasetMultiSelectComponent
+                break
             case "flat_data_select":
                 component = flatDataSelectComponent
                 break
@@ -562,6 +565,96 @@ Rectangle {
 
                 onClicked: {
                     datasetCombo.model = workflowWindow.workflowManager.getAvailableDatasets()
+                }
+            }
+        }
+    }
+
+    // Several datasets on one input node: the workflow runs once per
+    // dataset, in the order picked, and each run's outputs are named after
+    // its own input.
+    Component {
+        id: datasetMultiSelectComponent
+
+        ColumnLayout {
+            id: multiSelectRoot
+            property string paramName: ""
+            property var paramDef: ({})
+            property var currentValue: ""
+
+            Layout.fillWidth: true
+            spacing: 3
+
+            function currentNames() {
+                var stored = currentNode && currentNode.parameters
+                             ? currentNode.parameters["dataset_names"] : null
+                if (stored && stored.length !== undefined && stored.length > 0) {
+                    var names = []
+                    for (var i = 0; i < stored.length; i++) names.push(stored[i])
+                    return names
+                }
+                return currentValue ? [currentValue] : []
+            }
+
+            Text {
+                text: paramDef.label || paramName
+                color: textLight
+                font.pixelSize: 11
+            }
+
+            DatasetMultiSelect {
+                id: datasetList
+                Layout.fillWidth: true
+                Layout.preferredHeight: 132
+                visibleRows: 5
+                model: workflowWindow && workflowWindow.workflowManager ?
+                       workflowWindow.workflowManager.getAvailableDatasets() : []
+
+                bgColor: bgDark
+                borderColorNormal: borderColor
+                borderColorFocus: accentPink
+                textColor: textLight
+                textMutedColor: textMuted
+                selectionColor: accentPink
+
+                Component.onCompleted: setSelection(multiSelectRoot.currentNames())
+
+                onSelectionChanged: {
+                    // 'dataset_name' keeps the first pick so the node stays
+                    // valid for anything reading the single-dataset field.
+                    updateParameter("dataset_names", selectedDatasets)
+                    updateParameter(multiSelectRoot.paramName,
+                                    selectedDatasets.length > 0 ? selectedDatasets[0] : "")
+                }
+            }
+
+            Text {
+                Layout.fillWidth: true
+                visible: datasetList.selectedDatasets.length > 1
+                text: "Runs " + datasetList.selectedDatasets.length + " times, one dataset per run"
+                color: accentBlue
+                font.pixelSize: 10
+                wrapMode: Text.Wrap
+            }
+
+            Button {
+                text: "Refresh"
+                Layout.alignment: Qt.AlignRight
+
+                contentItem: Text {
+                    text: parent.text
+                    color: textMuted
+                    font.pixelSize: 10
+                }
+
+                background: Rectangle {
+                    color: parent.hovered ? bgLight : "transparent"
+                    radius: 3
+                }
+
+                onClicked: {
+                    datasetList.model = workflowWindow.workflowManager.getAvailableDatasets()
+                    datasetList.pruneSelection()
                 }
             }
         }

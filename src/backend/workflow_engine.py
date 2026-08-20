@@ -430,13 +430,17 @@ TOOL_DEFINITIONS = {
     "DatasetInput": {
         "display_name": "Dataset",
         "category": "Input",
-        "description": "Load a dataset into the workflow",
+        "description": "Load one or more datasets into the workflow. With several selected, the workflow runs once per dataset, in the order picked.",
         "inputs": [],
         "outputs": [
             {"id": "dataset", "name": "Dataset", "port_type": "dataset", "description": "Selected dataset"}
         ],
+        # 'dataset_name' stays the required parameter (and holds the first
+        # pick) so older workflows keep loading and validating; the full
+        # selection lives in 'dataset_names'.
         "parameters": {
-            "dataset_name": {"type": "dataset_select", "label": "Dataset", "required": True}
+            "dataset_name": {"type": "dataset_multi_select", "label": "Datasets", "required": True,
+                             "description": "Ctrl/Cmd- or Shift-click to run the workflow over several datasets in turn"}
         }
     },
 
@@ -788,9 +792,9 @@ TOOL_DEFINITIONS = {
         ],
         "outputs": [
             {"id": "peak_matrix", "name": "Peak Matrix", "port_type": "dataset", "description": "Occupancy table on the measured energy axis: 1 where a spectrum has a peak, blank elsewhere"},
-            {"id": "peak_matrix_binned", "name": "Peak Matrix (binned)", "port_type": "dataset", "description": "The same table binned at k_B*T — only produced when a temperature is set"},
+            {"id": "peak_matrix_binned", "name": "Peak Matrix (binned)", "port_type": "dataset", "description": "The same table binned at k_B*T/2 — only produced when a temperature is set"},
             {"id": "peak_matrix_offset", "name": "Peak Matrix (offset)", "port_type": "dataset", "description": "Occupancy table marked with each column's own number instead of 1, so plotting separates the spectra onto their own rows"},
-            {"id": "peak_matrix_binned_offset", "name": "Peak Matrix (binned, offset)", "port_type": "dataset", "description": "The offset table on the k_B*T bins — only produced when a temperature is set"},
+            {"id": "peak_matrix_binned_offset", "name": "Peak Matrix (binned, offset)", "port_type": "dataset", "description": "The offset table on the k_B*T/2 bins — only produced when a temperature is set"},
             {"id": "peaks", "name": "Peaks", "port_type": "dataset", "description": "Peak list, one row per detected peak"},
             {"id": "corrected", "name": "Corrected", "port_type": "dataset", "description": "Spectra with the background removed"},
             {"id": "baseline", "name": "Background", "port_type": "dataset", "description": "The fitted background that was subtracted"},
@@ -801,9 +805,9 @@ TOOL_DEFINITIONS = {
         "parameters": {
             # Fundo
             "baseline": {"type": "select", "label": "Background",
-                         "options": ["poly-iter", "poly", "als", "rubberband", "endpoints", "none"],
-                         "default": "poly-iter",
-                         "description": "poly-iter strips the peaks out of the fit so small features survive the height threshold"},
+                         "options": ["poly-iter", "poly", "arpls", "snip", "als", "rubberband", "endpoints", "none"],
+                         "default": "arpls",
+                         "description": "arpls fits in log space, where a tunnelling band edge is nearly straight — ModPoly cannot follow it and loses states an order of magnitude below the edges"},
             "baseline_degree": {"type": "int", "label": "Degree", "default": 3, "min": 0, "max": 15},
             "baseline_basis": {"type": "select", "label": "Coefficient basis",
                                "options": ["power", "legendre", "chebyshev"], "default": "power",
@@ -813,7 +817,7 @@ TOOL_DEFINITIONS = {
             "als_p": {"type": "float", "label": "ALS Asymmetry", "default": 0.01, "min": 0.001, "max": 0.5},
             # Thermal grouping
             "temperature_k": {"type": "float", "label": "Temperature (K)", "default": 0.0, "min": 0, "max": 5000,
-                              "description": "Acquisition temperature. k_B*T becomes the peak-position error bar and the energy bin width (94 K = 8.1 meV). 0 disables grouping."},
+                              "description": "Acquisition temperature. k_B*T becomes the peak-position error bar and minimum separation (94 K = 8.1 meV); the energy bins are half that (4.05 meV). 0 disables grouping."},
             "x_energy_unit": {"type": "select", "label": "X axis unit", "options": ["eV", "meV"], "default": "eV",
                               "description": "Unit of the independent variable, so k_B*T is computed in the same units"},
             # Dados
@@ -822,9 +826,11 @@ TOOL_DEFINITIONS = {
             "xmax": {"type": "float", "label": "To Xmax", "default": None, "required": False},
             # Filtro
             "direction": {"type": "select", "label": "Direction", "options": ["positive", "negative", "both"], "default": "positive"},
-            "height": {"type": "float", "label": "Height (%)", "default": 5.0, "min": 0, "max": 100,
-                       "description": "Threshold as a percentage of the corrected curve's span inside the search window"},
-            "height_mode": {"type": "select", "label": "Measured as", "options": ["range", "prominence", "max"], "default": "range"},
+            "height": {"type": "float", "label": "Threshold", "default": 2.0, "min": 0, "max": 100,
+                       "description": "With height_mode 'noise' (the default) this is a multiple of the spectrum's own noise sigma; with 'range'/'prominence'/'max' it is a percentage of the corrected curve's span"},
+            "height_mode": {"type": "select", "label": "Measured as",
+                            "options": ["range", "prominence", "max", "noise"], "default": "noise",
+                            "description": "noise compares each peak with the spectrum's own noise (height is then a multiple of sigma) — scale-free, so weak states survive; range and prominence scale with the curve's span, which the band edges set"},
             "smooth_points": {"type": "int", "label": "Smooth (half-width)", "default": 2, "min": 0, "max": 500,
                               "description": "0 disables it. An unsmoothed search over-detects badly on noisy spectra."},
             "smooth_type": {"type": "select", "label": "Smoother", "options": ["average", "savgol"], "default": "average"},
@@ -883,7 +889,10 @@ TOOL_DEFINITIONS = {
         ],
         "parameters": {
             "intervals": {"type": "interval_checklist", "label": "Intervals to Generate", "description": "Select which intervals to generate maps for (auto-populated from input)"},
-            "generate_all": {"type": "bool", "label": "Generate All", "default": True, "description": "Generate maps for all available intervals"}
+            "generate_all": {"type": "bool", "label": "Generate All", "default": True, "description": "Generate maps for all available intervals"},
+            "scan_type": {"type": "select", "label": "Scan type", "default": "auto",
+                          "options": ["auto", "map_meander", "map_raster", "line"],
+                          "description": "How the points were acquired: a meandering map needs every other row reversed, a line scan becomes a single row. 'auto' reads the dataset's own metadata."}
         }
     },
 

@@ -17,6 +17,19 @@ Item {
     id: root
     property var closeWindow: null
 
+    // Set by WindowManager while a browser drag hovers this tool, so the
+    // drop target is visible before the mouse is released.
+    property bool datasetDropActive: false
+
+    // Datasets dropped from the project browser join the selection (the tool
+    // never consumes them). Declaring this function is all a tool needs to
+    // become a drop target — see WindowManager.deliverDatasetDrop.
+    function acceptDatasetDrop(names) {
+        root.refreshDatasets()
+        datasetList.addToSelection(names)
+        datasetDropActive = false
+    }
+
     // Theme colors - reactive bindings to parent DraggableWindow
     property var parentWindow: Window.window
     property color bgDark: parentWindow ? parentWindow.bgDark : "#1a1a2e"
@@ -49,16 +62,56 @@ Item {
         GroupBox {
             title: "Dataset Selection"
             Layout.fillWidth: true
+            Layout.fillHeight: true
 
             ColumnLayout {
                 anchors.fill: parent
+                spacing: 4
 
-                DatasetComboBox {
-                    id: datasetCombo
+                DatasetMultiSelect {
+                    id: datasetList
                     Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    Layout.minimumHeight: 130
                     model: backend.getDatasetList()
+
+                    bgColor: bgLight
+                    borderColorNormal: root.datasetDropActive ? accentBlue : accentPurple
+                    borderColorFocus: accentPink
+                    textColor: textLight
+                    textMutedColor: textMuted
+                    selectionColor: accentPink
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+
+                    Label {
+                        Layout.fillWidth: true
+                        Layout.preferredWidth: 0
+                        text: root.datasetDropActive
+                              ? "Drop to add to the selection"
+                              : "…or drag datasets here from the project browser"
+                        font.pixelSize: 10
+                        color: root.datasetDropActive ? accentBlue : textMuted
+                        elide: Text.ElideRight
+                    }
+
+                    Button {
+                        text: "Refresh list"
+                        flat: true
+                        font.pixelSize: 10
+                        onClicked: root.refreshDatasets()
+                    }
                 }
             }
+        }
+
+        // Keep the list in step with imports and with datasets produced by
+        // other tools, dropping any pick that no longer exists.
+        Connections {
+            target: backend
+            function onDataLoaded(name) { root.refreshDatasets() }
         }
 
         GroupBox {
@@ -98,7 +151,8 @@ Item {
             Label {
                 text: "Numerical differentiation amplifies noise.\n" +
                       "Smoothing before and/or after is highly recommended.\n\n" +
-                      "Output will be saved as new dataset with prefix dIdV_ or d2IdV2_"
+                      "Select several datasets to process them one after another —\n" +
+                      "each produces its own output, named after its input."
                 wrapMode: Text.Wrap
                 font.pixelSize: 10
                 color: textMuted
@@ -111,8 +165,10 @@ Item {
             Layout.fillWidth: true
 
             Button {
-                text: "Calculate Derivative"
-                enabled: datasetCombo.currentIndex >= 0
+                text: datasetList.selectedDatasets.length > 1
+                      ? "Calculate Derivatives (" + datasetList.selectedDatasets.length + ")"
+                      : "Calculate Derivative"
+                enabled: datasetList.selectedDatasets.length > 0
                 highlighted: true
                 onClicked: performDerivative()
             }
@@ -133,19 +189,25 @@ Item {
         }
     }
 
+    function refreshDatasets() {
+        datasetList.model = backend.getDatasetList()
+        datasetList.pruneSelection()
+    }
+
     function performDerivative() {
         var order = orderCombo.currentIndex + 1
-        console.log("Calculating derivative order", order, "for:", datasetCombo.currentText)
+        var datasets = datasetList.selectedDatasets
+        if (datasets.length === 0)
+            return
 
-        var result = backend.calculateDerivative(
-            datasetCombo.currentText,
-            order,
-            smoothBeforeCheck.checked,
-            smoothAfterCheck.checked
-        )
+        console.log("Calculating derivative order", order, "for:", datasets.join(", "))
 
-        if (result) {
-            console.log("Derivative calculation complete, saved to:", result)
-        }
+        // One batch task: the datasets are processed in the order they were
+        // picked, each yielding its own output named after its input.
+        backend.runToolOnDatasets("derivative", datasets, {
+            "order": order,
+            "smooth_before": smoothBeforeCheck.checked,
+            "smooth_after": smoothAfterCheck.checked
+        })
     }
 }

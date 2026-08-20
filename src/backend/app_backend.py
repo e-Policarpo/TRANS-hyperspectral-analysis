@@ -172,6 +172,12 @@ class AppBackend(ToolImplementations, QObject):
     projectModifiedChanged = Signal(bool)  # is_modified
     projectReadyChanged = Signal(bool)  # project is set up and ready
     mapCreated = Signal(str, str)  # map_id, map_title
+    # Integration intervals the Map Generator found (or used), so the
+    # tool can list them before/after a run.
+    mapIntervalsReady = Signal('QVariantList')
+    # Name of the joined interval map a run produced, so the tool can offer
+    # to open it in the Hyperspectral tab.
+    intervalMapReady = Signal(str)
     mapDeleted = Signal(str)  # map_path - emitted when a map is deleted
     imageImported = Signal(str, str, str)  # map_name, file_path, map_id - opens in Map Editor tab
     windowClosed = Signal(str, str)  # window_type, window_id
@@ -336,6 +342,13 @@ class AppBackend(ToolImplementations, QObject):
         # Flag to suppress undo registration during undo/redo operations
         self._suppress_undo = False
 
+        # Set while a run processes SEVERAL inputs (a multi-dataset tool batch,
+        # a workflow run over several datasets). Results are still registered
+        # in the project browser, but they are not thrown on screen: twenty
+        # inputs would otherwise bury the workspace under twenty graphs and
+        # map windows. Open what you want from the browser instead.
+        self._suppress_auto_open = False
+
         # Map editor backend reference (set from QML)
         self._map_editor_backend = None
 
@@ -459,10 +472,26 @@ class AppBackend(ToolImplementations, QObject):
             operation=_write_batch,
         )
 
+    #: Longest filename stem a tool will produce. Filesystems allow 255 bytes
+    #: per component; this leaves room for an extension and a disambiguating
+    #: suffix while staying well clear of the limit.
+    MAX_FILENAME_LENGTH = 120
+
+    #: How much of the END of a long name is always kept. What distinguishes
+    #: two outputs sits there — the sweep direction, the operation — so it is
+    #: the middle that gets elided, never the tail.
+    _FILENAME_TAIL = 48
+
     def _sanitize_filename(self, name: str) -> str:
         """
         Sanitize a string for use as a filename.
         Removes/replaces special characters that are problematic in file paths.
+
+        Over-long names are shortened by dropping the MIDDLE. Cutting the tail
+        instead used to merge whole families of outputs onto one file: names
+        like "… line1 (26pts…) · Mixed · 1st Derivative" differ only at the
+        end, so truncation made Mixed, Forward and Backward all write to the
+        same path and only the last one survived.
         """
         import re
         # Replace spaces with underscores
@@ -475,10 +504,40 @@ class AppBackend(ToolImplementations, QObject):
         safe = re.sub(r'_+', '_', safe)
         # Remove leading/trailing underscores
         safe = safe.strip('_')
-        # Limit length
-        if len(safe) > 50:
-            safe = safe[:50]
+
+        limit = self.MAX_FILENAME_LENGTH
+        if len(safe) > limit:
+            tail = min(self._FILENAME_TAIL, limit // 2)
+            head = limit - tail - 1
+            safe = f"{safe[:head]}-{safe[-tail:]}"
         return safe
+
+    def _disambiguate_filename(self, name: str, source: str) -> str:
+        """Keep two different datasets from writing to the same file.
+
+        Names are stamped with their source, so re-running a tool on the same
+        dataset overwrites its own output (as it always has), while a
+        different dataset that sanitizes to the same string gets a short
+        suffix instead of silently clobbering it.
+        """
+        if not name:
+            return name
+        owners = getattr(self, '_filename_owners', None)
+        if owners is None:
+            owners = self._filename_owners = {}
+
+        owner = owners.get(name)
+        if owner is None or owner == source:
+            owners[name] = source
+            return name
+
+        import hashlib
+        tag = hashlib.md5(source.encode('utf-8')).hexdigest()[:4]
+        unique = f"{name}_{tag}"
+        logger.info("Output name %r is already taken by %r; writing %r instead",
+                    name, owner, unique)
+        owners.setdefault(unique, source)
+        return unique
 
     def _format_user_friendly_name(self, base_name: str, operation: str,
                                     source_dataset: str = None) -> str:
@@ -812,6 +871,10 @@ class AppBackend(ToolImplementations, QObject):
         # Sanitize for filesystem
         result = self._sanitize_filename(result)
 
+        # A preview must not claim the name; only a real call does.
+        if not preview:
+            result = self._disambiguate_filename(result, dataset_name)
+
         return result
 
     @Slot(result=str)
@@ -1046,8 +1109,29 @@ class AppBackend(ToolImplementations, QObject):
             project_data = self.project_manager.load_project(file_path)
 
             if project_data is None:
-                self.errorOccurred.emit("Open Error", "Failed to load project file")
+                self.errorOccurred.emit(
+                    "Open Error",
+                    "Failed to load project file. It may have been truncated by "
+                    "an interrupted save; check for a .hrt.bak beside it.")
                 return False
+
+            # A recovered project is missing whatever the interrupted save
+            # never wrote. Say so loudly — saving over the original would make
+            # that loss permanent, silently.
+            recovered = project_data.get('recovered')
+            if recovered:
+                if recovered.get('source') == 'backup':
+                    detail = ("The project file was damaged, so the previous "
+                              "save (.hrt.bak) was opened instead.")
+                else:
+                    detail = ("The project file was cut short by an interrupted "
+                              "save. Everything written before the cut was "
+                              "recovered; anything after it is lost.")
+                self.errorOccurred.emit(
+                    "Project recovered",
+                    f"{detail}\n\n{recovered.get('datasets', 0)} dataset(s) "
+                    f"recovered.\n\nSave under a NEW name to keep this "
+                    f"version — the damaged file is still on disk.")
 
             # Extract project info from metadata
             metadata = project_data.get('metadata', {})
@@ -1500,8 +1584,14 @@ class AppBackend(ToolImplementations, QObject):
             # Per detected line scan, one dataset per sweep direction
             # (positions × per-position rep-mean). Mixed first so it's active.
             for ls in line_scans:
+                # The name carries what identifies the line at a glance: how
+                # many positions it holds, how many repetitions each, and the
+                # point-index range it spans — so "which line was taken where"
+                # is answerable from the browser alone.
+                pts = ls.get('point_indices') or []
+                span = f"_pt{pts[0]}->pt{pts[-1]}" if pts else ""
                 base = (f"{label} · line{ls['id']} "
-                        f"({ls['n_points']}pts ×{ls['reps']})")
+                        f"({ls['n_points']}pts_{ls['reps']}reps{span})")
                 for sweep in ('Mixed', 'Forward', 'Backward'):
                     ls_name = f"{base} · {sweep}"
                     ds = _add(ls_name,
@@ -5161,6 +5251,12 @@ class AppBackend(ToolImplementations, QObject):
                     creation_date=m.get('timestamp'),
                     extra={
                         'sts_locations': m.get('locations', []),
+                        # Per-line outlines, so the hyperspectral map view can
+                        # show which line scan was taken where.
+                        'sts_line_scans': m.get('line_scans', []),
+                        # Marks the spectra as STM/STS, which is what makes
+                        # the map editor offer dI/dV for a clicked point.
+                        'sts_technique': 'STM',
                         'offset_m': (m.get('x_offset_m'), m.get('y_offset_m')),
                         'angle': m.get('angle', 0.0),
                         'session_label': m.get('session_label', ''),
@@ -5176,6 +5272,7 @@ class AppBackend(ToolImplementations, QObject):
                     'timestamp': m.get('timestamp')
                     or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     'sts_locations': m.get('locations', []),
+                    'sts_line_scans': m.get('line_scans', []),
                     'session_label': m.get('session_label'),
                 })
                 self.mapCreated.emit(map_id, m.get('title', map_id))
@@ -5206,7 +5303,17 @@ class AppBackend(ToolImplementations, QObject):
         return workflow_id
 
     def _open_map_window(self, map_path: str, map_id: str, map_title: str):
-        """Open a map visualization window."""
+        """Open a map visualization window.
+
+        A no-op while a multi-input run is in flight: the map is already
+        registered in the browser, and opening one window per input would
+        bury the workspace.
+        """
+        if self._suppress_auto_open:
+            logger.info("Multi-input run: %s left in the browser, not opened",
+                        map_title)
+            return
+
         from src.widgets.map_window import MapVisualizationWindow
 
         try:
@@ -6086,6 +6193,98 @@ class AppBackend(ToolImplementations, QObject):
 
         return self.calculate_derivative(dataset_name, order, smooth_before, smooth_after)
 
+    @Slot(str, 'QVariantList', 'QVariantMap')
+    def runToolOnDatasets(self, tool_key: str, dataset_names, params):
+        """Run a registered tool over several datasets, one after another.
+
+        Generic entry point for the multi-dataset selection in the tool
+        widgets: QML passes the tool's registry key (see
+        ``src.backend.batch_tools.BATCH_TOOLS``), the datasets in the order
+        the user selected them, and the tool's parameters as a map.
+
+        The whole batch is a single worker task, so the datasets are
+        processed strictly in sequence and one Cancel stops the run.
+        """
+        from src.backend import batch_tools
+
+        names = [str(n) for n in (dataset_names or []) if n]
+        spec = batch_tools.get_spec(tool_key)
+        if spec is None:
+            logger.error(f"runToolOnDatasets: unknown tool {tool_key!r}")
+            self.errorOccurred.emit("Tool Error", f"Unknown tool: {tool_key}")
+            return
+        if not names:
+            self.errorOccurred.emit(spec.label, "No dataset selected")
+            return
+
+        logger.info(f"Submitting {spec.label} batch over {len(names)} dataset(s)")
+        self.status = (f"{spec.label}: {names[0]}..." if len(names) == 1
+                       else f"{spec.label}: {len(names)} datasets...")
+
+        self.worker_manager.submit(
+            # The task name lists the datasets so two different selections
+            # aren't taken for the same task by the duplicate-submission
+            # guard — only a genuine repeat click is dropped.
+            name=f"{spec.label}: " + ", ".join(names[:3]) + ("…" if len(names) > 3 else ""),
+            operation=self._do_run_tool_on_datasets,
+            tool_key=tool_key,
+            dataset_names=names,
+            params=dict(params or {}),
+            on_finished=lambda results: self._on_batch_completed(
+                tool_key, spec.label, results),
+        )
+
+    def _do_run_tool_on_datasets(self, task, tool_key: str, dataset_names, params):
+        """Background worker body for :meth:`runToolOnDatasets`."""
+        from src.backend import batch_tools
+        return batch_tools.run_dataset_batch(self, task, tool_key,
+                                             dataset_names, params)
+
+    def _on_batch_completed(self, tool_key: str, label: str, results):
+        """Register every dataset's output once the batch finishes.
+
+        Each result is routed through ``_on_tool_completed`` so a batch run
+        leaves exactly the same trail — output files, undo entries, derived
+        dataset overlays — as running the tool once per dataset by hand.
+        """
+        results = results or []
+        failures = [r for r in results if r.get('error')]
+
+        # With more than one input, the outputs are registered but not opened:
+        # one graph per dataset would bury the workspace.
+        multi = len(results) > 1
+        if multi:
+            self._suppress_auto_open = True
+        from src.backend import batch_tools
+        spec = batch_tools.get_spec(tool_key)
+        handler = getattr(self, spec.completion, None) if (spec and spec.completion) else None
+
+        try:
+            for entry in results:
+                output = entry.get('output')
+                if not output:
+                    continue
+                if handler is not None:
+                    # A tool with its own result shape (maps to register,
+                    # datasets to publish) does its own completion.
+                    handler(output)
+                else:
+                    self._on_tool_completed(label, output)
+        finally:
+            if multi:
+                self._suppress_auto_open = False
+
+        done = len(results) - len(failures)
+        if failures:
+            self.status = f"{label}: {done} of {len(results)} datasets processed"
+            detail = "\n".join(f"{r['dataset']}: {r['error']}" for r in failures)
+            self.errorOccurred.emit(f"{label} Error",
+                                    f"{len(failures)} dataset(s) failed:\n{detail}")
+        else:
+            self.status = (f"{label} complete" if len(results) <= 1
+                           else f"{label} complete — {done} datasets "
+                                f"(results are in the project browser)")
+
     def _on_derivative_completed(self, output_path: str):
         """Called when derivative calculation completes."""
         logger.info(f"Derivative calculation completed: {output_path}")
@@ -6143,8 +6342,10 @@ class AppBackend(ToolImplementations, QObject):
         — smoothing, baseline, cosmic-ray, derivative, background
         subtraction, etc. — and ignores tools that add no dataset (map
         generation) or plain imports (no ``original``)."""
-        if self._workflow_mode:
-            # Intermediate workflow results aren't shown individually.
+        if self._workflow_mode or self._suppress_auto_open:
+            # Intermediate workflow results aren't shown individually, and
+            # neither are the results of a multi-input run — they would arrive
+            # as one graph per input.
             self._seen_dataset_keys = set(self._datasets)
             return
         new_keys = [k for k in self._datasets if k not in self._seen_dataset_keys]
@@ -6207,27 +6408,14 @@ class AppBackend(ToolImplementations, QObject):
             redo_fn=redo_tool
         ))
 
-    def _generate_multiple_maps(self, task, flat_dataset_name: str, value_indices: list):
-        """Generate maps for multiple values from flat data (runs in worker thread)."""
-        output_paths = []
-        for idx in value_indices:
-            if task.cancelled:
-                break
-            try:
-                base_path = self.generate_map(task, flat_dataset_name, idx)
-                # generate_map returns base path without extension - use PNG for viewing
-                if base_path:
-                    png_path = f"{base_path}.png"
-                    output_paths.append(png_path)
-                    logger.info(f"Generated map for value {idx}: {png_path}")
-            except Exception as e:
-                logger.error(f"Failed to generate map for value {idx}: {e}")
-                # Continue with other values
+    def _on_maps_completed(self, output_paths: list, open_paths=None):
+        """Called when multiple map generation completes.
 
-        return output_paths
-
-    def _on_maps_completed(self, output_paths: list):
-        """Called when multiple map generation completes."""
+        Every map is registered in the project browser; ``open_paths`` limits
+        which of them get a window. A run over many intervals produces dozens
+        of maps and opening one window each locks the UI up, so the caller
+        passes just the summary map.
+        """
         num_maps = len(output_paths)
         logger.info(f"Map generation completed: {num_maps} maps created")
         self.status = f"{num_maps} maps generated successfully"
@@ -6256,8 +6444,10 @@ class AppBackend(ToolImplementations, QObject):
                 logger.info(f"Registered map: {map_id} - {map_filename}")
                 filed |= self._auto_file(f"map:{map_id}", "Maps")
 
-                # Open visualization window for this map
-                self._open_map_window(path, map_id, map_filename)
+                # Opens a window unless a multi-input run is in flight
+                # (see _open_map_window) or the caller asked for only some.
+                if open_paths is None or path in open_paths:
+                    self._open_map_window(path, map_id, map_filename)
 
         if filed:
             self.browserTreeChanged.emit()
@@ -6330,70 +6520,118 @@ class AppBackend(ToolImplementations, QObject):
 
         return result
 
+    # -- Map Generator (spectra → integrated maps) --------------------------
+
+    @Slot(result='QVariantList')
+    def getIntervalDatasets(self):
+        """Datasets that carry integration intervals a map run can reuse.
+
+        These are the results of a Confinement Analysis (or an Integration)
+        already in the project — the Map Generator reads their intervals
+        directly, so no JSON file has to be exported and loaded back.
+        """
+        out = []
+        for name in self._datasets:
+            if self.dataset_intervals(name):
+                out.append(name)
+        return out
+
     @Slot(str, result='QVariantList')
-    def getFlatDataValues(self, dataset_name: str):
+    def getDatasetIntervals(self, dataset_name: str):
+        """Integration intervals carried by a dataset, as [[lo, hi], …]."""
+        return self.dataset_intervals(dataset_name)
+
+    @Slot(str, result=str)
+    def suggestedScanType(self, dataset_name: str) -> str:
+        """The scan path this dataset looks like — the combo's Auto value."""
+        dataset = self._datasets.get(dataset_name)
+        if dataset is None:
+            return 'map_raster'
+        return self._resolve_scan_type('auto', dataset.metadata)
+
+    @Slot(str, 'QVariantMap')
+    def detectMapIntervals(self, dataset_name: str, params: dict):
+        """Find integration intervals by peak detection, in the background.
+
+        Emits :attr:`mapIntervalsReady` so the tool can show what it found
+        before committing to a full map run.
         """
-        Get list of value columns from a flat dataset.
-
-        Flat data has one value per spatial point (e.g., integrated data, peak heights).
-        Returns a list of value column descriptions for display.
-        """
-        if dataset_name not in self._datasets:
-            return []
-
-        spectral_data = self._datasets[dataset_name]
-        data_df = spectral_data.data
-
-        # Get value columns (skip index column)
-        value_columns = [col for col in data_df.columns if col != 'Spectrum_Index']
-
-        # Check if this has interval information (integrated data)
-        if 'intervals' in spectral_data.metadata.additional_info:
-            intervals = spectral_data.metadata.additional_info['intervals']
-            result = []
-            for i, iv in enumerate(intervals):
-                if isinstance(iv, (list, tuple)) and len(iv) == 2:
-                    result.append(f"Interval {iv[0]:.3f} to {iv[1]:.3f}")
-                elif isinstance(iv, str):
-                    parts = iv.split('_')
-                    if len(parts) == 2:
-                        result.append(f"Interval {parts[0]} to {parts[1]}")
-                    else:
-                        result.append(f"Value: {iv}")
-                else:
-                    result.append(f"Value {i+1}")
-            return result
-
-        # For other flat data, use column names
-        result = []
-        for col in value_columns:
-            result.append(str(col))
-
-        return result if result else ["No values available"]
-
-    @Slot(str, 'QVariantList')
-    def generateMaps(self, flat_dataset_name: str, value_indices: list):
-        """QML wrapper for generating multiple maps from flat data - runs in background thread."""
-        logger.info(f"Submitting map generation for {len(value_indices)} values")
-        self.status = f"Generating {len(value_indices)} maps..."
+        logger.info(f"Detecting map intervals for {dataset_name}")
+        self.status = f"Finding intervals in {dataset_name}..."
         self.worker_manager.submit(
-            name="Generate Maps",
-            operation=self._generate_multiple_maps,
-            flat_dataset_name=flat_dataset_name,
-            value_indices=value_indices,
-            on_finished=lambda paths: self._on_maps_completed(paths)
+            name=f"Map Intervals {dataset_name}",
+            operation=self.detect_map_intervals,
+            dataset_name=dataset_name,
+            params=dict(params or {}),
+            on_finished=self._on_map_intervals_ready,
         )
 
-    @Slot(str, int)
-    def generateMap(self, flat_dataset_name: str, value_index: int):
-        """QML wrapper for map generation from flat data - runs in background thread."""
-        logger.info(f"Submitting map generation to worker")
+    def _on_map_intervals_ready(self, intervals):
+        intervals = [list(iv) for iv in (intervals or [])]
+        self.status = (f"{len(intervals)} interval(s) found" if intervals
+                       else "No peaks found — no intervals")
+        self.mapIntervalsReady.emit(intervals)
+
+    @Slot(str, 'QVariantMap')
+    def runMapGeneration(self, dataset_name: str, params: dict):
+        """QML wrapper for the spectra → maps run (background thread)."""
+        logger.info(f"Submitting map generation for {dataset_name}")
+        self.status = f"Generating maps from {dataset_name}..."
+        self.worker_manager.submit(
+            name=f"Generate Maps {dataset_name}",
+            operation=self.generate_maps_from_spectra,
+            dataset_name=dataset_name,
+            params=dict(params or {}),
+            on_finished=self._on_map_generation_completed,
+        )
+
+    def _on_map_generation_completed(self, result):
+        """Register the generated maps, exactly as the old flat-data path did."""
+        result = result or {}
+        paths = list(result.get('map_paths') or [])
+        # The joined interval map is registered alongside the per-interval
+        # ones, so it shows in the browser like any other map.
+        if result.get('interval_map_path'):
+            paths.append(result['interval_map_path'])
+        self.mapIntervalsReady.emit([list(iv) for iv in result.get('intervals', [])])
+        if result.get('interval_map'):
+            self.intervalMapReady.emit(result['interval_map'])
+        if not paths:
+            self.status = "No maps generated"
+            return
+
+        # Only the joined interval map is opened: it summarises the run, and
+        # opening the per-interval maps as well (dozens of windows) made the
+        # workspace crawl. The rest are in the browser, ready to open.
+        joined = result.get('interval_map_path')
+        if joined:
+            open_paths = {joined}
+        elif len(paths) == 1:
+            open_paths = None          # a single map: show it
+        else:
+            open_paths = set()         # many maps, no summary: open none
+
+        self._on_maps_completed(paths, open_paths=open_paths)
+        if result.get('output_folder'):
+            self.status = (f"{len(paths)} map(s) written to "
+                           f"{Path(result['output_folder']).name}/")
+
+    @Slot(str, int, str)
+    def generateMapFromFlatData(self, flat_dataset_name: str, value_index: int,
+                                scan_type: str = 'auto'):
+        """Map one column of a flat dataset (peak counts, fit coefficients, …).
+
+        The spectra → maps path is :meth:`runMapGeneration`; this one exists
+        for values that are already reduced to one number per point.
+        """
+        logger.info(f"Submitting flat-data map generation for {flat_dataset_name}")
         self.status = "Generating map..."
         self.worker_manager.submit(
-            name="Generate Map",
+            name=f"Generate Map {flat_dataset_name} {value_index}",
             operation=self.generate_map,
             flat_dataset_name=flat_dataset_name,
             value_index=value_index,
+            scan_type=scan_type,
             on_finished=lambda path: self._on_tool_completed("Map Generator", path)
         )
 
