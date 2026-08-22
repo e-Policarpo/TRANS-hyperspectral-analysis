@@ -615,6 +615,71 @@ class QMLGraphCanvas(QQuickPaintedItem):
             self.update()
             logger.info(f"Removed curve: {label}")
 
+    @Slot('QVariantList')
+    def setCurves(self, curves):
+        """Replace every curve in one pass.
+
+        Adding N curves one at a time costs O(N**2): each ``addCurve`` emits
+        ``curvesChanged``, and every emission makes QML rebuild the whole
+        curve ListView. Windows that are re-populated wholesale (a plot of
+        every selected STS point, a tool result) go through here instead, so
+        the list is rebuilt once and the canvas repaints once.
+        """
+        self._curves.clear()
+        self._invalidate_all_curve_paths()
+        had_selection = self._selected_curve_id is not None
+        self._selected_curve_id = None
+        self._curve_counter = 0
+
+        self._build_curves(curves)
+
+        self._needs_redraw = True
+        self.curvesChanged.emit()
+        self.curveSelected.emit(-1)
+        if had_selection:
+            self.selectedCurveIdChanged.emit(-1)
+        self.update()
+        logger.info("Set %d curves in one pass", len(self._curves))
+
+    @Slot('QVariantList')
+    def appendCurves(self, curves):
+        """Add several curves in one pass, keeping the existing ones.
+
+        Same reason as :meth:`setCurves`: one ``curvesChanged``, one repaint.
+        """
+        added = self._build_curves(curves)
+        if not added:
+            return
+        self._needs_redraw = True
+        self.curvesChanged.emit()
+        self.update()
+
+    def _build_curves(self, curves) -> int:
+        """Turn {label, x, y, color, linewidth} specs into curves. Returns the
+        number added."""
+        added = 0
+        for spec in (curves or []):
+            if not isinstance(spec, dict):
+                continue
+            x_data = spec.get('x') or []
+            y_data = spec.get('y') or []
+            if len(x_data) == 0 or len(y_data) == 0:
+                continue
+            curve_id = self._curve_counter
+            self._curve_counter += 1
+            color = spec.get('color') or self.DEFAULT_COLORS[
+                curve_id % len(self.DEFAULT_COLORS)]
+            self._curves[curve_id] = CurveData(
+                curve_id=curve_id,
+                label=spec.get('label') or f"Curve {curve_id + 1}",
+                x=np.array(x_data, dtype=np.float64),
+                y=np.array(y_data, dtype=np.float64),
+                color=color,
+                linewidth=float(spec.get('linewidth') or 2.0),
+            )
+            added += 1
+        return added
+
     @Slot()
     def clearCurves(self):
         """Remove all curves"""

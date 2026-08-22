@@ -581,6 +581,19 @@ Item {
         return true
     }
 
+    // Append curves to an open graph window without resending the ones it
+    // already holds. Returns false when the window (or its content) is gone,
+    // so the caller can fall back to opening one.
+    function appendGraphCurves(windowId, curves) {
+        var windowInfo = getWindow(windowId)
+        if (!windowInfo || !windowInfo.window) return false
+        var win = windowInfo.window
+        if (!win.contentItem || !win.contentItem.addCurvesAndFit) return false
+        win.contentItem.addCurvesAndFit(curves || [])
+        activateWindow(windowId)
+        return true
+    }
+
     // Check if a window exists and is valid
     function hasWindow(windowId) {
         return windowId && getWindow(windowId) !== null

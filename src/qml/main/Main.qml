@@ -1164,28 +1164,34 @@ ApplicationWindow {
                         })
                         mew.openSpectrumPlotRequested.connect(function(datasetName, spectra, forceNewWindow) {
                             console.log("Open spectrum plot requested:", datasetName, "with", spectra.length, "spectra")
-                            if (!spectra || spectra.length === 0) return
-
-                            var curves = []
-                            for (var i = 0; i < spectra.length; i++) {
-                                curves.push({
-                                    x: spectra[i].x,
-                                    y: spectra[i].y,
-                                    label: spectra[i].title || ("Spectrum " + (i+1)),
-                                    color: ""
-                                })
-                            }
-                            var title = datasetName + " Spectra"
-                            var xl = spectra[0].x_name || "X"
-                            var yl = spectra[0].y_name || "Intensity"
+                            if (!spectra) return
 
                             // Key the reused window by datasetName so distinct
                             // sources (e.g. "STS points · Forward/Backward/Mixed")
                             // each get their own window instead of clobbering one.
                             var ids = mainWindow.spectrumWindowIds
                             var wid = ids[datasetName]
-                            if (!forceNewWindow && wid
-                                    && toolWindowManager.hasWindow(wid)) {
+                            var open = !forceNewWindow && wid
+                                       && toolWindowManager.hasWindow(wid)
+
+                            // An empty list means "nothing is selected any
+                            // more" (Clear, or the last point toggled off):
+                            // empty the window rather than leaving spectra of
+                            // deselected points on screen. Never opens one.
+                            if (spectra.length === 0) {
+                                if (open) {
+                                    toolWindowManager.updateGraphWindow(
+                                        wid, "", [], "", "")
+                                }
+                                return
+                            }
+
+                            var curves = mainWindow.spectraToCurves(spectra)
+                            var title = datasetName + " Spectra"
+                            var xl = spectra[0].x_name || "X"
+                            var yl = spectra[0].y_name || "Intensity"
+
+                            if (open) {
                                 toolWindowManager.updateGraphWindow(
                                     wid, title, curves, xl, yl)
                             } else {
@@ -1194,6 +1200,23 @@ ApplicationWindow {
                                 ids[datasetName] = wid
                                 mainWindow.spectrumWindowIds = ids
                             }
+                        })
+                        mew.appendSpectrumCurvesRequested.connect(function(datasetName, spectra) {
+                            if (!spectra || spectra.length === 0) return
+                            var curves = mainWindow.spectraToCurves(spectra)
+                            var ids = mainWindow.spectrumWindowIds
+                            var wid = ids[datasetName]
+                            if (wid && toolWindowManager.hasWindow(wid)
+                                    && toolWindowManager.appendGraphCurves(wid, curves)) {
+                                return
+                            }
+                            // No window yet (first selected point) — open one.
+                            wid = toolWindowManager.openGraphWindow(
+                                datasetName + " Spectra", curves,
+                                spectra[0].x_name || "X",
+                                spectra[0].y_name || "Intensity")
+                            ids[datasetName] = wid
+                            mainWindow.spectrumWindowIds = ids
                         })
                         mew.openMultiDatasetSpectraRequested.connect(function(datasetSpectraList, forceNewWindow) {
                             console.log("Open multi-dataset spectra requested:", datasetSpectraList.length, "datasets")
@@ -1743,6 +1766,20 @@ ApplicationWindow {
 
     // Expose the WindowManager so embedded table contents can create graph windows
     function getToolWindowManager() { return toolWindowManager }
+
+    // Backend spectrum payloads ({x, y, title}) → graph-window curves.
+    function spectraToCurves(spectra) {
+        var curves = []
+        for (var i = 0; i < spectra.length; i++) {
+            curves.push({
+                x: spectra[i].x,
+                y: spectra[i].y,
+                label: spectra[i].title || ("Spectrum " + (i + 1)),
+                color: ""
+            })
+        }
+        return curves
+    }
 
     // Open spectra from multiple datasets at once
     function openMultiDatasetSpectra(datasetSpectraList, forceNewWindow) {

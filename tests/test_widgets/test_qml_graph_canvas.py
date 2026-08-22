@@ -353,3 +353,66 @@ def test_paint_does_not_raise_for_non_finite_view_range(app):
         push_history=False, disable_auto=True,
     )
     _paint_once(c)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Bulk curve loading — one curvesChanged for the whole batch
+# ---------------------------------------------------------------------------
+
+def _specs(n):
+    return [{'label': f"c{i}", 'x': [0.0, 1.0, 2.0], 'y': [float(i), 1.0, 2.0]}
+            for i in range(n)]
+
+
+def test_set_curves_replaces_and_notifies_once(canvas):
+    """Adding N curves one at a time is O(N**2) in QML: every emission
+    rebuilds the curve list. A bulk load must notify exactly once."""
+    _add_curve(canvas, "old")
+    fired = []
+    canvas.curvesChanged.connect(lambda: fired.append(1))
+
+    canvas.setCurves(_specs(5))
+
+    assert len(fired) == 1
+    labels = [c['label'] for c in canvas.getCurveList()]
+    assert labels == ["c0", "c1", "c2", "c3", "c4"]   # "old" is gone
+
+
+def test_set_curves_with_empty_list_clears(canvas):
+    _add_curve(canvas)
+    canvas.setCurves([])
+    assert canvas.getCurveList() == []
+
+
+def test_set_curves_skips_entries_without_data(canvas):
+    canvas.setCurves([{'label': 'a', 'x': [], 'y': []},
+                      {'label': 'b', 'x': [0.0, 1.0], 'y': [1.0, 2.0]}])
+    assert [c['label'] for c in canvas.getCurveList()] == ['b']
+
+
+def test_append_curves_keeps_existing_and_notifies_once(canvas):
+    _add_curve(canvas, "kept")
+    fired = []
+    canvas.curvesChanged.connect(lambda: fired.append(1))
+
+    canvas.appendCurves(_specs(3))
+
+    assert len(fired) == 1
+    assert [c['label'] for c in canvas.getCurveList()] == [
+        "kept", "c0", "c1", "c2"]
+
+
+def test_append_curves_is_silent_when_nothing_was_added(canvas):
+    _add_curve(canvas)
+    fired = []
+    canvas.curvesChanged.connect(lambda: fired.append(1))
+    canvas.appendCurves([])
+    assert fired == []
+
+
+def test_bulk_curves_honour_colour_and_linewidth(canvas):
+    canvas.setCurves([{'label': 'a', 'x': [0.0, 1.0], 'y': [1.0, 2.0],
+                       'color': '#ff0000', 'linewidth': 3.5}])
+    curve = canvas.getCurveList()[0]
+    assert curve['color'] == '#ff0000'
+    assert curve['linewidth'] == 3.5

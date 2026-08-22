@@ -35,6 +35,9 @@ Item {
     signal profileExportRequested(var profileData)
     signal mapClosed(string mapId)
     signal openSpectrumPlotRequested(string datasetName, var spectra, bool forceNewWindow)
+    // Add spectra to an already-open plot window, leaving the curves it holds
+    // alone — selecting another STS point should not resend all of them.
+    signal appendSpectrumCurvesRequested(string datasetName, var spectra)
     signal openMultiDatasetSpectraRequested(var datasetSpectraList, bool forceNewWindow)
 
     // Dataset list model for dropdown
@@ -99,6 +102,10 @@ Item {
         onOpenPlotWindowRequested: function(datasetName, spectra) {
             // Forward to Main.qml to open plot window (reuse existing window)
             root.openSpectrumPlotRequested(datasetName, spectra, false)
+        }
+
+        onAppendPlotCurvesRequested: function(datasetName, spectra) {
+            root.appendSpectrumCurvesRequested(datasetName, spectra)
         }
 
         onStsAverageUpdated: function(result) {

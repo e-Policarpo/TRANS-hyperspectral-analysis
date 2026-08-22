@@ -411,6 +411,31 @@ class TestBlockSelection:
         """Test clearSelection without canvas"""
         backend.clearSelection()  # Should not crash
 
+    def test_clearSelection_also_drops_the_sts_dots(self, backend, mock_canvas):
+        """"Clear" means nothing stays selected — dots included."""
+        backend.setCanvas(mock_canvas)
+        mcm = MultiChannelMap()
+        mcm.add_channel("Z", np.zeros((10, 10)), ChannelType.HEIGHT, "m")
+        mcm.metadata.extra = {'sts_locations': [
+            {'point_index': 3, 'px': [5, 5], 'avg_spectra': {
+                'V': [-1.0, 0.0, 1.0], 'Mixed': [0.1, 0.2, 0.3],
+                'Forward': None, 'Backward': None}}]}
+        backend._multi_channel_map = mcm
+        backend._on_sts_marker_clicked(0)
+        assert backend._sts_selected
+
+        avg, plots = [], []
+        backend.stsAverageUpdated.connect(avg.append)
+        backend.openPlotWindowRequested.connect(
+            lambda name, spectra: plots.append((name, list(spectra))))
+        backend.clearSelection()
+
+        assert backend._sts_selected == {}
+        assert mock_canvas.setSelectedStsMarkers.call_args.args == ([],)
+        assert avg[-1] == {}                       # inline panel emptied
+        # Both point-plot windows are emptied, not left showing dead spectra.
+        assert plots == [("STS points", []), ("STS points · dI/dV", [])]
+
     def test_selectAllBlocks(self, backend, mock_canvas):
         """Test selecting all blocks"""
         backend.setCanvas(mock_canvas)
@@ -874,6 +899,32 @@ class TestStsMarkerClick:
     """Clicking a 'where spectra were taken' dot plots that point's average."""
 
     @staticmethod
+    def _plot_windows(backend):
+        """Mirror what the plot windows end up holding.
+
+        Selecting a point appends only its own curves and deselecting resends
+        the window's whole contents, so a test that only watched one of the
+        two signals would see half the picture.
+        """
+        windows = {}
+
+        def replace(name, spectra):
+            windows[name] = list(spectra)
+
+        def append(name, spectra):
+            windows.setdefault(name, []).extend(spectra)
+
+        backend.openPlotWindowRequested.connect(replace)
+        backend.appendPlotCurvesRequested.connect(append)
+        # Keep the slots alive for the caller's lifetime.
+        windows['_conns'] = (replace, append)
+        return windows
+
+    @staticmethod
+    def _titles(windows, name):
+        return [c['title'] for c in windows.get(name, [])]
+
+    @staticmethod
     def _map_with_locations():
         mcm = MultiChannelMap()
         mcm.add_channel("Z", np.zeros((10, 10)), ChannelType.HEIGHT, "m")
@@ -893,9 +944,7 @@ class TestStsMarkerClick:
         both are kept — so one window carries them, not one window each."""
         mcm, V = self._map_with_locations()
         backend._multi_channel_map = mcm
-        by_name = {}
-        backend.openPlotWindowRequested.connect(
-            lambda name, spectra: by_name.__setitem__(name, spectra))
+        by_name = self._plot_windows(backend)
         backend._on_sts_marker_clicked(1)          # point 7
 
         assert "STS points" in by_name
@@ -913,9 +962,7 @@ class TestStsMarkerClick:
                 'V': [-1.0, 0.0, 1.0], 'Mixed': [0.5, 0.6, 0.7],
                 'Forward': None, 'Backward': None}}]}
         backend._multi_channel_map = mcm
-        by_name = {}
-        backend.openPlotWindowRequested.connect(
-            lambda name, spectra: by_name.__setitem__(name, spectra))
+        by_name = self._plot_windows(backend)
         backend._on_sts_marker_clicked(0)
 
         curves = {c['title']: c['y'] for c in by_name["STS points"]}
@@ -925,9 +972,7 @@ class TestStsMarkerClick:
         mcm, V = self._map_with_locations()
         mcm.metadata.extra['sts_technique'] = 'STM'
         backend._multi_channel_map = mcm
-        by_name = {}
-        backend.openPlotWindowRequested.connect(
-            lambda name, spectra: by_name.__setitem__(name, spectra))
+        by_name = self._plot_windows(backend)
         backend._on_sts_marker_clicked(1)
 
         assert "STS points · dI/dV" in by_name
@@ -942,9 +987,7 @@ class TestStsMarkerClick:
         mcm.metadata.extra['sts_technique'] = 'AFM'
         mcm.metadata.instrument = 'Park NX7'
         backend._multi_channel_map = mcm
-        by_name = {}
-        backend.openPlotWindowRequested.connect(
-            lambda name, spectra: by_name.__setitem__(name, spectra))
+        by_name = self._plot_windows(backend)
         backend._on_sts_marker_clicked(1)
 
         assert "STS points · dI/dV" not in by_name
@@ -958,16 +1001,17 @@ class TestStsMarkerClick:
     def test_clicking_dots_overlays_then_toggles_off(self, backend):
         mcm, _ = self._map_with_locations()
         backend._multi_channel_map = mcm
-        mixed = []
-        backend.openPlotWindowRequested.connect(
-            lambda name, spectra: mixed.append([s['title'] for s in spectra])
-            if name == "STS points" else None)
+        windows = self._plot_windows(backend)
         backend._on_sts_marker_clicked(0)          # Point 3
         backend._on_sts_marker_clicked(1)          # + Point 7 (overlay)
-        assert mixed[-1] == ["Point 3 · Forward", "Point 3 · Backward",
-                             "Point 7 · Forward", "Point 7 · Backward"]
+        assert self._titles(windows, "STS points") == [
+            "Point 3 · Forward", "Point 3 · Backward",
+            "Point 7 · Forward", "Point 7 · Backward"]
         backend._on_sts_marker_clicked(0)          # toggle Point 3 off
-        assert mixed[-1] == ["Point 7 · Forward", "Point 7 · Backward"]
+        assert self._titles(windows, "STS points") == [
+            "Point 7 · Forward", "Point 7 · Backward"]
+        backend._on_sts_marker_clicked(1)          # toggle the last one off
+        assert self._titles(windows, "STS points") == []
 
     def test_marker_click_is_safe_without_spectrum_or_out_of_range(self, backend):
         mcm = MultiChannelMap()
@@ -977,6 +1021,7 @@ class TestStsMarkerClick:
         backend._multi_channel_map = mcm
         fired = []
         backend.openPlotWindowRequested.connect(lambda n, s: fired.append(1))
+        backend.appendPlotCurvesRequested.connect(lambda n, s: fired.append(1))
         backend._on_sts_marker_clicked(0)    # no spectrum → no plot
         backend._on_sts_marker_clicked(99)   # out of range → safe
         backend._multi_channel_map = None
@@ -1031,9 +1076,7 @@ class TestStsMarkerClick:
              'avg_spectrum': {'V': V, 'y': [1e-8, 2e-8, 3e-8]}},
         ]}
         backend._multi_channel_map = mcm
-        by_name = {}
-        backend.openPlotWindowRequested.connect(
-            lambda name, spectra: by_name.__setitem__(name, spectra))
+        by_name = self._plot_windows(backend)
         backend._on_sts_marker_clicked(0)
         # The old schema has no directions, so Mixed is what gets plotted —
         # in the one spectra window (dI/dV rides alongside for STM data).

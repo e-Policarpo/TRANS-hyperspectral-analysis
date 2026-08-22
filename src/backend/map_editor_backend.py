@@ -61,6 +61,11 @@ class MapEditorBackend(QObject):
     linkedDatasetsChanged = Signal()
     spectrumReady = Signal(str, 'QVariantMap', arguments=['datasetName', 'spectrumData'])
     openPlotWindowRequested = Signal(str, 'QVariantList', arguments=['datasetName', 'spectra'])
+    # Append spectra to an already-open plot window instead of resending every
+    # curve it holds. Selecting the Nth STS point otherwise costs N curve
+    # conversions across the QML bridge, so a long selection crawls.
+    appendPlotCurvesRequested = Signal(str, 'QVariantList',
+                                       arguments=['datasetName', 'spectra'])
     # Average (mixed) spectrum of the currently-selected STS dots, pushed to the
     # inline "Average Spectrum" panel. Empty map ({}) clears it.
     stsAverageUpdated = Signal('QVariantMap', arguments=['result'])
@@ -610,6 +615,7 @@ class MapEditorBackend(QObject):
         if self._canvas is None:
             return
         self._sts_selected = {}   # new map → clear the point selection
+        self._sts_didv_cache = {}
         locs = []
         try:
             extra = getattr(mcm.metadata, 'extra', None) or {}
@@ -806,38 +812,35 @@ class MapEditorBackend(QObject):
         if sel is None:
             sel = {}
             self._sts_selected = sel
-        if pi in sel:
+        deselected = pi in sel
+        if deselected:
             del sel[pi]                       # toggle off
         else:
             sel[pi] = avg                     # {'V', 'Mixed', 'Forward', 'Backward'}
 
-        # ONE window holding both sweep directions: forward and backward of
-        # the same point belong side by side — that comparison is the whole
-        # reason both are kept — and three windows per click buried the
-        # workspace. Mixed is plotted only when the directions were not
-        # recorded separately, otherwise it is just their mean redrawn.
-        spectra = []
-        for p_i, a in sel.items():
-            directions = [(d, a.get(d)) for d in ('Forward', 'Backward')]
-            directions = [(d, y) for d, y in directions if y is not None]
-            if not directions:
-                directions = [('Mixed', a.get('Mixed'))] if a.get('Mixed') else []
-            for label, y in directions:
-                spectra.append({
-                    'x': a.get('V'), 'y': y,
-                    'title': f"Point {p_i} · {label}",
-                    'x_name': 'V', 'y_name': 'Current',
-                })
-        if spectra:
+        # Selecting appends only the new point's curves; deselecting is the
+        # only case that has to resend the window's whole contents. Rebuilding
+        # everything on every click made the Nth selection cost N curve
+        # conversions over the QML bridge — quadratic, and the reason a long
+        # selection ground to a halt.
+        show_didv = self._is_stm_source(mcm)
+        if deselected:
+            spectra, didv = [], []
+            for p_i in sel:
+                spectra.extend(self._point_curves(p_i, sel[p_i]))
+                didv.extend(self._point_didv(p_i, sel[p_i]))
             self.openPlotWindowRequested.emit("STS points", spectra)
-
-        # STM/STS data is read as dI/dV, so the derivative of each selected
-        # point's averaged sweep is shown alongside — in its own window,
-        # because nA and nA/V do not share an axis.
-        if self._is_stm_source(mcm):
-            didv = self._didv_spectra(sel)
-            if didv:
+            if show_didv:
                 self.openPlotWindowRequested.emit("STS points · dI/dV", didv)
+        else:
+            spectra = self._point_curves(pi, avg)
+            if spectra:
+                self.appendPlotCurvesRequested.emit("STS points", spectra)
+            if show_didv:
+                didv = self._point_didv(pi, avg)
+                if didv:
+                    self.appendPlotCurvesRequested.emit(
+                        "STS points · dI/dV", didv)
 
         # Highlight the selected dots on the canvas (instant click feedback).
         if self._canvas is not None:
@@ -864,6 +867,39 @@ class MapEditorBackend(QObject):
         instrument = str(getattr(getattr(mcm, 'metadata', None),
                                  'instrument', '') or '').lower()
         return any(key in instrument for key in ('matrix', 'omicron', 'stm'))
+
+    @staticmethod
+    def _point_curves(p_i, avg: dict) -> list:
+        """Plot payload for one STS point: its two sweep directions.
+
+        ONE window holds both directions — forward and backward of the same
+        point belong side by side, that comparison is the whole reason both
+        are kept. Mixed is plotted only when the directions were not recorded
+        separately, otherwise it is just their mean redrawn.
+        """
+        directions = [(d, avg.get(d)) for d in ('Forward', 'Backward')]
+        directions = [(d, y) for d, y in directions if y is not None]
+        if not directions:
+            directions = [('Mixed', avg.get('Mixed'))] if avg.get('Mixed') else []
+        return [{
+            'x': avg.get('V'), 'y': y,
+            'title': f"Point {p_i} · {label}",
+            'x_name': 'V', 'y_name': 'Current',
+        } for label, y in directions]
+
+    def _point_didv(self, p_i, avg: dict) -> list:
+        """dI/dV of one point's averaged sweep, computed once per point.
+
+        Memoised: a deselect rebuilds the window from every remaining point,
+        and differentiating them all again on each click is work already done.
+        """
+        cache = getattr(self, '_sts_didv_cache', None)
+        if cache is None:
+            cache = {}
+            self._sts_didv_cache = cache
+        if p_i not in cache:
+            cache[p_i] = self._didv_spectra({p_i: avg})
+        return cache[p_i]
 
     @staticmethod
     def _didv_spectra(sel: dict) -> list:
@@ -1188,9 +1224,22 @@ class MapEditorBackend(QObject):
 
     @Slot()
     def clearSelection(self):
-        """Clear block selection"""
+        """Clear every selection on the map.
+
+        "Clear" means nothing stays selected: the block selection AND the
+        selected STS marker dots, whose highlight and averaged spectrum
+        otherwise survived the button and left the inline panel showing an
+        average of points the user had just deselected.
+        """
         if self._canvas:
             self._canvas.clearBlockSelection()
+            self._canvas.setSelectedStsMarkers([])
+        self._sts_selected = {}
+        self._sts_didv_cache = {}
+        self.stsAverageUpdated.emit({})
+        # The point plots showed the now-deselected spectra otherwise.
+        self.openPlotWindowRequested.emit("STS points", [])
+        self.openPlotWindowRequested.emit("STS points · dI/dV", [])
 
     @Slot()
     def selectAllBlocks(self):

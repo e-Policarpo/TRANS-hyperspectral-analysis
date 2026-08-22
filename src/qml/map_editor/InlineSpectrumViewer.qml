@@ -135,10 +135,13 @@ Item {
             blockCount = result.block_count || 0
             stsPointCount = 0   // block selection overrides any STS-dot average
             spectrumGraph.clearCurves()
+            // GraphCanvas.addCurve is (label, x, y, color, linewidth) and the
+            // slot declares all five, so every argument has to be passed.
             spectrumGraph.addCurve(
-                result.x, result.y,
                 result.title || "Average Spectrum",
-                "#5BCEFA"  // accent blue
+                result.x, result.y,
+                "#5BCEFA",  // accent blue
+                2.0
             )
             spectrumGraph.setLabels(
                 result.x_name || "x",
@@ -164,9 +167,10 @@ Item {
             stsPointCount = result.point_count || 0
             spectrumGraph.clearCurves()
             spectrumGraph.addCurve(
-                result.x, result.y,
                 result.title || "Average Spectrum",
-                "#5BCEFA"
+                result.x, result.y,
+                "#5BCEFA",
+                2.0
             )
             spectrumGraph.setLabels(
                 result.x_name || "V",

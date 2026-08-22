@@ -921,13 +921,7 @@ Item {
     // Used to overlay a tool result onto the source dataset's open window.
     function addCurvesAndFit(curveList) {
         if (!curveList) return
-        for (var i = 0; i < curveList.length; i++) {
-            var c = curveList[i]
-            if (c && c.x && c.y && c.x.length > 0 && c.y.length > 0) {
-                graphCanvas.addCurve(c.label || ("Curve " + (i + 1)),
-                                     c.x, c.y, c.color || "", 2.0)
-            }
-        }
+        graphCanvas.appendCurves(labelledCurves(curveList))
         graphCanvas.resetView()
     }
 
@@ -978,22 +972,17 @@ Item {
     // Populate graph when curves property is set (e.g. from WindowManager)
     onCurvesChanged: {
         if (curves && curves.length > 0) {
-            graphCanvas.clearCurves()
-            for (var i = 0; i < curves.length; i++) {
-                var c = curves[i]
-                if (c.x && c.y && c.x.length > 0 && c.y.length > 0) {
-                    graphCanvas.addCurve(
-                        c.label || ("Curve " + (i + 1)),
-                        c.x,
-                        c.y,
-                        c.color || "",
-                        2.0
-                    )
-                }
-            }
+            // One bulk call: adding curves one by one rebuilds the curve list
+            // once per curve, which is quadratic when a window is re-filled
+            // with dozens of spectra (selecting STS points).
+            graphCanvas.setCurves(labelledCurves(curves))
             // Frame all points when the data first lands in the window.
             graphCanvas.resetView()
             // curvesChanged signal handles updateCurvesList() via Connections
+        } else {
+            // An empty list is a real instruction — the selection it came
+            // from was cleared — not "no news".
+            graphCanvas.clearCurves()
         }
     }
 
@@ -1022,20 +1011,29 @@ Item {
         if (graphTitle) graphCanvas.title = graphTitle
         // Apply initial curves if already set (may have been set before component completed)
         if (curves && curves.length > 0) {
-            for (var i = 0; i < curves.length; i++) {
-                var c = curves[i]
-                if (c.x && c.y && c.x.length > 0 && c.y.length > 0) {
-                    graphCanvas.addCurve(
-                        c.label || ("Curve " + (i + 1)),
-                        c.x, c.y,
-                        c.color || "", 2.0
-                    )
-                }
-            }
+            graphCanvas.setCurves(labelledCurves(curves))
             // Frame all points when the window opens with data already set.
             graphCanvas.resetView()
             // curvesChanged signal handles updateCurvesList() via Connections
         }
+    }
+
+    // Fill in the defaults setCurves does not guess at (a curve's ordinal
+    // label) and drop entries with no data.
+    function labelledCurves(list) {
+        var out = []
+        for (var i = 0; i < list.length; i++) {
+            var c = list[i]
+            if (c && c.x && c.y && c.x.length > 0 && c.y.length > 0) {
+                out.push({
+                    label: c.label || ("Curve " + (i + 1)),
+                    x: c.x, y: c.y,
+                    color: c.color || "",
+                    linewidth: c.linewidth || 2.0
+                })
+            }
+        }
+        return out
     }
 
     // Update curves list when curves are added/removed
