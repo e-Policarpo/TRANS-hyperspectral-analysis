@@ -43,6 +43,14 @@ class PersistentWorker(QThread):
     task_completed = Signal(str, object)  # task name, result
     task_failed = Signal(str, str, str)  # task name, error title, error message
 
+    #: Class-level default so the loop can still be read when the instance
+    #: dict has gone. During interpreter teardown the Python object is torn
+    #: down while its QThread is still spinning, and `while self._running`
+    #: then raised AttributeError *out of* run() — which PySide turns into
+    #: `Fatal Python error: Aborted`. Falling back to False means the loop
+    #: exits, which is what teardown wanted anyway.
+    _running = False
+
     def __init__(self, name: str = "TRANS-PersistentWorker"):
         super().__init__()
         # Name the thread so any future "QThread destroyed while running"

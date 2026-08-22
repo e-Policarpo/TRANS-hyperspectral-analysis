@@ -16,6 +16,47 @@ from src.models.spectral_data import SpectralData, SpectralMetadata
 
 
 # =============================================================================
+# Worker threads
+# =============================================================================
+
+@pytest.fixture(scope="session", autouse=True)
+def _shut_down_worker_threads():
+    """Stop any worker threads a test left running.
+
+    A ``WorkerManager`` owns two QThreads that keep spinning unless
+    ``shutdown()`` is called. Tests build backends and drop them, so at the
+    end of the session Python tears the objects down while their threads are
+    still alive — a use-after-free that killed the process with SIGABRT or
+    SIGSEGV *after* the summary line, turning a reported run into exit 134
+    (and a passing run into a CI failure).
+
+    Sweeping the heap rather than tracking constructions: the threads are
+    created deep inside backends that tests instantiate in a dozen different
+    ways, and missing one puts the crash back.
+    """
+    yield
+
+    import gc
+
+    try:
+        from src.backend.worker import PersistentWorker, WorkerManager
+    except Exception:                       # PySide6 not importable: nothing ran
+        return
+
+    for obj in gc.get_objects():
+        try:
+            if isinstance(obj, WorkerManager):
+                obj.shutdown()
+            elif isinstance(obj, PersistentWorker) and obj.isRunning():
+                obj.stop()
+                obj.wait(2000)
+        except Exception:
+            # Teardown is best-effort: a half-built object is not worth
+            # failing the whole session over.
+            pass
+
+
+# =============================================================================
 # SpectralData Fixtures
 # =============================================================================
 
