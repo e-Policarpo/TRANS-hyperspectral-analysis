@@ -668,6 +668,40 @@ TOOL_DEFINITIONS = {
         "parameters": {}
     },
 
+    "BaselineEstimate": {
+        "display_name": "Baseline Estimate",
+        "category": "Processing",
+        "description": "Estimate the spectral background with any of the arPLS / ALS / SNIP / rubberband / endpoint / polynomial methods, returning both the background and the corrected spectra",
+        "inputs": [
+            {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
+        ],
+        "outputs": [
+            {"id": "corrected", "name": "Corrected", "port_type": "dataset", "description": "Spectra with the background removed"},
+            {"id": "baseline", "name": "Background", "port_type": "dataset", "description": "The fitted background that was subtracted"},
+            {"id": "coefficients", "name": "Coefficients", "port_type": "flat_data", "description": "Polynomial background coefficients per spectrum — only for the polynomial methods; connect to a Map Generator for a metallicity map"}
+        ],
+        "parameters": {
+            "method": {"type": "select", "label": "Background",
+                       "options": ["poly-iter", "poly", "arpls", "snip", "als", "rubberband", "endpoints", "none"],
+                       "default": "arpls",
+                       "description": "arpls fits in log space, where a tunnelling band edge is nearly straight — ModPoly cannot follow it and loses states an order of magnitude below the edges"},
+            "degree": {"type": "int", "label": "Degree", "default": 3, "min": 0, "max": 15,
+                       "description": "Order of the polynomial background (poly, poly-iter, endpoints); the other methods ignore it. 3 is what Confinement Analysis uses, so a chain built out of these nodes reproduces it."},
+            "iterations": {"type": "int", "label": "Iterations (poly-iter/snip)", "default": 25, "min": 1, "max": 500,
+                           "description": "poly-iter stops as soon as the fit stops moving, so this is a ceiling and rarely reached; SNIP runs every pass, and the count is also its clipping window in samples."},
+            "direction": {"type": "select", "label": "Direction", "options": ["positive", "negative", "both"], "default": "positive",
+                          "description": "Which side the peaks stick out of, so poly-iter clips that side away before refitting. dI/dV states sit on top of the background, hence positive."},
+            "als_lambda": {"type": "float", "label": "ALS Smoothness", "default": 100000.0, "min": 100, "max": 10000000,
+                           "description": "Shared with arPLS, whose useful range is far lower (~1e4) — anything from 1e6 up is rescaled for it rather than adding a second knob."},
+            "als_p": {"type": "float", "label": "ALS Asymmetry", "default": 0.01, "min": 0.001, "max": 0.5},
+            "endpoint_points": {"type": "int", "label": "Endpoint points", "default": 10, "min": 2, "max": 500,
+                                "description": "Points taken from each end for the endpoints fit. Never more than a quarter of the spectrum from either end is used, whatever this says."},
+            "basis": {"type": "select", "label": "Coefficient basis",
+                      "options": ["power", "legendre", "chebyshev"], "default": "power",
+                      "description": "Basis for the polynomial background. Orthogonal bases give decorrelated coefficients that can be compared between spectra and fed to PCA."}
+        }
+    },
+
     "CurveFitting": {
         "display_name": "Baseline",
         "category": "Processing",
@@ -874,6 +908,48 @@ TOOL_DEFINITIONS = {
         }
     },
 
+    "EnergyBinning": {
+        "display_name": "Energy Binning",
+        "category": "Analysis",
+        "description": "Bin peaks that have already been found onto a k_B*T/2 energy grid and return the occupied bins as integration intervals — the same grid Confinement Analysis and the Map Generator report on, and deliberately NOT the FWHM intervals Peak Finder emits",
+        "inputs": [
+            {"id": "peaks", "name": "Peaks", "port_type": "dataset", "required": True, "description": "Peak table from Peak Finder or Confinement Analysis (needs spectrum_index and position_value columns)"},
+            {"id": "dataset", "name": "Source Spectra", "port_type": "dataset", "required": False, "description": "The spectra the peaks came from — supplies the sweep step, which is the floor on the bin width, and the span the grid covers"}
+        ],
+        "outputs": [
+            {"id": "intervals", "name": "Occupied Bins", "port_type": "intervals", "description": "One [lo, hi] per OCCUPIED bin — connect to Integration or Map Assembly"},
+            {"id": "all_bins", "name": "All Bins", "port_type": "intervals", "description": "Every bin spanning the sweep, occupied or not — this is the axis Confinement Analysis's binned occupancy table is reported on"},
+            {"id": "bins", "name": "Bin Table", "port_type": "dataset", "description": "One row per occupied bin: index, centre, bounds, how many spectra and peaks fell in it"}
+        ],
+        "parameters": {
+            "temperature_k": {"type": "float", "label": "Temperature (K)", "default": 0.0, "min": 0, "max": 5000,
+                              "description": "Acquisition temperature. k_B*T becomes the peak-position error bar and minimum separation (94 K = 8.1 meV); the energy bins are half that (4.05 meV). 0 disables grouping, leaving the sweep's own step as the grid."},
+            "x_energy_unit": {"type": "select", "label": "X axis unit", "options": ["eV", "meV"], "default": "eV",
+                              "description": "Unit of the independent variable, so k_B*T is computed in the same units"},
+            "bin_width": {"type": "float", "label": "Bin width", "default": 0.0, "min": 0,
+                          "description": "Override the width directly, in X units. 0 uses k_B*T/2, floored at the sweep's own step."},
+            "min_spectra_per_bin": {"type": "int", "label": "Min. spectra per bin", "default": 1, "min": 1,
+                                    "description": "Drop bins that too few spectra have a peak in, without widening the rest. 1 keeps a state that lives at a single position, which is what these maps are for."}
+        }
+    },
+
+    "OccupancyMatrix": {
+        "display_name": "Occupancy Matrix",
+        "category": "Analysis",
+        "description": "Turn a peak list into the occupancy table — 1 where a spectrum has a peak, blank elsewhere; one column per spectrum, one row per measured energy, or per bin when bins are connected",
+        "inputs": [
+            {"id": "peaks", "name": "Peaks", "port_type": "dataset", "required": True, "description": "Peak table from Peak Finder or Confinement Analysis"},
+            {"id": "dataset", "name": "Source Spectra", "port_type": "dataset", "required": False, "description": "The source spectra — supplies the energy axis and the full column list, so spectra with no peak still get a (blank) column"},
+            {"id": "intervals", "name": "Bins", "port_type": "intervals", "required": False, "description": "Bin the rows onto these instead of the measured axis — feed Energy Binning's 'all_bins' to reproduce Confinement Analysis's binned table"}
+        ],
+        "outputs": [
+            {"id": "matrix", "name": "Occupancy Matrix", "port_type": "dataset", "description": "1 where a spectrum has a peak, blank elsewhere"},
+            {"id": "matrix_offset", "name": "Occupancy Matrix (offset)", "port_type": "dataset", "description": "The same marks, each column carrying its own 1-based number so plotting separates the spectra onto their own rows"},
+            {"id": "peak_count", "name": "Peak Count", "port_type": "flat_data", "description": "Peaks per spectrum — connect to a Map Generator to map them spatially"}
+        ],
+        "parameters": {}
+    },
+
     # ===========================================================================
     # VISUALIZATION NODES
     # ===========================================================================
@@ -893,6 +969,31 @@ TOOL_DEFINITIONS = {
             "scan_type": {"type": "select", "label": "Scan type", "default": "auto",
                           "options": ["auto", "map_meander", "map_raster", "line"],
                           "description": "How the points were acquired: a meandering map needs every other row reversed, a line scan becomes a single row. 'auto' reads the dataset's own metadata."}
+        }
+    },
+
+    "MapAssembly": {
+        "display_name": "Map Assembly",
+        "category": "Visualization",
+        "description": "Lay one value per spectrum out on the sample — a calibrated map per value column in real physical units, plus the joined interval map when several columns share one energy grid",
+        "inputs": [
+            {"id": "flat_data", "name": "Flat Dataset", "port_type": "flat_data", "required": True, "description": "One row per spectrum, one column per value"},
+            {"id": "intervals", "name": "Intervals", "port_type": "intervals", "required": False, "description": "The energy interval each value column came from — sets the joined map's energy axis. Read from the flat dataset's own metadata when not connected."},
+            {"id": "source", "name": "Source Spectra", "port_type": "dataset", "required": False, "description": "The spectra the values came from — where the real positions come from when the flat data does not carry them"}
+        ],
+        "outputs": [
+            {"id": "maps", "name": "Maps", "port_type": "map", "description": "One calibrated TIFF per value column"},
+            {"id": "interval_map", "name": "Interval Map", "port_type": "dataset", "description": "Position across, interval up — registered as a line scan so the Hyperspectral tab opens it as a kymograph"},
+            {"id": "interval_map_path", "name": "Interval Map File", "port_type": "map", "description": "The joined map as a file"}
+        ],
+        "parameters": {
+            "scan_type": {"type": "select", "label": "Scan type", "default": "auto",
+                          "options": ["auto", "map_meander", "map_raster", "line"],
+                          "description": "How the points were acquired: a meandering map needs every other row reversed, a line scan becomes a single row. 'auto' reads the dataset's own metadata."},
+            "columns": {"type": "string", "label": "Value columns", "default": "",
+                        "description": "Comma-separated value columns to map. Blank maps every value column."},
+            "joined_map": {"type": "bool", "label": "Joined interval map", "default": True,
+                           "description": "Also write the joined map across the columns — position across, interval up. Needs more than one column."}
         }
     },
 
@@ -1238,22 +1339,26 @@ def get_tool_categories() -> List[Dict]:
         "TruncateData": 1,
         "Derivative": 2,
         "CurveSmoothing": 2,
-        "CurveFitting": 3,
-        "Integration": 4,
-        "SpatialAverage": 5,
-        "DataManipulation": 6,
-        "FFT1D": 7,
-        "FilterBadData": 8,
-        "CosmicRayFilter": 9,
-        "BackgroundSubtraction": 10,
+        "BaselineEstimate": 3,
+        "CurveFitting": 4,
+        "Integration": 5,
+        "SpatialAverage": 6,
+        "DataManipulation": 7,
+        "FFT1D": 8,
+        "FilterBadData": 9,
+        "CosmicRayFilter": 10,
+        "BackgroundSubtraction": 11,
         # Analysis tools
         "ConfinementAnalysis": 0,
         "SpectralFeatures": 1,
         "PeakFinder": 2,
-        "DetectBandgapDoping": 3,
-        "DiracPointEstimator": 4,
+        "EnergyBinning": 3,
+        "OccupancyMatrix": 4,
+        "DetectBandgapDoping": 5,
+        "DiracPointEstimator": 6,
         # Visualization
         "MapGenerator": 0,
+        "MapAssembly": 1,
         # Image Processing - image tools first, then map processing
         "ImageSmoothing": 0,
         "GradientFilter": 1,

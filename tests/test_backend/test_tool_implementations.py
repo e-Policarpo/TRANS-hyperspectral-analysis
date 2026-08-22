@@ -2621,6 +2621,27 @@ class TestPositionsSurviveDerivedDatasets(TestToolImplementationsSetup):
 
         assert tool_impl._line_step_m(orphan) == pytest.approx(self.STEP_M)
 
+    def test_an_integration_result_finds_them_through_original_dataset(self, tool_impl):
+        """The key the Integration tool writes.
+
+        Its flat table records only ``original_dataset``, and a decomposed
+        Integration -> Map Assembly chain has nothing else to go on: without
+        this the maps come out in point indices, which the export rule does
+        not allow when the metres are there to be had.
+        """
+        tool_impl._datasets['line'] = self._line(n_spectra=8)
+        integrated = SpectralData(
+            pd.DataFrame({'Spectrum_Index': np.arange(8),
+                          'Interval_0.150_0.250': np.arange(8.0)}),
+            SpectralMetadata(
+                source_type='integrated_flat', dimensions=(8, 1), scan_mode='line',
+                units={'independent': 'Index', 'dependent': 'Integrated Value'},
+                additional_info={'original_dataset': 'line',
+                                 'intervals': [(0.15, 0.25)]},
+                data_type='flat'))
+
+        assert tool_impl._line_step_m(integrated) == pytest.approx(self.STEP_M)
+
     def test_a_source_with_a_different_spectrum_count_is_not_used(self, tool_impl):
         """An average of a line is one spectrum: the line's positions are not
         its positions."""

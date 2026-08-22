@@ -26,17 +26,21 @@ from src.processing.spectral_features import (
 from src.processing.peak_detection import (
     Analysis,
     noise_sigma,
+    BASELINE_KINDS,
     POLYNOMIAL_BASES,
     als_baseline,
     analyze_many,
+    assign_bins,
     binned_peak_matrix,
     coefficient_names,
     endpoint_baseline,
     energy_bins,
+    estimate_baseline,
     eval_polynomial,
     fit_polynomial,
     normalized_axis,
     group_peaks_by_bin,
+    occupancy_matrix,
     params_from_dict,
     peak_matrix,
     rubberband_baseline,
@@ -146,6 +150,24 @@ def _expand(values: np.ndarray, idx: np.ndarray, n_samples: int) -> np.ndarray:
     return full
 
 
+def _write_occupancy_csv(frame: pd.DataFrame, columns, path) -> None:
+    """Write an occupancy table as bare integers with empty cells.
+
+    A float column would render as "1.0", and a global ``float_format`` would
+    round the energy axis, so only the mark columns are stringified -- the
+    in-memory dataset stays numeric (value / NaN). The blanks have to reach
+    the file as empty cells rather than zeros: zero is a measured value, and a
+    reader that sees a field of them cannot tell "no state here" from "a state
+    of size zero".
+    """
+    export_df = frame.copy()
+    for column in columns:
+        values = frame[column].to_numpy()
+        as_int = np.nan_to_num(values, nan=0.0).astype(np.int64).astype(str)
+        export_df[column] = np.where(np.isfinite(values), as_int, '')
+    export_df.to_csv(path, index=False)
+
+
 def _peak_fwhm(result: Analysis, full_indices) -> np.ndarray:
     """Peak widths at half prominence, in samples, on the corrected curve."""
     if not len(full_indices):
@@ -167,25 +189,38 @@ def _peak_fwhm(result: Analysis, full_indices) -> np.ndarray:
         return np.zeros(len(window_positions))
 
 
-def _fit_coefficients(result: Analysis, degree: int, basis: str = "power") -> np.ndarray:
-    """Ascending-order coefficients of this spectrum's fitted background.
+def _baseline_coefficients(x: np.ndarray, baseline: np.ndarray, degree: int,
+                           basis: str = "power") -> np.ndarray:
+    """Ascending-order coefficients of a fitted background curve.
 
-    Refits the stored background curve rather than re-deriving it, so the
-    numbers describe exactly what was subtracted. Index 0 is the constant
-    term, matching the Curve Fitting tool's convention.
+    Refits the background that was actually subtracted rather than
+    re-deriving it, so the numbers describe exactly what came off the
+    spectrum. Index 0 is the constant term, matching the Curve Fitting tool's
+    convention.
 
     The fit runs on the normalised axis, so an orthogonal basis is orthogonal
     over the spectrum's own range and the coefficients are comparable between
     spectra -- which is what makes them usable as classification features.
+
+    A background that could not be fitted (too few points for the degree, a
+    singular fit) reports zeros rather than raising: one unusable spectrum
+    must not lose the whole run's coefficient table.
     """
-    if result.baseline.size != result.x.size or result.x.size <= degree + 1:
+    x = np.asarray(x, dtype=np.float64)
+    baseline = np.asarray(baseline, dtype=np.float64)
+    if baseline.size != x.size or x.size <= degree + 1:
         return np.zeros(degree + 1)
     try:
         with np.errstate(all="ignore"):
-            return fit_polynomial(normalized_axis(result.x), result.baseline, degree, basis)
+            return fit_polynomial(normalized_axis(x), baseline, degree, basis)
     except Exception:
         logger.debug("Background coefficient refit failed", exc_info=True)
         return np.zeros(degree + 1)
+
+
+def _fit_coefficients(result: Analysis, degree: int, basis: str = "power") -> np.ndarray:
+    """Background coefficients of one :class:`Analysis`, on its own axis."""
+    return _baseline_coefficients(result.x, result.baseline, degree, basis)
 
 
 class ToolImplementations:
@@ -1257,6 +1292,188 @@ class ToolImplementations:
             self.errorOccurred.emit("Fitting Error", str(e))
             return ""
 
+    def estimate_dataset_baseline(self, task, dataset_name: str,
+                                  params: Optional[dict] = None) -> dict:
+        """Fit a background to every spectrum and subtract it.
+
+        Runs the whole :func:`src.processing.peak_detection.estimate_baseline`
+        family -- the same engine Confinement Analysis and the Map Generator
+        use, so a background estimated here is the one they would have
+        subtracted. Curve Fitting predates that engine and carries its own
+        polynomial/ALS/rubberband implementation, which cannot do arPLS or
+        SNIP at all.
+
+        ``method='none'`` returns a background of zeros, so the corrected
+        spectra are the raw ones. That is deliberate: a chain can keep the
+        node wired in and turn the correction off without being rewired, and
+        downstream nodes still see the axis and the column names they expect.
+
+        Parameters
+        ----------
+        params : dict
+            ``method`` plus the knobs :func:`estimate_baseline` takes. QML and
+            the workflow engine send every number as a float, so the integer
+            ones are cast back.
+
+        Returns
+        -------
+        dict with the created SpectralData objects (for workflow capture),
+        their names and the CSV paths.
+        """
+        empty = {'corrected': None, 'baseline': None, 'coefficients': None,
+                 'dataset_names': {}, 'corrected_path': '', 'baseline_path': ''}
+        try:
+            if dataset_name not in self._datasets:
+                self.errorOccurred.emit("Error", "Dataset not found")
+                return empty
+
+            spectral_data = self._datasets[dataset_name]
+            independent_var = np.asarray(spectral_data.independent_var, dtype=np.float64)
+            spectra = np.asarray(spectral_data.spectra.values, dtype=np.float64)
+            n_samples, n_spectra = spectra.shape
+
+            params = params or {}
+            method = str(params.get('method', CONFINEMENT_DEFAULTS['baseline']))
+            if method not in BASELINE_KINDS:
+                raise ValueError(f"Unknown background method {method!r}; "
+                                 f"expected one of {BASELINE_KINDS}")
+            degree = int(params.get('degree', 3))
+            iterations = int(params.get('iterations', 25))
+            direction = str(params.get('direction', 'positive'))
+            als_lambda = float(params.get('als_lambda', 1e5))
+            als_p = float(params.get('als_p', 0.01))
+            endpoint_points = int(params.get('endpoint_points', 10))
+            basis = str(params.get('basis', 'power'))
+
+            logger.info(
+                "BaselineEstimate: %s — %d spectra x %d points, background=%s"
+                "(deg %d, %s, %d iterations, %s)",
+                dataset_name, n_spectra, n_samples, method, degree, basis,
+                iterations, direction)
+
+            # Only the polynomial families have coefficients to report; for
+            # arPLS, SNIP and rubberband the background is not a polynomial
+            # and refitting one to it would describe the fit, not the data.
+            coefficient_columns = (coefficient_names(degree, basis)
+                                   if method in ('poly', 'poly-iter', 'endpoints')
+                                   else [])
+
+            baselines = np.full((n_samples, n_spectra), np.nan)
+            coeff_rows = []
+            for i in range(n_spectra):
+                if getattr(task, 'cancelled', False):
+                    logger.info("BaselineEstimate cancelled after %d/%d spectra",
+                                i, n_spectra)
+                    return empty
+
+                # Fit on the finite samples only and scatter the result back:
+                # a single NaN would otherwise poison a least-squares fit, and
+                # a gap in the sweep must stay a gap in the background rather
+                # than becoming a zero that the subtraction then keeps.
+                y = spectra[:, i]
+                idx = np.flatnonzero(np.isfinite(y) & np.isfinite(independent_var))
+                fitted = np.zeros(0)
+                if idx.size:
+                    fitted = np.asarray(
+                        estimate_baseline(independent_var[idx], y[idx], kind=method,
+                                          degree=degree, iterations=iterations,
+                                          direction=direction, als_lambda=als_lambda,
+                                          als_p=als_p, endpoint_points=endpoint_points,
+                                          basis=basis),
+                        dtype=np.float64)
+                    baselines[:, i] = _expand(fitted, idx, n_samples)
+
+                if coefficient_columns:
+                    coeffs = _baseline_coefficients(independent_var[idx], fitted,
+                                                    degree, basis)
+                    coeff_rows.append({'Spectrum_Index': i,
+                                       **{name: coeffs[p]
+                                          for p, name in enumerate(coefficient_columns)}})
+
+                task.progress = int(100 * (i + 1) / max(1, n_spectra))
+
+            corrected = spectra - baselines
+
+            base_name = self._extract_clean_base_name(dataset_name)
+            convention_name = self._apply_naming_convention(
+                dataset_name, operation="Baseline_Estimate")
+            fitted_dir = self._ensure_output_dir('fitted')
+            columns = list(spectral_data.spectra.columns)
+            created: dict = {}
+            settings = {'baseline_method': method, 'degree': degree,
+                        'basis': basis, 'direction': direction}
+
+            def _register(suffix: str, frame: pd.DataFrame, metadata: SpectralMetadata):
+                name = f"{base_name} - {suffix}"
+                try:
+                    dataset = SpectralData(frame, metadata)
+                except (ValueError, TypeError) as exc:
+                    logger.warning("BaselineEstimate: '%s' could not be built: %s", name, exc)
+                    return
+                self._datasets[name] = dataset
+                if not self._workflow_mode:
+                    self.dataLoaded.emit(name)
+                created[suffix] = name
+
+            def _meta(source_type, extra=None, *, overlay=False, flat=False):
+                info = {'created_from': 'baseline_estimate',
+                        'source_dataset': dataset_name, **settings, **(extra or {})}
+                if not flat:
+                    # Per-spectrum outputs keep the source's positions, so a
+                    # corrected line scan can still be mapped onto the sample.
+                    info = {**self._carry_spatial_info(spectral_data.metadata), **info}
+                if overlay:
+                    # Routes the result onto the source's graph window.
+                    info['original'] = dataset_name
+                return SpectralMetadata(
+                    source_type=source_type,
+                    dimensions=spectral_data.metadata.dimensions,
+                    scan_mode=spectral_data.metadata.scan_mode,
+                    units=dict(spectral_data.metadata.units or {}),
+                    additional_info=info,
+                    data_type='flat' if flat else spectral_data.metadata.data_type,
+                )
+
+            def _frame(values: np.ndarray) -> pd.DataFrame:
+                frame = pd.DataFrame(values, columns=columns)
+                frame.insert(0, spectral_data.independent_var_name, independent_var)
+                return frame
+
+            corrected_df = _frame(corrected)
+            corrected_path = fitted_dir / f"{convention_name}.csv"
+            corrected_df.to_csv(corrected_path, index=False)
+            _register('Baseline Corrected', corrected_df,
+                      _meta(spectral_data.metadata.source_type, overlay=True))
+
+            background_df = _frame(baselines)
+            baseline_path = fitted_dir / f"{convention_name}_Background.csv"
+            background_df.to_csv(baseline_path, index=False)
+            _register('Baseline', background_df,
+                      _meta(spectral_data.metadata.source_type, overlay=True))
+
+            if coeff_rows:
+                _register('Baseline Coefficients', pd.DataFrame(coeff_rows),
+                          _meta('fit_coefficients',
+                                {'coefficient_columns': coefficient_columns},
+                                flat=True))
+
+            logger.info("BaselineEstimate: %s over %d spectra; created %s",
+                        method, n_spectra, ", ".join(created.values()) or "nothing")
+
+            return {
+                'corrected': self._datasets.get(created.get('Baseline Corrected', '')),
+                'baseline': self._datasets.get(created.get('Baseline', '')),
+                'coefficients': self._datasets.get(created.get('Baseline Coefficients', '')),
+                'dataset_names': created,
+                'corrected_path': str(corrected_path),
+                'baseline_path': str(baseline_path),
+            }
+
+        except Exception as e:
+            logger.error(f"Baseline estimate error: {e}", exc_info=True)
+            self.errorOccurred.emit("Baseline Estimate Error", str(e))
+            return empty
+
     # ========================================================================
     # Map Generator
     # ========================================================================
@@ -1452,6 +1669,28 @@ class ToolImplementations:
                 return out
         return []
 
+    @staticmethod
+    def _grid_width(width: float, step: float,
+                    source: str = "k_B*T/2") -> Tuple[float, str]:
+        """``(width, why)`` for an energy grid, never finer than the sweep.
+
+        The bin is the coarser of the two resolutions in play: k_B*T/2 (what
+        the temperature justifies) and the sweep's own step (what the
+        measurement actually resolves). Going finer than the step produces
+        neighbouring bins that integrate the same two samples — duplicate
+        maps that only look like extra information.
+
+        Shared with :meth:`bin_peak_energies` so a chain built out of nodes
+        and the Map Generator cannot drift onto different grids. A width of
+        0.0 back means there is nothing to bin on at all: no temperature and
+        no sweep to take a step from.
+        """
+        if width <= 0:
+            return step, "no temperature set — using the sweep's own step"
+        if step > 0 and width < step:
+            return step, f"{source} is finer than the sweep step"
+        return width, source
+
     def detect_map_intervals(self, task, dataset_name: str,
                              params: Optional[dict] = None) -> list:
         """Find the integration intervals for a dataset by peak detection.
@@ -1495,20 +1734,8 @@ class ToolImplementations:
             return []
 
         # -- one interval per occupied bin ---------------------------------
-        #
-        # The bin is the coarser of the two resolutions in play: k_B*T/2 (what
-        # the temperature justifies) and the sweep's own step (what the
-        # measurement actually resolves). Going finer than the step produces
-        # neighbouring bins that integrate the same two samples — duplicate
-        # maps that only look like extra information.
         step = float(np.median(np.abs(np.diff(independent_var)))) if independent_var.size > 1 else 0.0
-        width = detect_params.bin_width
-        if width <= 0:
-            width, why = step, "no temperature set — using the sweep's own step"
-        elif step > 0 and width < step:
-            width, why = step, "k_B*T/2 is finer than the sweep step"
-        else:
-            why = "k_B*T/2"
+        width, why = self._grid_width(detect_params.bin_width, step)
 
         if width <= 0:
             logger.warning("Map Generator: cannot bin %s — no usable bias axis",
@@ -1531,6 +1758,215 @@ class ToolImplementations:
                     sum(len(r.peaks) for r in results), spectra.shape[1],
                     len(spectra_per_bin), width, why, len(intervals), min_spectra)
         return intervals
+
+    def bin_peak_energies(self, task, peaks_dataset_name: str,
+                          params: Optional[dict] = None,
+                          source_dataset_name: Optional[str] = None) -> dict:
+        """Bin peaks that have already been found onto the k_B*T/2 grid.
+
+        This is the second half of :meth:`detect_map_intervals` — the half
+        that turns peaks into intervals — with the search taken off the
+        front, so a chain that has already found its peaks (Peak Finder,
+        Confinement Analysis) does not pay for a second pass over the
+        spectra. Both share :meth:`_grid_width`, so the intervals a workflow
+        builds this way are the ones the Map Generator would have used.
+
+        Deliberately not Peak Finder's ``intervals`` port: those are FWHM
+        bands merged wherever they overlap, which fuses everything into a
+        handful of wide ones (on 4.5 K line-scan data, 206 occupied bins
+        against 3 merged bands, one of them a quarter of the sweep). Occupied
+        bins are also the axis Confinement Analysis reports its binned
+        occupancy table on, so the two tools describe the same states.
+
+        Parameters
+        ----------
+        source_dataset_name : str, optional
+            The spectra the peaks came from. It supplies the sweep step,
+            which floors the bin width, and the span the grid covers. Without
+            it the grid is anchored on the peaks themselves: it reaches no
+            further than the outermost state, and nothing catches a width
+            finer than the measurement can resolve.
+
+        Returns
+        -------
+        dict with the occupied bins, the whole grid, and the bin table.
+        """
+        empty = {'intervals': [], 'all_bins': [], 'bins': None, 'bins_name': '',
+                 'bin_width': 0.0, 'bin_width_reason': '', 'edges': []}
+        try:
+            if peaks_dataset_name not in self._datasets:
+                self.errorOccurred.emit("Error", "Peak table not found")
+                return empty
+
+            source_data = None
+            if source_dataset_name:
+                source_data = self._datasets.get(source_dataset_name)
+                if source_data is None:
+                    self.errorOccurred.emit("Error", "Dataset not found")
+                    return empty
+
+            # Peak Finder and Confinement Analysis both write snake_case, but
+            # a table that has been through a flat-data tool comes back with
+            # Spectrum_Index, so the names are matched case-insensitively.
+            frame = self._datasets[peaks_dataset_name].data
+            by_name = {str(column).lower(): column for column in frame.columns}
+            missing = [name for name in ('spectrum_index', 'position_value')
+                       if name not in by_name]
+            if missing:
+                self.errorOccurred.emit(
+                    "Energy Binning Error",
+                    f"The peak table has no {' and no '.join(missing)} column")
+                return empty
+
+            spectrum_index = pd.to_numeric(frame[by_name['spectrum_index']],
+                                           errors='coerce').to_numpy()
+            position = pd.to_numeric(frame[by_name['position_value']],
+                                     errors='coerce').to_numpy()
+            usable = np.isfinite(spectrum_index) & np.isfinite(position)
+            spectrum_index = spectrum_index[usable].astype(np.int64)
+            position = position[usable].astype(np.float64)
+            if position.size == 0:
+                # A run that found nothing is an answer, not a fault — the
+                # chain downstream gets no intervals and says so.
+                logger.warning("EnergyBinning: %s holds no usable peaks",
+                               peaks_dataset_name)
+                return empty
+
+            params = params or {}
+            # Validated through Params so the unit and the temperature are
+            # rejected here on exactly the terms the engine rejects them on.
+            grid_params = params_from_dict({
+                'temperature_k': params.get('temperature_k', 0.0),
+                'x_energy_unit': params.get('x_energy_unit', 'eV')})
+            grid_params.validate()
+
+            if source_data is not None:
+                x_span = np.asarray(source_data.independent_var, dtype=np.float64)
+                step = (float(np.median(np.abs(np.diff(x_span))))
+                        if x_span.size > 1 else 0.0)
+            else:
+                logger.info("EnergyBinning: no source spectra for %s — the grid "
+                            "is anchored on the peak positions, not the sweep",
+                            peaks_dataset_name)
+                x_span, step = position, 0.0
+
+            requested = float(params.get('bin_width', 0.0) or 0.0)
+            width, why = self._grid_width(
+                requested if requested > 0 else grid_params.bin_width, step,
+                "the requested bin width" if requested > 0 else "k_B*T/2")
+            if width <= 0:
+                logger.warning("EnergyBinning: cannot bin %s — no temperature, "
+                               "no bin width, and no sweep to take a step from",
+                               peaks_dataset_name)
+                return empty
+
+            edges, centers = energy_bins(x_span, width)
+
+            # Several peaks of one spectrum in one bin are one occupancy, the
+            # collapse group_peaks_by_bin performs: peaks closer together than
+            # the bin are not distinguishable, so counting them separately
+            # would let one spectrum outvote its neighbours in the
+            # min_spectra_per_bin filter.
+            occupancy = pd.DataFrame({'spectrum': spectrum_index,
+                                      'bin': assign_bins(position, edges)})
+            peaks_per_bin = occupancy.groupby('bin').size()
+            spectra_per_bin = occupancy.drop_duplicates().groupby('bin').size()
+
+            min_spectra = max(1, int(float(params.get('min_spectra_per_bin', 1) or 1)))
+            populated = [int(b) for b in spectra_per_bin.index]
+            intervals, rows = [], []
+            for done, bin_index in enumerate(populated):
+                if getattr(task, 'cancelled', False):
+                    logger.info("EnergyBinning cancelled after %d/%d bins",
+                                done, len(populated))
+                    return empty
+                n_spectra = int(spectra_per_bin.loc[bin_index])
+                occupied = n_spectra >= min_spectra
+                if occupied:
+                    intervals.append([float(edges[bin_index]),
+                                      float(edges[bin_index + 1])])
+                rows.append({'bin_center': float(centers[bin_index]),
+                             'bin_index': bin_index,
+                             'bin_low': float(edges[bin_index]),
+                             'bin_high': float(edges[bin_index + 1]),
+                             'n_spectra': n_spectra,
+                             'n_peaks': int(peaks_per_bin.loc[bin_index]),
+                             'occupied': int(occupied)})
+                task.progress = int(100 * (done + 1) / max(1, len(populated)))
+
+            all_bins = [[float(edges[b]), float(edges[b + 1])]
+                        for b in range(len(edges) - 1)]
+
+            base_name = self._extract_clean_base_name(
+                source_dataset_name or peaks_dataset_name)
+            bins_name = f"{base_name} - Energy Bins"
+            info = {
+                'created_from': 'energy_binning',
+                'source_dataset': source_dataset_name or peaks_dataset_name,
+                'peaks_dataset': peaks_dataset_name,
+                'bin_width': float(width),
+                'bin_width_reason': why,
+                'temperature_k': float(grid_params.temperature_k),
+                'x_energy_unit': grid_params.x_energy_unit,
+                'min_spectra_per_bin': min_spectra,
+                # Published under integration_intervals so dataset_intervals()
+                # finds them. Never under 'intervals': that key marks a
+                # dataset as integrated VALUES, which the Hyperspectral tab
+                # skips, and this one is a table of bins.
+                'integration_intervals': [list(iv) for iv in intervals],
+                'bin_edges': [float(edge) for edge in edges],
+            }
+            metadata = SpectralMetadata(
+                source_type='energy_bins',
+                dimensions=(len(rows), 1),
+                scan_mode='bins',
+                units=(dict(source_data.metadata.units or {})
+                       if source_data is not None
+                       else {'x': grid_params.x_energy_unit,
+                             'independent': grid_params.x_energy_unit}),
+                # No 'original' key on purpose: a table of bins is not a
+                # spectrum and must not be overlaid on the source's graph.
+                additional_info=info,
+            )
+
+            bins_dataset = None
+            if rows:
+                try:
+                    bins_dataset = SpectralData(
+                        pd.DataFrame(rows, columns=['bin_center', 'bin_index',
+                                                    'bin_low', 'bin_high',
+                                                    'n_spectra', 'n_peaks',
+                                                    'occupied']),
+                        metadata)
+                except (ValueError, TypeError) as exc:
+                    logger.warning("EnergyBinning: '%s' could not be built: %s",
+                                   bins_name, exc)
+            if bins_dataset is not None:
+                self._datasets[bins_name] = bins_dataset
+                if not self._workflow_mode:
+                    self.dataLoaded.emit(bins_name)
+            else:
+                bins_name = ''
+
+            logger.info("EnergyBinning: %d peak(s) over %d spectra -> %d occupied "
+                        "bin(s) of %.4g (%s), %d kept at >=%d spectra",
+                        int(position.size), int(occupancy['spectrum'].nunique()),
+                        len(populated), width, why, len(intervals), min_spectra)
+
+            return {
+                'intervals': intervals,
+                'all_bins': all_bins,
+                'bins': bins_dataset,
+                'bins_name': bins_name,
+                'bin_width': float(width),
+                'bin_width_reason': why,
+                'edges': [float(edge) for edge in edges],
+            }
+
+        except Exception as e:
+            logger.error(f"Energy binning error: {e}", exc_info=True)
+            self.errorOccurred.emit("Energy Binning Error", str(e))
+            return empty
 
     def _resolve_map_intervals(self, task, dataset_name: str,
                                params: dict) -> list:
@@ -1593,6 +2029,228 @@ class ToolImplementations:
             if hi > lo:
                 out.append([lo, hi])
         return out
+
+    def _assemble_value_maps(self, task, *, base_name: str, file_safe_name: str,
+                             value_columns: dict, intervals: Optional[list],
+                             source_data, source_dataset_name: str,
+                             scan_type: str, dims, columns: list,
+                             folders: dict, created_from: str,
+                             extra_info: Optional[dict] = None) -> dict:
+        """Lay one value per spectrum out on the sample, once per column.
+
+        Everything downstream of "one number per spectrum" lives here: the
+        layout, the physical scale, the per-column files and the joined
+        interval map. The Map Generator and the Map Assembly node both go
+        through it, so a chain rebuilt out of nodes cannot drift onto a
+        different orientation, a different file name or a different scale
+        from the composite it replaces.
+
+        ``intervals`` runs parallel to ``value_columns`` and is what makes the
+        joined map possible: without it the columns share no axis to be
+        stacked on, and only the per-column maps are written.
+
+        ``source_data`` is whatever knows where the spectra were taken, which
+        need not be the dataset holding the values — a flat table of integrals
+        usually records only its source's name. May be None, in which case
+        nothing claims a position and the maps go out in point indices.
+        """
+        # Real positions along the line, so a map's x axis is distance
+        # rather than a column index. Left unset for area scans, whose
+        # geometry the metadata already describes.
+        positions = (self._line_positions_m(source_data)
+                     if scan_type == 'line' else None)
+        position_step = (self._line_step_m(source_data)
+                         if scan_type == 'line' else None)
+        units = dict(getattr(getattr(source_data, 'metadata', None),
+                             'units', None) or {})
+        value_unit = units.get('dependent')
+
+        map_scale = None
+        if position_step:
+            map_scale = {'dx': position_step, 'dy': position_step,
+                         'unit': 'm', 'value_unit': value_unit,
+                         'x_offset': float(positions[0]) if positions is not None else 0.0,
+                         'axis_note': 'x=position (m)'}
+        elif scan_type == 'line':
+            # The loader did not record positions (a dataset re-imported
+            # from CSV, say). The column INDEX is still a real axis, so it
+            # is written as one rather than leaving the file dimensionless
+            # — what must never happen is claiming metres we do not have.
+            map_scale = {'dx': 1.0, 'dy': 1.0, 'unit': None,
+                         'value_unit': value_unit, 'mixed_axes': True,
+                         'axis_note': 'x=position (point index)'}
+
+        cancelled = {'map_paths': [], 'interval_map': '', 'interval_map_path': '',
+                     'interval_map_dataset': None, 'empty_bins': 0,
+                     'on_a_grid': False, 'cancelled': True}
+
+        map_paths = []
+        labels = list(value_columns)
+        for i, label in enumerate(labels):
+            if getattr(task, 'cancelled', False):
+                return cancelled
+            task.progress = i / len(labels)
+
+            map_data = self._reshape_map_values(value_columns[label], dims, scan_type)
+            output_base = (folders['root']
+                           / f"{file_safe_name}_Map_{self._sanitize_filename(str(label))}")
+            self._save_map_images(map_data, output_base,
+                                  source_metadata=getattr(source_data, 'metadata', None),
+                                  folders=folders, scale=map_scale)
+            map_paths.append(str(folders['tiff'] / f"{output_base.name}.tiff"))
+
+        # One map joining every interval: x is the position along the
+        # line, y is the interval, indexed by its midpoint. Reading a
+        # column gives that position's spectrum over the states found —
+        # what the per-interval maps cannot show side by side. (A 2-D
+        # grid would need a third axis; not built here.)
+        interval_map_name = ""
+        interval_map_path = ""
+        interval_map_dataset = None
+        empty_rows = 0
+        on_a_grid = False
+        if intervals and len(value_columns) > 1:
+            ordered = sorted(zip(intervals, value_columns.values()),
+                             key=lambda pair: (pair[0][0] + pair[0][1]) / 2.0)
+            n_spectra = int(np.asarray(ordered[0][1]).size)
+
+            # Detected intervals are bins on one uniform grid, and the
+            # occupied ones need not be adjacent. A file's energy axis is
+            # linear, so those rows are laid out on the FULL grid with
+            # ZERO rows where no spectrum had a peak — packing only the
+            # occupied rows together would put every state at the wrong
+            # bias. Hand-entered intervals are usually neither uniform nor
+            # aligned, and then one row per interval is all that can
+            # honestly be claimed.
+            #
+            # Empty bins are written as 0, not NaN: no peak means no
+            # spectral weight at that bias, which is a value. NaN means
+            # "not measured", and viewers render it as a masked or
+            # interpolated region — reading as though something were
+            # there.
+            bounds = [iv for iv, _ in ordered]
+            bin_width, on_a_grid = self._interval_grid(bounds)
+            first_low = float(bounds[0][0])
+
+            if on_a_grid:
+                def _row_of(interval):
+                    return int(round((interval[0] - first_low) / bin_width))
+
+                n_rows = _row_of(bounds[-1]) + 1
+                stack = np.zeros((n_rows, n_spectra), dtype=np.float64)
+                filled = np.zeros(n_rows, dtype=bool)
+                for interval, values_for_bin in ordered:
+                    row = _row_of(interval)
+                    stack[row, :] = np.asarray(values_for_bin, dtype=np.float64)
+                    filled[row] = True
+                empty_rows = int((~filled).sum())
+                midpoints = first_low + (np.arange(n_rows) + 0.5) * bin_width
+            else:
+                stack = np.vstack([np.asarray(v, dtype=np.float64)
+                                   for _, v in ordered])
+                midpoints = np.array([(lo + hi) / 2.0 for lo, hi in bounds])
+                n_rows = stack.shape[0]
+                empty_rows = 0
+
+            if empty_rows:
+                logger.info("Interval map: %d of %d rows are empty bins, "
+                            "written as zero (kept so the energy axis "
+                            "stays linear)", empty_rows, n_rows)
+
+            joined_base = folders['root'] / f"{file_safe_name}_IntervalMap"
+            # x is distance along the line, y is the interval's energy —
+            # two different quantities, so the export records both rather
+            # than labelling them with one unit (see export_field's
+            # ``mixed_axes``).
+            # The energy axis spans the intervals themselves — from the
+            # bottom of the lowest to the top of the highest — so a
+            # reader lands on real bias values, not row numbers. dy is
+            # that span divided by the rows, and the offset is where it
+            # starts; ``np.median`` of the midpoint spacing would be
+            # wrong the moment the occupied bins are not contiguous.
+            energy_low = float(min(lo for lo, _hi in bounds))
+            energy_high = (energy_low + n_rows * bin_width if on_a_grid
+                           else float(max(hi for _lo, hi in bounds)))
+            energy_span = energy_high - energy_low
+            x_unit = units.get('independent', 'V')
+
+            joined_scale = {
+                'dx': position_step if position_step else 1.0,
+                'dy': (energy_span / stack.shape[0]) if energy_span > 0 else 1.0,
+                'unit': None,          # the two axes do not share one
+                'value_unit': value_unit,
+                'mixed_axes': True,
+                'x_offset': float(positions[0]) if positions is not None else 0.0,
+                'y_offset': energy_low,
+                'axis_note': (
+                    f"x=position ({'m' if position_step else 'point index'}) "
+                    f"{'%.4g..%.4g' % (positions[0], positions[-1]) if positions is not None else '0..%d' % (stack.shape[1] - 1)}, "
+                    f"y=energy ({x_unit}) {energy_low:.4g}..{energy_high:.4g}"),
+            }
+            # Low bias at the bottom, matching the per-interval maps.
+            self._save_map_images(np.flipud(stack), joined_base,
+                                  source_metadata=None, folders=folders,
+                                  scale=joined_scale)
+            interval_map_path = str(folders['tiff'] / f"{joined_base.name}.tiff")
+
+            # Registered as a spectral dataset — bias on the independent
+            # axis, one column per position — so it opens in the
+            # Hyperspectral tab as a kymograph like any line scan.
+            joined = pd.DataFrame(stack, columns=columns)
+            # The row axis is energy. Naming it after the source works while
+            # the source is the spectra; a flat table's first column is the
+            # spectrum number, which would label the energy axis with the
+            # wrong quantity, so that case falls back to the recorded unit.
+            axis_name = getattr(source_data, 'independent_var_name', None)
+            if getattr(getattr(source_data, 'metadata', None),
+                       'data_type', 'flat') == 'flat':
+                axis_name = units.get('independent') or 'Energy'
+            joined.insert(0, axis_name, midpoints)
+            interval_map_name = f"{base_name} - Interval Map"
+            interval_map_dataset = SpectralData(
+                joined,
+                SpectralMetadata(
+                    source_type=getattr(getattr(source_data, 'metadata', None),
+                                        'source_type', 'map_values'),
+                    # (positions, 1): the Hyperspectral tab reads that as
+                    # a line scan and draws the kymograph.
+                    dimensions=(len(columns), 1),
+                    scan_mode='line',
+                    units=dict(units),
+                    additional_info={
+                        'created_from': created_from,
+                        'source_dataset': source_dataset_name,
+                        # NOT 'intervals': that key marks a dataset as
+                        # integrated values, which the Hyperspectral tab
+                        # skips. These bounds are documentation only.
+                        'interval_bounds': [list(iv) for iv, _ in ordered],
+                        'interval_midpoints': midpoints.tolist(),
+                        'bin_width': bin_width,
+                        'empty_bins': empty_rows,
+                        # Column positions in metres, so the kymograph's
+                        # x axis is distance and not a column number.
+                        'position_m': (self._line_positions_m(source_data).tolist()
+                                       if self._line_positions_m(source_data) is not None
+                                       else None),
+                        'position_step_m': position_step,
+                        'scan_type': scan_type,
+                        'spatial_layout': 'line',
+                        **(extra_info or {}),
+                    },
+                ))
+            self._datasets[interval_map_name] = interval_map_dataset
+            if not self._workflow_mode:
+                self.dataLoaded.emit(interval_map_name)
+            logger.info("Interval map: %d intervals x %d positions -> %s",
+                        stack.shape[0], stack.shape[1], interval_map_name)
+
+        return {'map_paths': map_paths,
+                'interval_map': interval_map_name,
+                'interval_map_path': interval_map_path,
+                'interval_map_dataset': interval_map_dataset,
+                'empty_bins': empty_rows,
+                'on_a_grid': on_a_grid,
+                'cancelled': False}
 
     def generate_maps_from_spectra(self, task, dataset_name: str,
                                    params: Optional[dict] = None) -> dict:
@@ -1700,31 +2358,7 @@ class ToolImplementations:
             # the noise floor. 0 restores the raw signed integral.
             noise_floor = max(0.0, float(params.get('noise_floor', 1.0) or 0.0))
 
-            # Real positions along the line, so a map's x axis is distance
-            # rather than a column index. Left unset for area scans, whose
-            # geometry the metadata already describes.
-            positions = (self._line_positions_m(spectral_data)
-                         if scan_type == 'line' else None)
-            position_step = (self._line_step_m(spectral_data)
-                             if scan_type == 'line' else None)
-            value_unit = (spectral_data.metadata.units or {}).get('dependent')
-
-            map_scale = None
-            if position_step:
-                map_scale = {'dx': position_step, 'dy': position_step,
-                             'unit': 'm', 'value_unit': value_unit,
-                             'x_offset': float(positions[0]) if positions is not None else 0.0,
-                             'axis_note': 'x=position (m)'}
-            elif scan_type == 'line':
-                # The loader did not record positions (a dataset re-imported
-                # from CSV, say). The column INDEX is still a real axis, so it
-                # is written as one rather than leaving the file dimensionless
-                # — what must never happen is claiming metres we do not have.
-                map_scale = {'dx': 1.0, 'dy': 1.0, 'unit': None,
-                             'value_unit': value_unit, 'mixed_axes': True,
-                             'axis_note': 'x=position (point index)'}
-
-            map_paths, value_columns = [], {}
+            value_columns = {}
             for i, (lo, hi) in enumerate(intervals):
                 if task.cancelled:
                     return empty
@@ -1764,142 +2398,17 @@ class ToolImplementations:
                 label = f"{lo:.3f}_{hi:.3f}"
                 value_columns[label] = values
 
-                map_data = self._reshape_map_values(values, dims, scan_type)
-                output_base = folders['root'] / f"{file_safe_name}_Map_{label}"
-                self._save_map_images(map_data, output_base,
-                                      source_metadata=spectral_data.metadata,
-                                      folders=folders, scale=map_scale)
-                map_paths.append(str(folders['tiff'] / f"{output_base.name}.tiff"))
-
-            # One map joining every interval: x is the position along the
-            # line, y is the interval, indexed by its midpoint. Reading a
-            # column gives that position's spectrum over the states found —
-            # what the per-interval maps cannot show side by side. (A 2-D
-            # grid would need a third axis; not built here.)
-            interval_map_name = ""
-            interval_map_path = ""
-            if len(value_columns) > 1:
-                ordered = sorted(zip(intervals, value_columns.values()),
-                                 key=lambda pair: (pair[0][0] + pair[0][1]) / 2.0)
-
-                # Detected intervals are bins on one uniform grid, and the
-                # occupied ones need not be adjacent. A file's energy axis is
-                # linear, so those rows are laid out on the FULL grid with
-                # ZERO rows where no spectrum had a peak — packing only the
-                # occupied rows together would put every state at the wrong
-                # bias. Hand-entered intervals are usually neither uniform nor
-                # aligned, and then one row per interval is all that can
-                # honestly be claimed.
-                #
-                # Empty bins are written as 0, not NaN: no peak means no
-                # spectral weight at that bias, which is a value. NaN means
-                # "not measured", and viewers render it as a masked or
-                # interpolated region — reading as though something were
-                # there.
-                bounds = [iv for iv, _ in ordered]
-                bin_width, on_a_grid = self._interval_grid(bounds)
-                first_low = float(bounds[0][0])
-
-                if on_a_grid:
-                    def _row_of(interval):
-                        return int(round((interval[0] - first_low) / bin_width))
-
-                    n_rows = _row_of(bounds[-1]) + 1
-                    stack = np.zeros((n_rows, n_spectra), dtype=np.float64)
-                    filled = np.zeros(n_rows, dtype=bool)
-                    for interval, values_for_bin in ordered:
-                        row = _row_of(interval)
-                        stack[row, :] = np.asarray(values_for_bin, dtype=np.float64)
-                        filled[row] = True
-                    empty_rows = int((~filled).sum())
-                    midpoints = first_low + (np.arange(n_rows) + 0.5) * bin_width
-                else:
-                    stack = np.vstack([np.asarray(v, dtype=np.float64)
-                                       for _, v in ordered])
-                    midpoints = np.array([(lo + hi) / 2.0 for lo, hi in bounds])
-                    n_rows = stack.shape[0]
-                    empty_rows = 0
-
-                if empty_rows:
-                    logger.info("Interval map: %d of %d rows are empty bins, "
-                                "written as zero (kept so the energy axis "
-                                "stays linear)", empty_rows, n_rows)
-
-                joined_base = folders['root'] / f"{file_safe_name}_IntervalMap"
-                # x is distance along the line, y is the interval's energy —
-                # two different quantities, so the export records both rather
-                # than labelling them with one unit (see export_field's
-                # ``mixed_axes``).
-                # The energy axis spans the intervals themselves — from the
-                # bottom of the lowest to the top of the highest — so a
-                # reader lands on real bias values, not row numbers. dy is
-                # that span divided by the rows, and the offset is where it
-                # starts; ``np.median`` of the midpoint spacing would be
-                # wrong the moment the occupied bins are not contiguous.
-                energy_low = float(min(lo for lo, _hi in bounds))
-                energy_high = (energy_low + n_rows * bin_width if on_a_grid
-                               else float(max(hi for _lo, hi in bounds)))
-                energy_span = energy_high - energy_low
-                x_unit = (spectral_data.metadata.units or {}).get('independent', 'V')
-
-                joined_scale = {
-                    'dx': position_step if position_step else 1.0,
-                    'dy': (energy_span / stack.shape[0]) if energy_span > 0 else 1.0,
-                    'unit': None,          # the two axes do not share one
-                    'value_unit': value_unit,
-                    'mixed_axes': True,
-                    'x_offset': float(positions[0]) if positions is not None else 0.0,
-                    'y_offset': energy_low,
-                    'axis_note': (
-                        f"x=position ({'m' if position_step else 'point index'}) "
-                        f"{'%.4g..%.4g' % (positions[0], positions[-1]) if positions is not None else '0..%d' % (stack.shape[1] - 1)}, "
-                        f"y=energy ({x_unit}) {energy_low:.4g}..{energy_high:.4g}"),
-                }
-                # Low bias at the bottom, matching the per-interval maps.
-                self._save_map_images(np.flipud(stack), joined_base,
-                                      source_metadata=None, folders=folders,
-                                      scale=joined_scale)
-                interval_map_path = str(folders['tiff'] / f"{joined_base.name}.tiff")
-
-                # Registered as a spectral dataset — bias on the independent
-                # axis, one column per position — so it opens in the
-                # Hyperspectral tab as a kymograph like any line scan.
-                joined = pd.DataFrame(stack, columns=columns)
-                joined.insert(0, spectral_data.independent_var_name, midpoints)
-                interval_map_name = f"{base_name} - Interval Map"
-                self._datasets[interval_map_name] = SpectralData(
-                    joined,
-                    SpectralMetadata(
-                        source_type=spectral_data.metadata.source_type,
-                        # (positions, 1): the Hyperspectral tab reads that as
-                        # a line scan and draws the kymograph.
-                        dimensions=(len(columns), 1),
-                        scan_mode='line',
-                        units=dict(spectral_data.metadata.units or {}),
-                        additional_info={
-                            'created_from': 'map_generator',
-                            'source_dataset': dataset_name,
-                            # NOT 'intervals': that key marks a dataset as
-                            # integrated values, which the Hyperspectral tab
-                            # skips. These bounds are documentation only.
-                            'interval_bounds': [list(iv) for iv, _ in ordered],
-                            'interval_midpoints': midpoints.tolist(),
-                            'bin_width': bin_width,
-                            'empty_bins': empty_rows,
-                            # Column positions in metres, so the kymograph's
-                            # x axis is distance and not a column number.
-                            'position_m': (self._line_positions_m(spectral_data).tolist()
-                                           if self._line_positions_m(spectral_data) is not None
-                                           else None),
-                            'position_step_m': position_step,
-                            'scan_type': scan_type,
-                            'spatial_layout': 'line',
-                        },
-                    ))
-                if not self._workflow_mode:
-                    self.dataLoaded.emit(interval_map_name)
-                logger.info("Interval map: %d intervals x %d positions -> %s",
-                            stack.shape[0], stack.shape[1], interval_map_name)
+            assembled = self._assemble_value_maps(
+                task, base_name=base_name, file_safe_name=file_safe_name,
+                value_columns=value_columns, intervals=intervals,
+                source_data=spectral_data, source_dataset_name=dataset_name,
+                scan_type=scan_type, dims=dims, columns=columns,
+                folders=folders, created_from='map_generator')
+            if assembled['cancelled']:
+                return empty
+            map_paths = assembled['map_paths']
+            interval_map_name = assembled['interval_map']
+            interval_map_path = assembled['interval_map_path']
 
             # The per-interval integrals as a flat dataset, so the numbers
             # behind the maps stay inspectable (and re-mappable) instead of
@@ -1958,6 +2467,193 @@ class ToolImplementations:
         except Exception as e:
             logger.error(f"Map generation error: {e}", exc_info=True)
             self.errorOccurred.emit("Map Generator Error", str(e))
+            return empty
+
+    @staticmethod
+    def _intervals_from_columns(names) -> Optional[list]:
+        """``[[lo, hi], …]`` read back out of value-column names, or None.
+
+        Integration writes ``Interval_0.150_0.250`` and the Map Generator
+        ``0.150_0.250``; both name the interval the column was integrated
+        over, so a table that has lost its metadata — round-tripped through
+        CSV, say — can still be stacked into a joined map. All or nothing: a
+        partial parse would pair the wrong energies with the wrong columns,
+        which is worse than having no energy axis at all.
+        """
+        import re
+
+        bounds = []
+        for name in names:
+            text = str(name)
+            if text.lower().startswith('interval_'):
+                text = text[len('interval_'):]
+            match = re.fullmatch(r'(-?\d+(?:\.\d+)?)_(-?\d+(?:\.\d+)?)', text)
+            if not match:
+                return None
+            lo, hi = float(match.group(1)), float(match.group(2))
+            bounds.append([min(lo, hi), max(lo, hi)])
+        return bounds or None
+
+    def assemble_maps(self, task, flat_dataset_name: str,
+                      params: Optional[dict] = None,
+                      source_dataset_name: Optional[str] = None,
+                      intervals: Optional[list] = None) -> dict:
+        """Lay one value per spectrum out on the sample, with its real scale.
+
+        The generic half of the Map Generator: numbers that already exist —
+        integrals, peak counts, background coefficients, confinement sizes —
+        turned into "show me where". Nothing here searches, corrects or
+        integrates; whatever produced the column decides what the map means.
+
+        The scale is the reason this exists next to ``generate_all_maps``,
+        which lays the same values out but writes a line scan with no
+        physical axis at all, so the file opens in Gwyddion as bare pixels.
+        Here the positions come from the spectra the values were measured on
+        and every field goes out in metres — the project's export rule, not a
+        nicety.
+
+        Parameters
+        ----------
+        source_dataset_name : str, optional
+            The spectra the values came from. A flat table rarely carries its
+            own positions, and this is where they come from when it does not;
+            failing both, the table's recorded origin is followed.
+        intervals : list, optional
+            The energy interval each value column covers, in the order the
+            columns appear. They are what the joined map's energy axis is
+            built on; without them each column is only a name, and the joined
+            map is not written.
+        """
+        params = params or {}
+        empty = {'map_paths': [], 'n_maps': 0, 'interval_map': '',
+                 'interval_map_path': '', 'interval_map_dataset': None,
+                 'scan_type': '', 'columns': []}
+        try:
+            if flat_dataset_name not in self._datasets:
+                self.errorOccurred.emit("Error", "Dataset not found")
+                return empty
+
+            flat_data = self._datasets[flat_dataset_name]
+            frame = flat_data.data
+            all_columns = [c for c in frame.columns if str(c) != 'Spectrum_Index']
+            if not all_columns:
+                self.errorOccurred.emit(
+                    "Map Assembly",
+                    "That dataset has no value columns — it holds only the "
+                    "spectrum index.")
+                return empty
+
+            # Where the positions come from. The values may live in a table
+            # that knows nothing about the sample, so the spectra are the
+            # better authority whenever the caller can name them.
+            source_data = flat_data
+            spatial_name = flat_dataset_name
+            if source_dataset_name:
+                if source_dataset_name not in self._datasets:
+                    self.errorOccurred.emit("Error", "Source dataset not found")
+                    return empty
+                source_data = self._datasets[source_dataset_name]
+                spatial_name = source_dataset_name
+
+            # Intervals pair with the columns by position, so a count that
+            # does not match cannot be trusted: the names are tried instead,
+            # and failing those the run simply has no energy axis.
+            #
+            # Cleaned rather than taken as they come: a wire carries whatever
+            # the node upstream had, and Integration passes hand-typed
+            # intervals through as ``{'lower': …, 'upper': …}`` dicts.
+            resolved = (self._clean_intervals(intervals) if intervals
+                        else self.dataset_intervals(flat_dataset_name))
+            if resolved and len(resolved) != len(all_columns):
+                logger.info("Map Assembly: %d interval(s) against %d value "
+                            "column(s) — reading the intervals off the column "
+                            "names instead", len(resolved), len(all_columns))
+                resolved = None
+            if not resolved:
+                resolved = self._intervals_from_columns(all_columns)
+
+            requested = [name.strip() for name
+                         in str(params.get('columns', '') or '').split(',')
+                         if name.strip()]
+            if requested:
+                wanted = {name.lower() for name in requested}
+                keep = [i for i, column in enumerate(all_columns)
+                        if str(column).lower() in wanted]
+                if not keep:
+                    self.errorOccurred.emit(
+                        "Map Assembly",
+                        f"None of {', '.join(requested)} is a value column of "
+                        f"{flat_dataset_name}")
+                    return empty
+            else:
+                keep = list(range(len(all_columns)))
+
+            # An interval names the state a map belongs to, which is what the
+            # Map Generator's file names say; a column with no interval can
+            # only be named after itself.
+            value_columns = {}
+            for i in keep:
+                column = all_columns[i]
+                label = (f"{resolved[i][0]:.3f}_{resolved[i][1]:.3f}"
+                         if resolved else str(column))
+                value_columns[label] = pd.to_numeric(
+                    frame[column], errors='coerce').to_numpy(dtype=np.float64)
+            paired = [resolved[i] for i in keep] if resolved else None
+            if not bool(params.get('joined_map', True)):
+                # The per-column maps still carry their interval names; only
+                # the stack across them is dropped.
+                paired = None
+
+            n_values = int(len(frame))
+            metadata = source_data.metadata
+            scan_type = self._resolve_scan_type(params.get('scan_type', 'auto'),
+                                                metadata)
+            dims = getattr(metadata, 'dimensions', None) or ()
+            dims = (int(dims[0]), int(dims[1])) if len(dims) >= 2 else (n_values, 1)
+
+            # One column name per spectrum, for the joined map's positions.
+            # The spectra name them when they are to hand; a flat table that
+            # came from the Map Generator recorded them; otherwise there is
+            # nothing to call them but their number.
+            columns = None
+            if getattr(metadata, 'data_type', '') != 'flat':
+                columns = list(source_data.spectra.columns)
+            if columns is None or len(columns) != n_values:
+                recorded = (getattr(flat_data.metadata, 'additional_info', None)
+                            or {}).get('spectrum_columns')
+                columns = (list(recorded) if recorded and len(recorded) == n_values
+                           else [f"col{i}" for i in range(n_values)])
+
+            logger.info("Map Assembly: %s — %d value(s) over %d spectra, %s "
+                        "layout %s, %s", flat_dataset_name, len(value_columns),
+                        n_values, scan_type, dims,
+                        f"{len(paired)} interval(s)" if paired else "no intervals")
+
+            assembled = self._assemble_value_maps(
+                task, base_name=self._extract_clean_base_name(flat_dataset_name),
+                file_safe_name=self._sanitize_filename(
+                    self._extract_clean_base_name(flat_dataset_name)),
+                value_columns=value_columns, intervals=paired,
+                source_data=source_data, source_dataset_name=spatial_name,
+                scan_type=scan_type, dims=dims, columns=columns,
+                folders=self._map_output_folders(flat_dataset_name),
+                created_from='map_assembly',
+                extra_info={'flat_dataset': flat_dataset_name})
+            if assembled['cancelled']:
+                return empty
+
+            task.progress = 1.0
+            return {'map_paths': assembled['map_paths'],
+                    'n_maps': len(assembled['map_paths']),
+                    'interval_map': assembled['interval_map'],
+                    'interval_map_path': assembled['interval_map_path'],
+                    'interval_map_dataset': assembled['interval_map_dataset'],
+                    'scan_type': scan_type,
+                    'columns': list(value_columns)}
+
+        except Exception as e:
+            logger.error(f"Map assembly error: {e}", exc_info=True)
+            self.errorOccurred.emit("Map Assembly Error", str(e))
             return empty
 
     #: Metadata that describes WHERE each spectrum was taken. A tool that
@@ -2028,8 +2724,31 @@ class ToolImplementations:
         steps = np.hypot(np.diff(arr[:, 0]), np.diff(arr[:, 1]))
         return np.concatenate([[0.0], np.cumsum(steps)])
 
+    @staticmethod
+    def _spectrum_count(spectral_data) -> Optional[int]:
+        """How many spectra a dataset describes, spectral or flat.
+
+        A flat table has one ROW per spectrum and one column per value, so
+        reading ``num_spectra`` off it counts the values instead: an
+        integration of eight positions over two intervals looks like two
+        spectra, and the guard below then refuses the very positions it came
+        from.
+        """
+        if getattr(getattr(spectral_data, 'metadata', None),
+                   'data_type', '') == 'flat':
+            return getattr(spectral_data, 'num_points', None)
+        return getattr(spectral_data, 'num_spectra', None)
+
     def _positions_from_source(self, spectral_data, depth: int = 0):
         """Follow a derived dataset back to whatever recorded the positions.
+
+        Three keys are tried because three generations of tools recorded the
+        provenance under three names: ``original`` (the overlay key), the
+        newer ``source_dataset``, and ``original_dataset``, which is what the
+        Integration tool writes. Missing the last one is not cosmetic — an
+        Integration -> Map Assembly chain then maps a line scan in point
+        indices instead of metres, and the export rule says a file must carry
+        the real dimensions whenever they are available.
 
         Bounded so a metadata loop cannot hang the run.
         """
@@ -2037,13 +2756,12 @@ class ToolImplementations:
             return None
         info = getattr(getattr(spectral_data, 'metadata', None),
                        'additional_info', None) or {}
-        for key in ('original', 'source_dataset'):
+        for key in ('original', 'source_dataset', 'original_dataset'):
             parent_name = info.get(key)
             parent = self._datasets.get(parent_name) if parent_name else None
             if parent is None or parent is spectral_data:
                 continue
-            if getattr(parent, 'num_spectra', None) != getattr(spectral_data,
-                                                               'num_spectra', None):
+            if self._spectrum_count(parent) != self._spectrum_count(spectral_data):
                 continue     # a different set of spectra: its positions are not ours
             found = self._line_positions_m(parent, depth + 1)
             if found is not None:
@@ -2623,16 +3341,7 @@ class ToolImplementations:
                 frame = pd.DataFrame(matrix, columns=columns)
                 frame.insert(0, spectral_data.independent_var_name, axis_values)
                 path = peaks_dir / filename
-                # Write bare integers and empty cells. A float column would
-                # render as "1.0", and a global float_format would round the
-                # energy axis, so only the mark columns are stringified -- the
-                # in-memory dataset stays numeric (value / NaN).
-                export_df = frame.copy()
-                for column in columns:
-                    values = frame[column].to_numpy()
-                    as_int = np.nan_to_num(values, nan=0.0).astype(np.int64).astype(str)
-                    export_df[column] = np.where(np.isfinite(values), as_int, '')
-                export_df.to_csv(path, index=False)
+                _write_occupancy_csv(frame, columns, path)
                 marked = int(np.isfinite(matrix).sum())
                 _register(suffix, frame,
                           _meta('peak_matrix',
@@ -2744,6 +3453,282 @@ class ToolImplementations:
             logger.error(f"Confinement analysis error: {e}", exc_info=True)
             self.errorOccurred.emit("Confinement Analysis Error", str(e))
             return empty
+
+    # ========================================================================
+    # Occupancy Matrix
+    # ========================================================================
+
+    def build_occupancy_matrix(self, task, peaks_dataset_name: str,
+                               params: Optional[dict] = None,
+                               source_dataset_name: Optional[str] = None,
+                               intervals=None) -> dict:
+        """Build the occupancy table from a peak list and an axis.
+
+        The engine already assembles these tables, but through
+        :func:`peak_matrix` / :func:`binned_peak_matrix`, which take
+        :class:`Analysis` objects -- the search's own output, which only the
+        tool that ran the search holds. A workflow carries a peak *table*
+        instead, because that is what travels down a wire. This builds the
+        same tables from that table plus an axis, reusing
+        :func:`occupancy_matrix` itself so a hand-wired chain lands on
+        Confinement Analysis's matrix rather than on something that resembles
+        it.
+
+        Marks are 1 and blanks are NaN, never 0: zero is a measured value, and
+        a table full of them cannot say whether a spectrum was searched and
+        found nothing or was never searched at all.
+
+        Parameters
+        ----------
+        source_dataset_name : str, optional
+            The spectra the peaks came from. It supplies the measured energy
+            axis and, more importantly, the full column list -- a spectrum
+            with no peak has no row in the peak table, so without the source
+            it would vanish from the table instead of standing there as a
+            blank column, which is the difference between "no state" and "not
+            measured".
+        intervals : list, optional
+            ``[[lo, hi], …]`` to put the rows on instead of the measured
+            samples. Feed Energy Binning's ``all_bins``: the occupied bins
+            alone would drop the empty rows and with them the regular energy
+            spacing that makes the table readable as a map.
+
+        Returns
+        -------
+        dict with the created SpectralData objects (for workflow capture),
+        their names and the CSV paths.
+        """
+        empty = {'matrix': None, 'matrix_offset': None, 'peak_count': None,
+                 'matrix_path': '', 'offset_matrix_path': '', 'dataset_names': {}}
+        try:
+            if peaks_dataset_name not in self._datasets:
+                self.errorOccurred.emit("Error", "Peak table not found")
+                return empty
+
+            source_data = None
+            if source_dataset_name:
+                source_data = self._datasets.get(source_dataset_name)
+                if source_data is None:
+                    self.errorOccurred.emit("Error", "Dataset not found")
+                    return empty
+
+            bins = sorted(self._clean_intervals(intervals), key=lambda iv: iv[0])
+            if not bins and source_data is None:
+                self.errorOccurred.emit(
+                    "Occupancy Matrix Error",
+                    "Building the table needs either the source spectra or a "
+                    "set of bins, to know what the rows are")
+                return empty
+
+            # Peak Finder and Confinement Analysis both write snake_case, but
+            # a table that has been through a flat-data tool comes back with
+            # Spectrum_Index, so the names are matched case-insensitively.
+            frame = self._datasets[peaks_dataset_name].data
+            by_name = {str(column).lower(): column for column in frame.columns}
+            missing = [name for name in ('spectrum_index', 'position_value')
+                       if name not in by_name]
+            if missing:
+                self.errorOccurred.emit(
+                    "Occupancy Matrix Error",
+                    f"The peak table has no {' and no '.join(missing)} column")
+                return empty
+
+            def _column(key):
+                return pd.to_numeric(frame[by_name[key]], errors='coerce').to_numpy()
+
+            spectrum_index = _column('spectrum_index')
+            position = _column('position_value')
+            usable = np.isfinite(spectrum_index) & np.isfinite(position)
+            spectrum_index = spectrum_index[usable].astype(np.int64)
+            position = position[usable].astype(np.float64)
+
+            if source_data is not None:
+                columns = [str(name) for name in source_data.spectra.columns]
+            else:
+                # Without the source the table is only as wide as the peaks
+                # reach, so the highest index that carries a peak is the last
+                # column there can be.
+                highest = int(spectrum_index.max()) if spectrum_index.size else -1
+                columns = [f"col{i}" for i in range(highest + 1)]
+            if not columns:
+                logger.warning("OccupancyMatrix: %s holds no usable peaks and no "
+                               "source spectra name the columns",
+                               peaks_dataset_name)
+                return empty
+
+            if bins:
+                lows = np.asarray([iv[0] for iv in bins], dtype=np.float64)
+                highs = np.asarray([iv[1] for iv in bins], dtype=np.float64)
+                axis_values = (lows + highs) / 2.0
+                # searchsorted picks the last bin that starts at or below the
+                # peak, so the containment test is the only thing left to do —
+                # and it has to be a real test, because a set of bins may have
+                # gaps in it (occupied bins, hand-typed intervals) and a peak
+                # in a gap belongs to no row at all.
+                slot = np.searchsorted(lows, position, side='right') - 1
+                placed = slot >= 0
+                rows = np.where(placed, slot, 0)
+                upper = highs[rows]
+                # The top edge belongs to the last row rather than to nothing:
+                # a state sitting exactly at the end of the sweep is where a
+                # band edge usually is, and dropping it would be a silent loss.
+                on_a_row = placed & np.where(rows == len(bins) - 1,
+                                             position <= upper, position < upper)
+            else:
+                axis_values = np.asarray(source_data.independent_var, dtype=np.float64)
+                if 'position_index' in by_name:
+                    sample = _column('position_index')[usable]
+                    on_a_row = np.isfinite(sample)
+                    rows = np.where(on_a_row, sample, 0).astype(np.int64)
+                else:
+                    # A table that lost its sample index — hand-edited, or from
+                    # a tool that kept only the physical columns — is still
+                    # placeable: the peak was found on the sweep, so the nearest
+                    # sample is its row to within half a step.
+                    rows = self._nearest_sample(axis_values, position)
+                    on_a_row = np.ones(position.size, dtype=bool)
+                    logger.info("OccupancyMatrix: %s carries no position_index; "
+                                "rows come from the nearest sample of %s",
+                                peaks_dataset_name, source_dataset_name)
+
+            n_columns = len(columns)
+            n_rows = int(len(axis_values))
+            in_range = (spectrum_index >= 0) & (spectrum_index < n_columns)
+            # Counted before the row test on purpose: a peak that falls outside
+            # the bins is still a peak that spectrum has, and a peak count that
+            # disagreed with the peak table would look like a bug in the search.
+            counts = np.bincount(spectrum_index[in_range], minlength=n_columns)
+
+            marked = in_range & on_a_row
+            by_column = {int(column): group.to_numpy() for column, group
+                         in pd.DataFrame({'column': spectrum_index[marked],
+                                          'row': rows[marked]}
+                                         ).groupby('column')['row']}
+            per_spectrum_rows = []
+            for done in range(n_columns):
+                if getattr(task, 'cancelled', False):
+                    logger.info("OccupancyMatrix cancelled after %d/%d spectra",
+                                done, n_columns)
+                    return empty
+                per_spectrum_rows.append(by_column.get(done, ()))
+                task.progress = int(100 * (done + 1) / max(1, n_columns))
+
+            base_name = self._extract_clean_base_name(
+                source_dataset_name or peaks_dataset_name)
+            file_safe_name = self._sanitize_filename(base_name)
+            peaks_dir = self._ensure_output_dir('peaks')
+            # The source's own label when there is a source; otherwise the peak
+            # table's name for the quantity, rather than inventing a unit that
+            # nothing in the chain actually told us.
+            axis_name = (source_data.independent_var_name if source_data is not None
+                         else str(by_name['position_value']))
+            settings = {'created_from': 'occupancy_matrix',
+                        'source_dataset': source_dataset_name or peaks_dataset_name,
+                        'peaks_dataset': peaks_dataset_name,
+                        'binned': bool(bins),
+                        'n_rows': n_rows}
+            created: dict = {}
+
+            def _register(suffix: str, frame_out: pd.DataFrame,
+                          source_type: str, extra: dict, *, flat=False):
+                info = {**settings, **extra}
+                if not flat and source_data is not None:
+                    # One column per spectrum, so this is a per-spectrum output:
+                    # it keeps the source's positions and a line scan's table
+                    # can still be mapped onto the sample.
+                    info = {**self._carry_spatial_info(source_data.metadata), **info}
+                metadata = SpectralMetadata(
+                    source_type=source_type,
+                    dimensions=(tuple(source_data.metadata.dimensions)
+                                if source_data is not None else (n_columns, 1)),
+                    scan_mode=(source_data.metadata.scan_mode
+                               if source_data is not None else 'peaks'),
+                    units=(dict(source_data.metadata.units or {})
+                           if source_data is not None else {}),
+                    # No 'original' key on purpose: a table of marks is not a
+                    # spectrum and must not be overlaid on the source's graph.
+                    additional_info=info,
+                    data_type='flat' if flat else (
+                        source_data.metadata.data_type
+                        if source_data is not None else 'spectral'),
+                )
+                name = f"{base_name} - {suffix}"
+                try:
+                    dataset = SpectralData(frame_out, metadata)
+                except (ValueError, TypeError) as exc:
+                    logger.warning("OccupancyMatrix: '%s' could not be built: %s",
+                                   name, exc)
+                    return
+                self._datasets[name] = dataset
+                if not self._workflow_mode:
+                    self.dataLoaded.emit(name)
+                created[suffix] = name
+
+            def _emit(suffix: str, matrix: np.ndarray, filename: str, extra: dict):
+                frame_out = pd.DataFrame(matrix, columns=columns)
+                frame_out.insert(0, axis_name, axis_values)
+                path = peaks_dir / filename
+                _write_occupancy_csv(frame_out, columns, path)
+                _register(suffix, frame_out, 'peak_matrix',
+                          {'total_peaks': int(np.isfinite(matrix).sum()), **extra})
+                return str(path)
+
+            matrix_path = _emit('Occupancy Matrix',
+                                occupancy_matrix(n_rows, per_spectrum_rows),
+                                f"{file_safe_name}_OccupancyMatrix.csv", {})
+
+            # Same marks, but each column carries its own 1-based number
+            # instead of a flat 1. Plotting the 1/blank table stacks every
+            # spectrum on one line; numbering offsets them onto separate rows
+            # so the columns can be told apart.
+            offset_matrix_path = _emit(
+                'Occupancy Matrix (offset)',
+                occupancy_matrix(n_rows, per_spectrum_rows, mark_by_column=True),
+                f"{file_safe_name}_OccupancyMatrix_offset.csv", {'offset': True})
+
+            _register('Peak Count',
+                      pd.DataFrame({'Spectrum_Index': np.arange(n_columns),
+                                    'Peak_Count': counts.astype(np.int64)}),
+                      'peak_count', {}, flat=True)
+
+            logger.info("OccupancyMatrix: %d peak(s) over %d spectra -> %d rows "
+                        "(%s), %d marked; created %s",
+                        int(position.size), n_columns, n_rows,
+                        "bins" if bins else "measured axis",
+                        int(marked.sum()), ", ".join(created.values()) or "nothing")
+
+            return {
+                'matrix': self._datasets.get(created.get('Occupancy Matrix', '')),
+                'matrix_offset': self._datasets.get(
+                    created.get('Occupancy Matrix (offset)', '')),
+                'peak_count': self._datasets.get(created.get('Peak Count', '')),
+                'matrix_path': matrix_path,
+                'offset_matrix_path': offset_matrix_path,
+                'dataset_names': created,
+            }
+
+        except Exception as e:
+            logger.error(f"Occupancy matrix error: {e}", exc_info=True)
+            self.errorOccurred.emit("Occupancy Matrix Error", str(e))
+            return empty
+
+    @staticmethod
+    def _nearest_sample(axis: np.ndarray, values: np.ndarray) -> np.ndarray:
+        """Index of the axis sample closest to each value.
+
+        The axis is not assumed to ascend: a retrace sweep runs the other way,
+        and searchsorted on it would return nonsense.
+        """
+        axis = np.asarray(axis, dtype=np.float64)
+        values = np.asarray(values, dtype=np.float64)
+        if axis.size < 2 or values.size == 0:
+            return np.zeros(values.size, dtype=np.int64)
+        order = np.argsort(axis)
+        ascending = axis[order]
+        slot = np.clip(np.searchsorted(ascending, values), 1, ascending.size - 1)
+        below, above = ascending[slot - 1], ascending[slot]
+        pick = np.where(values - below <= above - values, slot - 1, slot)
+        return order[pick].astype(np.int64)
 
     # ========================================================================
     # Spectral Features

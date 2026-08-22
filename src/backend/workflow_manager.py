@@ -492,6 +492,25 @@ class WorkflowExecutor:
                 if result_name in self.app_backend._datasets:
                     outputs['corrected'] = self.app_backend._datasets[result_name]
 
+        elif tool_name == "BaselineEstimate":
+            dataset = inputs.get('dataset')
+            if dataset:
+                if isinstance(dataset, str):
+                    logger.error(f"BaselineEstimate received string instead of dataset: {dataset}")
+                    return outputs
+
+                dataset_name = self._get_temp_dataset_name(dataset, "baseline")
+                self.app_backend._datasets[dataset_name] = dataset
+
+                class MockTask:
+                    cancelled = False
+                    progress = 0
+
+                result = self.app_backend.estimate_dataset_baseline(
+                    MockTask(), dataset_name, params=dict(params))
+                for port in ('corrected', 'baseline', 'coefficients'):
+                    outputs[port] = result.get(port)
+
         elif tool_name == "CurveFitting":
             dataset = inputs.get('dataset')
             if dataset:
@@ -544,6 +563,40 @@ class WorkflowExecutor:
                     scan_type=params.get('scan_type', 'auto'))
                 outputs['maps'] = map_paths
                 logger.info(f"MapGenerator created {len(map_paths)} TIFF maps")
+
+        elif tool_name == "MapAssembly":
+            flat_data = inputs.get('flat_data')
+            if flat_data is not None:
+                if isinstance(flat_data, str):
+                    logger.error(f"MapAssembly received string instead of dataset: {flat_data}")
+                    return outputs
+
+                flat_name = self._get_temp_dataset_name(flat_data)
+                self.app_backend._datasets[flat_name] = flat_data
+
+                # Both extras are optional and answer different questions: the
+                # spectra say where the values were measured, the intervals say
+                # what energy each column covers.
+                source = inputs.get('source')
+                source_name = None
+                if source is not None and not isinstance(source, str):
+                    source_name = self._get_temp_dataset_name(source)
+                    self.app_backend._datasets[source_name] = source
+
+                class MockTask:
+                    cancelled = False
+                    progress = 0
+
+                result = self.app_backend.assemble_maps(
+                    MockTask(), flat_name, params=dict(params),
+                    source_dataset_name=source_name,
+                    intervals=inputs.get('intervals') or [])
+                outputs['maps'] = result.get('map_paths', [])
+                outputs['interval_map'] = result.get('interval_map_dataset')
+                outputs['interval_map_path'] = result.get('interval_map_path', '')
+                logger.info("MapAssembly wrote %d map(s)%s", result.get('n_maps', 0),
+                            " and the joined interval map"
+                            if result.get('interval_map_path') else "")
 
         elif tool_name == "FFT1D":
             dataset = inputs.get('dataset')
@@ -776,6 +829,65 @@ class WorkflowExecutor:
                                   ('coefficients', 'coefficients'), ('peak_count', 'peak_count')):
                     outputs[port] = result.get(key)
                 outputs['intervals'] = result.get('intervals', [])
+
+        elif tool_name == "EnergyBinning":
+            peaks = inputs.get('peaks')
+            if peaks is not None:
+                if isinstance(peaks, str):
+                    logger.error(f"EnergyBinning received string instead of dataset: {peaks}")
+                    return outputs
+
+                peaks_name = self._get_temp_dataset_name(peaks)
+                self.app_backend._datasets[peaks_name] = peaks
+
+                # The source spectra are optional: without them the grid is
+                # anchored on the peaks and has no sweep step to be floored at.
+                source = inputs.get('dataset')
+                source_name = None
+                if source is not None and not isinstance(source, str):
+                    source_name = self._get_temp_dataset_name(source)
+                    self.app_backend._datasets[source_name] = source
+
+                class MockTask:
+                    cancelled = False
+                    progress = 0
+
+                result = self.app_backend.bin_peak_energies(
+                    MockTask(), peaks_name, params=dict(params),
+                    source_dataset_name=source_name)
+                outputs['intervals'] = result.get('intervals', [])
+                outputs['all_bins'] = result.get('all_bins', [])
+                outputs['bins'] = result.get('bins')
+
+        elif tool_name == "OccupancyMatrix":
+            peaks = inputs.get('peaks')
+            if peaks is not None:
+                if isinstance(peaks, str):
+                    logger.error(f"OccupancyMatrix received string instead of dataset: {peaks}")
+                    return outputs
+
+                peaks_name = self._get_temp_dataset_name(peaks)
+                self.app_backend._datasets[peaks_name] = peaks
+
+                # Both extras are optional and answer different questions: the
+                # spectra give the axis and the columns, the bins replace the
+                # axis with a coarser one.
+                source = inputs.get('dataset')
+                source_name = None
+                if source is not None and not isinstance(source, str):
+                    source_name = self._get_temp_dataset_name(source)
+                    self.app_backend._datasets[source_name] = source
+
+                class MockTask:
+                    cancelled = False
+                    progress = 0
+
+                result = self.app_backend.build_occupancy_matrix(
+                    MockTask(), peaks_name, params=dict(params),
+                    source_dataset_name=source_name,
+                    intervals=inputs.get('intervals') or [])
+                for port in ('matrix', 'matrix_offset', 'peak_count'):
+                    outputs[port] = result.get(port)
 
         elif tool_name == "SpectralFeatures":
             dataset = inputs.get('dataset')

@@ -134,6 +134,24 @@ Rectangle {
                                      : bg + " deg " + (params.baseline_degree !== undefined
                                                        ? params.baseline_degree : 3))
             if (params.temperature_k > 0) parts.push(params.temperature_k + " K")
+        } else if (nodeData.tool_name === "BaselineEstimate") {
+            var method = params.method || "arpls"
+            parts.push(method === "none" ? "no background"
+                                         : (method === "poly" || method === "poly-iter"
+                                            || method === "endpoints")
+                                           ? method + " deg " + (params.degree !== undefined
+                                                                 ? params.degree : 3)
+                                           : method)
+        } else if (nodeData.tool_name === "EnergyBinning") {
+            if (params.bin_width > 0) parts.push("bins of " + params.bin_width)
+            else if (params.temperature_k > 0) parts.push(params.temperature_k + " K bins")
+            else parts.push("sweep-step bins")
+            if (params.min_spectra_per_bin > 1)
+                parts.push("min " + params.min_spectra_per_bin + " spectra")
+        } else if (nodeData.tool_name === "MapAssembly") {
+            parts.push(params.scan_type || "auto")
+            if (params.columns) parts.push(params.columns)
+            if (params.joined_map === false) parts.push("no joined map")
         } else if (nodeData.tool_name === "MapGenerator") {
             if (params.column_index !== undefined) {
                 parts.push("col: " + params.column_index)
