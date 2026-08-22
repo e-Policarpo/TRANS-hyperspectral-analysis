@@ -5,12 +5,18 @@ direct confinement solvers — into this repository, translated to English, as
 first-class TRANS tools.
 
 Status: written 2026-08-22, decisions locked the same day (§10).
-**Phase 1 is built and tested** (§9) — `BaselineEstimate`, `EnergyBinning`,
-`OccupancyMatrix` and `MapAssembly` are workflow nodes today, and a hand-wired
-chain reproduces both Confinement Analysis's occupancy tables and a Map
-Generator interval map (`tests/test_backend/test_composite_decomposition.py`).
-Phase 0 (the physics package) has not started, and nothing has been moved out
-of the Tk app.
+**Phases 0 and 1 are built and tested** (§9):
+
+- Phase 0 — `src/physics/` holds the whole solver core, the branch splitting,
+  the line-scan loop and the extracted inverse designer, in English, with no
+  UI toolkit anywhere in `src/`. 173 tests in `tests/test_physics/`.
+- Phase 1 — `BaselineEstimate`, `EnergyBinning`, `OccupancyMatrix` and
+  `MapAssembly` are workflow nodes, and a hand-wired chain reproduces both
+  Confinement Analysis's occupancy tables and a Map Generator interval map
+  (`tests/test_backend/test_composite_decomposition.py`).
+
+Nothing has been deleted from the Tk app, and no designer tool exists in the
+UI yet — that is phase 2.
 
 ---
 
@@ -391,13 +397,40 @@ Glossary to fix up front and use consistently:
 Each phase leaves the repository working and tested. Nothing is deleted from
 the Tk app until phase 6.
 
-### Phase 0 — the physics package (no UI)
+### Phase 0 — the physics package (no UI) ✅ **done**
 Move `core/` → `src/physics/`, translated with keys split from labels, with
 `trans_bridge` deleted and `peak_detection` imported directly. Extract the
 search from `gui/tab_inverse.py` into `src/physics/designer.py`. Port the
 tests that do not need Tk (~150 of 209).
 *Done when:* `pytest tests/test_physics` is green and nothing in `src/`
 imports tkinter. No user-visible change.
+
+Landed as 13 modules / ~3 600 lines under `src/physics/`, with 173 tests.
+Four things worth recording:
+
+- **`CONFINEMENT_DEFAULTS` moved down** into
+  `src/processing/peak_detection.py`, the engine it was measured against, and
+  is re-exported from `tool_implementations` where callers have always found
+  it. It had to: the physics package cannot import the Qt backend, and
+  copying the dict is exactly what `trans_bridge` did and what made the two
+  able to drift.
+- **The boundary refinement came across too.** `on_refine_edges` was a
+  fixed-point loop buried in the tab; it is now
+  `pairing.refine_boundaries(peaks, run_search, …)` with the search injected,
+  the same shape `line_scan.analyze_line_scan` already used. `current_edges`
+  became `pairing.edges_from_solutions`.
+- **The dot models and the 0D coordinate systems are now the same keys**
+  (`spherical` / `disc` / `parabolic`), so the lookup table that used to map
+  a Portuguese combo label to a model name is gone rather than translated.
+- **The search is seedable.** `Designer(seed=…)` pins the global
+  optimisation, which is what makes a candidate-level test possible at all;
+  unseeded it behaves exactly as before.
+
+What did NOT come across, because it belongs to the tool rather than the
+physics: filling the entry fields from an imported curve (`_apply_didv`), the
+Find button's orchestration of both carriers, and the plotting. Those are
+phase 2/3 work and their tests were dropped rather than rewritten against a
+UI that does not exist yet.
 
 ### Phase 1 — the three shared nodes ✅ **done**
 `MapAssembly`, `BaselineEstimate`, `EnergyBinning` (§5.4), plus
@@ -527,7 +560,7 @@ explicitly **out of scope for v1** (§5.3).
 
 | Phase | Scope | Estimate |
 |---|---|---|
-| 0 | physics package + designer extraction + tests | 2–3 days |
+| 0 | physics package + designer extraction + tests | ~~2–3 days~~ **done** |
 | 1 | `MapAssembly`, `BaselineEstimate`, `EnergyBinning` | ~~3–4 days~~ **done** |
 | 2 | `FigureCanvasItem` + single-spectrum tool | 2 days |
 | 3 | line-scan tool, worker, dataset output, workflow | 3–4 days |

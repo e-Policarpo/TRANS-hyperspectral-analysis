@@ -38,6 +38,7 @@ from src.processing.peak_detection import (
     estimate_baseline,
     eval_polynomial,
     fit_polynomial,
+    CONFINEMENT_DEFAULTS,
     normalized_axis,
     group_peaks_by_bin,
     occupancy_matrix,
@@ -53,45 +54,10 @@ logger = logging.getLogger(__name__)
 # Confinement Analysis helpers
 # =============================================================================
 
-#: Product defaults for Confinement Analysis, applied before the caller's own
-#: values. They deliberately differ from the bare engine defaults, which are
-#: the identity (no background, no smoothing) as befits a primitive:
-#:
-#: - ``poly-iter`` because the band edges otherwise bury the in-gap states.
-#: - ``smooth_points=2`` because on real, noisy spectra an unsmoothed search
-#:   over-detects badly -- on 1%-noise test data it found 278 peaks where 53
-#:   were planted, against 47 with a 5-sample window. QtiPlot defaults to no
-#:   smoothing, but it is used one curve at a time with the result on screen;
-#:   here a hyperspectral run is unattended.
-#:
-#: Must stay in step with the ConfinementAnalysis node definition; a test
-#: asserts they agree.
-CONFINEMENT_DEFAULTS = {
-    # Measured against planted states (synthetic STS, 15 runs x 4 states) at
-    # the amplitude that matters — a state ~1% of the band-edge height:
-    #
-    #   poly-iter d5, any threshold      0% of states found, 2.0 invented
-    #   arpls + noise 2 sigma          100% of states found, 0.0 invented
-    #   arpls + noise 3 sigma           92% of states found, 0.0 invented
-    #
-    # ModPoly cannot follow an exponential band edge, so it either sits far
-    # off it (burying weak states in residual) or absorbs them. arPLS fits in
-    # log space, where that edge is nearly straight. It costs ~9 ms/spectrum
-    # against ModPoly's 3.8 ms.
-    'baseline': 'arpls',
-    'height': 2.0,
-    'smooth_points': 2,
-    # Measured against planted states (synthetic STS, 15 runs x 4 states) and
-    # on real 4.5 K line-scan data:
-    #
-    # 'range' and 'prominence' both scale their threshold by the corrected
-    # curve's SPAN, which the band edges set — so on a real spectrum 5% of it
-    # rejects genuine in-gap states. 'noise' compares each peak's prominence
-    # with the spectrum's own noise instead: scale-free, so weak states in a
-    # quiet spectrum survive. `height` is then a multiple of sigma, not a
-    # percentage.
-    'height_mode': 'noise',
-}
+#: Product defaults for Confinement Analysis. They live with the engine
+#: they were measured against (:mod:`src.processing.peak_detection`), so
+#: the physics package can read them without importing the Qt backend;
+#: re-exported here because this is where callers have always found them.
 
 
 #: Map Generator defaults, on top of CONFINEMENT_DEFAULTS. Measured on
