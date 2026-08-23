@@ -178,6 +178,11 @@ class AppBackend(ToolImplementations, QObject):
     # Name of the joined interval map a run produced, so the tool can offer
     # to open it in the Hyperspectral tab.
     intervalMapReady = Signal(str)
+    # Everything one Confinement Designer run produced: the candidates, the
+    # peaks they were fitted to, and the band edges the offsets imply. One
+    # map rather than a path, because nothing here is a file — the result is
+    # a list the panel draws and the user picks from.
+    designerCompleted = Signal('QVariantMap')
     mapDeleted = Signal(str)  # map_path - emitted when a map is deleted
     imageImported = Signal(str, str, str)  # map_name, file_path, map_id - opens in Map Editor tab
     windowClosed = Signal(str, str)  # window_type, window_id
@@ -6683,6 +6688,94 @@ class AppBackend(ToolImplementations, QObject):
                 (result or {}).get('peaks_path', '')
                 if isinstance(result, dict) else (result or ''))
         )
+
+    @Slot(str, "QVariantMap")
+    def runConfinementDesigner(self, dataset_name: str, params: dict):
+        """QML wrapper for the Confinement Designer - runs on the worker.
+
+        A search is seconds, not milliseconds, so it never runs on the GUI
+        thread. The result is a map rather than a path: no file is written,
+        and the panel needs the candidates themselves.
+        """
+        logger.info(f"Submitting confinement designer for {dataset_name} to worker")
+        self.status = f"Designing confinement for {dataset_name}..."
+        self.worker_manager.submit(
+            name=f"Confinement Designer {dataset_name}",
+            operation=self.design_confinement,
+            dataset_name=dataset_name,
+            params=dict(params or {}),
+            on_finished=self._on_designer_completed,
+        )
+
+    def _on_designer_completed(self, result):
+        """Hand the run's candidates to the panel, and say what happened."""
+        result = result if isinstance(result, dict) else {}
+        count = len(result.get('candidates') or [])
+        message = result.get('error') or ""
+        if count:
+            self.status = (f"Confinement Designer: {count} candidate(s)"
+                           + (f", {result['pairs']} pair(s)" if result.get('pairs')
+                              else ""))
+        else:
+            self.status = f"Confinement Designer: {message or 'no candidates'}"
+        self.designerCompleted.emit(result)
+
+    @Slot(str, int, "QVariantMap", result="QVariantMap")
+    def previewDesignerTargets(self, dataset_name: str, spectrum_index: int,
+                               params: dict):
+        """The peaks one spectrum offers the search, split by carrier.
+
+        Finding the peaks is milliseconds where the search is seconds, so the
+        panel can show what it is about to fit — and how the branch
+        boundaries split it — while the knobs are still being turned. The
+        caller debounces; this stays on the GUI thread.
+        """
+        blank = {'ok': False, 'x': [], 'raw': [], 'baseline': [],
+                 'corrected': [], 'peaks_V': [], 'electron_eV': [],
+                 'hole_eV': [], 'in_gap_V': [], 'column': '', 'error': ''}
+        try:
+            from src.physics.branches import DidvCurve, analyze_curve
+
+            if dataset_name not in self._datasets:
+                return {**blank, 'error': "Dataset not found"}
+
+            spectral_data = self._datasets[dataset_name]
+            spectra = spectral_data.spectra
+            index = max(0, min(int(spectrum_index), spectra.shape[1] - 1))
+            x = np.asarray(spectral_data.independent_var, dtype=np.float64)
+            y = np.asarray(spectra.values[:, index], dtype=np.float64)
+
+            params = dict(params or {})
+            split_e = float(params.get('split_e', 0.0) or 0.0)
+            split_h = float(params.get('split_h', 0.0) or 0.0)
+            peaks = analyze_curve(
+                DidvCurve(x=x, y=y, name=str(spectra.columns[index])), params,
+                min_abs_V=float(params.get('min_abs_V', 0.0) or 0.0),
+                split_e=split_e, split_h=split_h)
+
+            return {
+                'ok': True,
+                'x': x.tolist(),
+                'raw': y.tolist(),
+                'baseline': (peaks.baseline.tolist()
+                             if peaks.baseline is not None else []),
+                'corrected': (peaks.corrected.tolist()
+                              if peaks.corrected is not None else []),
+                'peaks_V': [float(v) for v in peaks.peaks_V],
+                'electron_eV': [float(v) for v in peaks.electron_eV],
+                'hole_eV': [float(v) for v in peaks.hole_eV],
+                'in_gap_V': [float(v) for v in peaks.in_gap_V],
+                'column': str(spectra.columns[index]),
+                # Echoed back so the preview can draw the boundaries it was
+                # split at — seeing where the line falls is how a user
+                # notices a torn ladder before the search reports nonsense.
+                'split_e': split_e,
+                'split_h': split_h,
+                'error': '',
+            }
+        except Exception as e:
+            logger.error(f"Designer preview error: {e}", exc_info=True)
+            return {**blank, 'error': str(e)}
 
     @Slot(str, int, "QVariantMap", result="QVariantMap")
     def previewConfinementAnalysis(self, dataset_name: str, spectrum_index: int, params: dict):

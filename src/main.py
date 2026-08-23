@@ -26,6 +26,8 @@ from src.backend.app_backend import AppBackend
 from src.widgets.qml_map_canvas import QMLMapCanvas
 from src.widgets.qml_profile_canvas import QMLProfileCanvas
 from src.widgets.qml_graph_canvas import QMLGraphCanvas
+from src.widgets.qml_figure_canvas import FigureCanvasItem
+from src.widgets.qml_designer_canvas import DesignerCanvas
 from src.widgets.qml_image_canvas import QMLImageCanvas
 from src.widgets.image_provider import TransImageProvider
 from src.backend.map_editor_backend import MapEditorBackend
@@ -97,6 +99,11 @@ def main():
     qmlRegisterType(QMLGraphCanvas, "TransQML", 1, 0, "GraphCanvas")
     qmlRegisterType(QMLImageCanvas, "TransQML", 1, 0, "ImageCanvas")
     qmlRegisterType(MapEditorBackend, "TransQML", 1, 0, "MapEditorBackend")
+    # A matplotlib figure hosted in QML, and the designer plots drawn into
+    # one. Any tool that wants a real matplotlib plot — colorbars, 3-D
+    # surfaces — uses FigureCanvas rather than reimplementing it in QPainter.
+    qmlRegisterType(FigureCanvasItem, "TransQML", 1, 0, "FigureCanvas")
+    qmlRegisterType(DesignerCanvas, "TransQML", 1, 0, "DesignerCanvas")
 
     # Create QML engine
     engine = QQmlApplicationEngine()

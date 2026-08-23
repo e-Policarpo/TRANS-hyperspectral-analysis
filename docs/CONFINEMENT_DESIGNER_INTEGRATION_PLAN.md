@@ -5,7 +5,7 @@ direct confinement solvers — into this repository, translated to English, as
 first-class TRANS tools.
 
 Status: written 2026-08-22, decisions locked the same day (§10).
-**Phases 0 and 1 are built and tested** (§9):
+**Phases 0, 1 and 2 are built and tested** (§9):
 
 - Phase 0 — `src/physics/` holds the whole solver core, the branch splitting,
   the line-scan loop and the extracted inverse designer, in English, with no
@@ -15,8 +15,13 @@ Status: written 2026-08-22, decisions locked the same day (§10).
   Confinement Analysis's occupancy tables and a Map Generator interval map
   (`tests/test_backend/test_composite_decomposition.py`).
 
-Nothing has been deleted from the Tk app, and no designer tool exists in the
-UI yet — that is phase 2.
+- Phase 2 — `FigureCanvasItem` hosts a matplotlib figure in QML, and the
+  **Confinement Designer** is a tool window: one spectrum in, candidate
+  geometries out. A candidate found in TRANS matches the Tk app's for the
+  same spectrum to 1e-8 nm.
+
+Nothing has been deleted from the Tk app. Phase 3 — the line-scan designer,
+the one of real value — is next.
 
 ---
 
@@ -457,13 +462,44 @@ the phases below:
   crashed `assemble_maps`; every method that takes intervals from a port now
   goes through `_clean_intervals`. Worth checking on each new node.
 
-### Phase 2 — `FigureCanvasItem` + the single-spectrum designer
+### Phase 2 — `FigureCanvasItem` + the single-spectrum designer ✅ **done**
 Build the matplotlib host, then the **Confinement Designer** tool: dataset
 combo, spectrum index, carrier mode, mass list, tolerance, matching mode →
 candidate list + the two existing plots.
 *Done when:* a candidate found in TRANS matches one found in the Tk app for
 the same spectrum. This phase proves the embedding pattern; if it is wrong,
 it is wrong here, cheaply.
+
+**Checked directly.** The same three targets (an 8 nm well read from E_F, so
+every level carries a +0.30 eV offset) through both applications:
+
+| | primary well | RRMSE | offset |
+|---|---|---|---|
+| Tk app | 8.0000 nm | 0.0 | −0.30 eV |
+| `src/physics` | 8.0000 nm | 0.0 | −0.30 eV |
+
+Same aliases (8 and 16 nm), same order, difference 1.07e-08 nm. The
+embedding pattern holds; phase 3 can be built on it.
+
+What the phase actually needed, beyond the plan's ~150-line estimate for the
+host:
+
+- `FigureCanvasItem` (~200 lines) and a `DesignerCanvas` subclass (~230) that
+  draws the two plots. The host stayed domain-free — the plan's "independently
+  useful" — and the drawing came across from the Tk canvas essentially
+  unchanged apart from its labels.
+- A `previewDesignerTargets` slot beside the search. Finding the peaks is
+  milliseconds where a search is seconds, so the panel shows what the search
+  is *about* to be given while the knobs are still moving. Without it the
+  only feedback is a several-second wait.
+- The alias reduction had to be **deduplicated afterwards**: the search
+  dedupes what it found, and folding the aliases in collapses several of
+  those onto one well, so the list showed the same candidate repeatedly.
+
+A QML load test (`tests/test_widgets/test_designer_tool_qml.py`) instantiates
+the panel against a stub backend and asserts the parameter keys it sends are
+the ones `DESIGNER_DEFAULTS` declares. qmllint cannot catch a renamed key;
+that test can.
 
 ### Phase 3 — the line-scan designer
 The tool of real value. Dataset in → per-position search on the worker →
@@ -562,7 +598,7 @@ explicitly **out of scope for v1** (§5.3).
 |---|---|---|
 | 0 | physics package + designer extraction + tests | ~~2–3 days~~ **done** |
 | 1 | `MapAssembly`, `BaselineEstimate`, `EnergyBinning` | ~~3–4 days~~ **done** |
-| 2 | `FigureCanvasItem` + single-spectrum tool | 2 days |
+| 2 | `FigureCanvasItem` + single-spectrum tool | ~~2 days~~ **done** |
 | 3 | line-scan tool, worker, dataset output, workflow | 3–4 days |
 | 4 | palette division + saved-workflow runner | 2 days |
 | 5 | 1D and 0D solver tools | 3 days |

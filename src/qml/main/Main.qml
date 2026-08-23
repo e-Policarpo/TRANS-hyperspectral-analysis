@@ -86,7 +86,7 @@ ApplicationWindow {
                 "Derivative Calculator", "Curve Fitting", "Gradient Filter",
                 "Integration Utility", "Map Generator", "Spatial Average",
                 "Truncate Data", "Curve Analysis", "Confinement Analysis",
-                "Spectral Features", "Peak Indexing",
+                "Spectral Features", "Confinement Designer", "Peak Indexing",
                 "Average Curves", "Filter Bad Data", "Cosmic Ray Filter",
                 "Background Subtraction",
                 "Dirac Point Estimator", "Detect Bandgap & Doping",
@@ -596,6 +596,15 @@ ApplicationWindow {
                 // Also available on the Hyperspectral tab: it is the tool that
                 // turns a map's spectra into the peak-occupancy table.
                 visible: currentTabIndex === 0 || currentTabIndex === 1
+                height: visible ? implicitHeight : 0
+                onTriggered: openToolWindow(text)
+            }
+            MenuItem {
+                text: "Confinement Designer"
+                // The inverse of Confinement Analysis: that one reports which
+                // levels a spectrum has, this one asks which well would
+                // produce them.
+                visible: currentTabIndex === 0
                 height: visible ? implicitHeight : 0
                 onTriggered: openToolWindow(text)
             }
@@ -1682,6 +1691,7 @@ ApplicationWindow {
     // Spectral, and a tool with a plot needs more room than a form does.
     property var multiTabTools: ({ "Confinement Analysis": true, "Spectral Features": true })
     property var toolWindowSizes: ({ "Confinement Analysis": { width: 1000, height: 700 },
+                                     "Confinement Designer": { width: 1120, height: 760 },
                                      "Spectral Features": { width: 1020, height: 720 } })
 
     function toolWindowSize(toolName) {
@@ -1712,6 +1722,7 @@ ApplicationWindow {
             "Curve Analysis": "../tools/CurveAnalysisTool.qml",
             "Truncate Data": "../tools/TruncateTool.qml",
             "Confinement Analysis": "../tools/ConfinementAnalysisTool.qml",
+            "Confinement Designer": "../tools/ConfinementDesignerTool.qml",
             "Spectral Features": "../tools/SpectralFeaturesTool.qml",
             "Peak Indexing": "../tools/PeakIndexingTool.qml",
             "Filter Bad Data": "../tools/FilterBadDataTool.qml",

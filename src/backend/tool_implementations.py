@@ -3421,6 +3421,251 @@ class ToolImplementations:
             return empty
 
     # ========================================================================
+    # Confinement Designer
+    # ========================================================================
+
+    #: Defaults for one designer run, applied under the caller's own values.
+    #: The search range and tolerance are the Tk app's; the detection knobs
+    #: come from CONFINEMENT_DEFAULTS, so the designer and Confinement
+    #: Analysis see the same peaks.
+    DESIGNER_DEFAULTS = {
+        'spectrum_index': 0,
+        'carrier': 'electrons',
+        'meff_e': '0.067',
+        'meff_h': '0.45',
+        'ndim': '1D',
+        'coords': 'cartesian',
+        'sym': 'orthorhombic',
+        'Lmin': 1.0,
+        'Lmax': 20.0,
+        'tol': 5.0,
+        'maxsol': 6,
+        'match': 'delta_e',
+        'priority': 'uniform',
+        'split_e': 0.0,
+        'split_h': 0.0,
+        'min_abs_V': 0.0,
+        'pair_tol_nm': 1.0,
+        'sort': 'rrmse',
+    }
+
+    @staticmethod
+    def _designer_carriers(params: dict, peaks) -> list:
+        """The searches to run, one per carrier asked for.
+
+        Each carries its own targets and its own list of effective masses:
+        the same energy with a heavier carrier asks for a different well, so
+        electron and hole are separate searches that only the geometry ties
+        back together.
+        """
+        from src.physics.designer import (CARRIER_BOTH, CARRIER_ELECTRON,
+                                          CARRIER_HOLE, parse_masses)
+
+        mode = str(params.get('carrier', CARRIER_ELECTRON))
+        carriers = []
+        if mode in (CARRIER_ELECTRON, CARRIER_BOTH):
+            carriers.append({'carrier': 'e', 'label': 'electron',
+                             'Et': np.asarray(peaks.electron_eV, dtype=float),
+                             'meffs': parse_masses(params.get('meff_e', '0.067'),
+                                                   'm*_e')})
+        if mode in (CARRIER_HOLE, CARRIER_BOTH):
+            carriers.append({'carrier': 'h', 'label': 'hole',
+                             'Et': np.asarray(peaks.hole_eV, dtype=float),
+                             'meffs': parse_masses(params.get('meff_h', '0.45'),
+                                                   'm*_h')})
+        return carriers
+
+    @staticmethod
+    def _designer_candidate(sol: dict, index: int) -> dict:
+        """One candidate as plain numbers, for QML and for the plot.
+
+        Everything the panel and the figure need travels in this map, so
+        neither has to reach back into a Python-side cache that a second run
+        would have replaced underneath them.
+        """
+        from src.physics.pairing import confinement_size_nm
+
+        matches = sol.get('matches') or []
+        targets = [float(m['target_E']) for m in matches]
+        computed = [float(m['computed_E']) for m in matches]
+        errors = [((c - t) / t * 100.0) if t else 0.0
+                  for t, c in zip(targets, computed)]
+        hole = sol.get('pair_hole')
+
+        out = {
+            'index': int(index),
+            'dims_nm': [float(d) for d in sol.get('dims', ())],
+            'size_nm': float(confinement_size_nm(sol, sol.get('meff'))),
+            'rrmse': float(sol.get('RRMSE', float('nan'))),
+            'rrmse_de': float(sol.get('RRMSE_dE', sol.get('RRMSE', float('nan')))),
+            'meff': float(sol.get('meff', 0.0)),
+            'carrier': str(sol.get('carrier', 'e')),
+            'offset_eV': float(sol.get('offset', 0.0) or 0.0),
+            'ndim': str(sol.get('ndim', '')),
+            'coords': str(sol.get('coords', '')),
+            'sym': str(sol.get('sym', '')),
+            'targets': targets,
+            'computed': computed,
+            'errors_pct': errors,
+            'qn': [[int(q) for q in (m.get('qn') or ())] for m in matches],
+        }
+        if hole:
+            out['hole'] = ToolImplementations._designer_candidate(hole, index)
+            out['pair_score'] = float(sol.get('pair_score', float('nan')))
+            out['pair_mismatch_nm'] = float(sol.get('pair_mismatch_nm', 0.0))
+        return out
+
+    def design_confinement(self, task, dataset_name: str,
+                           params: Optional[dict] = None) -> dict:
+        """Which well produces this spectrum's ladder of levels?
+
+        One spectrum in, candidate geometries out. The peaks come from the
+        same engine Confinement Analysis uses, are split into the electron
+        and hole branches by the sign of the bias, and each branch is
+        searched separately; with both carriers asked for, the two are paired
+        by geometry, because it is one well that confines them both.
+
+        Slow enough to belong on the worker — a search is ~0.25 s per
+        candidate — and cancellable between carriers and masses.
+        """
+        empty = {'ok': False, 'candidates': [], 'pairs': 0, 'edges': None,
+                 'peaks': {}, 'error': '', 'dataset': dataset_name,
+                 'spectrum_index': 0}
+        try:
+            from src.physics.branches import DidvCurve, analyze_curve
+            from src.physics.designer import CARRIER_BOTH, Designer
+            from src.physics.pairing import edges_from_solutions, pair_candidates
+
+            if dataset_name not in self._datasets:
+                self.errorOccurred.emit("Error", "Dataset not found")
+                return {**empty, 'error': "Dataset not found"}
+
+            params = {**self.DESIGNER_DEFAULTS, **(params or {})}
+            spectral_data = self._datasets[dataset_name]
+            spectra = spectral_data.spectra
+            n_spectra = int(spectra.shape[1])
+            index = max(0, min(int(params.get('spectrum_index', 0)), n_spectra - 1))
+
+            x = np.asarray(spectral_data.independent_var, dtype=np.float64)
+            y = np.asarray(spectra.values[:, index], dtype=np.float64)
+            column = str(spectra.columns[index])
+
+            peaks = analyze_curve(
+                DidvCurve(x=x, y=y, name=column), params,
+                min_abs_V=float(params.get('min_abs_V', 0.0)),
+                split_e=float(params.get('split_e', 0.0)),
+                split_h=float(params.get('split_h', 0.0)))
+
+            carriers = self._designer_carriers(params, peaks)
+            # Two targets are the minimum that means anything: one level is
+            # explained by any size at all, so the fit would be a tautology.
+            for carrier in carriers:
+                if carrier['Et'].size < 2:
+                    return {**empty,
+                            'error': (f"Only {carrier['Et'].size} peak(s) on the "
+                                      f"{carrier['label']} branch — a single level "
+                                      f"is explained by any size."),
+                            'peaks': self._designer_peak_summary(peaks, column),
+                            'spectrum_index': index}
+
+            search = {'ndim': str(params['ndim']), 'coords': str(params['coords']),
+                      'sym': str(params['sym']),
+                      'fixed': dict(params.get('fixed')
+                                    or {'d1': None, 'd2': None, 'd3': None}),
+                      'Lmin': float(params['Lmin']), 'Lmax': float(params['Lmax']),
+                      'tol': float(params['tol']), 'maxsol': int(params['maxsol']),
+                      'priority': str(params['priority']),
+                      'match': str(params['match'])}
+
+            designer = Designer(seed=params.get('seed'))
+            by_carrier = {}
+            for carrier in carriers:
+                if getattr(task, 'cancelled', False):
+                    logger.info("Confinement Designer cancelled")
+                    return empty
+                task.progress = 0.1
+                found = designer.search_carrier(search, carrier)
+                # Aliases before anything else: a well k times larger matches
+                # the same targets with the quantum numbers multiplied by k,
+                # and which one the optimiser lands on is the random seed.
+                #
+                # Deduplicated AFTER the reduction, not before: the search
+                # dedupes the geometries it found, and two of those collapse
+                # onto one well the moment the aliases are folded in. Without
+                # this the list showed the same candidate several times.
+                reduced = []
+                for sol in found:
+                    primary = designer.primary_alias(
+                        sol, {**search, 'Et': carrier['Et'],
+                              'meff': sol.get('meff')})
+                    if not any(abs(primary['meff'] - kept['meff']) < 1e-9
+                               and designer.is_duplicate(primary, [kept])
+                               for kept in reduced):
+                        reduced.append(primary)
+                by_carrier[carrier['carrier']] = reduced
+
+            paired = str(params.get('carrier')) == CARRIER_BOTH
+            pairs = []
+            if paired:
+                pairs = pair_candidates(by_carrier.get('e', []),
+                                        by_carrier.get('h', []),
+                                        tol_nm=float(params['pair_tol_nm']))
+                # The pair's own error rides on the electron candidate, which
+                # is what the list shows and sorts by.
+                for pair in pairs:
+                    pair['electron']['pair_hole'] = pair['hole']
+                    pair['electron']['pair_score'] = pair['score']
+                    pair['electron']['pair_mismatch_nm'] = pair['mismatch_nm']
+                solutions = [pair['electron'] for pair in pairs]
+            else:
+                solutions = [sol for sols in by_carrier.values() for sol in sols]
+
+            solutions = designer.sort_solutions(
+                solutions, str(params.get('sort', 'rrmse')), paired=bool(pairs))
+
+            edges = edges_from_solutions(by_carrier, pairs,
+                                         float(params.get('split_e', 0.0)),
+                                         float(params.get('split_h', 0.0)))
+
+            task.progress = 1.0
+            logger.info("Confinement Designer: %s[%d] — %d candidate(s)%s",
+                        dataset_name, index, len(solutions),
+                        f", {len(pairs)} pair(s)" if paired else "")
+            return {
+                'ok': bool(solutions),
+                'candidates': [self._designer_candidate(sol, i)
+                               for i, sol in enumerate(solutions)],
+                'pairs': len(pairs),
+                'edges': edges,
+                'peaks': self._designer_peak_summary(peaks, column),
+                'error': "" if solutions else "No candidate fits within the tolerance.",
+                'dataset': dataset_name,
+                'spectrum_index': index,
+            }
+
+        except ValueError as exc:
+            # A bad mass list or an empty target field: the user's to fix, and
+            # naming it is the whole point of the message.
+            logger.info("Confinement Designer: %s", exc)
+            return {**empty, 'error': str(exc)}
+        except Exception as e:
+            logger.error(f"Confinement designer error: {e}", exc_info=True)
+            self.errorOccurred.emit("Confinement Designer Error", str(e))
+            return {**empty, 'error': str(e)}
+
+    @staticmethod
+    def _designer_peak_summary(peaks, column: str) -> dict:
+        """What the search was given, for the panel to show alongside it."""
+        return {
+            'column': column,
+            'electron_eV': [float(v) for v in peaks.electron_eV],
+            'hole_eV': [float(v) for v in peaks.hole_eV],
+            'peaks_V': [float(v) for v in peaks.peaks_V],
+            'in_gap_V': [float(v) for v in peaks.in_gap_V],
+            'total': int(peaks.total),
+        }
+
+    # ========================================================================
     # Occupancy Matrix
     # ========================================================================
 
