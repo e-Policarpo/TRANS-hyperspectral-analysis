@@ -73,6 +73,10 @@ Rectangle {
             var catObj = categoriesList[i]
             var category = catObj.category
             var tools = catObj.tools
+            // Which of this category's tools do several operations in one
+            // pass. Not a category of their own: category means domain, and
+            // being composite is orthogonal to it.
+            var composite = catObj.composite || []
             for (var j = 0; j < tools.length; j++) {
                 var toolInfo = workflowManager.getToolInfo(tools[j])
                 var portTypesStr = JSON.stringify(toolInfo.port_types || [])
@@ -81,7 +85,8 @@ Rectangle {
                     "toolName": tools[j],
                     "displayName": toolInfo.display_name || tools[j],
                     "description": toolInfo.description || "",
-                    "portTypes": portTypesStr
+                    "portTypes": portTypesStr,
+                    "isComposite": composite.indexOf(tools[j]) >= 0
                 })
                 totalTools++
             }
@@ -195,10 +200,39 @@ Rectangle {
                         Layout.fillWidth: true
                         spacing: 2
 
-                        Text {
-                            text: displayName
-                            color: textLight
-                            font.pixelSize: 12
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 5
+
+                            Text {
+                                text: displayName
+                                color: textLight
+                                font.pixelSize: 12
+                            }
+
+                            // A composite does several operations in one pass
+                            // with decisions between them. Saying so is what
+                            // makes "you could build this yourself out of the
+                            // simple nodes" a real claim rather than a slogan.
+                            Rectangle {
+                                visible: isComposite
+                                Layout.preferredHeight: 13
+                                Layout.preferredWidth: compositeBadge.implicitWidth + 8
+                                radius: 3
+                                color: "transparent"
+                                border.color: accentPurple
+                                border.width: 1
+
+                                Text {
+                                    id: compositeBadge
+                                    anchors.centerIn: parent
+                                    text: "composite"
+                                    color: accentPurple
+                                    font.pixelSize: 8
+                                }
+                            }
+
+                            Item { Layout.fillWidth: true }
                         }
 
                         Text {

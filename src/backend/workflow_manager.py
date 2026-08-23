@@ -1794,6 +1794,88 @@ class WorkflowManager(QObject):
             result['errors']
         )
 
+    @Slot(str, 'QVariantList')
+    def runSavedWorkflow(self, file_path: str, dataset_names):
+        """Run a saved ``.flow`` over the given datasets, on the worker.
+
+        A saved workflow is a composite tool nobody had to code: this is what
+        makes it one. The chain runs with the parameters it was saved with —
+        only the datasets are asked for — and it runs off the GUI thread,
+        because a chain ending in a per-spectrum search is minutes, not
+        milliseconds.
+
+        The editor's own Run button is unchanged and still runs in place: it
+        has a canvas to report into, and its runs are usually a quick check
+        of the chain being built.
+        """
+        try:
+            with open(file_path, 'r', encoding='utf-8') as handle:
+                data = json.load(handle)
+            workflow = Workflow.from_dict(data)
+        except Exception as exc:
+            logger.error("Could not load workflow %s: %s", file_path, exc)
+            self.workflowExecutionCompleted.emit(
+                Path(file_path).stem, False, ["Could not load: %s" % exc])
+            return
+
+        names = [str(n) for n in (dataset_names or []) if n]
+        if names:
+            self._set_workflow_datasets(workflow, names)
+
+        # Kept out of ``self.workflows``: running a saved chain must not
+        # replace whatever the user has open in the editor.
+        logger.info("Running saved workflow %r over %d dataset(s)",
+                    workflow.name, len(names))
+        self.workflowExecutionStarted.emit(workflow.name)
+
+        worker = getattr(self.app_backend, 'worker_manager', None)
+        if worker is None:                      # tests, or a headless backend
+            self._run_workflow_object(None, workflow)
+            return
+        worker.submit(
+            name="Workflow %s" % workflow.name,
+            operation=self._run_workflow_object,
+            workflow=workflow,
+        )
+
+    @staticmethod
+    def _set_workflow_datasets(workflow, names) -> int:
+        """Point every DatasetInput node at ``names``. Returns how many.
+
+        ``dataset_names`` carries the whole selection and ``dataset_name``
+        the first pick — the executor runs the graph once per dataset, and
+        the second key is what older workflows and the validator read.
+        """
+        count = 0
+        for node in workflow.nodes:
+            if node.tool_name != "DatasetInput":
+                continue
+            node.parameters['dataset_names'] = list(names)
+            node.parameters['dataset_name'] = names[0]
+            count += 1
+        return count
+
+    def _run_workflow_object(self, task, workflow):
+        """Execute a workflow object and report it, wherever it runs."""
+        self.executor = WorkflowExecutor(self.app_backend)
+
+        def progress_callback(current, total, message):
+            if task is not None:
+                task.progress = current / max(1, total)
+            self.workflowExecutionProgress.emit(current, total, message)
+
+        try:
+            result = self.executor.execute(workflow, progress_callback)
+        except Exception as exc:
+            logger.error("Workflow %r failed: %s", workflow.name, exc,
+                         exc_info=True)
+            self.workflowExecutionCompleted.emit(workflow.name, False, [str(exc)])
+            return ""
+
+        self.workflowExecutionCompleted.emit(workflow.name, result['success'],
+                                             result['errors'])
+        return workflow.name
+
     @Slot()
     def cancelExecution(self):
         """Cancel current workflow execution"""

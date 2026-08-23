@@ -5,7 +5,7 @@ direct confinement solvers — into this repository, translated to English, as
 first-class TRANS tools.
 
 Status: written 2026-08-22, decisions locked the same day (§10).
-**Phases 0 to 3 are built and tested** (§9):
+**Phases 0 to 4 are built and tested** (§9):
 
 - Phase 0 — `src/physics/` holds the whole solver core, the branch splitting,
   the line-scan loop and the extracted inverse designer, in English, with no
@@ -25,8 +25,12 @@ Status: written 2026-08-22, decisions locked the same day (§10).
   line in metres. Multi-dataset (`BATCH_TOOLS`) and a workflow node
   (`ConfinementDesign`).
 
-Nothing has been deleted from the Tk app. Phase 4 — the palette division and
-the saved-workflow runner — is next.
+- Phase 4 — the Tools menu is split into *Tools* / *Composite tools* /
+  *Saved workflows*, node definitions carry a `composite` flag the palette
+  badges, and a saved `.flow` runs from the menu over a dataset selection.
+
+Nothing has been deleted from the Tk app. Phase 5 — the 1D and 0D direct
+solvers — is next, and phase 6 (the 2D/3D editors) stays deferred.
 
 ---
 
@@ -538,11 +542,31 @@ Two honest notes on the acceptance:
   Generator and Map Assembly consume. Opening the *table* as a kymograph
   would mean inventing a spectral axis it does not have.
 
-### Phase 4 — palette division and saved workflows
+### Phase 4 — palette division and saved workflows ✅ **done**
 The three-group Tools menu, the `composite` flag and its badge in the node
 palette, and the v1 *Saved workflows* runner (§5.2, §5.3).
 *Done when:* a `.flow` saved from the editor runs from the Tools menu over a
 multi-dataset selection.
+
+The runner (`SavedWorkflowRunner.qml` + `WorkflowManager.runSavedWorkflow`)
+loads the `.flow`, points every `DatasetInput` node at the selection, and
+executes **on the worker** — a chain that ends in a per-spectrum search is
+minutes, not milliseconds. The editor's own Run button is unchanged and still
+runs in place; it has a canvas to report into and its runs are usually a quick
+check of the chain being built. Exposed parameters remain out of scope, as
+§5.3 says.
+
+Two things the grouping turned up:
+
+- **Two tools had no menu entry at all** — Multi-Peak Fitting and Spectral
+  Axis Converter were in `currentTools` and the tool map, so they appeared in
+  the palette panel but never in the menu. They have entries now, and
+  `tests/test_widgets/test_tools_menu.py` holds the menu, the tool map and
+  the palette list to each other so the next one cannot drift in unnoticed.
+- **The menu is where the taxonomy becomes visible.** A test asserts the
+  composite group is exactly the composite tools, and that the ones which are
+  also workflow nodes carry `composite: True` — the menu grouping and the
+  palette badge cannot disagree.
 
 ### Phase 5 — the direct solvers
 "Quantum Well Solver" (1D) and "Quantum Dot Solver" (0D) as composite tools.
@@ -629,7 +653,7 @@ explicitly **out of scope for v1** (§5.3).
 | 1 | `MapAssembly`, `BaselineEstimate`, `EnergyBinning` | ~~3–4 days~~ **done** |
 | 2 | `FigureCanvasItem` + single-spectrum tool | ~~2 days~~ **done** |
 | 3 | line-scan tool, worker, dataset output, workflow | ~~3–4 days~~ **done** |
-| 4 | palette division + saved-workflow runner | 2 days |
+| 4 | palette division + saved-workflow runner | ~~2 days~~ **done** |
 | 5 | 1D and 0D solver tools | 3 days |
 | 6 | 2D/3D editors *(deferred)* | 1–2 weeks |
 

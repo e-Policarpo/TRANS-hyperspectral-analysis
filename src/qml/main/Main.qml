@@ -513,7 +513,23 @@ ApplicationWindow {
                 }
             }
 
-            // Spectral Analysis tools (tab 0)
+            // Three groups, one flat list. A simple tool is one operation and
+            // maps 1:1 onto a workflow node; a composite does several in one
+            // pass with decisions between them; a saved workflow is a chain
+            // the user built that nobody had to code. The headers are
+            // disabled MenuItems rather than submenus, so the per-tab
+            // visibility on each entry keeps working unchanged.
+            MenuItem {
+                text: "Tools"
+                enabled: false
+                contentItem: Text {
+                    text: "— Tools —"
+                    font.pixelSize: 11
+                    font.italic: true
+                    color: textMuted
+                    leftPadding: 10
+                }
+            }
             MenuItem {
                 text: "1D FFT"
                 visible: currentTabIndex === 0
@@ -557,7 +573,7 @@ ApplicationWindow {
                 onTriggered: openToolWindow(text)
             }
             MenuItem {
-                text: "Map Generator"
+                text: "Spatial Average"
                 visible: currentTabIndex === 0
                 height: visible ? implicitHeight : 0
                 onTriggered: openToolWindow(text)
@@ -575,12 +591,6 @@ ApplicationWindow {
                 onTriggered: openToolWindow(text)
             }
             MenuItem {
-                text: "Spatial Average"
-                visible: currentTabIndex === 0
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-            MenuItem {
                 text: "Truncate Data"
                 visible: currentTabIndex === 0
                 height: visible ? implicitHeight : 0
@@ -589,39 +599,6 @@ ApplicationWindow {
             MenuItem {
                 text: "Curve Analysis"
                 visible: currentTabIndex === 0
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-            MenuItem {
-                text: "Confinement Analysis"
-                // Also available on the Hyperspectral tab: it is the tool that
-                // turns a map's spectra into the peak-occupancy table.
-                visible: currentTabIndex === 0 || currentTabIndex === 1
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-            MenuItem {
-                text: "Confinement Designer"
-                // The inverse of Confinement Analysis: that one reports which
-                // levels a spectrum has, this one asks which well would
-                // produce them.
-                visible: currentTabIndex === 0
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-            MenuItem {
-                text: "Line Scan Designer"
-                // The Confinement Designer over a whole line: one search per
-                // position, and a map of where the confinement is.
-                visible: currentTabIndex === 0 || currentTabIndex === 1
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-            MenuItem {
-                text: "Spectral Features"
-                // Also on the Hyperspectral tab: it turns a map's spectra
-                // into the table that classification runs on.
-                visible: currentTabIndex === 0 || currentTabIndex === 1
                 height: visible ? implicitHeight : 0
                 onTriggered: openToolWindow(text)
             }
@@ -656,7 +633,69 @@ ApplicationWindow {
                 onTriggered: openToolWindow(text)
             }
             MenuItem {
-                text: "Dirac Point Estimator"
+                text: "Spectral Axis Converter"
+                visible: currentTabIndex === 0
+                height: visible ? implicitHeight : 0
+                onTriggered: openToolWindow(text)
+            }
+            MenuSeparator {
+                contentItem: Rectangle {
+                    implicitHeight: 1
+                    color: borderColor
+                }
+            }
+            MenuItem {
+                text: "Composite tools"
+                enabled: false
+                contentItem: Text {
+                    text: "— Composite tools —"
+                    font.pixelSize: 11
+                    font.italic: true
+                    color: textMuted
+                    leftPadding: 10
+                }
+            }
+            MenuItem {
+                text: "Map Generator"
+                visible: currentTabIndex === 0
+                height: visible ? implicitHeight : 0
+                onTriggered: openToolWindow(text)
+            }
+                // Also available on the Hyperspectral tab: it is the tool that
+                // turns a map's spectra into the peak-occupancy table.
+            MenuItem {
+                text: "Confinement Analysis"
+                visible: currentTabIndex === 0 || currentTabIndex === 1
+                height: visible ? implicitHeight : 0
+                onTriggered: openToolWindow(text)
+            }
+                // Also on the Hyperspectral tab: it turns a map's spectra
+                // into the table that classification runs on.
+            MenuItem {
+                text: "Spectral Features"
+                visible: currentTabIndex === 0 || currentTabIndex === 1
+                height: visible ? implicitHeight : 0
+                onTriggered: openToolWindow(text)
+            }
+                // The inverse of Confinement Analysis: that one reports which
+                // levels a spectrum has, this one asks which well would
+                // produce them.
+            MenuItem {
+                text: "Confinement Designer"
+                visible: currentTabIndex === 0
+                height: visible ? implicitHeight : 0
+                onTriggered: openToolWindow(text)
+            }
+                // The Confinement Designer over a whole line: one search per
+                // position, and a map of where the confinement is.
+            MenuItem {
+                text: "Line Scan Designer"
+                visible: currentTabIndex === 0 || currentTabIndex === 1
+                height: visible ? implicitHeight : 0
+                onTriggered: openToolWindow(text)
+            }
+            MenuItem {
+                text: "Multi-Peak Fitting"
                 visible: currentTabIndex === 0
                 height: visible ? implicitHeight : 0
                 onTriggered: openToolWindow(text)
@@ -666,6 +705,76 @@ ApplicationWindow {
                 visible: currentTabIndex === 0
                 height: visible ? implicitHeight : 0
                 onTriggered: openToolWindow(text)
+            }
+            MenuItem {
+                text: "Dirac Point Estimator"
+                visible: currentTabIndex === 0
+                height: visible ? implicitHeight : 0
+                onTriggered: openToolWindow(text)
+            }
+            MenuSeparator {
+                contentItem: Rectangle {
+                    implicitHeight: 1
+                    color: borderColor
+                }
+            }
+            MenuItem {
+                text: "Saved workflows"
+                enabled: false
+                contentItem: Text {
+                    text: "— Saved workflows —"
+                    font.pixelSize: 11
+                    font.italic: true
+                    color: textMuted
+                    leftPadding: 10
+                }
+            }
+
+            // One entry per .flow in the project, each opening a runner that
+            // asks which datasets to run it over — the same chain, over new
+            // data, without opening the editor.
+            Instantiator {
+                id: savedWorkflowsInstantiator
+                model: ListModel { id: savedWorkflowsModel }
+                delegate: MenuItem {
+                    id: savedWorkflowItem
+                    required property int index
+                    required property string name
+                    required property string path
+                    text: name
+                    contentItem: Text {
+                        text: savedWorkflowItem.name
+                        font.pixelSize: 13
+                        color: textLight
+                        leftPadding: 10
+                        rightPadding: 10
+                    }
+                    background: Rectangle {
+                        color: savedWorkflowItem.highlighted ? accentPink : "transparent"
+                        opacity: savedWorkflowItem.highlighted ? 0.3 : 1
+                    }
+                    onTriggered: openSavedWorkflowRunner(savedWorkflowItem.name,
+                                                         savedWorkflowItem.path)
+                }
+                onObjectAdded: function(index, object) {
+                    toolsMenu.insertItem(toolsMenu.count - 1, object)
+                }
+                onObjectRemoved: function(index, object) {
+                    toolsMenu.removeItem(object)
+                }
+            }
+
+            MenuItem {
+                text: "(none saved yet)"
+                enabled: false
+                visible: savedWorkflowsModel.count === 0
+                height: visible ? implicitHeight : 0
+                contentItem: Text {
+                    text: "(none yet — build one in the workflow editor)"
+                    font.pixelSize: 11
+                    color: textMuted
+                    leftPadding: 10
+                }
             }
         }
 
@@ -1698,6 +1807,13 @@ ApplicationWindow {
 
     // Tools usable from more than one tab must not yank the user back to
     // Spectral, and a tool with a plot needs more room than a form does.
+    // Which saved workflow a runner window is about to be opened for. Set
+    // immediately before the window is created and read by the runner on
+    // completion; WindowManager owns the instantiation, so there is nowhere
+    // to pass it directly.
+    property string pendingWorkflowName: ""
+    property string pendingWorkflowPath: ""
+
     property var multiTabTools: ({ "Confinement Analysis": true, "Spectral Features": true,
                                    "Line Scan Designer": true })
     property var toolWindowSizes: ({ "Confinement Analysis": { width: 1000, height: 700 },
@@ -1905,6 +2021,7 @@ ApplicationWindow {
 
     function refreshProjectWorkflows() {
         projectWorkflowsModel.clear()
+        savedWorkflowsModel.clear()
         if (backend && backend.workflowManager) {
             var workflows = backend.workflowManager.getSavedWorkflows()
             for (var i = 0; i < workflows.length; i++) {
@@ -1912,8 +2029,34 @@ ApplicationWindow {
                     name: workflows[i].name,
                     path: workflows[i].path
                 })
+                // The same list under Tools, where clicking one runs it over
+                // a dataset selection instead of opening the editor.
+                savedWorkflowsModel.append({
+                    name: workflows[i].name,
+                    path: workflows[i].path
+                })
             }
         }
+    }
+
+    // A saved workflow is a composite tool nobody had to code: the runner
+    // asks which datasets, and runs the chain with the parameters it was
+    // saved with. Exposing those parameters is a separate feature.
+    function openSavedWorkflowRunner(name, path) {
+        var component = Qt.createComponent("../tools/SavedWorkflowRunner.qml")
+        if (component.status !== Component.Ready) {
+            console.error("SavedWorkflowRunner:", component.errorString())
+            return
+        }
+        // WindowManager instantiates the content itself, so the runner reads
+        // which workflow it is for off the application window — the same
+        // handoff the editor's loadWorkflowLoader already uses.
+        mainWindow.pendingWorkflowName = name
+        mainWindow.pendingWorkflowPath = path
+        toolWindowManager.createToolWindow(name, component, {
+            width: 460,
+            height: 540
+        })
     }
 
     function closeAllWorkflowWindows() {

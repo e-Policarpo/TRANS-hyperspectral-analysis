@@ -818,6 +818,7 @@ TOOL_DEFINITIONS = {
     },
 
     "ConfinementAnalysis": {
+        "composite": True,
         "display_name": "Confinement Analysis",
         "category": "Analysis",
         "description": "Subtract a background and detect peaks in one pass, with an occupancy table",
@@ -881,6 +882,7 @@ TOOL_DEFINITIONS = {
     },
 
     "SpectralFeatures": {
+        "composite": True,
         "display_name": "Spectral Features",
         "category": "Analysis",
         "description": "Reduce each spectrum to physical features (gap, doping, metallicity, confined states) for classification",
@@ -909,6 +911,7 @@ TOOL_DEFINITIONS = {
     },
 
     "ConfinementDesign": {
+        "composite": True,
         "display_name": "Confinement Design",
         "category": "Analysis",
         "description": "Search every position of a line scan for the well that produces its ladder of levels — one confinement size per spectrum, or the reason there is none",
@@ -1001,6 +1004,7 @@ TOOL_DEFINITIONS = {
     # VISUALIZATION NODES
     # ===========================================================================
     "MapGenerator": {
+        "composite": True,
         "display_name": "Map Generator",
         "category": "Visualization",
         "description": "Create spatial maps from flat data",
@@ -1235,6 +1239,7 @@ TOOL_DEFINITIONS = {
     },
 
     "DetectBandgapDoping": {
+        "composite": True,
         "display_name": "Detect Bandgap & Doping",
         "category": "Analysis",
         "description": "Bandgap size and doping type (N/P/Neutral) per spectrum",
@@ -1254,6 +1259,7 @@ TOOL_DEFINITIONS = {
     },
 
     "DiracPointEstimator": {
+        "composite": True,
         "display_name": "Dirac Point Estimator",
         "category": "Analysis",
         "description": "Estimate Dirac point from linear slope intersections",
@@ -1358,11 +1364,19 @@ def get_tool_categories() -> List[Dict]:
     category_order = ["Input", "Output", "Annotations", "Processing", "Analysis", "Visualization", "Image Processing"]
 
     categories: Dict[str, List[str]] = {}
+    #: Tools that do several operations in one pass with decisions between
+    #: them. The palette badges these: a composite is a tool you could in
+    #: principle rebuild from the simple nodes, and knowing which is which is
+    #: what makes that a real option rather than a slogan.
+    composite: Dict[str, List[str]] = {}
     for tool_name, tool_def in TOOL_DEFINITIONS.items():
         category = tool_def.get('category', 'Other')
         if category not in categories:
             categories[category] = []
+            composite[category] = []
         categories[category].append(tool_name)
+        if tool_def.get('composite'):
+            composite[category].append(tool_name)
 
     # Sort tools within each category for logical flow
     tool_order = {
@@ -1423,16 +1437,21 @@ def get_tool_categories() -> List[Dict]:
         categories[category].sort(key=lambda x: tool_order.get(x, 999))
 
     # Build ordered list to preserve category order (QVariantList, not QVariantMap)
+    # ``composite`` rides alongside ``tools`` as a list of names rather than
+    # replacing the flat list of strings, so the palette's existing delegate
+    # keeps working and only has to ask whether a name is in it.
     result = []
     for cat in category_order:
         if cat in categories:
-            result.append({"category": cat, "tools": categories[cat]})
+            result.append({"category": cat, "tools": categories[cat],
+                           "composite": composite.get(cat, [])})
 
     # Add any remaining categories not in the order list
     seen = {r["category"] for r in result}
     for cat in categories:
         if cat not in seen:
-            result.append({"category": cat, "tools": categories[cat]})
+            result.append({"category": cat, "tools": categories[cat],
+                           "composite": composite.get(cat, [])})
 
     return result
 
