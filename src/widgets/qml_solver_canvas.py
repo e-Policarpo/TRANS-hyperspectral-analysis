@@ -142,10 +142,21 @@ class SolverCanvas(FigureCanvasItem):
         self.redraw()
 
     @staticmethod
-    def _well_title(result: dict, comparison: dict) -> str:
+    def _is_number(value) -> bool:
+        """True for a real number, False for None and for NaN.
+
+        `value == value` alone reads as "not NaN" — and is also True for
+        None, which is what a missing comparison hands over. That mistake
+        raised inside the title and took the rest of the figure with it.
+        """
+        return isinstance(value, (int, float)) and not isinstance(value, bool) \
+            and value == value
+
+    @classmethod
+    def _well_title(cls, result: dict, comparison: dict) -> str:
         levels = len(result.get('E_eV') or [])
         title = f"{levels} state(s)"
-        if comparison.get('rrmse_pct') == comparison.get('rrmse_pct'):  # not NaN
+        if cls._is_number(comparison.get('rrmse_pct')):
             title += f" — {comparison['rrmse_pct']:.3f}% against the measured levels"
             if comparison.get('covered') is False:
                 title += " (targets above the last level solved)"
@@ -238,13 +249,13 @@ class SolverCanvas(FigureCanvasItem):
         self.figure.tight_layout(pad=0.6)
         self.redraw()
 
-    @staticmethod
-    def _dot_title(result: dict) -> str:
+    @classmethod
+    def _dot_title(cls, result: dict) -> str:
         levels = result.get('levels') or []
         shells = result.get('shells') or []
         title = f"{len(levels)} level(s) in {len(shells)} shell(s)"
         comparison = dict(result.get('comparison') or {})
-        if comparison.get('rrmse_pct') == comparison.get('rrmse_pct'):
+        if cls._is_number(comparison.get('rrmse_pct')):
             title += f" — {comparison['rrmse_pct']:.3f}% vs measured"
         return title
 

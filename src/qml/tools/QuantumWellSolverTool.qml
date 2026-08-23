@@ -130,13 +130,19 @@ Item {
         spacing: 10
 
         ScrollView {
+            id: paramsScroll
             Layout.preferredWidth: 300
+            Layout.minimumWidth: 300
             Layout.fillHeight: true
             clip: true
+            // Pin the content to the viewport: a ScrollView's child
+            // otherwise takes its own implicit width — the widest
+            // unwrapped label — and everything past the edge is clipped.
+            contentWidth: availableWidth
             ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
             ColumnLayout {
-                width: parent.width
+                width: paramsScroll.availableWidth
                 spacing: 8
 
                 Label {
@@ -157,19 +163,19 @@ Item {
                         Label { text: "Width (nm):"; color: textLight }
                         ToolSpinBox {
                             id: widthSpin
-                            from: 1; to: 100000; value: 1000; stepSize: 50; decimals: 3
+                            from: 1; to: 100000; value: 1000; stepSize: 50; decimals: 2
                         }
 
                         Label { text: "m*:"; color: textLight }
                         ToolSpinBox {
                             id: massSpin
-                            from: 1; to: 100000; value: 67; stepSize: 5; decimals: 4
+                            from: 1; to: 100000; value: 670; stepSize: 10; decimals: 4
                         }
 
                         Label { text: "Barrier V₀ (eV):"; color: textLight }
                         ToolSpinBox {
                             id: barrierSpin
-                            from: 0; to: 100000; value: 0; stepSize: 50; decimals: 3
+                            from: 0; to: 100000; value: 0; stepSize: 50; decimals: 2
                         }
 
                         Label {

@@ -232,8 +232,12 @@ Item {
     ListModel { id: candidateModel }
 
     Component.onCompleted: {
-        refreshDatasets()
+        // The placeholders first: if the dataset refresh throws, the rest of
+        // this handler never runs, and a blank canvas with no message reads
+        // as a broken tool rather than an empty one.
         candidateCanvas.showMessage("Run a search to see candidates")
+        spectrumCanvas.showMessage("Pick a dataset and a spectrum")
+        refreshDatasets()
     }
 
     Component.onDestruction: {
@@ -253,13 +257,19 @@ Item {
 
         // ---------------- knobs ----------------
         ScrollView {
+            id: paramsScroll
             Layout.preferredWidth: 360
+            Layout.minimumWidth: 360
             Layout.fillHeight: true
             clip: true
+            // Pin the content to the viewport: a ScrollView's child
+            // otherwise takes its own implicit width — the widest
+            // unwrapped label — and everything past the edge is clipped.
+            contentWidth: availableWidth
             ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
             ColumnLayout {
-                width: parent.width
+                width: paramsScroll.availableWidth
                 spacing: 8
 
                 Label {

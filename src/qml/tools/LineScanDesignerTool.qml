@@ -159,8 +159,10 @@ Item {
     }
 
     Component.onCompleted: {
-        refreshDatasets()
+        // Placeholder first: a refresh that throws must not leave a blank
+        // canvas with nothing to explain it.
         stripCanvas.showMessage("Pick a line scan and run the search")
+        refreshDatasets()
     }
 
     Component.onDestruction: { if (stripCanvas) stripCanvas.cleanup() }
@@ -171,13 +173,19 @@ Item {
         spacing: 10
 
         ScrollView {
+            id: paramsScroll
             Layout.preferredWidth: 360
+            Layout.minimumWidth: 360
             Layout.fillHeight: true
             clip: true
+            // Pin the content to the viewport: a ScrollView's child
+            // otherwise takes its own implicit width — the widest
+            // unwrapped label — and everything past the edge is clipped.
+            contentWidth: availableWidth
             ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
             ColumnLayout {
-                width: parent.width
+                width: paramsScroll.availableWidth
                 spacing: 8
 
                 Label {

@@ -143,13 +143,19 @@ Item {
         spacing: 10
 
         ScrollView {
+            id: paramsScroll
             Layout.preferredWidth: 320
+            Layout.minimumWidth: 320
             Layout.fillHeight: true
             clip: true
+            // Pin the content to the viewport: a ScrollView's child
+            // otherwise takes its own implicit width — the widest
+            // unwrapped label — and everything past the edge is clipped.
+            contentWidth: availableWidth
             ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
             ColumnLayout {
-                width: parent.width
+                width: paramsScroll.availableWidth
                 spacing: 8
 
                 Label {
@@ -181,7 +187,7 @@ Item {
                         }
                         ToolSpinBox {
                             id: radiusSpin
-                            from: 1; to: 100000; value: 500; stepSize: 25; decimals: 3
+                            from: 1; to: 100000; value: 500; stepSize: 25; decimals: 2
                             enabled: modelKey() !== "parabolic"
                         }
 
@@ -191,7 +197,7 @@ Item {
                         }
                         ToolSpinBox {
                             id: heightSpin
-                            from: 1; to: 100000; value: 300; stepSize: 25; decimals: 3
+                            from: 1; to: 100000; value: 300; stepSize: 25; decimals: 2
                             enabled: modelKey() === "disc"
                         }
 
@@ -218,7 +224,7 @@ Item {
                         Label { text: "m*:"; color: textLight }
                         ToolSpinBox {
                             id: massSpin
-                            from: 1; to: 100000; value: 67; stepSize: 5; decimals: 4
+                            from: 1; to: 100000; value: 670; stepSize: 10; decimals: 4
                         }
 
                         Label {
@@ -227,7 +233,7 @@ Item {
                         }
                         ToolSpinBox {
                             id: barrierSpin
-                            from: 0; to: 100000; value: 0; stepSize: 50; decimals: 3
+                            from: 0; to: 100000; value: 0; stepSize: 50; decimals: 2
                             enabled: modelKey() !== "parabolic"
                         }
 

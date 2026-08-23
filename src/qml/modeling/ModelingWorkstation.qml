@@ -113,13 +113,20 @@ Item {
             : ""
     }
 
+    // The layout is built before the non-visual children are, so every
+    // binding that reads the backend has to survive it being null for one
+    // pass. These three are the readings the layout does.
+    function isThreeD() { return modelBackend ? modelBackend.mode === "3d" : false }
+    function modelSelectedIndex() { return modelBackend ? modelBackend.selectedIndex : -1 }
+    function statusText() { return modelBackend ? modelBackend.status : "" }
+
     function kindKey(index) {
         var kinds = modelBackend.availableKinds()
         return (index >= 0 && index < kinds.length) ? kinds[index].key : ""
     }
 
     function projection() {
-        return modelBackend.mode === "3d"
+        return root.isThreeD()
                ? ["xy", "xz", "yz"][Math.max(0, projectionCombo.currentIndex)]
                : "xy"
     }
@@ -206,31 +213,79 @@ Item {
     Component.onDestruction: { if (canvas) canvas.cleanup() }
 
     // =====================================================================
-    RowLayout {
+    ColumnLayout {
         anchors.fill: parent
-        anchors.margins: 8
-        spacing: 8
+        spacing: 0
 
-        // ---------------- the model ----------------
-        ScrollView {
-            Layout.preferredWidth: 300
-            Layout.fillHeight: true
-            clip: true
-            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+        // A header strip, like the Map Editor's: it separates the workstation
+        // from the tab selector directly above it, and says what this tab is
+        // without spending the top of the parameter column on a paragraph.
+        Rectangle {
+            Layout.fillWidth: true
+            Layout.preferredHeight: 46
+            color: root.bgMedium
 
-            ColumnLayout {
+            Rectangle {
+                anchors.bottom: parent.bottom
                 width: parent.width
-                spacing: 8
+                height: 1
+                color: root.bgLight
+            }
+
+            RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: 12
+                anchors.rightMargin: 12
+                spacing: 12
+
+                Label {
+                    text: "Modeling"
+                    color: root.textLight
+                    font.pixelSize: 16
+                    font.bold: true
+                }
 
                 Label {
                     Layout.fillWidth: true
+                    Layout.preferredWidth: 0
                     text: "Place wells and barriers in a box, then solve for the " +
                           "states they hold. Drag a feature to move it; drag its " +
                           "corner to resize; double-click empty space to add one."
-                    wrapMode: Text.Wrap
-                    color: accentPurple
+                    color: root.textMuted
+                    font.pixelSize: 11
+                    elide: Text.ElideRight
+                }
+
+                Label {
+                    text: root.statusText()
+                    color: root.accentBlue
                     font.pixelSize: 11
                 }
+            }
+        }
+
+        RowLayout {
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            Layout.margins: 8
+            spacing: 8
+
+        // ---------------- the model ----------------
+        ScrollView {
+            id: paramsScroll
+            Layout.preferredWidth: 300
+            Layout.minimumWidth: 300
+            Layout.fillHeight: true
+            clip: true
+            // Pin the content to the viewport: a ScrollView's child
+            // otherwise takes its own implicit width — the widest
+            // unwrapped label — and everything past the edge is clipped.
+            contentWidth: availableWidth
+            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+
+            ColumnLayout {
+                width: paramsScroll.availableWidth
+                spacing: 8
 
                 ToolSection {
                     title: "The box"
@@ -271,12 +326,12 @@ Item {
 
                         Label {
                             text: "Lz (nm):"
-                            color: modelBackend.mode === "3d" ? textLight : textMuted
+                            color: root.isThreeD() ? textLight : textMuted
                         }
                         ToolSpinBox {
                             id: domainZSpin
                             from: 10; to: 1000000; value: 2000; stepSize: 100; decimals: 2
-                            enabled: modelBackend.mode === "3d"
+                            enabled: root.isThreeD()
                             onValueChanged: modelBackend.setDomain(domainXSpin.realValue,
                                                             domainYSpin.realValue, realValue)
                         }
@@ -285,7 +340,7 @@ Item {
                             id: projectionRow
                             Layout.columnSpan: 2
                             Layout.fillWidth: true
-                            visible: modelBackend.mode === "3d"
+                            visible: root.isThreeD()
 
                             Label { text: "Showing:"; color: textLight }
                             ToolComboBox {
@@ -303,7 +358,7 @@ Item {
                         Label {
                             Layout.columnSpan: 2
                             Layout.fillWidth: true
-                            visible: modelBackend.mode === "3d"
+                            visible: root.isThreeD()
                             text: "A volume is edited one plane at a time: a drag " +
                                   "moves the two coordinates you can see and leaves " +
                                   "the third where it was."
@@ -357,7 +412,7 @@ Item {
                                     width: featureList.width
                                     height: 22
                                     radius: 3
-                                    color: index === modelBackend.selectedIndex ? root.accentPink
+                                    color: index === root.modelSelectedIndex() ? root.accentPink
                                                                          : "transparent"
 
                                     RowLayout {
@@ -393,12 +448,12 @@ Item {
 
                             Button {
                                 text: "Duplicate"
-                                enabled: modelBackend.selectedIndex >= 0
+                                enabled: root.modelSelectedIndex() >= 0
                                 onClicked: modelBackend.duplicateFeature(modelBackend.selectedIndex)
                             }
                             Button {
                                 text: "Remove"
-                                enabled: modelBackend.selectedIndex >= 0
+                                enabled: root.modelSelectedIndex() >= 0
                                 onClicked: modelBackend.removeFeature(modelBackend.selectedIndex)
                             }
                             Item { Layout.fillWidth: true }
@@ -463,12 +518,12 @@ Item {
 
                         Label {
                             text: "Nz:"
-                            color: modelBackend.mode === "3d" ? textLight : textMuted
+                            color: root.isThreeD() ? textLight : textMuted
                         }
                         ToolSpinBox {
                             id: nzSpin
                             from: 6; to: 200; value: 24
-                            enabled: modelBackend.mode === "3d"
+                            enabled: root.isThreeD()
                         }
 
                         Label { text: "States:"; color: textLight }
@@ -477,7 +532,7 @@ Item {
                         Label { text: "m*:"; color: textLight }
                         ToolSpinBox {
                             id: massSpin
-                            from: 1; to: 100000; value: 67; stepSize: 5; decimals: 4
+                            from: 1; to: 100000; value: 670; stepSize: 10; decimals: 4
                         }
 
                         Label { text: "Background (eV):"; color: textLight }
@@ -497,6 +552,7 @@ Item {
                             Layout.columnSpan: 2
                             Layout.fillWidth: true
                             text: {
+                                if (!modelBackend) return ""
                                 var cost = modelBackend.gridCost({"Nx": nxSpin.value,
                                                            "Ny": nySpin.value,
                                                            "Nz": nzSpin.value})
@@ -504,7 +560,7 @@ Item {
                                        + " grid points"
                                        + (cost.too_big
                                           ? " — past the limit, coarsen the grid"
-                                          : (modelBackend.mode === "3d"
+                                          : (root.isThreeD()
                                              ? " (3D cost is the product of the three)"
                                              : ""))
                             }
@@ -572,13 +628,6 @@ Item {
                     }
                 }
 
-                Label {
-                    Layout.fillWidth: true
-                    text: modelBackend.status
-                    color: textMuted
-                    font.pixelSize: 11
-                    wrapMode: Text.Wrap
-                }
 
                 RowLayout {
                     Layout.fillWidth: true
@@ -697,10 +746,12 @@ Item {
         }
     }
 
+    }
+
     // Kept as functions so the delegates above do not each need a reference
     // to the backend — a delegate's `model` is the ListView's, not this one.
-    function modelSelected() { return modelBackend.selectedIndex }
-    function selectFeature(index) { modelBackend.selectedIndex = index }
+    function modelSelected() { return root.modelSelectedIndex() }
+    function selectFeature(index) { if (modelBackend) modelBackend.selectedIndex = index }
 
     // A model is a box and a list of features — text, and small. Saving it
     // beside the project rather than inside it keeps a model portable
