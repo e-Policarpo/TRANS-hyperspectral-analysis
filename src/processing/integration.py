@@ -13,6 +13,7 @@ import logging
 from typing import List, Tuple, Dict
 
 from ..models.spectral_data import SpectralData
+from .positivity import positive_integral
 
 logger = logging.getLogger(__name__)
 
@@ -22,8 +23,13 @@ class IntegrationProcessor:
     Processes spectral data integration over voltage intervals.
     """
     
-    def __init__(self):
+    def __init__(self, positive_only: bool = True):
         self.intervals: List[Tuple[float, float]] = []
+        #: Integrate only where the spectrum is above zero. dI/dV is a
+        #: density of states and cannot be negative, so a dip below zero is
+        #: noise and must not cancel the weight of a real state in the same
+        #: interval. Clear it for a signed quantity such as I(V).
+        self.positive_only = bool(positive_only)
     
     def set_intervals(self, intervals: List[Tuple[float, float]]):
         """Set integration intervals."""
@@ -61,7 +67,7 @@ class IntegrationProcessor:
             interval_spectra = spectra[mask, :]
 
             # Perform integration
-            integrated = np.trapz(interval_spectra, x=interval_voltage, axis=0)
+            integrated = self._integrate(interval_spectra, interval_voltage)
 
             # Store result
             interval_key = f"{start_v:.3f}_{end_v:.3f}"
@@ -69,6 +75,13 @@ class IntegrationProcessor:
 
         logger.info(f"Integrated over {len(results)} intervals")
         return results
+
+    def _integrate(self, block: np.ndarray, axis_values: np.ndarray) -> np.ndarray:
+        """Trapezoidal integral along the spectral axis, honouring the switch."""
+        if self.positive_only:
+            return positive_integral(block, axis_values, axis=0)
+        _trapz = getattr(np, 'trapezoid', None) or np.trapz
+        return _trapz(block, x=axis_values, axis=0)
 
     def integrate_single_interval(self, spectral_data: SpectralData, v_min: float, v_max: float,
                                    grid_shape: Tuple[int, int]) -> np.ndarray:
@@ -108,7 +121,7 @@ class IntegrationProcessor:
         interval_data = data_array[mask, :]
 
         # Perform integration for each spectrum (column)
-        integrated = np.trapz(interval_data, x=interval_voltage, axis=0)
+        integrated = self._integrate(interval_data, interval_voltage)
 
         # Reshape to grid
         n_v, n_h = grid_shape

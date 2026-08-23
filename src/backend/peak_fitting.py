@@ -26,6 +26,8 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.optimize import least_squares
+
+from src.processing.positivity import positive_mask
 from scipy.signal import find_peaks
 
 logger = logging.getLogger(__name__)
@@ -301,6 +303,7 @@ def fit_multipeak(
     n_peaks_auto: Optional[int] = None,
     auto_prominence: Optional[float] = None,
     max_nfev: int = 4000,
+    positive_only: bool = True,
 ) -> MultiPeakFitResult:
     """Fit a sum of peaks plus a polynomial baseline to ``y(x)``.
 
@@ -324,6 +327,15 @@ def fit_multipeak(
         Minimum prominence forwarded to :func:`detect_peaks` when auto-detecting.
     max_nfev
         Forwarded to :func:`scipy.optimize.least_squares`.
+    positive_only
+        Fit only the samples at or above zero. Default True: a dI/dV curve
+        is a density of states, so a sample below zero is noise or an
+        over-subtracted background, and letting it into the least-squares
+        pulls the model down exactly where the curve is weakest. Peaks are
+        still *detected* on the whole curve — a detector needs a contiguous
+        grid to measure width and prominence on — and the mask is dropped
+        if it would leave too few points to determine the model. Set False
+        for a signed quantity such as I(V) or a difference spectrum.
     """
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
@@ -331,11 +343,27 @@ def fit_multipeak(
     if x.shape != y.shape or x.size < 4:
         raise ValueError("x and y must be 1-D arrays of the same length (≥ 4)")
 
+    # Which samples the least-squares is allowed to see. Detection below
+    # still runs on the whole curve.
+    fit_mask = positive_mask(y) if positive_only else np.isfinite(y)
+    if fit_mask.sum() < max(4, 2 * (max(baseline_degree, 0) + 1)):
+        # An all-negative or nearly-all-negative curve: honouring the rule
+        # would leave nothing to determine the model from, and a fit to three
+        # points is not a measurement. Fall back rather than fail.
+        if positive_only and np.isfinite(y).any():
+            logger.debug("positive_only left %d of %d samples; fitting all of them",
+                         int(fit_mask.sum()), y.size)
+        fit_mask = np.isfinite(y)
+    if not fit_mask.all():
+        x_fit, y_fit = x[fit_mask], y[fit_mask]
+    else:
+        x_fit, y_fit = x, y
+
     if baseline_degree is None or baseline_degree < 0:
         baseline_degree = -1
         base_init = None
     else:
-        base_init = np.polyfit(x, y, baseline_degree)
+        base_init = np.polyfit(x_fit, y_fit, baseline_degree)
 
     if initial_peaks is None:
         # Subtract baseline before detection so peaks stand out.
@@ -363,6 +391,7 @@ def fit_multipeak(
         return _make_result(
             x, y, peaks, base_coeffs, fitted, base_curve,
             success=True, message="No peaks detected; baseline only.",
+            fit_mask=fit_mask,
         )
 
     p0, per_peak = _pack_params(
@@ -393,7 +422,7 @@ def fit_multipeak(
     bdeg = max(baseline_degree, 0)
 
     def residuals(p):
-        return _model(p, x, n_peaks, shape, bdeg) - y
+        return _model(p, x_fit, n_peaks, shape, bdeg) - y_fit
 
     try:
         result = least_squares(
@@ -406,7 +435,7 @@ def fit_multipeak(
         logger.exception("least_squares failed: %s", e)
         return _make_result(
             x, y, [], np.array([]), np.zeros_like(x), np.zeros_like(x),
-            success=False, message=str(e),
+            success=False, message=str(e), fit_mask=fit_mask,
         )
 
     fitted_peaks, base_coeffs = _unpack_params(p_opt, n_peaks, shape, bdeg)
@@ -420,17 +449,24 @@ def fit_multipeak(
 
     res = _make_result(
         x, y, fitted_peaks, base_coeffs, fitted_curve, base_curve,
-        success=success, message=message,
+        success=success, message=message, fit_mask=fit_mask,
     )
     res.components = components
     return res
 
 
 def _make_result(x, y, peaks, base_coeffs, fitted, baseline,
-                 *, success: bool, message: str) -> MultiPeakFitResult:
+                 *, success: bool, message: str,
+                 fit_mask: Optional[np.ndarray] = None) -> MultiPeakFitResult:
+    # The residual curve spans the whole spectrum so it can be plotted
+    # against it, but the goodness of fit is measured only where the fit was
+    # actually made: scoring it against samples deliberately excluded as
+    # unphysical would report a worse fit for obeying the rule.
     residuals = y - fitted
-    rss = float(np.sum(residuals ** 2))
-    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+    scored = residuals if fit_mask is None else residuals[fit_mask]
+    y_scored = y if fit_mask is None else y[fit_mask]
+    rss = float(np.sum(scored ** 2))
+    ss_tot = float(np.sum((y_scored - np.mean(y_scored)) ** 2)) if y_scored.size else 0.0
     rsq = 1.0 - rss / ss_tot if ss_tot > 1e-30 else 1.0
     return MultiPeakFitResult(
         x=x, y=y, peaks=peaks, baseline_coeffs=base_coeffs,

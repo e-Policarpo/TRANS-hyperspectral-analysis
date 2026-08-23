@@ -2229,10 +2229,22 @@ class TestNoiseFloorAtIntegration(TestToolImplementationsSetup):
         _, state = self._columns(tool_impl, result)
         assert state[-1] > 3 * state[0]        # planted 8x, kept well clear
 
-    def test_zero_restores_the_signed_integral(self, tool_impl):
+    def test_zero_removes_the_floor_but_not_the_positivity(self, tool_impl):
+        # A density of states cannot be negative, so the integral is over the
+        # positive part whatever the floor is. noise_floor=0 means "count
+        # everything above zero", not "count the negative excursions too".
         result = self._run(tool_impl, 'signed', noise_floor=0.0)
-        empty, _ = self._columns(tool_impl, result)
-        assert (empty < 0).any(), "with no floor the noise must stay signed"
+        empty, state = self._columns(tool_impl, result)
+        assert not (empty < 0).any(), "a negative integral is not a measurement"
+        assert not (state < 0).any()
+
+    def test_zero_still_counts_more_of_the_noise_than_the_default(self, tool_impl):
+        # The floor must still do something: without it the empty bin keeps
+        # the positive half of its noise, with it that collapses too.
+        raw = self._run(tool_impl, 'raw_floor', noise_floor=0.0)
+        floored = self._run(tool_impl, 'set_floor', noise_floor=1.0)
+        assert (self._columns(tool_impl, raw)[0].sum()
+                > self._columns(tool_impl, floored)[0].sum())
 
     def test_the_floor_is_recorded_with_the_values(self, tool_impl):
         result = self._run(tool_impl, 'recorded', noise_floor=2.0)

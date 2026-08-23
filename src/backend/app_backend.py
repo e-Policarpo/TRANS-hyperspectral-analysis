@@ -53,6 +53,7 @@ from src.backend.tool_implementations import (
 )
 from src.backend.peak_fitting import estimate_noise_sigma
 from src.processing.peak_detection import Params, analyze, params_from_dict
+from src.processing.positivity import positive_integral
 from src.processing.spectral_features import (
     feature_columns,
     gap_features,
@@ -5410,8 +5411,17 @@ class AppBackend(ToolImplementations, QObject):
     # ========================================================================
 
     @Slot(str, 'QVariantList')
-    def integrate(self, dataset_name: str, intervals: List):
-        """QML wrapper for integration - runs in background thread."""
+    @Slot(str, 'QVariantList', bool)
+    def integrate(self, dataset_name: str, intervals: List,
+                  positive_only: bool = True):
+        """QML wrapper for integration - runs in background thread.
+
+        ``positive_only`` integrates the positive part of each spectrum only,
+        which is the right reading for dI/dV: a density of states cannot be
+        negative, so a dip below zero is noise and must not cancel real
+        weight elsewhere in the interval. Clear it for a signed quantity —
+        an I(V) sweep really is negative at negative bias.
+        """
         logger.info(f"Submitting integration for {dataset_name} to worker")
         self.status = f"Integrating {dataset_name}..."
         self.worker_manager.submit(
@@ -5419,10 +5429,12 @@ class AppBackend(ToolImplementations, QObject):
             operation=self._do_integrate,
             dataset_name=dataset_name,
             intervals=intervals,
+            positive_only=bool(positive_only),
             on_finished=lambda path: self._on_tool_completed("Integration Utility", path)
         )
 
-    def _do_integrate(self, task, dataset_name: str, intervals: List):
+    def _do_integrate(self, task, dataset_name: str, intervals: List,
+                      positive_only: bool = True):
         """
         Perform integration over specified intervals.
 
@@ -5434,6 +5446,12 @@ class AppBackend(ToolImplementations, QObject):
             Name of dataset to integrate
         intervals : List[Dict]
             List of intervals with 'lower' and 'upper' keys
+        positive_only : bool
+            Integrate only where the spectrum is above zero. Default True:
+            dI/dV is a density of states and cannot be negative, so a
+            negative excursion is noise and must not subtract from the
+            weight of a real state in the same interval. Set False for a
+            signed quantity such as I(V).
 
         Returns:
         --------
@@ -5482,14 +5500,13 @@ class AppBackend(ToolImplementations, QObject):
                 interval_spectra = spectra[mask, :]
 
                 # Perform trapezoidal integration
-                try:
+                if positive_only:
+                    integrated = positive_integral(interval_spectra,
+                                                   interval_var, axis=0)
+                else:
                     # Use np.trapezoid if available (NumPy 2.0+), otherwise np.trapz
-                    if hasattr(np, 'trapezoid'):
-                        integrated = np.trapezoid(interval_spectra, x=interval_var, axis=0)
-                    else:
-                        integrated = np.trapz(interval_spectra, x=interval_var, axis=0)
-                except:
-                    integrated = np.trapz(interval_spectra, x=interval_var, axis=0)
+                    _trapz = getattr(np, 'trapezoid', None) or np.trapz
+                    integrated = _trapz(interval_spectra, x=interval_var, axis=0)
 
                 integration_results.append({
                     'interval': f"{start_v:.3f}_{end_v:.3f}",

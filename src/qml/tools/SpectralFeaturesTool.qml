@@ -158,7 +158,8 @@ Item {
             "poly_basis": basisCombo.currentText,
             "edge_fraction": edgeFractionSpin.realValue,
             "state_noise_sigmas": sigmaSpin.realValue,
-            "state_width_samples": stateWidthSpin.value
+            "state_width_samples": stateWidthSpin.value,
+            "positive_only": positiveOnlyCheck.checked
         }
     }
 
@@ -395,6 +396,24 @@ Item {
                             textFromValue: function(v) { return (v / 100.0).toFixed(2) }
                             valueFromText: function(t) { return Math.round(parseFloat(t) * 100) }
                             onValueChanged: queuePreview()
+                        }
+
+                        Label { text: "Fit above zero only:"; color: textLight }
+                        CheckBox {
+                            id: positiveOnlyCheck
+                            text: "the LDOS cannot be negative"
+                            checked: true
+                            onCheckedChanged: queuePreview()
+                            // See IntegrationTool: the control sizes itself
+                            // from its own `text`, so it has to be set there.
+                            contentItem: Text {
+                                text: positiveOnlyCheck.text
+                                color: textMuted
+                                font.pixelSize: 10
+                                leftPadding: positiveOnlyCheck.indicator.width
+                                             + positiveOnlyCheck.spacing
+                                verticalAlignment: Text.AlignVCenter
+                            }
                         }
 
                         Label {

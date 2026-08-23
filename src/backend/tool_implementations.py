@@ -23,6 +23,7 @@ from src.processing.spectral_features import (
     feature_columns,
     feature_table,
 )
+from src.processing.positivity import positive_integral, positive_mask
 from src.processing.peak_detection import (
     Analysis,
     noise_sigma,
@@ -2321,7 +2322,11 @@ class ToolImplementations:
             # there is no systematic overshoot to remove. At 1 sigma the
             # negatives vanish, the states keep their weight, and the empty
             # bins collapse to ~0 — the map shows spectral weight instead of
-            # the noise floor. 0 restores the raw signed integral.
+            # the noise floor. 0 removes the floor but NOT the positivity
+            # rule: the integral is always over the positive part, because a
+            # density of states cannot be negative. This tool is dI/dV-only
+            # (it runs the confinement engine), so there is nothing signed
+            # for it to be wrong about.
             noise_floor = max(0.0, float(params.get('noise_floor', 1.0) or 0.0))
 
             value_columns = {}
@@ -2355,11 +2360,13 @@ class ToolImplementations:
                 if noise_floor > 0:
                     # Only the part standing above each spectrum's own noise
                     # counts as spectral weight; the rest is not measurement.
-                    block = np.maximum(block - noise_floor * spectrum_sigma[None, :], 0.0)
-                # np.trapezoid is the NumPy 2 name; this project still runs
-                # on 1.26, where only np.trapz exists.
-                _trapz = getattr(np, 'trapezoid', None) or np.trapz
-                values = _trapz(block, x=independent_var[mask], axis=0)
+                    block = block - noise_floor * spectrum_sigma[None, :]
+                # Negative LDOS is not a measurement: only the positive part
+                # is integrated, so a two-sided noise excursion cannot cancel
+                # real spectral weight elsewhere in the same interval. With
+                # noise_floor at 0 this is the only thing keeping the map off
+                # the fit residual.
+                values = positive_integral(block, independent_var[mask], axis=0)
 
                 label = f"{lo:.3f}_{hi:.3f}"
                 value_columns[label] = values

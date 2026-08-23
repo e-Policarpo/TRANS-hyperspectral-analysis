@@ -740,7 +740,9 @@ TOOL_DEFINITIONS = {
             {"id": "intervals_out", "name": "Intervals", "port_type": "intervals", "description": "Pass-through intervals"}
         ],
         "parameters": {
-            "intervals": {"type": "interval_list", "label": "Integration Intervals (manual)", "required": False}
+            "intervals": {"type": "interval_list", "label": "Integration Intervals (manual)", "required": False},
+            "positive_only": {"type": "bool", "label": "Positive part only", "default": True,
+                              "description": "dI/dV is a density of states and cannot be negative, so a dip below zero is noise and must not cancel a real state in the same interval. Clear it for a signed quantity such as I(V)"}
         }
     },
 
@@ -906,7 +908,9 @@ TOOL_DEFINITIONS = {
             "state_noise_sigmas": {"type": "float", "label": "State threshold (sigma)", "default": 4.0, "min": 0.5, "max": 20.0,
                                    "description": "In-gap states must clear this many noise sigmas; a percentage threshold inside a flat gap just counts noise"},
             "state_width_samples": {"type": "int", "label": "State width (samples)", "default": 11, "min": 3, "max": 101,
-                                    "description": "Narrower features are suppressed before gap detection, so a confined state is not mistaken for a band edge"}
+                                    "description": "Narrower features are suppressed before gap detection, so a confined state is not mistaken for a band edge"},
+            "positive_only": {"type": "bool", "label": "Fit the positive part only", "default": True,
+                              "description": "The band-edge polynomial ignores samples below zero: the LDOS cannot be negative, and those samples drag the fit down at the foot of the edge, which is where the steepness is read"}
         }
     },
 

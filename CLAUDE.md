@@ -63,6 +63,43 @@ Reference: <https://gwyddion.net/documentation/user-guide-en/gsf.html>
 - Don't assume the lateral unit is µm; route through `src/utils/units.py`,
   which handles m/mm/µm/nm/Å/pm and returns `None` for non-length units.
 
+## Negative LDOS is not a measurement
+
+dI/dV is proportional to a density of states, and a density of states cannot
+be negative. Where a corrected spectrum dips below zero it is noise, or a
+background subtracted a little too hard — never signal. Two things must not
+let it in, and both go through **`src/processing/positivity.py`**:
+
+- **Model fits** take `positive_mask(y)` (finite and `>= 0`; zero is kept — it
+  is a real reading of "no states here"). Applied in `metallicity_features`
+  and `fit_multipeak`, both with `positive_only=True` by default. Peaks are
+  still *detected* on the whole curve: a detector needs a contiguous grid to
+  measure width and prominence on.
+- **Integrals** take `positive_integral(y, x, axis=0)`. It is not
+  `np.trapz(np.maximum(y, 0))` — clipping first moves a zero crossing to the
+  end of its segment and over-counts the triangle beyond it, by a factor of
+  two on a curve that swings evenly about zero. The crossing is solved for,
+  so the answer does not depend on the bias grid.
+
+**This does NOT apply to background fitting.** arPLS, ALS and ModPoly work by
+*sitting below* the data; dropping the samples underneath them biases the
+baseline upward and breaks the asymmetry they are built on. `fit_curves` is
+the baseline tool, so it is untouched for the same reason.
+
+**Nor to signed quantities.** Current in an I(V) sweep really is negative at
+negative bias, and so is a difference or a derivative spectrum. Every entry
+point is therefore a `positive_only` parameter defaulting to True, exposed on
+the Integration tool, the Spectral Features tool and both workflow nodes. The
+Map Generator is the exception and is unconditional — it runs the confinement
+engine on dI/dV only, so it has nothing signed to be wrong about.
+
+Note the interaction with `noise_floor`: excluding negatives on its own makes
+an *empty* bin read **higher**, not lower, because the two-sided noise no
+longer cancels itself. The 1σ floor is what still collapses it (measured:
+empty bin at 0.09% of a real state at the default floor, 0.69% at
+`noise_floor=0`). `noise_floor=0` now means "no floor, but still positive
+part only" — it no longer restores a signed integral.
+
 ## Other conventions
 
 - QML properties use `Property()` (not `@Slot(result=...)`) so bindings update.

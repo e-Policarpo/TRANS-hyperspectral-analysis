@@ -379,7 +379,12 @@ class WorkflowExecutor:
                     cancelled = False
                     progress = 0
 
-                result_path = self.app_backend._do_integrate(MockTask(), dataset_name, intervals)
+                # Default True: dI/dV cannot be negative, so the integral is
+                # over the positive part unless the node says otherwise.
+                positive_only = params.get('positive_only', True)
+                result_path = self.app_backend._do_integrate(
+                    MockTask(), dataset_name, intervals,
+                    positive_only=bool(positive_only))
 
                 # Get the integrated dataset using friendly name pattern
                 base_name = self.app_backend._extract_clean_base_name(dataset_name)

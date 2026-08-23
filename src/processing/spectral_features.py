@@ -45,6 +45,7 @@ import numpy as np
 
 from src.backend.peak_fitting import estimate_noise_sigma
 from src.backend.sts_algorithms import detect_bandgap, classify_doping, validate_ldos
+from src.processing.positivity import positive_mask
 from src.processing.peak_detection import (
     Params,
     analyze,
@@ -87,6 +88,11 @@ class FeatureConfig:
     #: Features narrower than this many samples are suppressed before gap
     #: detection, so a confined state cannot be mistaken for a band edge.
     state_width_samples: int = 11
+    #: Fit the band-edge polynomial only where the spectrum is at or above
+    #: zero. A density of states cannot be negative, so anything below is
+    #: noise or an over-subtracted background. Clear it only if the input is
+    #: a signed quantity rather than an LDOS.
+    positive_only: bool = True
 
     def validate(self) -> None:
         if self.normalize not in NORMALIZATIONS:
@@ -240,7 +246,8 @@ def doping_features(x: np.ndarray, y: np.ndarray, gap: Dict[str, float],
 
 def metallicity_features(x: np.ndarray, y: np.ndarray, gap: Dict[str, float],
                          degree: int = 4, basis: str = "legendre",
-                         edge_fraction: float = 0.15) -> Dict[str, float]:
+                         edge_fraction: float = 0.15,
+                         positive_only: bool = True) -> Dict[str, float]:
     """How steeply the LDOS rises outside the gap.
 
     The polynomial is fitted to the band-edge regions only -- the union of
@@ -248,6 +255,13 @@ def metallicity_features(x: np.ndarray, y: np.ndarray, gap: Dict[str, float],
     interior would dilute exactly the steepness being measured. The fit runs
     on the normalised axis so an orthogonal basis is orthogonal over this
     spectrum's own range and the coefficients compare across spectra.
+
+    With ``positive_only`` (the default) the fit ignores samples below zero:
+    the LDOS cannot be negative, so those are noise or an over-subtracted
+    background, and they drag the band edge down at its foot -- precisely
+    the part of the curve the steepness is read from. The ``in_gap_weight``
+    reference below is left as it was on purpose: it is a magnitude, and it
+    takes the modulus already.
     """
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
@@ -260,11 +274,12 @@ def metallicity_features(x: np.ndarray, y: np.ndarray, gap: Dict[str, float],
     # measurement: when the detected gap swallows nearly the whole sweep the
     # coefficients explode by orders of magnitude and would dominate any
     # subsequent PCA. Demand real over-determination or report nothing.
-    if outside.sum() >= 3 * (degree + 1):
+    fit_samples = (outside & positive_mask(y)) if positive_only else outside
+    if fit_samples.sum() >= 3 * (degree + 1):
         try:
             with np.errstate(all="ignore"):
-                coeffs = fit_polynomial(normalized_axis(x)[outside], y[outside],
-                                        degree, basis)
+                coeffs = fit_polynomial(normalized_axis(x)[fit_samples],
+                                        y[fit_samples], degree, basis)
             features.update(dict(zip(names, (float(c) for c in coeffs))))
         except Exception:
             logger.debug("Metallicity fit failed", exc_info=True)
@@ -363,7 +378,8 @@ def spectrum_features(x: np.ndarray, y: np.ndarray,
     row.update({k: v for k, v in gap.items() if k != "gap_center"})
     row.update(doping_features(x, normalized, gap, cfg.doping_smooth_points))
     row.update(metallicity_features(x, normalized, gap, cfg.poly_degree,
-                                    cfg.poly_basis, cfg.edge_fraction))
+                                    cfg.poly_basis, cfg.edge_fraction,
+                                    cfg.positive_only))
     row.update(confinement_features(x, normalized, gap, cfg.confinement_params(),
                                     cfg.state_noise_sigmas))
     if not is_valid:

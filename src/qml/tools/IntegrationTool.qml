@@ -311,6 +311,43 @@ Item {
             }
         }
 
+        // How the integral treats a curve that dips below zero
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: 8
+
+            CheckBox {
+                id: positiveOnlyCheck
+                text: "Integrate the positive part only"
+                checked: true
+                // The text must be on the CheckBox, not only on the
+                // contentItem: the control sizes itself from its own `text`,
+                // and with that empty the indicator collapses out of view.
+                contentItem: Text {
+                    text: positiveOnlyCheck.text
+                    color: textLight
+                    leftPadding: positiveOnlyCheck.indicator.width
+                                 + positiveOnlyCheck.spacing
+                    verticalAlignment: Text.AlignVCenter
+                }
+            }
+
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                Layout.minimumWidth: 0
+                text: positiveOnlyCheck.checked
+                      ? "dI/dV is a density of states and cannot be negative, so a dip "
+                        + "below zero is noise — it must not cancel the weight of a real "
+                        + "state in the same interval."
+                      : "Signed: the negative parts subtract. Correct for I(V) or a "
+                        + "difference spectrum, wrong for an LDOS."
+                color: positiveOnlyCheck.checked ? textMuted : accentPink
+                font.pixelSize: 10
+                wrapMode: Text.WordWrap
+            }
+        }
+
         // Action buttons
         RowLayout {
             Layout.fillWidth: true
@@ -458,7 +495,8 @@ Item {
         console.log("Integrating over", intervals.length, "intervals")
 
         // Call backend
-        var result = backend.integrate(datasetCombo.currentText, intervals)
+        var result = backend.integrate(datasetCombo.currentText, intervals,
+                                       positiveOnlyCheck.checked)
 
         if (result) {
             console.log("Integration complete, saved to:", result)
