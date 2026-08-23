@@ -5,7 +5,7 @@ direct confinement solvers — into this repository, translated to English, as
 first-class TRANS tools.
 
 Status: written 2026-08-22, decisions locked the same day (§10).
-**Phases 0 to 5 are built and tested** (§9):
+**Phases 0 to 6 are built and tested** (§9):
 
 - Phase 0 — `src/physics/` holds the whole solver core, the branch splitting,
   the line-scan loop and the extracted inverse designer, in English, with no
@@ -34,8 +34,12 @@ Status: written 2026-08-22, decisions locked the same day (§10).
   geometry, with the fields already filled and the measured levels drawn
   across the result.
 
-Nothing has been deleted from the Tk app. Phase 6 (the 2D/3D editors) stays
-deferred; phase 7 is retirement, and that is a decision rather than work.
+- Phase 6 — the **Modeling** tab: a third workstation next to Spectral and
+  Hyperspectral, where features are placed by dragging them and the potential
+  they make is solved in 2D or 3D.
+
+Nothing has been deleted from the Tk app. Phase 7 is retirement, and that is
+a decision rather than work.
 
 ---
 
@@ -602,14 +606,46 @@ re-solving behind the user's back, the comparison reports `covered: False`
 when a target sits above the last level solved, and the panel says to raise
 the state count. The information is the same and the loop is the user's.
 
-### Phase 6 — the 2D/3D feature editors *(decide later)*
+### Phase 6 — the 2D/3D feature editors ✅ **done**
 `tab_2d_features.py` (1 045), `tab_multi_well_3d.py` (1 264) and
 `interactive_canvas.py` (879) — the interactive potential editor with
 draggable features. This is the expensive third of the port and the least
-connected to STS data. Recommendation: **defer, and revisit only if the
-2D/3D solvers turn out to be used on real data.** If they come, they belong
-in a third tab ("Modeling") next to Spectral and Hyperspectral, not in a
-tool window — they are a workstation, like the Map Editor.
+connected to STS data. The recommendation was to defer; **the call was made
+to build it**, and it went in as the plan said it should if it came: a third
+tab ("Modeling") next to Spectral and Hyperspectral, not a tool window.
+
+`src/physics/feature_specs.py` is the piece the Tk app did not have and the
+port needed: one table naming every shape's fields, from which constructing,
+reading back, moving, hit-testing and the labels on a form are all derived.
+Adding a shape is one row. It is also what makes a model **saveable** — a
+model is a box and a list of features, so it is JSON, and it saves beside the
+project rather than inside it so it can be reused across projects.
+
+`PotentialCanvas` does the mouse work on top of `FigureCanvasItem`, which
+gained `data_at`/`item_at` for it. Unlike the native-rendered canvases in
+this repository, matplotlib really has laid the axes out here, so
+``transData`` is the honest transform rather than something to reimplement —
+what the conversion does have to get right is the device pixel ratio and
+matplotlib's bottom-left origin.
+
+**A 3-D model is edited one plane at a time (XY / XZ / YZ).** That is not a
+compromise for the drawing's sake: a drag in a projection is exactly two of
+the three coordinates and the third stays where it was, which is what makes
+the interaction unambiguous. The Tk app's 3-D wireframe view did **not** come
+across — it is ~250 lines of per-shape wireframe drawing that shows the same
+placement the projections do.
+
+The grid cost is reported before a solve and a grid past 400 000 points is
+refused, because 3-D cost is the product of the three counts: 24³ is seconds
+and 60³ is minutes, and a mistyped zero is a solve that never finishes.
+
+Also ported, because it is what those tabs did with a solution: the
+tunnelling analysis — which feature each state lives in, and the WKB rate
+between them.
+
+*Done when:* a model can be built by dragging, solved in 2D and 3D, and
+saved. All three, with 103 tests over the specs, the solvers, the backend,
+the canvas interaction and the workstation itself.
 
 ### Phase 7 — retirement
 Delete the Tk app once phases 0–5 are in use, or archive it under
@@ -682,10 +718,12 @@ explicitly **out of scope for v1** (§5.3).
 | 3 | line-scan tool, worker, dataset output, workflow | ~~3–4 days~~ **done** |
 | 4 | palette division + saved-workflow runner | ~~2 days~~ **done** |
 | 5 | 1D and 0D solver tools | ~~3 days~~ **done** |
-| 6 | 2D/3D editors *(deferred)* | 1–2 weeks |
+| 6 | 2D/3D editors | ~~1–2 weeks~~ **done** |
 
 Phases 0–3 are the ones that pay: they put the designer where the data is,
 and phase 1 pays into two existing tools on the way. Phase 4 is what makes
 the composite/simple distinction real to the user. Phase 5 is comfort.
-Phase 6 is a project of its own and should be justified by use, not by
-completeness.
+Phase 6 was written up as a project of its own to be justified by use rather
+than completeness; it was built anyway, and came in smaller than the estimate
+because phases 0–2 had already moved the physics, the figure host and the
+feature classes it needed.

@@ -174,6 +174,48 @@ class FigureCanvasItem(QQuickPaintedItem):
         self._cached_image = image
         self.rendered.emit()
 
+    # ── where a click lands in the data ──────────────────────────────────
+
+    def data_at(self, x: float, y: float, ax=None):
+        """``(x, y)`` in data coordinates for a point in item coordinates.
+
+        Two conversions, and both are easy to get wrong. The figure is
+        rendered at ``BASE_DPI * dpr``, so item coordinates have to be scaled
+        by the device pixel ratio to reach it; and matplotlib's origin is the
+        bottom-left where Qt's is the top-left, so y is flipped.
+
+        Unlike the native-rendered canvases in this project, the axes here
+        really are laid out — matplotlib drew the figure — so ``transData``
+        is the honest transform rather than something to reimplement. Returns
+        None when there is no axes to land in.
+        """
+        ax = ax or (self.figure.axes[0] if self.figure.axes else None)
+        if ax is None or self._cached_image is None:
+            return None
+        height = self._cached_image.height()
+        point = (float(x) * self._dpr, height - float(y) * self._dpr)
+        try:
+            data = ax.transData.inverted().transform(point)
+        except Exception:
+            return None
+        return float(data[0]), float(data[1])
+
+    def item_at(self, x: float, y: float, ax=None):
+        """The inverse of :meth:`data_at` — data coordinates to item ones.
+
+        Used for hit tests that have to be in pixels (a handle is a fixed
+        size on screen, not a fixed size in nanometres).
+        """
+        ax = ax or (self.figure.axes[0] if self.figure.axes else None)
+        if ax is None or self._cached_image is None:
+            return None
+        height = self._cached_image.height()
+        try:
+            point = ax.transData.transform((float(x), float(y)))
+        except Exception:
+            return None
+        return float(point[0]) / self._dpr, (height - float(point[1])) / self._dpr
+
     # ── geometry ─────────────────────────────────────────────────────────
 
     def geometryChange(self, new_geometry, old_geometry) -> None:

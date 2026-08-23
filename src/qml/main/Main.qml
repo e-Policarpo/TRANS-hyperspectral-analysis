@@ -96,6 +96,10 @@ ApplicationWindow {
             ]
         } else if (currentTabIndex === 1) {
             return ["Confinement Analysis", "Spectral Features", "Image Smoothing", "Gradient Filter", "Map Discretizer", "Map Processing"]
+        } else if (currentTabIndex === 2) {
+            // The Modeling tab is a workstation: everything it does is in the
+            // workstation itself, so the tool palette has nothing to offer.
+            return []
         }
         return []
     }
@@ -1136,6 +1140,8 @@ ApplicationWindow {
                                 // Lazy-load MapEditorWorkstation on first switch to Hyperspectral tab
                                 if (currentIndex === 1) {
                                     mapEditorLoader.ensureLoaded()
+                                } else if (currentIndex === 2) {
+                                    modelingLoader.ensureLoaded()
                                 }
                             }
 
@@ -1172,6 +1178,27 @@ ApplicationWindow {
                             }
                             TabButton {
                                 text: "Hyperspectral Analysis"
+                                contentItem: Text {
+                                    text: parent.text
+                                    font.pixelSize: 14
+                                    font.bold: parent.checked
+                                    color: parent.checked ? accentPink : textMuted
+                                    horizontalAlignment: Text.AlignHCenter
+                                    verticalAlignment: Text.AlignVCenter
+                                }
+                                background: Rectangle {
+                                    color: parent.checked ? bgLight : "transparent"
+                                    Rectangle {
+                                        visible: parent.parent.checked
+                                        anchors.bottom: parent.bottom
+                                        width: parent.width
+                                        height: 2
+                                        color: accentPink
+                                    }
+                                }
+                            }
+                            TabButton {
+                                text: "Modeling"
                                 contentItem: Text {
                                     text: parent.text
                                     font.pixelSize: 14
@@ -1230,7 +1257,7 @@ ApplicationWindow {
         StackLayout {
             id: workspaceStack
             anchors.fill: parent
-            // Tab indices: 0=Spectral, 1=Hyperspectral
+            // Tab indices: 0=Spectral, 1=Hyperspectral, 2=Modeling
             currentIndex: currentTabIndex
 
             // Unified Workspace (for Spectral Analysis tab)
@@ -1393,6 +1420,35 @@ ApplicationWindow {
             // because property lookup from JS functions doesn't traverse
             // up into nested items the way property bindings do.
             property var mapEditorWorkstation: mapEditorLoader.item
+
+            // Modeling workstation — a potential you build, and the states it
+            // holds. Lazy like the Map Editor: it is a whole second solver and
+            // most sessions never open it.
+            Loader {
+                id: modelingLoader
+                active: false
+                source: ""
+                property bool initialized: false
+
+                function ensureLoaded() {
+                    if (!active) {
+                        source = "../modeling/ModelingWorkstation.qml"
+                        active = true
+                    }
+                }
+
+                onLoaded: {
+                    if (!initialized && item) {
+                        initialized = true
+                        // The backend needs the app's worker: a 3-D solve is
+                        // seconds to minutes and never runs on this thread.
+                        if (item.modelingBackend && backend
+                                && backend.setModelingBackend) {
+                            backend.setModelingBackend(item.modelingBackend)
+                        }
+                    }
+                }
+            }
 
         }  // StackLayout
 

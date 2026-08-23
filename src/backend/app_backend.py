@@ -684,6 +684,19 @@ class AppBackend(ToolImplementations, QObject):
             backend.set_app_backend(self)
         logger.info("Map editor backend registered with app backend")
 
+    @Slot('QVariant')
+    def setModelingBackend(self, backend):
+        """Store the Modeling workstation's backend and hand it this one.
+
+        The workstation owns its model; what it needs from here is the
+        worker, because a 3-D solve is seconds to minutes and must not run on
+        the GUI thread.
+        """
+        self._modeling_backend = backend
+        if backend is not None and hasattr(backend, "set_app_backend"):
+            backend.set_app_backend(self)
+        logger.info("Modeling backend registered with app backend")
+
     @Slot()
     def relinkDatasetsToMapEditor(self):
         """Re-link every dataset into the map editor, in Python, in one batch.

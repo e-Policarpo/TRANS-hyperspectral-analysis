@@ -28,7 +28,7 @@ from scipy.sparse import diags
 from scipy.sparse.linalg import eigsh
 
 from src.physics.features import SegmentFeature1D, build_potential_from_features
-from src.physics.laplacian import lap1d
+from src.physics.laplacian import lap1d, lap2d_cartesian, lap3d_cartesian
 from src.physics.quantum_dot import (DOT_DISC, DOT_PARABOLIC, DOT_SPHERICAL,
                                      Level, disc_dot, parabolic_dot,
                                      spherical_dot)
@@ -104,6 +104,120 @@ def solve_well_1d(L_nm: float, N: int = 800, n_states: int = 8,
     logger.debug("1D well: L=%.4g nm, N=%d, %d state(s), m*=%g",
                  L_nm, N, len(E), meff)
     return {'E_eV': (E / e), 'psi': psi, 'V_eV': (V / e), 'x_nm': x_nm}
+
+
+def grid_axis(L_nm: float, N: int, bc: str = "dirichlet"):
+    """``(x_nm, spacing_m)`` for one axis of a box of length ``L_nm``.
+
+    Where the samples sit depends on the boundary: with Dirichlet the walls
+    are just outside the grid, so the first and last samples are a step
+    inside the box; otherwise the grid starts at the edge. Getting this wrong
+    shifts every level by a fraction of a step, which looks like a physical
+    result rather than an indexing choice.
+    """
+    if L_nm <= 0:
+        raise ValueError("the box length must be positive")
+    N = max(4, int(N))
+    L = L_nm * 1e-9
+    if str(bc).lower() == "dirichlet":
+        spacing = L / (N + 1)
+        axis = np.linspace(spacing * 1e9, L_nm - spacing * 1e9, N)
+    else:
+        spacing = L / N
+        axis = np.linspace(0.0, L_nm - spacing * 1e9, N)
+    return axis, spacing
+
+
+def _solve_on_grid(potential_J, laplacian, meff: float, n_states: int):
+    """Lowest ``n_states`` eigenpairs of -hbar²/2m ∇² + V, on any grid.
+
+    Shared by 2D and 3D because the only difference between them is which
+    Laplacian is handed in — the Hamiltonian, the shift and the ordering are
+    the same problem at a different size.
+    """
+    flat = np.asarray(potential_J).flatten(order="C")
+    H = (-(hbar ** 2) / (2.0 * float(meff) * m_e)) * laplacian + \
+        diags(flat, 0, format="csr")
+
+    k = max(1, min(int(n_states), MAX_STATES, H.shape[0] - 2))
+    if k < 1:
+        raise ValueError("the grid is too small to hold a state")
+    # Just below the potential floor: the states wanted are the lowest ones.
+    floor = float(flat.min())
+    sigma = floor - (0.01 * e if floor == 0 else 0.1 * abs(floor))
+    E, psi = eigsh(H, k=k, sigma=sigma, which="LM")
+    order = np.argsort(E)
+    return E[order], psi[:, order]
+
+
+def solve_well_2d(Lx_nm: float, Ly_nm: float, Nx: int = 80, Ny: int = 80,
+                  n_states: int = 6, meff: float = 0.067,
+                  features: Optional[list] = None,
+                  V_background_eV: float = 0.0,
+                  bc=("dirichlet", "dirichlet")) -> dict:
+    """Bound states of a 2-D box, with whatever features are inside it.
+
+    Returns ``{'E_eV', 'psi', 'V_eV', 'x_nm', 'y_nm', 'shape'}``. ``psi``
+    keeps the flat eigenvector layout the solver produced; ``shape`` is what
+    to reshape a column to (``(Nx, Ny)``, C order), which is how the
+    potential is already shaped.
+
+    The cost is the grid squared: 80x80 is 6400 unknowns and quick, 300x300
+    is 90 000 and not.
+    """
+    bcx, bcy = (bc, bc) if isinstance(bc, str) else (bc[0], bc[1])
+    x_nm, dx = grid_axis(Lx_nm, Nx, bcx)
+    y_nm, dy = grid_axis(Ly_nm, Ny, bcy)
+
+    V, _ = build_potential_from_features(features or [], (x_nm, y_nm),
+                                         float(V_background_eV))
+    laplacian = lap2d_cartesian(len(x_nm), len(y_nm), dx, dy, bc=(bcx, bcy))
+    E, psi = _solve_on_grid(V, laplacian, meff, n_states)
+
+    logger.debug("2D well: %.4g x %.4g nm, %dx%d, %d state(s)",
+                 Lx_nm, Ly_nm, len(x_nm), len(y_nm), len(E))
+    return {'E_eV': E / e, 'psi': psi, 'V_eV': V / e, 'x_nm': x_nm,
+            'y_nm': y_nm, 'shape': (len(x_nm), len(y_nm))}
+
+
+def solve_well_3d(Lx_nm: float, Ly_nm: float, Lz_nm: float,
+                  Nx: int = 24, Ny: int = 24, Nz: int = 24,
+                  n_states: int = 6, meff: float = 0.067,
+                  features: Optional[list] = None,
+                  V_background_eV: float = 0.0,
+                  bc=("dirichlet", "dirichlet", "dirichlet")) -> dict:
+    """Bound states of a 3-D box, with whatever features are inside it.
+
+    Same shape of answer as :func:`solve_well_2d`, one axis larger. The cost
+    is the grid **cubed**: 24³ is 13 824 unknowns and seconds; 60³ is 216 000
+    and minutes. That is why the defaults here are so much coarser than the
+    2D ones, and why the caller is told the count before it runs.
+    """
+    if isinstance(bc, str):
+        bcx = bcy = bcz = bc
+    else:
+        bcx, bcy, bcz = bc[0], bc[1], bc[2]
+    x_nm, dx = grid_axis(Lx_nm, Nx, bcx)
+    y_nm, dy = grid_axis(Ly_nm, Ny, bcy)
+    z_nm, dz = grid_axis(Lz_nm, Nz, bcz)
+
+    V, _ = build_potential_from_features(features or [], (x_nm, y_nm, z_nm),
+                                         float(V_background_eV))
+    laplacian = lap3d_cartesian(len(x_nm), len(y_nm), len(z_nm), dx, dy, dz,
+                                bc=(bcx, bcy, bcz))
+    E, psi = _solve_on_grid(V, laplacian, meff, n_states)
+
+    logger.debug("3D well: %.4g x %.4g x %.4g nm, %dx%dx%d, %d state(s)",
+                 Lx_nm, Ly_nm, Lz_nm, len(x_nm), len(y_nm), len(z_nm), len(E))
+    return {'E_eV': E / e, 'psi': psi, 'V_eV': V / e, 'x_nm': x_nm,
+            'y_nm': y_nm, 'z_nm': z_nm,
+            'shape': (len(x_nm), len(y_nm), len(z_nm))}
+
+
+def density(psi, shape, index: int = 0):
+    """|psi|² of one state, reshaped onto the grid it was solved on."""
+    column = np.asarray(psi)[:, int(index)]
+    return (np.abs(column) ** 2).reshape(shape, order="C")
 
 
 def solve_dot(model: str, dims_nm, meff: float = 0.067,

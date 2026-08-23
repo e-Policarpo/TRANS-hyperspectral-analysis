@@ -29,6 +29,8 @@ from src.widgets.qml_graph_canvas import QMLGraphCanvas
 from src.widgets.qml_figure_canvas import FigureCanvasItem
 from src.widgets.qml_designer_canvas import DesignerCanvas
 from src.widgets.qml_solver_canvas import SolverCanvas
+from src.widgets.qml_potential_canvas import PotentialCanvas
+from src.backend.modeling_backend import ModelingBackend
 from src.widgets.qml_image_canvas import QMLImageCanvas
 from src.widgets.image_provider import TransImageProvider
 from src.backend.map_editor_backend import MapEditorBackend
@@ -106,6 +108,10 @@ def main():
     qmlRegisterType(FigureCanvasItem, "TransQML", 1, 0, "FigureCanvas")
     qmlRegisterType(DesignerCanvas, "TransQML", 1, 0, "DesignerCanvas")
     qmlRegisterType(SolverCanvas, "TransQML", 1, 0, "SolverCanvas")
+    # The Modeling workstation: an interactive potential and the backend
+    # that owns the features in it.
+    qmlRegisterType(PotentialCanvas, "TransQML", 1, 0, "PotentialCanvas")
+    qmlRegisterType(ModelingBackend, "TransQML", 1, 0, "ModelingBackend")
 
     # Create QML engine
     engine = QQmlApplicationEngine()

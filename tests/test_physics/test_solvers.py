@@ -18,8 +18,9 @@ from src.physics.features import SegmentFeature1D
 from src.physics.quantum_dot import dot_energies
 from src.physics.solution_spec import SolutionSpec
 from src.physics.solvers import (BOUNDARY_CONDITIONS, MAX_STATES,
-                                 can_simulate, compare_with_targets,
-                                 dot_from_spec, solve_dot, solve_well_1d,
+                                 can_simulate, compare_with_targets, density,
+                                 dot_from_spec, grid_axis, solve_dot,
+                                 solve_well_1d, solve_well_2d, solve_well_3d,
                                  states_needed, well_from_spec)
 
 
@@ -253,3 +254,91 @@ class TestComparingWithTheMeasurement:
 
         assert comparison['matched'] == []
         assert np.isnan(comparison['rrmse_pct'])
+
+
+class TestTheTwoAndThreeDimensionalWells:
+    """The grids the Modeling workstation solves on."""
+
+    def test_2d_reproduces_the_closed_form(self):
+        from src.physics.analytical import box_energies_2d_eV
+
+        solved = solve_well_2d(10.0, 6.0, Nx=120, Ny=80, n_states=4,
+                               meff=0.067)
+        exact = [E for E, _ in box_energies_2d_eV(10.0, 6.0, 0.067, 4)]
+
+        assert solved['E_eV'] == pytest.approx(exact, rel=1e-3)
+
+    def test_3d_reproduces_the_closed_form(self):
+        """Coarser, because the cost is the grid cubed — so the tolerance is
+        looser, and that is the honest trade rather than a weaker claim."""
+        from src.physics.analytical import box_energies_3d_eV
+
+        solved = solve_well_3d(8.0, 6.0, 5.0, Nx=28, Ny=24, Nz=20,
+                               n_states=3, meff=0.067)
+        exact = [E for E, _ in box_energies_3d_eV(8.0, 6.0, 5.0, 0.067, 3)]
+
+        assert solved['E_eV'] == pytest.approx(exact, rel=6e-3)
+
+    def test_a_square_box_is_degenerate(self):
+        """(1,2) and (2,1) are the same energy; a solver that splits them has
+        an asymmetry it should not have."""
+        solved = solve_well_2d(8.0, 8.0, Nx=70, Ny=70, n_states=3)
+
+        assert solved['E_eV'][1] == pytest.approx(solved['E_eV'][2], rel=1e-6)
+
+    def test_the_potential_comes_back_shaped_like_the_grid(self):
+        solved = solve_well_2d(10.0, 6.0, Nx=40, Ny=30, n_states=2)
+
+        assert solved['shape'] == (40, 30)
+        assert solved['V_eV'].shape == (40, 30)
+        assert solved['psi'].shape == (1200, 2)
+
+    def test_a_feature_binds_a_state_below_zero(self):
+        from src.physics.features import CircleFeature2D
+
+        well = CircleFeature2D(10.0, 10.0, 4.0, -0.4, 0.067)
+        solved = solve_well_2d(20.0, 20.0, Nx=80, Ny=80, n_states=2,
+                               features=[well])
+
+        assert solved['E_eV'][0] < 0
+        assert solved['V_eV'].min() == pytest.approx(-0.4)
+
+    def test_a_density_is_one_state_on_the_grid(self):
+        solved = solve_well_2d(10.0, 6.0, Nx=40, Ny=30, n_states=2)
+        grid = density(solved['psi'], solved['shape'], 1)
+
+        assert grid.shape == (40, 30)
+        assert grid.sum() == pytest.approx(1.0)
+        assert (grid >= 0).all()
+
+    def test_a_3d_state_is_a_volume(self):
+        solved = solve_well_3d(6.0, 6.0, 6.0, Nx=14, Ny=14, Nz=14, n_states=1)
+        grid = density(solved['psi'], solved['shape'], 0)
+
+        assert grid.shape == (14, 14, 14)
+        assert grid.sum() == pytest.approx(1.0)
+
+    def test_the_state_count_is_capped_here_too(self):
+        solved = solve_well_2d(10.0, 10.0, Nx=30, Ny=30, n_states=10_000)
+
+        assert len(solved['E_eV']) <= MAX_STATES
+
+
+class TestTheGridAxis:
+    def test_dirichlet_keeps_the_samples_inside_the_box(self):
+        """The walls sit just outside the grid; a sample on the wall is a
+        sample where the wavefunction is zero by construction."""
+        axis, spacing = grid_axis(10.0, 9, "dirichlet")
+
+        assert axis[0] == pytest.approx(1.0)
+        assert axis[-1] == pytest.approx(9.0)
+        assert spacing == pytest.approx(1e-9)
+
+    def test_the_other_conditions_start_at_the_edge(self):
+        axis, _spacing = grid_axis(10.0, 10, "neumann")
+
+        assert axis[0] == pytest.approx(0.0)
+
+    def test_a_zero_length_axis_is_refused(self):
+        with pytest.raises(ValueError, match="positive"):
+            grid_axis(0.0, 10)
