@@ -40,8 +40,14 @@ def tools_menu(main_qml):
 
 
 def _menu_entries(text):
-    """Every clickable tool entry, in menu order."""
-    return re.findall(r'text: "([^"]+)"\n\s*visible: [^\n]+\n\s*height: '
+    """Every clickable tool entry, in menu order.
+
+    Comment lines between the text and the visibility are allowed: several
+    entries carry a line saying why they appear on a second tab, and a
+    parser that ignored them would quietly report the entry as missing.
+    """
+    return re.findall(r'text: "([^"]+)"\n(?:\s*//[^\n]*\n)*'
+                      r'\s*visible: [^\n]+\n\s*height: '
                       r'visible \? implicitHeight : 0\n\s*onTriggered: '
                       r'openToolWindow\(text\)', text)
 
@@ -80,8 +86,16 @@ class TestTheThreeGroups:
     def test_the_composite_group_is_the_composite_tools(self, tools_menu):
         assert set(_group(tools_menu, "Composite tools")) == {
             "Map Generator", "Confinement Analysis", "Spectral Features",
-            "Confinement Designer", "Line Scan Designer", "Multi-Peak Fitting",
+            "Confinement Designer", "Line Scan Designer",
+            "Quantum Well Solver", "Quantum Dot Solver", "Multi-Peak Fitting",
             "Detect Bandgap & Doping", "Dirac Point Estimator"}
+
+    def test_the_solvers_are_composite_too(self, tools_menu):
+        """Each does several things in one pass — build the potential, solve
+        it, group the levels into shells, compare with the measurement."""
+        composite = set(_group(tools_menu, "Composite tools"))
+
+        assert {"Quantum Well Solver", "Quantum Dot Solver"} <= composite
 
     def test_a_simple_tool_is_in_the_first_group(self, tools_menu):
         simple = set(_group(tools_menu, "Tools"))

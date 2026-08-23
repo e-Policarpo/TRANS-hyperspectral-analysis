@@ -163,7 +163,7 @@ Item {
         stripCanvas.showMessage("Pick a line scan and run the search")
     }
 
-    Component.onDestruction: stripCanvas.cleanup()
+    Component.onDestruction: { if (stripCanvas) stripCanvas.cleanup() }
 
     RowLayout {
         anchors.fill: parent

@@ -87,7 +87,8 @@ ApplicationWindow {
                 "Integration Utility", "Map Generator", "Spatial Average",
                 "Truncate Data", "Curve Analysis", "Confinement Analysis",
                 "Spectral Features", "Confinement Designer",
-                "Line Scan Designer", "Peak Indexing",
+                "Line Scan Designer", "Quantum Well Solver",
+                "Quantum Dot Solver", "Peak Indexing",
                 "Average Curves", "Filter Bad Data", "Cosmic Ray Filter",
                 "Background Subtraction",
                 "Dirac Point Estimator", "Detect Bandgap & Doping",
@@ -691,6 +692,20 @@ ApplicationWindow {
             MenuItem {
                 text: "Line Scan Designer"
                 visible: currentTabIndex === 0 || currentTabIndex === 1
+                height: visible ? implicitHeight : 0
+                onTriggered: openToolWindow(text)
+            }
+            MenuItem {
+                text: "Quantum Well Solver"
+                // The other direction from the designer: a geometry in, its
+                // levels out, solved numerically rather than searched for.
+                visible: currentTabIndex === 0
+                height: visible ? implicitHeight : 0
+                onTriggered: openToolWindow(text)
+            }
+            MenuItem {
+                text: "Quantum Dot Solver"
+                visible: currentTabIndex === 0
                 height: visible ? implicitHeight : 0
                 onTriggered: openToolWindow(text)
             }
@@ -1814,11 +1829,43 @@ ApplicationWindow {
     property string pendingWorkflowName: ""
     property string pendingWorkflowPath: ""
 
+    // The geometry a solver window is about to be opened for, and the
+    // measured energies it should be compared against. Same handoff as the
+    // workflow runner's, for the same reason.
+    property var pendingSolverParams: null
+    property var pendingSolverTargets: []
+
+    // "Simulate" on a designer candidate: the designer found the geometry
+    // analytically, and the solver says what that geometry really gives.
+    // Which window to open is the candidate's own model — and a 2D or 3D
+    // candidate opens neither, because no solver here builds one.
+    function openSolverForSpec(description) {
+        if (!description || !description.ok) {
+            // The status bar is the backend's, and this is exactly the kind
+            // of thing it is for: the user asked for something the tools
+            // cannot do, and the answer is a sentence, not a dialog.
+            console.log("openSolverForSpec:", description ? description.error : "no candidate")
+            if (backend) {
+                backend.status = (description && description.error)
+                                 ? description.error
+                                 : "That candidate cannot be simulated here."
+            }
+            return false
+        }
+        mainWindow.pendingSolverParams = description.params
+        mainWindow.pendingSolverTargets = description.targets || []
+        openToolWindow(description.solver === "dot" ? "Quantum Dot Solver"
+                                                    : "Quantum Well Solver")
+        return true
+    }
+
     property var multiTabTools: ({ "Confinement Analysis": true, "Spectral Features": true,
                                    "Line Scan Designer": true })
     property var toolWindowSizes: ({ "Confinement Analysis": { width: 1000, height: 700 },
                                      "Confinement Designer": { width: 1120, height: 760 },
                                      "Line Scan Designer": { width: 1080, height: 740 },
+                                     "Quantum Well Solver": { width: 1000, height: 700 },
+                                     "Quantum Dot Solver": { width: 1060, height: 720 },
                                      "Spectral Features": { width: 1020, height: 720 } })
 
     function toolWindowSize(toolName) {
@@ -1851,6 +1898,8 @@ ApplicationWindow {
             "Confinement Analysis": "../tools/ConfinementAnalysisTool.qml",
             "Confinement Designer": "../tools/ConfinementDesignerTool.qml",
             "Line Scan Designer": "../tools/LineScanDesignerTool.qml",
+            "Quantum Well Solver": "../tools/QuantumWellSolverTool.qml",
+            "Quantum Dot Solver": "../tools/QuantumDotSolverTool.qml",
             "Spectral Features": "../tools/SpectralFeaturesTool.qml",
             "Peak Indexing": "../tools/PeakIndexingTool.qml",
             "Filter Bad Data": "../tools/FilterBadDataTool.qml",

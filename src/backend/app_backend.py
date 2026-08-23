@@ -6723,6 +6723,30 @@ class AppBackend(ToolImplementations, QObject):
             self.status = f"Confinement Designer: {message or 'no candidates'}"
         self.designerCompleted.emit(result)
 
+    @Slot("QVariantMap", result="QVariantMap")
+    def solveQuantumWell(self, params: dict):
+        """Solve one 1-D well and hand the levels straight back.
+
+        Milliseconds at any sensible grid, so it runs on the calling thread:
+        a solver window is turn-a-knob-and-look, and a round trip through the
+        worker would cost more than the solve.
+        """
+        return self.solve_quantum_well(dict(params or {}))
+
+    @Slot("QVariantMap", result="QVariantMap")
+    def solveQuantumDot(self, params: dict):
+        """Solve one quantum dot and hand back its shells."""
+        return self.solve_quantum_dot(dict(params or {}))
+
+    @Slot("QVariantMap", result="QVariantMap")
+    def describeCandidate(self, candidate: dict):
+        """Which solver can simulate a designer candidate, and with what.
+
+        The "Simulate" bridge: the designer holds candidates as plain maps,
+        and this says which window to open and what to put in its fields.
+        """
+        return self.describe_candidate(dict(candidate or {}))
+
     @Slot(str, "QVariantMap")
     def runLineScanDesigner(self, dataset_name: str, params: dict):
         """QML wrapper for the Line Scan Designer - runs on the worker.

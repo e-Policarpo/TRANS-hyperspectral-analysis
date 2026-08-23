@@ -170,6 +170,27 @@ Item {
 
     function dimensionText(candidate) { return Vocab.dimensionText(candidate) }
 
+    // "Simulate": hand the selected candidate to whichever solver builds its
+    // geometry. The designer matched energies analytically; the solver says
+    // what the well it found really gives, which is how a real solution is
+    // told from an alias of the arithmetic.
+    function simulateSelected() {
+        if (root.selectedCandidate < 0
+                || root.selectedCandidate >= root.candidates.length) return
+        var description = backend.describeCandidate(
+            root.candidates[root.selectedCandidate])
+        if (!description || !description.ok) {
+            statusLabel.text = description && description.error
+                               ? description.error
+                               : "That candidate cannot be simulated here."
+            return
+        }
+        if (parentWindow && parentWindow.openSolverForSpec) {
+            parentWindow.openSolverForSpec(description)
+            statusLabel.text = "Simulating " + description.label + " numerically…"
+        }
+    }
+
     Connections {
         target: backend
         function onDataLoaded(name) { refreshDatasets() }
@@ -216,8 +237,10 @@ Item {
     }
 
     Component.onDestruction: {
-        spectrumCanvas.cleanup()
-        candidateCanvas.cleanup()
+        // Destruction order is not guaranteed: a canvas child can already be
+        // gone when the panel's own handler runs.
+        if (spectrumCanvas) spectrumCanvas.cleanup()
+        if (candidateCanvas) candidateCanvas.cleanup()
     }
 
     // =====================================================================
@@ -607,15 +630,27 @@ Item {
                     anchors.margins: 6
                     spacing: 4
 
-                    Label {
-                        text: root.candidates.length > 0
-                              ? "Candidates — the smallest well that explains the ladder " +
-                                "is the primary one; the rest are its aliases and other masses"
-                              : "No candidates yet"
-                        color: textMuted
-                        font.pixelSize: 10
-                        wrapMode: Text.Wrap
+                    RowLayout {
                         Layout.fillWidth: true
+                        spacing: 6
+
+                        Label {
+                            text: root.candidates.length > 0
+                                  ? "Candidates — the smallest well that explains the " +
+                                    "ladder is the primary one; the rest are its aliases " +
+                                    "and other masses"
+                                  : "No candidates yet"
+                            color: textMuted
+                            font.pixelSize: 10
+                            wrapMode: Text.Wrap
+                            Layout.fillWidth: true
+                        }
+
+                        Button {
+                            text: "Simulate"
+                            enabled: root.selectedCandidate >= 0
+                            onClicked: root.simulateSelected()
+                        }
                     }
 
                     ListView {

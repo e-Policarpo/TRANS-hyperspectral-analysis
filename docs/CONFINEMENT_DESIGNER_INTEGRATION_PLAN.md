@@ -5,7 +5,7 @@ direct confinement solvers — into this repository, translated to English, as
 first-class TRANS tools.
 
 Status: written 2026-08-22, decisions locked the same day (§10).
-**Phases 0 to 4 are built and tested** (§9):
+**Phases 0 to 5 are built and tested** (§9):
 
 - Phase 0 — `src/physics/` holds the whole solver core, the branch splitting,
   the line-scan loop and the extracted inverse designer, in English, with no
@@ -29,8 +29,13 @@ Status: written 2026-08-22, decisions locked the same day (§10).
   *Saved workflows*, node definitions carry a `composite` flag the palette
   badges, and a saved `.flow` runs from the menu over a dataset selection.
 
-Nothing has been deleted from the Tk app. Phase 5 — the 1D and 0D direct
-solvers — is next, and phase 6 (the 2D/3D editors) stays deferred.
+- Phase 5 — the **Quantum Well Solver** (1D) and **Quantum Dot Solver** (0D),
+  and "Simulate" on a designer candidate opens whichever of them builds its
+  geometry, with the fields already filled and the measured levels drawn
+  across the result.
+
+Nothing has been deleted from the Tk app. Phase 6 (the 2D/3D editors) stays
+deferred; phase 7 is retirement, and that is a decision rather than work.
 
 ---
 
@@ -568,12 +573,34 @@ Two things the grouping turned up:
   also workflow nodes carry `composite: True` — the menu grouping and the
   palette badge cannot disagree.
 
-### Phase 5 — the direct solvers
+### Phase 5 — the direct solvers ✅ **done**
 "Quantum Well Solver" (1D) and "Quantum Dot Solver" (0D) as composite tools.
 These are `tab_1d.py` (595 lines) and `tab_quantum_dot.py` (482) — modest UI,
 and the `accept_solution` bridge already exists, so a candidate from the
 designer can be simulated numerically inside TRANS exactly as it is today.
 *Done when:* "Simulate in ▸" works across two TRANS tool windows.
+
+`src/physics/solvers.py` is the assembly the Tk tabs had inline: the
+potential from `features`, the operator from `laplacian`, the eigenvalues
+from `eigensolver`, the 0D models from `quantum_dot` — plus the three pieces
+that made a candidate runnable (`well_from_spec`, `dot_from_spec`,
+`states_needed`) and `compare_with_targets`, which is what the whole bridge
+is for.
+
+Two things worth keeping in mind:
+
+- **The numerics are checked against the closed form.** The 1D solver
+  reproduces the textbook ladder to 1e-4 relative, its error falls as the
+  square of the grid spacing, and the dot fills its shells at 2, 8, 18. A
+  grid solution that quietly missed those would still look like an answer.
+- **A candidate that cannot be simulated says so.** `can_simulate` returns
+  an empty string for a 2D or 3D geometry, and "Simulate" then reports it
+  rather than opening a solver that would build something else.
+
+The Tk `_widen_until_targets_covered` retry did *not* come across: instead of
+re-solving behind the user's back, the comparison reports `covered: False`
+when a target sits above the last level solved, and the panel says to raise
+the state count. The information is the same and the loop is the user's.
 
 ### Phase 6 — the 2D/3D feature editors *(decide later)*
 `tab_2d_features.py` (1 045), `tab_multi_well_3d.py` (1 264) and
@@ -654,7 +681,7 @@ explicitly **out of scope for v1** (§5.3).
 | 2 | `FigureCanvasItem` + single-spectrum tool | ~~2 days~~ **done** |
 | 3 | line-scan tool, worker, dataset output, workflow | ~~3–4 days~~ **done** |
 | 4 | palette division + saved-workflow runner | ~~2 days~~ **done** |
-| 5 | 1D and 0D solver tools | 3 days |
+| 5 | 1D and 0D solver tools | ~~3 days~~ **done** |
 | 6 | 2D/3D editors *(deferred)* | 1–2 weeks |
 
 Phases 0–3 are the ones that pay: they put the designer where the data is,

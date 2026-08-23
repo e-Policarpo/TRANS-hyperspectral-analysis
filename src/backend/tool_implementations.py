@@ -3948,6 +3948,255 @@ class ToolImplementations:
         return table_name
 
     # ========================================================================
+    # Direct solvers
+    # ========================================================================
+
+    #: A quantum well solved numerically, rather than searched for.
+    WELL_SOLVER_DEFAULTS = {
+        'L_nm': 10.0,
+        'N': 800,
+        'n_states': 8,
+        'meff': 0.067,
+        'V0_eV': 0.0,          # 0 = infinite barrier: the box walls confine
+        'bc': 'dirichlet',
+    }
+
+    #: A quantum dot solved numerically. ``channels`` is l for the sphere and
+    #: |m| for the disc — how many angular-momentum ladders to open.
+    DOT_SOLVER_DEFAULTS = {
+        'model': 'spherical',
+        'R_nm': 5.0,
+        'Lz_nm': 3.0,
+        'hw_xy_meV': 30.0,
+        'hw_z_meV': 100.0,
+        'meff': 0.067,
+        'V0_eV': 0.0,
+        'channels': 3,
+        'n_per_channel': 4,
+        'N': 800,
+        'state_index': 0,
+        'broadening_eV': 0.005,
+        'charging_eV': 0.0,
+    }
+
+    @staticmethod
+    def _solver_spec(candidate: Optional[dict]):
+        """A :class:`SolutionSpec` from a designer candidate map, or None.
+
+        The bridge between the two halves of the tool: the designer produces
+        candidates as plain maps for QML, and the solvers want a spec.
+        """
+        from src.physics.solution_spec import spec_from_designer
+
+        candidate = dict(candidate or {})
+        if not candidate.get('dims_nm'):
+            return None
+        solution = {
+            'ndim': candidate.get('ndim', '1D'),
+            'coords': candidate.get('coords', 'cartesian'),
+            'dims': list(candidate['dims_nm']),
+            'offset': candidate.get('offset_eV', 0.0),
+            'RRMSE': candidate.get('rrmse'),
+            'sym': candidate.get('sym', ''),
+            'match': candidate.get('match', ''),
+            'matches': [{'computed_E': value, 'qn': qn}
+                        for value, qn in zip(candidate.get('computed') or [],
+                                             candidate.get('qn') or [])],
+        }
+        return spec_from_designer(solution, float(candidate.get('meff', 0.067)),
+                                  candidate.get('targets') or [],
+                                  V0_eV=candidate.get('V0_eV'))
+
+    def describe_candidate(self, candidate: Optional[dict]) -> dict:
+        """What a candidate is, and which solver could simulate it.
+
+        ``solver`` is ``"well"``, ``"dot"`` or ``""`` — and the empty answer
+        is a real one: a 2D or 3D candidate is a geometry neither solver
+        builds, and offering to simulate it would mean simulating something
+        else.
+        """
+        from src.physics.solvers import (can_simulate, dot_from_spec,
+                                         states_needed, well_from_spec)
+
+        blank = {'ok': False, 'solver': '', 'model': '', 'label': '',
+                 'params': {}, 'error': ''}
+        try:
+            spec = self._solver_spec(candidate)
+            if spec is None:
+                return {**blank, 'error': "That candidate has no geometry."}
+
+            solver = can_simulate(spec)
+            if not solver:
+                return {**blank, 'model': spec.model, 'label': spec.label(),
+                        'error': (f"{spec.label()} is a {spec.ndim}D geometry — "
+                                  f"no solver here builds one.")}
+
+            if solver == "well":
+                args = well_from_spec(spec)
+                params = {'L_nm': args['L_nm'], 'meff': args['meff'],
+                          'n_states': args['n_states'],
+                          'V0_eV': 0.0 if spec.infinite_barrier
+                                   else abs(spec.V0_eV),
+                          'bc': args['bc']}
+            else:
+                args = dot_from_spec(spec)
+                dims = list(args['dims_nm']) + [0.0, 0.0]
+                params = {'model': spec.model.replace('dot_', ''),
+                          'meff': args['meff'],
+                          'channels': args['channels'],
+                          'V0_eV': abs(spec.V0_eV or 0.0),
+                          'R_nm': dims[0], 'Lz_nm': dims[1],
+                          'hw_xy_meV': dims[0], 'hw_z_meV': dims[1],
+                          'n_states': states_needed(spec)}
+
+            return {'ok': True, 'solver': solver, 'model': spec.model,
+                    'label': spec.label(), 'params': params,
+                    'targets': [float(t) for t in spec.targets_eV],
+                    'error': ''}
+        except Exception as exc:
+            logger.error("describe_candidate failed: %s", exc, exc_info=True)
+            return {**blank, 'error': str(exc)}
+
+    def solve_quantum_well(self, params: Optional[dict] = None) -> dict:
+        """Solve one 1-D well on a grid and report its levels.
+
+        Numerical where the designer is analytical: this is how an alias of
+        the arithmetic is told from a well that really produces those levels.
+        Milliseconds at any sensible grid size, so it runs where it is called
+        from rather than going to the worker.
+        """
+        from src.physics.features import SegmentFeature1D
+        from src.physics.solvers import compare_with_targets, solve_well_1d
+
+        blank = {'ok': False, 'E_eV': [], 'x_nm': [], 'V_eV': [], 'psi': [],
+                 'comparison': {}, 'error': ''}
+        try:
+            params = {**self.WELL_SOLVER_DEFAULTS, **(params or {})}
+            L_well = float(params['L_nm'])
+            V0 = abs(float(params.get('V0_eV', 0.0) or 0.0))
+
+            # A finite barrier needs room for the evanescent tail: putting
+            # the box wall against the well returns the box's levels.
+            if V0 > 0:
+                L_box = max(3.0 * L_well, L_well + 10.0)
+                x0 = (L_box - L_well) / 2.0
+                features = [SegmentFeature1D(x0, L_well, -V0,
+                                             float(params['meff']))]
+            else:
+                L_box = L_well
+                features = [SegmentFeature1D(0.0, L_well, 0.0,
+                                             float(params['meff']))]
+
+            result = solve_well_1d(
+                L_nm=L_box, N=int(params['N']),
+                n_states=int(params['n_states']), meff=float(params['meff']),
+                features=features, V_background_eV=0.0,
+                bc=str(params.get('bc', 'dirichlet')))
+
+            # Only bound states are levels: above the barrier the "state" is
+            # the box's, and reporting it as the well's is a lie the grid
+            # makes easy.
+            energies = [float(E) for E in result['E_eV']]
+            bound = [E for E in energies if V0 <= 0 or E < 0.0]
+            targets = [float(t) for t in (params.get('targets') or [])]
+
+            psi = result['psi']
+            density = [(psi[:, i] ** 2).tolist() for i in range(psi.shape[1])]
+            return {
+                'ok': True,
+                'E_eV': energies,
+                'bound': bound if V0 > 0 else energies,
+                'x_nm': result['x_nm'].tolist(),
+                'V_eV': result['V_eV'].tolist(),
+                'psi': density,
+                'L_box_nm': L_box,
+                'comparison': (compare_with_targets(
+                    energies, self._target_spec(targets)) if targets else {}),
+                'error': '',
+            }
+        except Exception as exc:
+            logger.error("Quantum well solver failed: %s", exc, exc_info=True)
+            return {**blank, 'error': str(exc)}
+
+    @staticmethod
+    def _target_spec(targets):
+        """A throwaway spec carrying only targets, for the comparison."""
+        from src.physics.solution_spec import SolutionSpec
+
+        return SolutionSpec(model='1d', dims_nm=(1.0,),
+                            targets_eV=tuple(targets))
+
+    def solve_quantum_dot(self, params: Optional[dict] = None) -> dict:
+        """Solve one quantum dot and report its shells.
+
+        A dot confines in every direction, so the spectrum is discrete and
+        reads like an atom's: levels group into shells, and the addition
+        energies peak where a shell closes — the signature a Coulomb-blockade
+        measurement shows.
+        """
+        from src.physics.quantum_dot import (addition_energies, level_spectrum,
+                                             shell_table)
+        from src.physics.solvers import compare_with_targets, solve_dot
+
+        blank = {'ok': False, 'levels': [], 'shells': [], 'addition_eV': [],
+                 'dos': {}, 'radial': {}, 'comparison': {}, 'error': ''}
+        try:
+            params = {**self.DOT_SOLVER_DEFAULTS, **(params or {})}
+            model = str(params['model'])
+            if model == 'parabolic':
+                dims = [float(params['hw_xy_meV']), float(params['hw_z_meV'])]
+            elif model == 'disc':
+                dims = [float(params['R_nm']), float(params['Lz_nm'])]
+            else:
+                dims = [float(params['R_nm'])]
+
+            levels = solve_dot(model, dims, meff=float(params['meff']),
+                               V0_eV=abs(float(params.get('V0_eV', 0.0) or 0.0)) or None,
+                               channels=int(params['channels']),
+                               n_per_channel=int(params['n_per_channel']),
+                               N=int(params['N']))
+            if not levels:
+                return {**blank,
+                        'error': ("No state fits in this dot — widen it or "
+                                  "deepen the barrier.")}
+
+            index = max(0, min(int(params.get('state_index', 0)), len(levels) - 1))
+            chosen = levels[index]
+            grid, dos = level_spectrum(
+                levels, broadening_eV=float(params['broadening_eV']))
+
+            targets = [float(t) for t in (params.get('targets') or [])]
+            return {
+                'ok': True,
+                'levels': [{'index': i, 'E_eV': float(lv.E_eV),
+                            'label': lv.label,
+                            'degeneracy': int(lv.degeneracy),
+                            'occupancy': int(lv.occupancy),
+                            'channel': int(lv.channel),
+                            'qn': [int(q) for q in lv.quantum_numbers]}
+                           for i, lv in enumerate(levels)],
+                'shells': [{'E_eV': float(E), 'labels': list(labels),
+                            'degeneracy': int(degeneracy), 'filled': int(filled)}
+                           for E, labels, degeneracy, filled
+                           in shell_table(levels)],
+                'addition_eV': [float(v) for v in addition_energies(
+                    levels, charging_eV=float(params['charging_eV']))],
+                'dos': {'x': grid.tolist(), 'y': dos.tolist()},
+                'radial': ({'r_nm': chosen.r_nm.tolist(),
+                            'psi': (chosen.radial ** 2).tolist(),
+                            'label': chosen.label, 'index': index}
+                           if chosen.radial is not None
+                           and chosen.r_nm is not None else {}),
+                'comparison': (compare_with_targets(
+                    [lv.E_eV for lv in levels], self._target_spec(targets))
+                    if targets else {}),
+                'error': '',
+            }
+        except Exception as exc:
+            logger.error("Quantum dot solver failed: %s", exc, exc_info=True)
+            return {**blank, 'error': str(exc)}
+
+    # ========================================================================
     # Occupancy Matrix
     # ========================================================================
 
