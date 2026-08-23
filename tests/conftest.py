@@ -6,6 +6,7 @@ Shared fixtures for all test modules
 import pytest
 import numpy as np
 import pandas as pd
+import weakref
 from pathlib import Path
 import sys
 
@@ -19,40 +20,66 @@ from src.models.spectral_data import SpectralData, SpectralMetadata
 # Worker threads
 # =============================================================================
 
+#: Every worker thread built during the session, weakly held so a test that
+#: does tidy up after itself is not kept alive by this.
+_LIVE_WORKERS = weakref.WeakSet()
+
+
 @pytest.fixture(scope="session", autouse=True)
-def _shut_down_worker_threads():
-    """Stop any worker threads a test left running.
+def _track_worker_threads():
+    """Record every worker thread as it is constructed.
 
     A ``WorkerManager`` owns two QThreads that keep spinning unless
-    ``shutdown()`` is called. Tests build backends and drop them, so at the
-    end of the session Python tears the objects down while their threads are
-    still alive — a use-after-free that killed the process with SIGABRT or
-    SIGSEGV *after* the summary line, turning a reported run into exit 134
-    (and a passing run into a CI failure).
+    ``shutdown()`` is called. Tests build backends a dozen different ways and
+    drop them, so the threads pile up: the session used to end by tearing
+    down objects whose threads were still alive (SIGABRT *after* the summary,
+    exit 134), and once enough of them accumulated — a hundred, on a full
+    run — the process aborted mid-run instead, at a different test each time.
 
-    Sweeping the heap rather than tracking constructions: the threads are
-    created deep inside backends that tests instantiate in a dozen different
-    ways, and missing one puts the crash back.
+    Wrapping the constructor rather than sweeping the heap: `gc.get_objects()`
+    per test is far too slow over a suite this size, and the set has to be
+    exact or the crash comes back.
     """
-    yield
-
-    import gc
-
     try:
-        from src.backend.worker import PersistentWorker, WorkerManager
-    except Exception:                       # PySide6 not importable: nothing ran
+        from src.backend.worker import PersistentWorker
+    except Exception:                       # PySide6 not importable: nothing to do
+        yield
         return
 
-    for obj in gc.get_objects():
+    original = PersistentWorker.__init__
+
+    def tracked(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        _LIVE_WORKERS.add(self)
+
+    PersistentWorker.__init__ = tracked
+    try:
+        yield
+    finally:
+        PersistentWorker.__init__ = original
+        _stop_worker_threads()
+
+
+@pytest.fixture(autouse=True)
+def _stop_worker_threads_after_each_test():
+    """Stop the threads this test started, before the next one runs.
+
+    Per test and not per session: it is the accumulation that kills the run,
+    so cleaning up at the end would be too late to help.
+    """
+    yield
+    _stop_worker_threads()
+
+
+def _stop_worker_threads():
+    for worker in list(_LIVE_WORKERS):
         try:
-            if isinstance(obj, WorkerManager):
-                obj.shutdown()
-            elif isinstance(obj, PersistentWorker) and obj.isRunning():
-                obj.stop()
-                obj.wait(2000)
+            if worker.isRunning():
+                worker.stop()
+                worker.wait(2000)
         except Exception:
             # Teardown is best-effort: a half-built object is not worth
-            # failing the whole session over.
+            # failing a test over.
             pass
 
 
