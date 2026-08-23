@@ -55,6 +55,44 @@ ApplicationWindow {
     property string _pendingMapLoadById: ""
     property string _pendingLineScan: ""
 
+    // One workspace tab. Declared once so the three stay identical, and so
+    // the sizing rule lives in one place.
+    //
+    // The rule: a TabBar hands every button an EQUAL share of its width
+    // unless the button sets a width of its own (QQuickTabBar only resizes
+    // children whose width is not valid). With three tabs in a fixed 400 px
+    // bar that was 133 px each — narrower than "Hyperspectral Analysis" — so
+    // the name ran past its own background and the selection highlight
+    // stopped short of it. Binding width to implicitWidth opts each tab out
+    // of the share-out and sizes it to its own label plus the padding.
+    component WorkspaceTab: TabButton {
+        width: implicitWidth
+        leftPadding: 22
+        rightPadding: 22
+
+        contentItem: Text {
+            text: parent.text
+            font.pixelSize: 14
+            font.bold: parent.checked
+            color: parent.checked ? accentPink : textMuted
+            horizontalAlignment: Text.AlignHCenter
+            verticalAlignment: Text.AlignVCenter
+        }
+
+        background: Rectangle {
+            // Fills the button, which now fills the name.
+            color: parent.checked ? bgLight : "transparent"
+            radius: 3
+            Rectangle {
+                visible: parent.parent.checked
+                anchors.bottom: parent.bottom
+                width: parent.width
+                height: 2
+                color: accentPink
+            }
+        }
+    }
+
     // Show startup dialog on launch and apply saved color scheme
     Component.onCompleted: {
         var t0 = Date.now()
@@ -1132,7 +1170,14 @@ ApplicationWindow {
                         // Tab selector (still useful for tool filtering)
                         TabBar {
                             id: tabBar
-                            Layout.preferredWidth: 400
+                            // Sized by its tabs, not the other way round.
+                            // The minimum matters: the tabs now carry their
+                            // own widths, so a layout squeeze would clip them
+                            // rather than shrink them. The spacer to the left
+                            // gives way instead.
+                            Layout.preferredWidth: implicitWidth
+                            Layout.minimumWidth: implicitWidth
+                            spacing: 6
                             currentIndex: currentTabIndex
                             onCurrentIndexChanged: {
                                 currentTabIndex = currentIndex
@@ -1155,69 +1200,9 @@ ApplicationWindow {
                                 }
                             }
 
-                            TabButton {
-                                text: "Spectral Analysis"
-                                contentItem: Text {
-                                    text: parent.text
-                                    font.pixelSize: 14
-                                    font.bold: parent.checked
-                                    color: parent.checked ? accentPink : textMuted
-                                    horizontalAlignment: Text.AlignHCenter
-                                    verticalAlignment: Text.AlignVCenter
-                                }
-                                background: Rectangle {
-                                    color: parent.checked ? bgLight : "transparent"
-                                    Rectangle {
-                                        visible: parent.parent.checked
-                                        anchors.bottom: parent.bottom
-                                        width: parent.width
-                                        height: 2
-                                        color: accentPink
-                                    }
-                                }
-                            }
-                            TabButton {
-                                text: "Hyperspectral Analysis"
-                                contentItem: Text {
-                                    text: parent.text
-                                    font.pixelSize: 14
-                                    font.bold: parent.checked
-                                    color: parent.checked ? accentPink : textMuted
-                                    horizontalAlignment: Text.AlignHCenter
-                                    verticalAlignment: Text.AlignVCenter
-                                }
-                                background: Rectangle {
-                                    color: parent.checked ? bgLight : "transparent"
-                                    Rectangle {
-                                        visible: parent.parent.checked
-                                        anchors.bottom: parent.bottom
-                                        width: parent.width
-                                        height: 2
-                                        color: accentPink
-                                    }
-                                }
-                            }
-                            TabButton {
-                                text: "Modeling"
-                                contentItem: Text {
-                                    text: parent.text
-                                    font.pixelSize: 14
-                                    font.bold: parent.checked
-                                    color: parent.checked ? accentPink : textMuted
-                                    horizontalAlignment: Text.AlignHCenter
-                                    verticalAlignment: Text.AlignVCenter
-                                }
-                                background: Rectangle {
-                                    color: parent.checked ? bgLight : "transparent"
-                                    Rectangle {
-                                        visible: parent.parent.checked
-                                        anchors.bottom: parent.bottom
-                                        width: parent.width
-                                        height: 2
-                                        color: accentPink
-                                    }
-                                }
-                            }
+                            WorkspaceTab { text: "Spectral Analysis" }
+                            WorkspaceTab { text: "Hyperspectral Analysis" }
+                            WorkspaceTab { text: "Modeling" }
                         }  // TabBar
 
                         // Workflow Editor button
