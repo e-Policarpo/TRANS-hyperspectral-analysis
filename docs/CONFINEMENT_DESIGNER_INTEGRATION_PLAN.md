@@ -38,8 +38,9 @@ Status: written 2026-08-22, decisions locked the same day (§10).
   Hyperspectral, where features are placed by dragging them and the potential
   they make is solved in 2D or 3D.
 
-Nothing has been deleted from the Tk app. Phase 7 is retirement, and that is
-a decision rather than work.
+Nothing has been deleted from the Tk app, and **phase 7 is deliberately not
+being done** (decided 2026-08-23): the calculator stays where it is for now.
+Everything below is built; the port is complete without retiring anything.
 
 ---
 
@@ -647,9 +648,20 @@ between them.
 saved. All three, with 103 tests over the specs, the solvers, the backend,
 the canvas interaction and the workstation itself.
 
-### Phase 7 — retirement
+### Phase 7 — retirement ⏸ **not yet, by decision**
 Delete the Tk app once phases 0–5 are in use, or archive it under
 `archive/` (already gitignored).
+
+**Held, 2026-08-23.** The standalone app keeps running untouched at
+`~/Documents/Doutorado/Programas importantes/calculadora_autoestados`. Its
+physics, its inverse designer, both direct solvers and both 2D/3D editors now
+run inside TRANS, so retiring it is a tidying decision and not a dependency:
+nothing in this repository imports it, and nothing here needs it gone.
+
+Worth knowing if it is picked up later: the Tk app is not a git repository,
+so archiving is a move rather than a delete, and the only things in it that
+never came across are the 3-D wireframe view (§9, phase 6) and the CSV
+readers, which the project's own loaders replace.
 
 ---
 
