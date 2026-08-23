@@ -3666,6 +3666,288 @@ class ToolImplementations:
         }
 
     # ========================================================================
+    # Line Scan Designer
+    # ========================================================================
+
+    #: On top of DESIGNER_DEFAULTS, for a whole line rather than one
+    #: spectrum. ``max_rrmse`` doubles as the search tolerance, so a position
+    #: whose best candidate is worse than this is reported as having no
+    #: confinement rather than being given a number anyway.
+    LINE_DESIGNER_DEFAULTS = {
+        'maxsol': 1,
+        'group_tol_nm': 1.0,
+        'max_rrmse': 5.0,
+    }
+
+    #: Columns the table always has, in this order. Everything numeric is
+    #: NaN where a position has no confinement — never 0, which would map as
+    #: a very small well and read as a real measurement.
+    LINE_DESIGNER_COLUMNS = ('point_index', 'position_m', 'size_nm',
+                             'rrmse_pct', 'group', 'meff', 'n_peaks')
+
+    def _line_scan_from_dataset(self, spectral_data, dataset_name: str):
+        """A :class:`~src.physics.line_scan.LineScan` over a dataset's spectra.
+
+        The step comes from the loader's own positions, so the map's axis is
+        distance rather than a column number; without one the axis falls back
+        to the point index, which is honest rather than invented.
+        """
+        from src.physics.line_scan import LineScan
+
+        step_m = self._line_step_m(spectral_data)
+        return LineScan(
+            x=np.asarray(spectral_data.independent_var, dtype=np.float64),
+            ys=np.asarray(spectral_data.spectra.values, dtype=np.float64),
+            names=[str(c) for c in spectral_data.spectra.columns],
+            path=dataset_name,
+            step_nm=(float(step_m) * 1e9) if step_m else None)
+
+    def design_line_scan(self, task, dataset_name: str,
+                         params: Optional[dict] = None) -> dict:
+        """One confinement search per position along a line.
+
+        The single-spectrum question repeated point by point — and **not
+        converging is an answer**. On an arbitrary scan most positions fall
+        outside the confining structure, and a map where every point has a
+        size is a map that lies; those come back as NaN with the reason
+        recorded beside them.
+
+        The output is a flat table, one row per position, because that is
+        what the rest of the project can already use: Map Assembly lays any
+        of its columns out on the sample, and the Hyperspectral tab opens it.
+        """
+        empty = {'ok': False, 'dataset': '', 'map_paths': [], 'groups': [],
+                 'summary': {}, 'error': '', 'points': []}
+        try:
+            from src.physics.branches import analyze_curve
+            from src.physics.designer import (CARRIER_BOTH, CARRIER_HOLE,
+                                              MATCH_ABSOLUTE, Designer)
+            from src.physics.line_scan import (NO_PAIR, analyze_line_scan,
+                                               group_by_size,
+                                               segments_along_line, summarize)
+            from src.physics.pairing import confinement_size_nm, pair_candidates
+
+            if dataset_name not in self._datasets:
+                self.errorOccurred.emit("Error", "Dataset not found")
+                return {**empty, 'error': "Dataset not found"}
+
+            params = {**self.DESIGNER_DEFAULTS, **self.LINE_DESIGNER_DEFAULTS,
+                      **(params or {})}
+            spectral_data = self._datasets[dataset_name]
+            scan = self._line_scan_from_dataset(spectral_data, dataset_name)
+
+            # A dummy peak table decides nothing here; the carriers do, and
+            # they are rebuilt per position because each spectrum has its own
+            # peaks. This only reads the mass lists and the mode.
+            from src.physics.branches import DidvPeaks
+            carriers = self._designer_carriers(
+                params, DidvPeaks(electron_eV=[], hole_eV=[], peaks_V=[]))
+            if not carriers:
+                return {**empty, 'error': "No carrier selected"}
+            paired = str(params.get('carrier')) == CARRIER_BOTH
+            hole_first = str(params.get('carrier')) == CARRIER_HOLE
+            primary = carriers[0]
+
+            search = {'ndim': str(params['ndim']), 'coords': str(params['coords']),
+                      'sym': str(params['sym']),
+                      'fixed': dict(params.get('fixed')
+                                    or {'d1': None, 'd2': None, 'd3': None}),
+                      'Lmin': float(params['Lmin']), 'Lmax': float(params['Lmax']),
+                      'tol': float(params['max_rrmse']),
+                      'maxsol': int(params['maxsol']),
+                      'priority': str(params['priority']),
+                      'match': str(params['match'])}
+            designer = Designer(seed=params.get('seed'))
+
+            split_e = float(params.get('split_e', 0.0) or 0.0)
+            split_h = float(params.get('split_h', 0.0) or 0.0)
+            # In delta-E only the differences count, so a lone peak defines no
+            # ladder; in absolute energies one level is already a constraint.
+            min_peaks = 1 if search['match'] == MATCH_ABSOLUTE else 2
+
+            def targets_fn(curve):
+                peaks = analyze_curve(curve, params, split_e=split_e,
+                                      split_h=split_h,
+                                      min_abs_V=float(params.get('min_abs_V', 0.0)))
+                branch = peaks.hole_eV if hole_first else peaks.electron_eV
+                return {'targets': branch, 'peaks': peaks,
+                        'n_peaks': len(peaks.peaks_V)}
+
+            def _candidates(targets, carrier):
+                found = []
+                for meff in carrier['meffs']:
+                    p = {**search, 'Et': np.asarray(targets, dtype=float),
+                         'meff': meff, 'carrier': carrier['carrier']}
+                    found.extend(designer.primary_alias(sol, p)
+                                 for sol in designer.find_solutions(p))
+                return found
+
+            def search_fn(found):
+                solutions = _candidates(found['targets'], primary)
+                if not paired:
+                    return solutions
+
+                # Both carriers: the position only counts when the two close
+                # on the same well — the pair's requirement, point by point.
+                hole_targets = found['peaks'].hole_eV
+                if len(hole_targets) < 2:
+                    found['reason'] = NO_PAIR
+                    return []
+                holes = _candidates(hole_targets, carriers[-1])
+                pairs = pair_candidates(solutions, holes,
+                                        tol_nm=float(params['pair_tol_nm']),
+                                        max_pairs=int(params['maxsol']))
+                if not pairs:
+                    found['reason'] = NO_PAIR
+                    return []
+                found['hole_size_nm'] = confinement_size_nm(
+                    pairs[0]['hole'], pairs[0]['hole'].get('meff'))
+                found['mismatch_nm'] = pairs[0]['mismatch_nm']
+                return [pair['electron'] for pair in pairs]
+
+            def progress(index, total):
+                task.progress = index / max(1, total)
+                return not bool(getattr(task, 'cancelled', False))
+
+            logger.info("Line Scan Designer: %s — %d position(s), %s/%s, "
+                        "match %s, carrier %s", dataset_name, scan.n_points,
+                        search['ndim'], search['coords'], search['match'],
+                        params.get('carrier'))
+
+            results = analyze_line_scan(
+                scan, targets_fn, search_fn,
+                size_fn=lambda sol: confinement_size_nm(sol, sol.get('meff')),
+                min_peaks=min_peaks, max_rrmse=float(params['max_rrmse']),
+                progress=progress)
+
+            groups = group_by_size(results, float(params['group_tol_nm']))
+            table_name = self._register_line_scan_table(
+                results, dataset_name, spectral_data, params)
+
+            # The size map, laid out by the same node any other per-spectrum
+            # column goes through — no second export path to keep in step.
+            assembled = self.assemble_maps(
+                task, table_name, params={'scan_type': 'line',
+                                          'columns': 'size_nm',
+                                          'joined_map': False},
+                source_dataset_name=dataset_name)
+
+            task.progress = 1.0
+            return {
+                'ok': True,
+                'dataset': table_name,
+                'map_paths': assembled.get('map_paths', []),
+                'groups': [{k: v for k, v in group.items()} for group in groups],
+                'summary': summarize(results),
+                'points': [self._line_point_row(r) for r in results],
+                # The spatial reading: where each domain starts and ends,
+                # with the empty stretches between them, which are part of
+                # the answer rather than gaps in it.
+                'segments': [{'group': (-1 if seg['group'] is None
+                                        else int(seg['group'])),
+                              'start': float(seg['start']),
+                              'end': float(seg['end']),
+                              'count': int(seg['count'])}
+                             for seg in segments_along_line(results)],
+                'error': '',
+            }
+
+        except ValueError as exc:
+            logger.info("Line Scan Designer: %s", exc)
+            return {**empty, 'error': str(exc)}
+        except Exception as e:
+            logger.error(f"Line scan designer error: {e}", exc_info=True)
+            self.errorOccurred.emit("Line Scan Designer Error", str(e))
+            return {**empty, 'error': str(e)}
+
+    @staticmethod
+    def _line_point_row(point) -> dict:
+        """One position as plain numbers, for QML and for the strip plot."""
+        def _number(value):
+            return float(value) if value is not None else float('nan')
+
+        return {
+            'point_index': int(point.index),
+            'position_nm': float(point.position),
+            'size_nm': _number(point.size_nm),
+            'rrmse_pct': _number(point.rrmse),
+            'group': (int(point.group) if point.group is not None else -1),
+            'n_peaks': int(point.n_peaks),
+            'reason': str(point.reason or ''),
+            'converged': bool(point.converged),
+        }
+
+    def _register_line_scan_table(self, results, dataset_name: str,
+                                  spectral_data, params: dict) -> str:
+        """The run as a flat table, one row per position.
+
+        Flat because the rest of the project consumes flat data: every column
+        is immediately a map, and ``group`` is an integer for the same reason
+        — a categorical string cannot be plotted or mapped, an integer can.
+
+        Nothing that failed to converge is written as 0. NaN is an empty cell
+        in CSV, is skipped by plots and masked by the colour strip; 0 would
+        map as a very small well and read as a real measurement.
+        """
+        positions_m = self._line_positions_m(spectral_data)
+        n_dims = max((len(r.dims_nm) for r in results), default=0)
+        nan = float('nan')
+
+        frame = pd.DataFrame({
+            'point_index': [r.index for r in results],
+            'position_m': [float(positions_m[r.index])
+                           if positions_m is not None and r.index < len(positions_m)
+                           else nan for r in results],
+            'size_nm': [r.size_nm if r.size_nm is not None else nan for r in results],
+            'rrmse_pct': [r.rrmse if r.rrmse is not None else nan for r in results],
+            'group': [float(r.group) if r.group is not None else nan for r in results],
+            'meff': [r.meff if r.meff is not None else nan for r in results],
+            'n_peaks': [r.n_peaks for r in results],
+        })
+        for d in range(n_dims):
+            frame[f'dim_{d + 1}_nm'] = [
+                float(r.dims_nm[d]) if len(r.dims_nm) > d else nan for r in results]
+        if any(r.hole_size_nm is not None for r in results):
+            frame['hole_size_nm'] = [r.hole_size_nm if r.hole_size_nm is not None
+                                     else nan for r in results]
+            frame['mismatch_nm'] = [r.mismatch_nm if r.mismatch_nm is not None
+                                    else nan for r in results]
+        # The only string column, and the only place a reason appears.
+        frame['reason'] = [r.reason or '' for r in results]
+
+        base_name = self._extract_clean_base_name(dataset_name)
+        table_name = f"{base_name} - Confinement"
+        metadata = SpectralMetadata(
+            source_type='confinement_line',
+            dimensions=spectral_data.metadata.dimensions,
+            scan_mode=spectral_data.metadata.scan_mode,
+            units={'independent': 'Index', 'dependent': 'Confinement size (nm)'},
+            additional_info={
+                'created_from': 'line_scan_designer',
+                'source_dataset': dataset_name,
+                'original_dataset': dataset_name,
+                'ndim': params.get('ndim'),
+                'coords': params.get('coords'),
+                'match': params.get('match'),
+                'carrier': params.get('carrier'),
+                'group_tol_nm': float(params.get('group_tol_nm', 1.0)),
+                'max_rrmse': float(params.get('max_rrmse', 0.0)),
+                **self._carry_spatial_info(spectral_data.metadata),
+            },
+            data_type='flat',
+        )
+        self._datasets[table_name] = SpectralData(frame, metadata)
+
+        path = self._ensure_output_dir('confinement') / (
+            self._sanitize_filename(table_name) + '.csv')
+        frame.to_csv(path, index=False)
+        logger.info("Line Scan Designer: %d position(s) -> %s", len(frame), path)
+
+        if not self._workflow_mode:
+            self.dataLoaded.emit(table_name)
+        return table_name
+
+    # ========================================================================
     # Occupancy Matrix
     # ========================================================================
 

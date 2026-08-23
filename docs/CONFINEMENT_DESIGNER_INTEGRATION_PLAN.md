@@ -5,7 +5,7 @@ direct confinement solvers — into this repository, translated to English, as
 first-class TRANS tools.
 
 Status: written 2026-08-22, decisions locked the same day (§10).
-**Phases 0, 1 and 2 are built and tested** (§9):
+**Phases 0 to 3 are built and tested** (§9):
 
 - Phase 0 — `src/physics/` holds the whole solver core, the branch splitting,
   the line-scan loop and the extracted inverse designer, in English, with no
@@ -20,8 +20,13 @@ Status: written 2026-08-22, decisions locked the same day (§10).
   geometries out. A candidate found in TRANS matches the Tk app's for the
   same spectrum to 1e-8 nm.
 
-Nothing has been deleted from the Tk app. Phase 3 — the line-scan designer,
-the one of real value — is next.
+- Phase 3 — the **Line Scan Designer**: one search per position, a flat
+  table with a row per position, and the confinement size laid out along the
+  line in metres. Multi-dataset (`BATCH_TOOLS`) and a workflow node
+  (`ConfinementDesign`).
+
+Nothing has been deleted from the Tk app. Phase 4 — the palette division and
+the saved-workflow runner — is next.
 
 ---
 
@@ -501,13 +506,37 @@ the panel against a stub backend and asserts the parameter keys it sends are
 the ones `DESIGNER_DEFAULTS` declares. qmllint cannot catch a renamed key;
 that test can.
 
-### Phase 3 — the line-scan designer
+### Phase 3 — the line-scan designer ✅ **done**
 The tool of real value. Dataset in → per-position search on the worker →
 flat-table dataset out (§10.4) → colour-strip map in a `FigureCanvasItem`.
 Add the `BATCH_TOOLS` entry, the workflow node, and `export_field` for the
 map.
 *Done when:* a MATRIX line scan produces a confinement table in the project
 browser that the Map Generator can map and the Hyperspectral tab can open.
+
+Built as `design_line_scan` + `LineScanDesignerTool.qml` + the
+`ConfinementDesign` node + one `BATCH_TOOLS` entry. The table is §10.4's
+exactly, including `group` as a number and `reason` as the only text column.
+
+**The map goes through Map Assembly rather than a second export path.** The
+plan said "`export_field` for the map"; phase 1 had already built the node
+that does exactly this, so the tool registers its table and then calls
+`assemble_maps` on it with `columns='size_nm'`. One export path, and every
+other column of the table is a map away for the user too — which is the
+decomposition principle applied to the tool that motivated it.
+
+Two honest notes on the acceptance:
+
+- **Verified on a synthetic line scan**, not on a MATRIX file: a scan with a
+  planted 8 nm well at two of five positions comes back with those two
+  positions at 8.00 nm, the other three empty with their reasons, one size
+  group over exactly those points, and a map whose `XReal` is the line's real
+  length in metres. Running it on real MATRIX data is a use question, not a
+  correctness one.
+- **The Hyperspectral tab opens the source line scan, not the table.** The
+  table is flat data — one row per position — and that is the shape the Map
+  Generator and Map Assembly consume. Opening the *table* as a kymograph
+  would mean inventing a spectral axis it does not have.
 
 ### Phase 4 — palette division and saved workflows
 The three-group Tools menu, the `composite` flag and its badge in the node
@@ -599,7 +628,7 @@ explicitly **out of scope for v1** (§5.3).
 | 0 | physics package + designer extraction + tests | ~~2–3 days~~ **done** |
 | 1 | `MapAssembly`, `BaselineEstimate`, `EnergyBinning` | ~~3–4 days~~ **done** |
 | 2 | `FigureCanvasItem` + single-spectrum tool | ~~2 days~~ **done** |
-| 3 | line-scan tool, worker, dataset output, workflow | 3–4 days |
+| 3 | line-scan tool, worker, dataset output, workflow | ~~3–4 days~~ **done** |
 | 4 | palette division + saved-workflow runner | 2 days |
 | 5 | 1D and 0D solver tools | 3 days |
 | 6 | 2D/3D editors *(deferred)* | 1–2 weeks |

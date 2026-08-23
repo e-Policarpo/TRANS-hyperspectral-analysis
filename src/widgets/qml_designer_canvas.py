@@ -225,6 +225,96 @@ class DesignerCanvas(FigureCanvasItem):
         self.figure.tight_layout(pad=0.6)
         self.redraw()
 
+    # ── the line, position by position ───────────────────────────────────
+
+    #: What a position with no confinement is painted. Deliberately not a
+    #: colour from the scale: absence is a result, and giving it one would be
+    #: inventing a size for it.
+    NO_CONFINEMENT_GREY = "0.82"
+
+    @Slot('QVariantMap')
+    def showLineScan(self, run) -> None:
+        """A colour strip along the line, and the sizes under it by group.
+
+        The strip is a ``pcolormesh`` and not an ``imshow``: with a single
+        row of cells imshow resamples and blurs the boundary between one
+        domain and its neighbour, which is exactly what the map is read for.
+        """
+        import matplotlib
+
+        run = dict(run or {})
+        points = list(run.get('points') or [])
+        self.figure.clf()
+        if not points:
+            self._draw_message(run.get('error') or "No line scan yet")
+            return
+
+        positions = np.array([float(p.get('position_nm', i))
+                              for i, p in enumerate(points)], dtype=float)
+        sizes = np.array([float(p.get('size_nm', float('nan')))
+                          if p.get('converged') else float('nan')
+                          for p in points], dtype=float)
+        masked = np.ma.masked_invalid(sizes)
+
+        strip_ax = self.figure.add_subplot(211)
+        profile_ax = self.figure.add_subplot(212, sharex=strip_ax)
+
+        half = ((positions[1] - positions[0]) / 2.0 if positions.size > 1
+                else 0.5)
+        edges = np.concatenate([positions - half, [positions[-1] + half]])
+        cmap = matplotlib.colormaps.get_cmap("viridis").copy()
+        cmap.set_bad(self.NO_CONFINEMENT_GREY)
+        # A masked cell is not drawn at all: the grey comes from the axes
+        # background, so "no confinement" reads as outside the scale.
+        strip_ax.set_facecolor(self.NO_CONFINEMENT_GREY)
+        image = strip_ax.pcolormesh(edges, np.array([0.0, 1.0]),
+                                    masked.reshape(1, -1), cmap=cmap,
+                                    shading="flat")
+        strip_ax.set_yticks([])
+        strip_ax.set_title("Confinement along the line "
+                           "(grey = none found)", fontsize=9)
+        bar = self.figure.colorbar(image, ax=strip_ax, pad=0.01)
+        bar.set_label("size (nm)", fontsize=8, color=self._foreground)
+        bar.ax.tick_params(colors=self._foreground, labelsize=7)
+
+        # The profile, coloured by group, with the empty stretches shaded.
+        for segment in (run.get('segments') or []):
+            if segment.get('group') is None or segment.get('group') < 0:
+                profile_ax.axvspan(float(segment.get('start', 0.0)) - half,
+                                   float(segment.get('end', 0.0)) + half,
+                                   color="#3a3a4e", alpha=0.35, zorder=0)
+
+        groups = list(run.get('groups') or [])
+        if groups:
+            palette = matplotlib.colormaps.get_cmap("tab10")
+            for group in groups:
+                index = int(group.get('index', 0))
+                rows = [i for i, p in enumerate(points)
+                        if int(p.get('group', -1)) == index]
+                profile_ax.plot(positions[rows], sizes[rows], "o", ms=4,
+                                color=palette(index % 10),
+                                label=f"{float(group.get('size_nm', 0)):.2f} nm "
+                                      f"({int(group.get('count', len(rows)))})")
+            legend = profile_ax.legend(fontsize=7, title="groups",
+                                       title_fontsize=7,
+                                       facecolor=self._background,
+                                       edgecolor=self._grid)
+            for text in legend.get_texts():
+                text.set_color(self._foreground)
+            legend.get_title().set_color(self._foreground)
+
+        profile_ax.set_xlabel(run.get('position_label') or "Position (nm)")
+        profile_ax.set_ylabel("Confinement (nm)")
+        for ax in (strip_ax, profile_ax):
+            self._style(ax)
+        # Set last, because _style paints the theme background: the strip's
+        # missing cells must NOT be the panel colour. Viridis runs to nearly
+        # black at its low end, so on a dark background "no confinement" and
+        # "the smallest well on the line" would look the same.
+        strip_ax.set_facecolor(self.NO_CONFINEMENT_GREY)
+        self.figure.tight_layout(pad=0.6)
+        self.redraw()
+
     # ── nothing to draw ──────────────────────────────────────────────────
 
     def _draw_message(self, message: str) -> None:

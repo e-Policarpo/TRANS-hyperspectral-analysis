@@ -1,5 +1,5 @@
 """
-Loads the Confinement Designer panel and drives it with a stub backend.
+Loads the two designer panels and drives them with a stub backend.
 
 qmllint parses the file; it does not catch a property the backend does not
 have, a signal handler whose name no longer matches, or a result map whose
@@ -29,6 +29,7 @@ from src.widgets.qml_figure_canvas import FigureCanvasItem
 
 QML_ROOT = Path(__file__).resolve().parents[2] / "src" / "qml"
 TOOL_QML = QML_ROOT / "tools" / "ConfinementDesignerTool.qml"
+LINE_QML = QML_ROOT / "tools" / "LineScanDesignerTool.qml"
 
 
 class StubBackend(QObject):
@@ -36,15 +37,18 @@ class StubBackend(QObject):
 
     dataLoaded = Signal(str)
     designerCompleted = Signal('QVariantMap')
+    lineScanDesignCompleted = Signal('QVariantMap')
 
     def __init__(self):
         super().__init__()
         self.runs = []
         self.previews = []
+        self.line_runs = []
+        self.batches = []
 
     @Slot(result='QVariantList')
     def getDatasetList(self):
-        return ["Line scan"]
+        return ["Line scan", "Other"]
 
     @Slot(str, result='QVariantMap')
     def getDatasetInfo(self, name):
@@ -61,6 +65,14 @@ class StubBackend(QObject):
     @Slot(str, 'QVariantMap')
     def runConfinementDesigner(self, name, params):
         self.runs.append((name, dict(params)))
+
+    @Slot(str, 'QVariantMap')
+    def runLineScanDesigner(self, name, params):
+        self.line_runs.append((name, dict(params)))
+
+    @Slot(str, 'QVariantList', 'QVariantMap')
+    def runToolOnDatasets(self, key, names, params):
+        self.batches.append((key, list(names), dict(params)))
 
     @Slot()
     def cancelCurrentOperation(self):
@@ -196,3 +208,117 @@ class TestRunningAndReporting:
                                        Q_ARG("QVariant", 1))
 
         assert item.property("selectedCandidate") == 1
+
+
+@pytest.fixture
+def line_panel(app):
+    """The line-scan panel, instantiated against the same stub."""
+    engine = QQmlEngine()
+    engine.addImportPath(str(QML_ROOT))
+    backend = StubBackend()
+    engine.rootContext().setContextProperty("backend", backend)
+
+    component = QQmlComponent(engine, QUrl.fromLocalFile(str(LINE_QML)))
+    assert component.status() == QQmlComponent.Ready, component.errorString()
+    item = component.create()
+    assert item is not None, component.errorString()
+
+    yield item, backend
+
+    item.deleteLater()
+
+
+def _line_result(points, groups=(), segments=(), summary=None, error=""):
+    return {'ok': bool(points), 'dataset': 'line - Confinement',
+            'map_paths': [], 'groups': list(groups), 'segments': list(segments),
+            'summary': summary or {'total': len(points), 'converged': 0,
+                                   'reasons': {}},
+            'points': points, 'error': error}
+
+
+def _point(index, size=float('nan'), group=-1, converged=False, reason=""):
+    return {'point_index': index, 'position_nm': index * 5.0, 'size_nm': size,
+            'rrmse_pct': float('nan'), 'group': group, 'n_peaks': 3,
+            'reason': reason, 'converged': converged}
+
+
+class TestTheLineScanPanel:
+    def test_it_instantiates(self, line_panel):
+        item, _backend = line_panel
+        assert item is not None
+
+    def test_picking_one_line_runs_the_tool_directly(self, line_panel):
+        item, backend = line_panel
+        item.metaObject().invokeMethod(item, "acceptDatasetDrop",
+                                       Q_ARG("QVariant", ["Line scan"]))
+        item.metaObject().invokeMethod(item, "runSearch")
+
+        assert backend.line_runs, "the run button did not reach the backend"
+        assert backend.line_runs[-1][0] == "Line scan"
+        assert backend.batches == []
+        assert item.property("running") is True
+
+    def test_picking_several_lines_runs_them_as_a_batch(self, line_panel):
+        """One entry in BATCH_TOOLS is all it takes; the panel just has to
+        route to the batch slot rather than the single-dataset one."""
+        item, backend = line_panel
+        item.metaObject().invokeMethod(item, "acceptDatasetDrop",
+                                       Q_ARG("QVariant", ["Line scan", "Other"]))
+        item.metaObject().invokeMethod(item, "runSearch")
+
+        assert backend.batches, "a multi-selection did not go through the batch"
+        key, names, _params = backend.batches[-1]
+        assert key == "line_scan_designer"
+        assert names == ["Line scan", "Other"]
+        assert backend.line_runs == []
+
+    def test_nothing_selected_runs_nothing(self, line_panel):
+        item, backend = line_panel
+        item.metaObject().invokeMethod(item, "runSearch")
+
+        assert backend.line_runs == [] and backend.batches == []
+
+    def test_the_backend_understands_every_key_the_panel_sends(self, line_panel):
+        """The panel's map and the backend's defaults have to name the same
+        knobs; a rename on either side breaks here rather than silently."""
+        from src.backend.tool_implementations import ToolImplementations
+
+        item, backend = line_panel
+        item.metaObject().invokeMethod(item, "acceptDatasetDrop",
+                                       Q_ARG("QVariant", ["Line scan"]))
+        item.metaObject().invokeMethod(item, "runSearch")
+
+        # The detection knobs are not in the defaults maps: they belong to
+        # the peak engine, which the search hands the whole map to.
+        from src.processing.peak_detection import Params
+
+        known = (set(ToolImplementations.DESIGNER_DEFAULTS)
+                 | set(ToolImplementations.LINE_DESIGNER_DEFAULTS)
+                 | set(vars(Params())))
+        assert backend.line_runs
+        _name, params = backend.line_runs[-1]
+        assert set(params) <= known, set(params) - known
+        # And the ones that decide the search are actually there.
+        assert {'ndim', 'coords', 'match', 'carrier', 'max_rrmse',
+                'group_tol_nm'} <= set(params)
+
+    def test_a_finished_run_draws_the_strip_and_names_the_table(self, line_panel):
+        item, backend = line_panel
+        backend.lineScanDesignCompleted.emit(_line_result(
+            [_point(0), _point(1, 8.0, 0, True), _point(2)],
+            groups=[{'index': 0, 'size_nm': 8.0, 'count': 1, 'points': [1]}],
+            segments=[{'group': -1, 'start': 0.0, 'end': 0.0, 'count': 1},
+                      {'group': 0, 'start': 5.0, 'end': 5.0, 'count': 1},
+                      {'group': -1, 'start': 10.0, 'end': 10.0, 'count': 1}],
+            summary={'total': 3, 'converged': 1, 'reasons': {'no_peaks': 2}}))
+
+        assert item.property("running") is False
+        assert item.property("tableName") == "line - Confinement"
+
+    def test_a_run_that_found_nothing_says_so(self, line_panel):
+        item, backend = line_panel
+        backend.lineScanDesignCompleted.emit(
+            _line_result([], error="Dataset not found"))
+
+        assert item.property("tableName") == ""
+

@@ -226,3 +226,98 @@ class TestPaletteAndMessages:
         canvas._render()
 
         assert canvas._cached_image is not None
+
+
+class TestTheLineStrip:
+    """Position across, colour by size, grey where there is nothing."""
+
+    def _run(self, **over):
+        points = [
+            {'point_index': 0, 'position_nm': 0.0, 'size_nm': float('nan'),
+             'group': -1, 'converged': False, 'reason': 'no_peaks'},
+            {'point_index': 1, 'position_nm': 5.0, 'size_nm': 8.0,
+             'group': 0, 'converged': True, 'reason': ''},
+            {'point_index': 2, 'position_nm': 10.0, 'size_nm': 8.05,
+             'group': 0, 'converged': True, 'reason': ''},
+            {'point_index': 3, 'position_nm': 15.0, 'size_nm': float('nan'),
+             'group': -1, 'converged': False, 'reason': 'too_few_peaks'},
+        ]
+        run = {'points': points,
+               'groups': [{'index': 0, 'size_nm': 8.025, 'count': 2,
+                           'points': [1, 2]}],
+               'segments': [{'group': -1, 'start': 0.0, 'end': 0.0, 'count': 1},
+                            {'group': 0, 'start': 5.0, 'end': 10.0, 'count': 2},
+                            {'group': -1, 'start': 15.0, 'end': 15.0, 'count': 1}],
+               'position_label': 'Position (nm)'}
+        run.update(over)
+        return run
+
+    def test_it_draws_the_strip_over_the_profile(self, canvas):
+        canvas.showLineScan(self._run())
+
+        # The strip, the profile, and the colourbar's own axes.
+        assert len(canvas.figure.axes) == 3
+
+    def test_a_position_with_no_confinement_is_masked_not_coloured(self, canvas):
+        """Absence is a result; giving it a colour from the scale would be
+        inventing a size for it."""
+        canvas.showLineScan(self._run())
+        mesh = canvas.figure.axes[0].collections[0]
+
+        assert np.ma.is_masked(mesh.get_array())
+        assert mesh.get_array().mask.sum() == 2
+
+    def test_the_masked_cells_show_the_axes_grey(self, canvas):
+        canvas.showLineScan(self._run())
+
+        assert canvas.figure.axes[0].get_facecolor()[:3] == pytest.approx(
+            (0.82, 0.82, 0.82), abs=1e-2)
+
+    def test_each_cell_is_one_position_wide(self, canvas):
+        """pcolormesh and not imshow: with one row of cells imshow resamples
+        and blurs the boundary between one domain and its neighbour."""
+        canvas.showLineScan(self._run())
+        mesh = canvas.figure.axes[0].collections[0]
+
+        assert mesh.get_array().shape == (1, 4)
+
+    def test_the_profile_marks_each_group_separately(self, canvas):
+        canvas.showLineScan(self._run())
+        profile = canvas.figure.axes[1]
+
+        assert len(profile.lines) == 1                 # one group
+        assert profile.lines[0].get_xdata().tolist() == [5.0, 10.0]
+
+    def test_the_empty_stretches_are_shaded(self, canvas):
+        canvas.showLineScan(self._run())
+        spans = [p for p in canvas.figure.axes[1].patches]
+
+        assert len(spans) == 2                         # the two bare ends
+
+    def test_the_axis_is_labelled_with_the_position_unit(self, canvas):
+        canvas.showLineScan(self._run(position_label="Point"))
+
+        assert canvas.figure.axes[1].get_xlabel() == "Point"
+
+    def test_a_line_with_nothing_on_it_still_draws(self, canvas):
+        """A scan where nothing converged is an answer, not an error."""
+        run = self._run()
+        for point in run['points']:
+            point['converged'] = False
+            point['size_nm'] = float('nan')
+        run['groups'] = []
+        canvas.showLineScan(run)
+
+        assert canvas.figure.axes[0].collections[0].get_array().mask.all()
+
+    def test_no_run_at_all_says_so(self, canvas):
+        canvas.showLineScan({'points': []})
+
+        assert canvas.figure.axes[0].texts[0].get_text() == "No line scan yet"
+
+    def test_a_single_position_does_not_divide_by_zero(self, canvas):
+        canvas.showLineScan({'points': [
+            {'point_index': 0, 'position_nm': 0.0, 'size_nm': 8.0,
+             'group': 0, 'converged': True, 'reason': ''}]})
+
+        assert canvas.figure.axes[0].collections[0].get_array().shape == (1, 1)

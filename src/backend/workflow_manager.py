@@ -830,6 +830,31 @@ class WorkflowExecutor:
                     outputs[port] = result.get(key)
                 outputs['intervals'] = result.get('intervals', [])
 
+        elif tool_name == "ConfinementDesign":
+            dataset = inputs.get('dataset')
+            if dataset is not None:
+                if isinstance(dataset, str):
+                    logger.error(f"ConfinementDesign received string instead of dataset: {dataset}")
+                    return outputs
+
+                dataset_name = self._get_temp_dataset_name(dataset)
+                self.app_backend._datasets[dataset_name] = dataset
+
+                class MockTask:
+                    cancelled = False
+                    progress = 0
+
+                result = self.app_backend.design_line_scan(
+                    MockTask(), dataset_name, params=dict(params))
+                # The table is registered under its own name inside the tool;
+                # the port carries the dataset object so a downstream node
+                # (Map Assembly, an output) gets it without a lookup.
+                table = result.get('dataset')
+                outputs['table'] = self.app_backend._datasets.get(table)
+                outputs['maps'] = result.get('map_paths', [])
+                logger.info("ConfinementDesign: %s",
+                            result.get('summary') or result.get('error'))
+
         elif tool_name == "EnergyBinning":
             peaks = inputs.get('peaks')
             if peaks is not None:

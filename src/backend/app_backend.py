@@ -183,6 +183,9 @@ class AppBackend(ToolImplementations, QObject):
     # map rather than a path, because nothing here is a file — the result is
     # a list the panel draws and the user picks from.
     designerCompleted = Signal('QVariantMap')
+    # One line-scan design run: the table it registered, the size groups it
+    # found, and one row per position for the strip plot.
+    lineScanDesignCompleted = Signal('QVariantMap')
     mapDeleted = Signal(str)  # map_path - emitted when a map is deleted
     imageImported = Signal(str, str, str)  # map_name, file_path, map_id - opens in Map Editor tab
     windowClosed = Signal(str, str)  # window_type, window_id
@@ -6719,6 +6722,42 @@ class AppBackend(ToolImplementations, QObject):
         else:
             self.status = f"Confinement Designer: {message or 'no candidates'}"
         self.designerCompleted.emit(result)
+
+    @Slot(str, "QVariantMap")
+    def runLineScanDesigner(self, dataset_name: str, params: dict):
+        """QML wrapper for the Line Scan Designer - runs on the worker.
+
+        A search per position, so a long line is minutes rather than seconds:
+        never on the GUI thread, and cancellable between positions.
+        """
+        logger.info(f"Submitting line scan design for {dataset_name} to worker")
+        self.status = f"Mapping confinement along {dataset_name}..."
+        self.worker_manager.submit(
+            name=f"Line Scan Designer {dataset_name}",
+            operation=self.design_line_scan,
+            dataset_name=dataset_name,
+            params=dict(params or {}),
+            on_finished=self._on_line_scan_design_completed,
+        )
+
+    def _on_line_scan_design_completed(self, result):
+        """Publish the table and the size map, and say what the line held."""
+        result = result if isinstance(result, dict) else {}
+        summary = result.get('summary') or {}
+        if result.get('ok'):
+            converged = summary.get('converged', 0)
+            total = summary.get('total', 0)
+            groups = len(result.get('groups') or [])
+            self.status = (f"Confinement: {converged}/{total} position(s), "
+                           f"{groups} size group(s)")
+            paths = list(result.get('map_paths') or [])
+            if paths:
+                # One map, and it summarises the run — open it.
+                self._on_maps_completed(paths, open_paths=None)
+        else:
+            self.status = (f"Line Scan Designer: "
+                           f"{result.get('error') or 'nothing found'}")
+        self.lineScanDesignCompleted.emit(result)
 
     @Slot(str, int, "QVariantMap", result="QVariantMap")
     def previewDesignerTargets(self, dataset_name: str, spectrum_index: int,

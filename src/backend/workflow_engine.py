@@ -908,6 +908,53 @@ TOOL_DEFINITIONS = {
         }
     },
 
+    "ConfinementDesign": {
+        "display_name": "Confinement Design",
+        "category": "Analysis",
+        "description": "Search every position of a line scan for the well that produces its ladder of levels — one confinement size per spectrum, or the reason there is none",
+        "inputs": [
+            {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
+        ],
+        "outputs": [
+            {"id": "table", "name": "Confinement", "port_type": "flat_data", "description": "One row per position: size, error, group, geometry — NaN where there is no confinement, with the reason beside it"},
+            {"id": "maps", "name": "Size Map", "port_type": "map", "description": "The confinement size laid out along the line, in metres"}
+        ],
+        "parameters": {
+            "carrier": {"type": "select", "label": "Carriers", "default": "electrons",
+                        "options": ["electrons", "holes", "both"],
+                        "description": "Which branch of the spectrum is searched. 'both' requires the two carriers to close on the same well at a position before it counts."},
+            "meff_e": {"type": "string", "label": "m* electron", "default": "0.067",
+                       "description": "One search per mass in the list — the mass is usually the least known number in the problem"},
+            "meff_h": {"type": "string", "label": "m* hole", "default": "0.45"},
+            "ndim": {"type": "select", "label": "Dimensions", "default": "1D",
+                     "options": ["0D", "1D", "2D", "3D"]},
+            "coords": {"type": "select", "label": "Shape", "default": "cartesian",
+                       "options": ["cartesian", "circular", "cylindrical", "spherical", "disc", "parabolic"],
+                       "description": "For a 0D geometry this names the dot model outright"},
+            "sym": {"type": "select", "label": "Symmetry", "default": "orthorhombic",
+                    "options": ["", "square", "rectangular", "cubic", "tetragonal", "orthorhombic"]},
+            "Lmin": {"type": "float", "label": "Smallest (nm)", "default": 1.0, "min": 0.01},
+            "Lmax": {"type": "float", "label": "Largest (nm)", "default": 20.0, "min": 0.02},
+            "match": {"type": "select", "label": "Match by", "default": "delta_e",
+                      "options": ["absolute", "delta_e", "delta_e_ratios"],
+                      "description": "In STS the energies are read from E_F and the model counts from the bottom of the well; matching on differences cancels that unknown offset, and the offset it finds is the band edge."},
+            "priority": {"type": "select", "label": "Weighting", "default": "uniform",
+                         "options": ["uniform", "ground_state", "low_quantum_numbers"]},
+            "max_rrmse": {"type": "float", "label": "Max error (%)", "default": 5.0, "min": 0.01,
+                          "description": "A position whose best candidate is worse than this has no confinement reported — better than handing back a number that does not fit"},
+            "maxsol": {"type": "int", "label": "Candidates per point", "default": 1, "min": 1, "max": 20,
+                       "description": "Each costs a global optimisation, and only the primary one reaches the map; 1 is what a long line wants"},
+            "group_tol_nm": {"type": "float", "label": "Group tolerance (nm)", "default": 1.0, "min": 0.001,
+                             "description": "Positions whose sizes are within this of each other are one domain"},
+            "pair_tol_nm": {"type": "float", "label": "Pair tolerance (nm)", "default": 1.0, "min": 0.001},
+            "height": {"type": "float", "label": "Peak threshold (x sigma)", "default": 3.0, "min": 0.1,
+                       "description": "The list goes straight into the search: a noise peak costs a geometry"},
+            "split_e": {"type": "float", "label": "Electron edge (V)", "default": 0.0,
+                        "description": "The boundary that matters is the band edge, not E_F: in a doped well the lowest electron levels are filled and appear at negative bias, and a split at 0 V tears that ladder in half"},
+            "split_h": {"type": "float", "label": "Hole edge (V)", "default": 0.0}
+        }
+    },
+
     "EnergyBinning": {
         "display_name": "Energy Binning",
         "category": "Analysis",
@@ -1354,8 +1401,9 @@ def get_tool_categories() -> List[Dict]:
         "PeakFinder": 2,
         "EnergyBinning": 3,
         "OccupancyMatrix": 4,
-        "DetectBandgapDoping": 5,
-        "DiracPointEstimator": 6,
+        "ConfinementDesign": 5,
+        "DetectBandgapDoping": 6,
+        "DiracPointEstimator": 7,
         # Visualization
         "MapGenerator": 0,
         "MapAssembly": 1,

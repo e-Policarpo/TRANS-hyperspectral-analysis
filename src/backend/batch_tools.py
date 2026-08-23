@@ -78,6 +78,13 @@ BATCH_TOOLS: Dict[str, BatchToolSpec] = {
         params_as_dict=True,
         completion="_on_map_generation_completed",
     ),
+    'line_scan_designer': BatchToolSpec(
+        label="Line Scan Designer",
+        method="design_line_scan",
+        takes_task=True,
+        params_as_dict=True,
+        completion="_on_line_scan_design_completed",
+    ),
     'derivative': BatchToolSpec(
         label="Derivative Calculator",
         method="calculate_derivative",

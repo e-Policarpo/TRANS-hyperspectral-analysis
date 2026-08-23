@@ -11,6 +11,7 @@ import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
 import TransQML 1.0
 import "../components"
+import "DesignerVocabulary.js" as Vocab
 
 // Confinement Designer: measured levels in, candidate geometries out.
 //
@@ -44,71 +45,25 @@ Item {
 
     Rectangle { anchors.fill: parent; color: root.bgDark; z: -1 }
 
-    // ---------------------------------------------------------------------
-    // The vocabulary. Keys are what the backend compares and stores; the
-    // labels beside them are only ever displayed — the split is what makes a
-    // saved project survive a change of wording.
-    // ---------------------------------------------------------------------
-    readonly property var ndimKeys: ["0D", "1D", "2D", "3D"]
-    readonly property var ndimLabels: [
-        "0D — quantum dot", "1D — well", "2D — well or disc", "3D — box or cylinder"
-    ]
+    // The vocabulary lives in DesignerVocabulary.js — the line-scan panel
+    // asks the same questions, and one copy of the answers is what stops a
+    // mode being renamed in one place and silently ignored in the other.
+    readonly property var ndimLabels: Vocab.ndimLabels
+    readonly property var carrierLabels: Vocab.carrierLabels
+    readonly property var matchLabels: Vocab.matchLabels
+    readonly property var priorityLabels: Vocab.priorityLabels
+    readonly property var sortLabels: Vocab.sortLabels
 
-    readonly property var carrierKeys: ["electrons", "holes", "both"]
-    readonly property var carrierLabels: [
-        "Electrons (empty states, V > 0)",
-        "Holes (filled states, V < 0)",
-        "Electrons + holes (paired by geometry)"
-    ]
+    function coordsFor(ndim) { return Vocab.coordsFor(ndim) }
+    function symsFor(ndim, coords) { return Vocab.symsFor(ndim, coords) }
 
-    readonly property var matchKeys: ["absolute", "delta_e", "delta_e_ratios"]
-    readonly property var matchLabels: [
-        "Absolute energies", "Differences (ΔE)", "ΔE ratios"
-    ]
-
-    readonly property var priorityKeys: ["uniform", "ground_state", "low_quantum_numbers"]
-    readonly property var priorityLabels: [
-        "Uniform", "Ground state only", "Low quantum numbers"
-    ]
-
-    readonly property var sortKeys: ["rrmse", "rrmse_delta_e", "size_asc",
-                                     "size_desc", "anisotropy", "ground_state"]
-    readonly property var sortLabels: [
-        "Error (RRMSE)", "Error in the spacings (ΔE)", "Size — smallest first",
-        "Size — largest first", "Anisotropy — most symmetric", "E₁ (ground state)"
-    ]
-
-    // Which coordinate systems and symmetries a dimensionality allows. A 0D
-    // geometry's `coords` names its model outright, which is why the dot
-    // models appear here rather than in a list of their own.
-    function coordsFor(ndim) {
-        if (ndim === "0D") return {keys: ["spherical", "disc", "parabolic"],
-                                   labels: ["Spherical", "Disc / lens", "Parabolic"]}
-        if (ndim === "1D") return {keys: ["cartesian"], labels: ["Cartesian"]}
-        if (ndim === "2D") return {keys: ["cartesian", "circular"],
-                                   labels: ["Cartesian", "Circular (disc)"]}
-        return {keys: ["cartesian", "cylindrical"], labels: ["Cartesian", "Cylindrical"]}
-    }
-
-    function symsFor(ndim, coords) {
-        if (ndim === "2D" && coords === "cartesian")
-            return {keys: ["square", "rectangular"], labels: ["Square (Lx = Ly)", "Rectangular"]}
-        if (ndim === "3D" && coords === "cartesian")
-            return {keys: ["cubic", "tetragonal", "orthorhombic"],
-                    labels: ["Cubic (Lx = Ly = Lz)", "Tetragonal (Lx = Ly)", "Orthorhombic"]}
-        return {keys: [""], labels: ["—"]}
-    }
-
-    function ndimKey() { return ndimKeys[Math.max(0, ndimCombo.currentIndex)] }
+    function ndimKey() { return Vocab.keyAt(Vocab.ndimKeys, ndimCombo.currentIndex) }
     function coordsKey() {
-        var options = coordsFor(ndimKey())
-        return options.keys[Math.max(0, Math.min(coordsCombo.currentIndex,
-                                                 options.keys.length - 1))]
+        return Vocab.keyAt(Vocab.coordsFor(ndimKey()).keys, coordsCombo.currentIndex)
     }
     function symKey() {
-        var options = symsFor(ndimKey(), coordsKey())
-        return options.keys[Math.max(0, Math.min(symCombo.currentIndex,
-                                                 options.keys.length - 1))]
+        return Vocab.keyAt(Vocab.symsFor(ndimKey(), coordsKey()).keys,
+                           symCombo.currentIndex)
     }
 
     // ---------------------------------------------------------------------
@@ -117,7 +72,7 @@ Item {
     function searchParams() {
         return {
             "spectrum_index": spectrumSpin.value,
-            "carrier": carrierKeys[Math.max(0, carrierCombo.currentIndex)],
+            "carrier": Vocab.keyAt(Vocab.carrierKeys, carrierCombo.currentIndex),
             "meff_e": massElectronField.text,
             "meff_h": massHoleField.text,
             "ndim": ndimKey(),
@@ -127,9 +82,9 @@ Item {
             "Lmax": lmaxSpin.realValue,
             "tol": tolSpin.realValue,
             "maxsol": maxsolSpin.value,
-            "match": matchKeys[Math.max(0, matchCombo.currentIndex)],
-            "priority": priorityKeys[Math.max(0, priorityCombo.currentIndex)],
-            "sort": sortKeys[Math.max(0, sortCombo.currentIndex)],
+            "match": Vocab.keyAt(Vocab.matchKeys, matchCombo.currentIndex),
+            "priority": Vocab.keyAt(Vocab.priorityKeys, priorityCombo.currentIndex),
+            "sort": Vocab.keyAt(Vocab.sortKeys, sortCombo.currentIndex),
             "pair_tol_nm": pairTolSpin.realValue,
             "split_e": splitESpin.realValue,
             "split_h": splitHSpin.realValue,
@@ -213,14 +168,7 @@ Item {
         candidateCanvas.showCandidate(root.candidates[index])
     }
 
-    function dimensionText(candidate) {
-        var dims = candidate.dims_nm || []
-        var unit = (candidate.ndim === "0D" && candidate.coords === "parabolic")
-                   ? " meV" : " nm"
-        var parts = []
-        for (var i = 0; i < dims.length; i++) parts.push(dims[i].toFixed(3))
-        return parts.join(" × ") + unit
-    }
+    function dimensionText(candidate) { return Vocab.dimensionText(candidate) }
 
     Connections {
         target: backend
