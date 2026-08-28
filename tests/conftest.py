@@ -3,6 +3,15 @@ TRANS-QML Test Configuration and Fixtures
 Shared fixtures for all test modules
 """
 
+import os
+
+# The app sets this before it creates its QGuiApplication (`main.py`), and a
+# QML test that does not measures a different set of controls than the one
+# that ships: the macOS style sizes a Button from its text, the Basic style
+# gives every one of them an implicit width of 100 px. A layout that fits
+# under the first and clips under the second passed for months.
+os.environ.setdefault("QT_QUICK_CONTROLS_STYLE", "Basic")
+
 import pytest
 import numpy as np
 import pandas as pd

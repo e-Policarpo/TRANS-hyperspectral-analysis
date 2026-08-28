@@ -6,6 +6,31 @@ All functions are standalone — they take physical parameters and return arrays
 import numpy as np
 from scipy.constants import e
 
+from src.physics.laplacian import (azimuth_nodes, polar_angle_nodes,
+                                   radial_nodes)
+
+
+def _angular_mask(grid, centre_rad, sweep_rad):
+    """Which nodes of a periodic angle a sweep of *sweep_rad* about
+    *centre_rad* covers.
+
+    There are two ways to get this wrong and the 3-D builders had one of them.
+    A full turn is it: reduced mod 2*pi the two ends land on the same angle, so
+    a well meant to wrap the whole way round came out exactly one node wide —
+    and a ring is the commonest shape there is on a cylindrical or spherical
+    grid, which made the wedge door useless for the shapes it was most wanted
+    for. The other is a sweep straddling the seam at 0, where the interval is
+    the union of two rather than an intersection.
+    """
+    sweep = float(sweep_rad)
+    if sweep >= 2 * np.pi - 1e-12:
+        return np.ones_like(grid, dtype=bool)
+    lo = (centre_rad - sweep / 2) % (2 * np.pi)
+    hi = (centre_rad + sweep / 2) % (2 * np.pi)
+    if lo <= hi:
+        return (grid >= lo) & (grid <= hi)
+    return (grid >= lo) | (grid <= hi)
+
 
 # ─── 3D Cartesian ────────────────────────────────────────────────────────────
 
@@ -79,21 +104,23 @@ def build_potential_3d_cylindrical(wells, R, Lz, Nr, Nz, Ntheta,
     R : float  — max radius in metres
     Lz : float — height in metres
     Nr, Nz, Ntheta : int
+    bc : str
+        Boundary condition along z, which is the only axis whose grid it can
+        still change: the radial nodes are cell-centred either way, because
+        that is what makes the operator in :mod:`~src.physics.laplacian`
+        regular at r = 0, and a potential sampled anywhere else would be
+        sampled off the grid the states are solved on.
     """
     half_Lz = Lz / 2
+    r, dr = radial_nodes(R, Nr)
+    theta, _ = azimuth_nodes(Ntheta)
 
     if bc.lower() == "dirichlet":
-        dr = R / (Nr + 1)
         dz = Lz / (Nz + 1)
-        r = np.linspace(dr, R - dr, Nr)
         z = np.linspace(-half_Lz + dz, half_Lz - dz, Nz)
     else:
-        dr = R / Nr
         dz = Lz / Nz
-        r = np.linspace(dr / 2, R - dr / 2, Nr)
         z = np.linspace(-half_Lz + dz / 2, half_Lz - dz / 2, Nz)
-
-    theta = np.linspace(0, 2 * np.pi, Ntheta, endpoint=False)
 
     RR, TT, ZZ = np.meshgrid(r, theta, z, indexing='ij')
     V = np.full((Nr, Ntheta, Nz), V_barrier_eV * e)
@@ -110,18 +137,10 @@ def build_potential_3d_cylindrical(wells, R, Lz, Nr, Nz, Ntheta,
         r_max = r_c + dr_well / 2
         z_min = z_c - dz_well / 2
         z_max = z_c + dz_well / 2
-        theta_min = theta_c - dtheta_well / 2
-        theta_max = theta_c + dtheta_well / 2
 
         r_mask = (RR >= r_min) & (RR <= r_max)
         z_mask = (ZZ >= z_min) & (ZZ <= z_max)
-
-        theta_min_norm = theta_min % (2 * np.pi)
-        theta_max_norm = theta_max % (2 * np.pi)
-        if theta_min_norm <= theta_max_norm:
-            theta_mask = (TT >= theta_min_norm) & (TT <= theta_max_norm)
-        else:
-            theta_mask = (TT >= theta_min_norm) | (TT <= theta_max_norm)
+        theta_mask = _angular_mask(TT, theta_c, dtheta_well)
 
         V[r_mask & theta_mask & z_mask] = V0_eV * e
 
@@ -131,7 +150,7 @@ def build_potential_3d_cylindrical(wells, R, Lz, Nr, Nz, Ntheta,
 # ─── 3D Spherical ────────────────────────────────────────────────────────────
 
 def build_potential_3d_spherical(wells, R, Nr, Ntheta, Nphi,
-                                  V_barrier_eV=0.0, bc="dirichlet"):
+                                  V_barrier_eV=0.0):
     """
     Build 3D potential on a spherical grid.
 
@@ -140,16 +159,14 @@ def build_potential_3d_spherical(wells, R, Nr, Ntheta, Nphi,
     wells : list of tuples
         Each: (r_c_nm, theta_c_deg, phi_c_deg, dr_nm, dtheta_deg, dphi_deg, V0_eV, meff)
     R : float  — max radius in metres
-    """
-    if bc.lower() == "dirichlet":
-        dr = R / (Nr + 1)
-        r = np.linspace(dr, R - dr, Nr)
-    else:
-        dr = R / Nr
-        r = np.linspace(dr / 2, R - dr / 2, Nr)
 
-    theta = np.linspace(0, np.pi, Ntheta, endpoint=False) + np.pi / (2 * Ntheta)
-    phi = np.linspace(0, 2 * np.pi, Nphi, endpoint=False)
+    There is no boundary-condition argument: every axis of a spherical grid is
+    cell-centred, r off the origin and theta off both poles, so the wall at R
+    is the operator's business rather than the grid's.
+    """
+    r, dr = radial_nodes(R, Nr)
+    theta, _ = polar_angle_nodes(Ntheta)
+    phi, _ = azimuth_nodes(Nphi)
 
     RR, TT, PP = np.meshgrid(r, theta, phi, indexing='ij')
     V = np.full((Nr, Ntheta, Nphi), V_barrier_eV * e)
@@ -164,20 +181,14 @@ def build_potential_3d_spherical(wells, R, Nr, Ntheta, Nphi,
 
         r_min = max(0, r_c - dr_well / 2)
         r_max = r_c + dr_well / 2
+        # theta is not periodic — it runs from pole to pole — so it clamps
+        # rather than wrapping, and only phi goes through _angular_mask.
         theta_min = max(0, theta_c - dtheta_well / 2)
         theta_max = min(np.pi, theta_c + dtheta_well / 2)
-        phi_min = phi_c - dphi_well / 2
-        phi_max = phi_c + dphi_well / 2
 
         r_mask = (RR >= r_min) & (RR <= r_max)
         theta_mask = (TT >= theta_min) & (TT <= theta_max)
-
-        phi_min_norm = phi_min % (2 * np.pi)
-        phi_max_norm = phi_max % (2 * np.pi)
-        if phi_min_norm <= phi_max_norm:
-            phi_mask = (PP >= phi_min_norm) & (PP <= phi_max_norm)
-        else:
-            phi_mask = (PP >= phi_min_norm) | (PP <= phi_max_norm)
+        phi_mask = _angular_mask(PP, phi_c, dphi_well)
 
         V[r_mask & theta_mask & phi_mask] = V0_eV * e
 

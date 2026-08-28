@@ -37,6 +37,7 @@ FEATURE_FIELDS: Dict[str, Tuple[type, Tuple[str, ...]]] = {
     'gaussian_1d': (_features.GaussianFeature1D, ('cx', 'sigma')),
     # 2D
     'rect': (_features.RectFeature2D, ('x0', 'y0', 'w', 'h')),
+    'triangle': (_features.TriangleFeature2D, ('cx', 'cy', 'w', 'h')),
     'circle': (_features.CircleFeature2D, ('cx', 'cy', 'r')),
     'ellipse': (_features.EllipseFeature2D, ('cx', 'cy', 'a', 'b')),
     'wedge': (_features.WedgeFeature2D,
@@ -63,13 +64,15 @@ FEATURE_EXTRAS: Dict[str, Tuple[str, ...]] = {
 #: Which kinds belong to which editor. A 1D feature in a 2D domain has no
 #: meaning, and offering it is how a nonsense potential gets built.
 KINDS_1D = ('segment', 'gaussian_1d')
-KINDS_2D = ('rect', 'circle', 'ellipse', 'wedge', 'gaussian_2d')
+KINDS_2D = ('rect', 'triangle', 'circle', 'ellipse', 'wedge',
+            'gaussian_2d')
 KINDS_3D = ('box', 'sphere', 'cylinder', 'pyramid', 'prism', 'cone',
             'gaussian_3d', 'lens')
 
 KIND_LABELS = {
     'segment': "Segment", 'gaussian_1d': "Gaussian",
-    'rect': "Rectangle", 'circle': "Circle", 'ellipse': "Ellipse",
+    'rect': "Rectangle", 'triangle': "Triangle",
+    'circle': "Circle", 'ellipse': "Ellipse",
     'wedge': "Wedge / sector", 'gaussian_2d': "Gaussian",
     'box': "Box", 'sphere': "Sphere", 'cylinder': "Cylinder",
     'pyramid': "Pyramid", 'prism': "Prism", 'cone': "Cone",
@@ -107,7 +110,7 @@ FIELD_DEFAULTS = {
 #: which is why this cannot be one rule.
 POSITION_FIELDS = {
     'segment': ('x0',), 'gaussian_1d': ('cx',),
-    'rect': ('x0', 'y0'),
+    'rect': ('x0', 'y0'), 'triangle': ('cx', 'cy'),
     'circle': ('cx', 'cy'), 'ellipse': ('cx', 'cy'),
     'wedge': ('cx', 'cy'), 'gaussian_2d': ('cx', 'cy'),
     'box': ('cx', 'cy', 'cz'), 'sphere': ('cx', 'cy', 'cz'),
@@ -271,12 +274,27 @@ def spec_extent(spec: dict, axes=(0, 1)) -> Tuple[float, ...]:
 
     A Gaussian has no edge, so it is taken at 3σ — the same place the
     feature's own ``contains`` stops.
+
+    A lens is the one shape whose radial half-extent is not one of its own
+    fields. Its cap belongs to a sphere of radius ``Rs = (R² + H²) / 2H``
+    whose centre sits ``H - Rs`` above the base, so a tall lens — ``H > R``,
+    which is where that centre rises into the body — is widest at ``Rs``
+    part-way up rather than at ``R`` on the base. Reporting ``R`` there puts
+    the hit test and the resize handle inside a shape that is drawn wider
+    than them, and the default lens (R = 2 nm, H = 4 nm) is exactly that
+    case. A shallow one is widest on its base, where ``R`` is right.
     """
     kind = str(spec.get('kind', ''))
+    if kind == 'lens':
+        R, H = abs(float(spec.get('R', 0.0))), abs(float(spec.get('H', 0.0)))
+        radial = (R ** 2 + H ** 2) / (2.0 * H) if H > R else R
+        halves = (radial, radial, H / 2.0)
+        return tuple(halves[axis] if axis < 3 else 0.0 for axis in axes)
     per_axis = {
         'segment': ('width',),
         'gaussian_1d': ('sigma',),
         'rect': ('w', 'h'),
+        'triangle': ('w', 'h'),
         'circle': ('r', 'r'),
         'ellipse': ('a', 'b'),
         'wedge': ('r_outer', 'r_outer'),
@@ -298,7 +316,7 @@ def spec_extent(spec: dict, axes=(0, 1)) -> Tuple[float, ...]:
             continue
         name = per_axis[axis]
         value = float(spec.get(name, 0.0))
-        if name in ('w', 'h', 'width', 'Lx', 'Ly', 'Lz', 'H'):
+        if name in ('w', 'h', 'width', 'Lx', 'Ly', 'Lz', 'H', 'base'):
             value /= 2.0            # a size, not a radius
         elif name in ('sigma', 'sx', 'sy', 'sz'):
             value *= 3.0            # a Gaussian's edge is where it stops

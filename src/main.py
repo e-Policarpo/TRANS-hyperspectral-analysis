@@ -30,6 +30,7 @@ from src.widgets.qml_figure_canvas import FigureCanvasItem
 from src.widgets.qml_designer_canvas import DesignerCanvas
 from src.widgets.qml_solver_canvas import SolverCanvas
 from src.widgets.qml_potential_canvas import PotentialCanvas
+from src.widgets.qml_states_canvas import StatesCanvas
 from src.backend.modeling_backend import ModelingBackend
 from src.widgets.qml_image_canvas import QMLImageCanvas
 from src.widgets.image_provider import TransImageProvider
@@ -111,6 +112,10 @@ def main():
     # The Modeling workstation: an interactive potential and the backend
     # that owns the features in it.
     qmlRegisterType(PotentialCanvas, "TransQML", 1, 0, "PotentialCanvas")
+    # What a solved model looks like: the |psi|^2 cloud with its features
+    # around it, its three cuts, and the tunnelling picture behind the same
+    # canvas's mode.
+    qmlRegisterType(StatesCanvas, "TransQML", 1, 0, "StatesCanvas")
     qmlRegisterType(ModelingBackend, "TransQML", 1, 0, "ModelingBackend")
 
     # Create QML engine

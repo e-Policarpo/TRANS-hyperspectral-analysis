@@ -325,6 +325,21 @@ class TestSolving:
         assert len(plane['values']) == 12
         assert len(plane['values'][0]) == 12
 
+    def test_a_slice_crosses_the_bridge_as_plain_lists(self, model):
+        """The solver's axes are numpy arrays. One left as such reaches the
+        canvas as an array, where the emptiness guard raised inside paint()
+        rather than answering — a blank canvas and a traceback per frame."""
+        model.addFeature('circle', 10.0, 10.0)
+        model.solve({'Nx': 40, 'Ny': 40, 'n_states': 1})
+
+        json.dumps(model.densityFor(0, 'xy'))
+
+        model.mode = "3d"
+        model.setDomain(10.0, 10.0, 10.0)
+        model.solve({'Nx': 12, 'Ny': 12, 'Nz': 12, 'n_states': 1})
+
+        json.dumps(model.densityFor(0, 'xz'))
+
     def test_asking_for_a_state_before_solving_gives_nothing(self, model):
         assert model.densityFor(0, 'xy') == {}
 
@@ -451,3 +466,199 @@ class TestTunnelling:
     def test_what_it_returns_survives_the_bridge(self, model):
         self._two_wells(model)
         json.dumps(model.tunneling())
+
+
+class TestWhereTheCutLands:
+    """A 3-D model is shown one plane at a time, and the plane is steerable.
+
+    Two things follow. The slider has to be told where the cut actually
+    landed — the request is snapped to a grid line, and a readout quoting the
+    number it sent drifts from the picture by up to half a step. And the cut
+    has to be honoured at all: a slice that silently stayed in the middle
+    would look right on every model whose feature happens to be there.
+    """
+
+    @staticmethod
+    def _volume(model):
+        model.mode = "3d"
+        model.setDomain(20.0, 20.0, 20.0)
+        model.addFeature('sphere', 10.0, 10.0)
+        model.updateFeature(0, {'cz': 5.0, 'R': 3.0, 'V0': -0.5})
+        model.solve({'Nx': 16, 'Ny': 16, 'Nz': 16, 'n_states': 1})
+
+    def test_a_3d_slice_says_where_it_cut(self, model):
+        self._volume(model)
+        plane = model.densityFor(0, 'xy')
+
+        assert 'slice_at' in plane
+        assert 0.0 <= plane['slice_at'] <= 20.0
+
+    def test_the_position_it_reports_is_a_grid_line(self, model):
+        """Not the number that was asked for: 7 nm on a 16-node grid is not
+        a plane that exists."""
+        self._volume(model)
+        plane = model.densityFor(0, 'xy', 7.0)
+        axis = model.previewPotential('xy', 7.0)
+
+        assert plane['slice_at'] != pytest.approx(7.0, abs=1e-9)
+        assert plane['slice_at'] == pytest.approx(7.0, abs=1.5)
+        assert axis['slice_at'] == pytest.approx(plane['slice_at'], abs=1.5)
+
+    def test_a_2d_model_has_no_hidden_axis_to_report(self, model):
+        """There is nothing to disambiguate, and a `slice_at` of None would
+        reach the canvas as a title claiming a plane."""
+        model.addFeature('circle', 10.0, 10.0)
+        model.solve({'Nx': 30, 'Ny': 30, 'n_states': 1})
+
+        assert 'slice_at' not in model.densityFor(0, 'xy')
+
+    def test_a_cut_through_a_feature_is_not_the_cut_that_misses_it(self, model):
+        """The claim the whole slider rests on. A sphere at z = 5 is in the
+        plane z = 5 and is not in the plane z = 18."""
+        self._volume(model)
+        through = model.previewPotential('xy', 5.0)
+        past = model.previewPotential('xy', 18.0)
+
+        assert min(min(row) for row in through['V_eV']) < 0
+        assert min(min(row) for row in past['V_eV']) == 0.0
+
+    def test_the_state_is_where_the_well_is(self, model):
+        """Same for the density: the bound state lives in the sphere, so the
+        plane through it carries far more of |psi|² than one that misses."""
+        self._volume(model)
+        through = np.asarray(model.densityFor(0, 'xy', 5.0)['values'])
+        past = np.asarray(model.densityFor(0, 'xy', 18.0)['values'])
+
+        assert through.max() > 10 * past.max()
+
+    def test_a_cut_with_no_opinion_lands_in_the_middle(self, model):
+        """Negative means "wherever the middle is" — the convention every
+        slicing call here answers to, so a caller that has not been dragged
+        yet does not have to invent a position."""
+        self._volume(model)
+
+        assert model.densityFor(0, 'xy', -1.0)['slice_at'] == \
+            pytest.approx(10.0, abs=1.0)
+
+    def test_each_plane_is_cut_on_its_own_axis(self, model):
+        self._volume(model)
+
+        assert model.densityFor(0, 'xz', 4.0)['slice_at'] == \
+            pytest.approx(4.0, abs=1.5)      # y
+        assert model.densityFor(0, 'yz', 16.0)['slice_at'] == \
+            pytest.approx(16.0, abs=1.5)     # x
+
+
+class TestTheFourPicturesOfAState:
+    """`statePlots` feeds the 2x2 view. Everything it returns has to be small
+    — a 3-D grid across the QML bridge is the slowest thing the app could
+    do — and normalised, because the cuts are drawn on a shared scale."""
+
+    @staticmethod
+    def _solved(model, n=2, N=16):
+        model.mode = "3d"
+        model.setDomain(20.0, 20.0, 20.0)
+        model.addFeature('sphere', 7.0, 10.0)
+        model.updateFeature(0, {'cz': 10.0, 'R': 4.0, 'V0': -0.6})
+        model.solve({'Nx': N, 'Ny': N, 'Nz': N, 'n_states': n})
+        return model.statePlots(0)
+
+    def test_it_answers_with_the_three_cuts_and_the_cloud(self, model):
+        plots = self._solved(model)
+
+        assert plots['ok'] is True
+        assert plots['error'] == ""
+        assert plots['state'] == 0
+        assert set(plots) >= {'E_eV', 'x_nm', 'y_nm', 'z_nm', 'xy', 'xz',
+                              'yz', 'scatter', 'features'}
+
+    def test_each_cut_is_a_plane_of_the_grid(self, model):
+        plots = self._solved(model)
+
+        for plane, rows, cols in [('xy', 'x_nm', 'y_nm'),
+                                  ('xz', 'x_nm', 'z_nm'),
+                                  ('yz', 'y_nm', 'z_nm')]:
+            values = plots[plane]['values']
+            assert len(values) == len(plots[rows]), plane
+            assert len(values[0]) == len(plots[cols]), plane
+
+    def test_every_cut_says_where_it_was_taken(self, model):
+        plots = self._solved(model)
+
+        assert plots['xy']['slice_at'] in plots['z_nm']
+        assert plots['xz']['slice_at'] in plots['y_nm']
+        assert plots['yz']['slice_at'] in plots['x_nm']
+
+    def test_the_cuts_are_normalised_to_the_state(self, model):
+        """max == 1 over the volume, so the three panels share a scale and a
+        faint cut reads as faint rather than being stretched to look full."""
+        plots = self._solved(model)
+        peak = max(max(max(row) for row in plots[plane]['values'])
+                   for plane in ('xy', 'xz', 'yz'))
+
+        assert peak == pytest.approx(1.0)
+        assert all(v >= 0 for row in plots['xy']['values'] for v in row)
+
+    def test_the_cuts_can_be_steered_one_axis_at_a_time(self, model):
+        self._solved(model)
+        plots = model.statePlots(0, 4.0, 15.0, 8.0)
+
+        assert plots['xy']['slice_at'] == pytest.approx(8.0, abs=1.5)   # z
+        assert plots['xz']['slice_at'] == pytest.approx(15.0, abs=1.5)  # y
+        assert plots['yz']['slice_at'] == pytest.approx(4.0, abs=1.5)   # x
+
+    def test_the_cloud_is_only_where_the_state_is(self, model):
+        plots = self._solved(model)
+        cloud = plots['scatter']
+
+        assert len(cloud['x']) == len(cloud['c']) > 0
+        assert min(cloud['c']) > ModelingBackend.SCATTER_THRESHOLD
+
+    def test_the_cloud_is_capped_before_it_crosses_the_bridge(self, model):
+        """A 60³ solve puts 200 000 points over the threshold. What gets
+        dropped is the faint rim, so the cloud shrinks onto the state rather
+        than thinning everywhere."""
+        cap = ModelingBackend.MAX_SCATTER_POINTS
+        try:
+            ModelingBackend.MAX_SCATTER_POINTS = 50
+            self._solved(model, N=20)
+            cloud = model.statePlots(0)['scatter']
+            again = model.statePlots(0)['scatter']
+        finally:
+            ModelingBackend.MAX_SCATTER_POINTS = cap
+
+        assert len(cloud['c']) == 50
+        assert min(cloud['c']) > 0.05
+        assert again == cloud            # and the same 50 every time
+
+    def test_it_carries_the_features_for_the_wireframes(self, model):
+        plots = self._solved(model)
+
+        assert [f['kind'] for f in plots['features']] == ['sphere']
+
+    def test_what_it_returns_survives_the_bridge(self, model):
+        """The whole answer is plain lists; a numpy array in it reaches the
+        canvas as an array, where the emptiness guards raise inside paint()."""
+        json.dumps(self._solved(model))
+
+    def test_a_state_that_was_not_solved_is_refused_by_number(self, model):
+        self._solved(model)
+        refused = model.statePlots(99)
+
+        assert refused['ok'] is False
+        assert "99" in refused['error']
+
+    def test_it_says_so_before_a_solve(self, model):
+        model.mode = "3d"
+
+        assert model.statePlots(0)['ok'] is False
+
+    def test_a_2d_model_has_no_volume_to_draw(self, model):
+        """The view is three orthogonal cuts through a volume, and a plane
+        has none — so it is a message rather than three copies of itself."""
+        model.addFeature('circle', 10.0, 10.0)
+        model.solve({'Nx': 30, 'Ny': 30, 'n_states': 1})
+        refused = model.statePlots(0)
+
+        assert refused['ok'] is False
+        assert "2-D" in refused['error']

@@ -9,8 +9,13 @@ For smooth potentials (Gaussian), `potential_at(X, Y, Z=None)` returns V(r)
 in eV on the same grid.
 
 The simulation grid is always Cartesian; features just define which grid
-points lie inside a given region.
+points lie inside a given region. The geometry itself is exact — a sphere's
+test is r <= R and a wedge's is an angle — so what is Cartesian is the
+*sampling*, not the shape. See ``build_potential_from_features`` for what
+that costs and how ``subsample`` pays it back.
 """
+
+import itertools
 
 import numpy as np
 
@@ -22,6 +27,7 @@ KIND_LABELS = {
     "segment": "Segment",
     "gaussian": "Gaussian",
     "rect": "Rectangle",
+    "triangle": "Triangle",
     "circle": "Circle",
     "ellipse": "Ellipse",
     "wedge": "Wedge",
@@ -106,6 +112,43 @@ class RectFeature2D:
 
     def label(self, idx):
         return (f"F{idx}: Rect ({self.x0:.1f},{self.y0:.1f}) "
+                f"{self.w:.1f}×{self.h:.1f}nm V={self.V0:.2f}eV")
+
+
+class TriangleFeature2D:
+    """Isoceles triangle, apex toward +y, base on y = cy - h/2.
+
+    The taper is the cone's, read in the plane: full width w at the base,
+    closing linearly to a point at the apex. Keeping the two the same means a
+    triangle and a side view of a cone never disagree about which end is the
+    apex or where the base sits.
+    """
+    kind = "triangle"
+
+    def __init__(self, cx_nm, cy_nm, w_nm, h_nm, V0_eV, meff=1.0):
+        self.cx, self.cy = cx_nm, cy_nm
+        self.w, self.h = w_nm, h_nm
+        self.V0 = V0_eV
+        self.meff = meff
+
+    def contains(self, X, Y):
+        y_bot = self.cy - self.h / 2
+        y_top = self.cy + self.h / 2
+        y_ok = (Y >= y_bot) & (Y <= y_top)
+
+        # A height of zero has no interior to taper through, so the divisor is
+        # held off zero rather than dividing by it; the band it leaves is the
+        # single line y = cy, and the width there is 0, so nothing is inside.
+        h_safe = self.h if abs(self.h) > 1e-12 else 1e-12
+        frac = np.clip((y_top - Y) / h_safe, 0, 1)
+        half_width = self.w / 2 * frac
+        return y_ok & (np.abs(X - self.cx) <= half_width)
+
+    def center_nm(self):
+        return np.array([self.cx, self.cy])
+
+    def label(self, idx):
+        return (f"F{idx}: Tri c=({self.cx:.1f},{self.cy:.1f}) "
                 f"{self.w:.1f}×{self.h:.1f}nm V={self.V0:.2f}eV")
 
 
@@ -484,8 +527,13 @@ class GaussianFeature3D:
 
 
 class LensFeature3D:
-    """Lens-shaped quantum dot (intersection of two spheres) — common InAs/GaAs QD shape.
-    Defined by base radius R, height H, centre of base at (cx, cy, cz)."""
+    """Lens-shaped quantum dot (a spherical cap) — common InAs/GaAs QD shape.
+
+    Defined by base radius R and height H about a centre at (cx, cy, cz):
+    the base sits on z = cz - H/2 and the apex on z = cz + H/2, the same
+    convention as the box, the sphere and the cylinder, so the editor's
+    position and extent tables describe it correctly.
+    """
     kind = "lens"
 
     def __init__(self, cx_nm, cy_nm, cz_nm, R_nm, H_nm, V0_eV, meff=1.0):
@@ -493,21 +541,25 @@ class LensFeature3D:
         self.R, self.H = R_nm, H_nm
         self.V0 = V0_eV
         self.meff = meff
-        # Sphere radius from R and H:  R_sphere = (R^2 + H^2) / (2*H)
-        self._Rs = (R_nm ** 2 + H_nm ** 2) / (2.0 * H_nm)
+        # Sphere radius from R and H:  R_sphere = (R^2 + H^2) / (2*H).
+        # Held off zero the way PrismFeature3D holds its base off zero: a
+        # height of 0 is a shape with nothing in it, not an error worth
+        # raising from a constructor the preview calls on every keystroke.
+        self._Rs = (R_nm ** 2 + H_nm ** 2) / (2.0 * max(abs(H_nm), 1e-12))
 
     def contains(self, X, Y, Z):
         rho2 = (X - self.cx) ** 2 + (Y - self.cy) ** 2
-        z_rel = Z - self.cz  # z relative to base centre
+        z_rel = Z - (self.cz - self.H / 2)  # height above the base plane
 
         # Above the base plane and below the spherical cap
         z_ok = (z_rel >= 0) & (z_rel <= self.H)
-        # Spherical cap condition: rho^2 + (z_rel - (Rs - H))^2 <= Rs^2
-        sphere_ok = rho2 + (z_rel - (self._Rs - self.H)) ** 2 <= self._Rs ** 2
+        # The cap's sphere is centred Rs - H *below* the base, which is what
+        # makes the section R wide there and closes it to a point at z_rel=H.
+        sphere_ok = rho2 + (z_rel - (self.H - self._Rs)) ** 2 <= self._Rs ** 2
         return z_ok & sphere_ok
 
     def center_nm(self):
-        return np.array([self.cx, self.cy, self.cz + self.H / 2])
+        return np.array([self.cx, self.cy, self.cz])
 
     def label(self, idx):
         return (f"F{idx}: Lens ({self.cx:.1f},{self.cy:.1f},{self.cz:.1f}) "
@@ -518,7 +570,35 @@ class LensFeature3D:
 # Unified potential builder
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_potential_from_features(features, grid_arrays, V_barrier_eV=0.0):
+def _cell_offsets(axis, subsample: int):
+    """Where a cell's sub-samples sit, relative to its centre.
+
+    An axis of one point has no cell to divide, and a preview that has
+    already been sliced hands exactly that in for the axis it cut — which
+    must not be averaged through, or the slice stops being a slice.
+    """
+    axis = np.asarray(axis, dtype=float)
+    if subsample <= 1 or axis.size < 2:
+        return np.zeros(1)
+    step = float(axis[1] - axis[0])
+    return ((np.arange(subsample) + 0.5) / subsample - 0.5) * step
+
+
+def _occupancy(feat, meshes, offsets):
+    """What fraction of each cell the feature covers, in [0, 1]."""
+    covered = None
+    samples = 0
+    for shifts in itertools.product(*offsets):
+        inside = feat.contains(*[mesh + shift
+                                 for mesh, shift in zip(meshes, shifts)])
+        covered = np.asarray(inside, dtype=float) if covered is None \
+            else covered + inside
+        samples += 1
+    return covered / samples
+
+
+def build_potential_from_features(features, grid_arrays, V_barrier_eV=0.0,
+                                  subsample: int = 1):
     """
     Build potential on a Cartesian grid from a list of Feature objects.
 
@@ -528,6 +608,15 @@ def build_potential_from_features(features, grid_arrays, V_barrier_eV=0.0):
     grid_arrays : tuple of 1D arrays in nm
         1D: (x,)     2D: (x, y)     3D: (x, y, z)
     V_barrier_eV : float — background potential
+    subsample : int
+        How many sub-samples per cell per axis. The default of 1 asks
+        ``contains`` at the cell centre only, so every cell is wholly in or
+        wholly out: a round feature becomes a staircase of whole cells, its
+        volume jumps as it is dragged across the grid, and the preview draws
+        it as blocks. Above 1, a boundary cell takes the fraction of itself
+        the feature actually covers and the potential there is that fraction
+        of the depth — the standard cure for a curved boundary on a square
+        grid, at ``subsample ** ndim`` evaluations of ``contains``.
 
     Returns
     -------
@@ -536,50 +625,30 @@ def build_potential_from_features(features, grid_arrays, V_barrier_eV=0.0):
     """
     from scipy.constants import e as eV_to_J
 
-    ndim = len(grid_arrays)
+    meshes = np.meshgrid(*grid_arrays, indexing='ij')
+    offsets = [_cell_offsets(axis, subsample) for axis in grid_arrays]
 
-    if ndim == 1:
-        x = grid_arrays[0]
-        V = np.full(len(x), V_barrier_eV * eV_to_J)
-        for feat in features:
-            if hasattr(feat, 'potential_at'):
-                V_eV = feat.potential_at(x)
-                V = np.where(feat.contains(x), V_eV * eV_to_J, V)
-            else:
-                V[feat.contains(x)] = feat.V0 * eV_to_J
-        return V, (x,)
-
-    elif ndim == 2:
-        x, y = grid_arrays
-        X, Y = np.meshgrid(x, y, indexing='ij')
-        V = np.full(X.shape, V_barrier_eV * eV_to_J)
-        for feat in features:
-            if hasattr(feat, 'potential_at'):
-                V_eV = feat.potential_at(X, Y)
-                mask = feat.contains(X, Y)
-                V = np.where(mask, V_eV * eV_to_J, V)
-            else:
-                V[feat.contains(X, Y)] = feat.V0 * eV_to_J
-        return V, (X, Y)
-
-    else:  # 3D
-        x, y, z = grid_arrays
-        X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
-        V = np.full(X.shape, V_barrier_eV * eV_to_J)
-        for feat in features:
-            if hasattr(feat, 'potential_at'):
-                V_eV = feat.potential_at(X, Y, Z)
-                mask = feat.contains(X, Y, Z)
-                V = np.where(mask, V_eV * eV_to_J, V)
-            else:
-                V[feat.contains(X, Y, Z)] = feat.V0 * eV_to_J
-        return V, (X, Y, Z)
+    V = np.full(meshes[0].shape, V_barrier_eV * eV_to_J)
+    for feat in features:
+        depth = (feat.potential_at(*meshes) * eV_to_J
+                 if hasattr(feat, 'potential_at') else feat.V0 * eV_to_J)
+        # Blended rather than assigned, so a partly-covered cell is partly
+        # deep. At subsample=1 the fraction is 0 or 1 and this is the plain
+        # overwrite it replaces, feature by feature, in order. Guarded by
+        # `covered > 0` because the blend multiplies rather than selects:
+        # 0.0 * nan is nan, so a `potential_at` that goes non-finite anywhere
+        # — a Gaussian typed with sigma 0 does — would otherwise poison cells
+        # the feature does not even cover, and the solve dies later with an
+        # unrelated LAPACK message.
+        covered = _occupancy(feat, meshes, offsets)
+        V = np.where(covered > 0, covered * depth + (1.0 - covered) * V, V)
+    return V, tuple(meshes)
 
 
 # Registry for UI dropdowns
 FEATURE_TYPES_1D = [SegmentFeature1D, GaussianFeature1D]
-FEATURE_TYPES_2D = [RectFeature2D, CircleFeature2D, EllipseFeature2D,
-                     WedgeFeature2D, GaussianFeature2D]
+FEATURE_TYPES_2D = [RectFeature2D, TriangleFeature2D, CircleFeature2D,
+                    EllipseFeature2D, WedgeFeature2D, GaussianFeature2D]
 FEATURE_TYPES_3D = [BoxFeature3D, SphereFeature3D, CylinderFeature3D,
-                     PyramidFeature3D, PrismFeature3D, ConeFeature3D,
-                     GaussianFeature3D, LensFeature3D]
+                    PyramidFeature3D, PrismFeature3D, ConeFeature3D,
+                    GaussianFeature3D, LensFeature3D]

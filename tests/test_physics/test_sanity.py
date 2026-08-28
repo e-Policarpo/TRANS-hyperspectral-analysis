@@ -10,7 +10,8 @@ import pytest
 from scipy.constants import hbar, m_e, e, pi
 from scipy.sparse.linalg import eigsh
 
-from src.physics.features import (BoxFeature3D, PyramidFeature3D, PrismFeature3D,
+from src.physics.features import (BoxFeature3D, CircleFeature2D,
+                            PyramidFeature3D, PrismFeature3D,
                             ConeFeature3D, SphereFeature3D,
                             build_potential_from_features)
 from src.physics.analytical import (box_energies_1d_eV, box_energies_2d_eV,
@@ -218,6 +219,70 @@ class TestPotentialBuilder:
         mid = len(x) // 2
         V_centre = V[mid, mid, mid]
         assert abs(V_centre - (-0.3 * e)) / (0.3 * e) < 1e-6
+
+    def test_subsampling_gives_a_boundary_cell_a_partial_depth(self):
+        """A cell the feature only half covers is only half as deep.
+
+        Without this every cell is wholly in or wholly out: a round feature
+        is a staircase of whole cells on a square grid, which is what made
+        the preview blocky and the energies jump as a feature was dragged.
+        """
+        x = np.linspace(-10, 10, 41)
+        y = np.linspace(-10, 10, 41)
+        circle = CircleFeature2D(0.0, 0.0, 5.0, -0.4)
+
+        hard, _ = build_potential_from_features([circle], (x, y))
+        soft, _ = build_potential_from_features([circle], (x, y), subsample=4)
+
+        assert set(np.unique(hard / e).round(6)) == {0.0, -0.4}
+        partial = (soft / e)[(soft / e < -1e-9) & (soft / e > -0.4 + 1e-9)]
+        assert partial.size > 20                # a ring of edge cells
+        assert soft.min() == pytest.approx(hard.min())    # the middle is
+        assert soft.max() == pytest.approx(hard.max())    # still the depth
+
+    def test_subsampling_measures_the_area_better(self):
+        """The integral of the well over the plane, against pi r^2 V0.
+
+        Swept across one cell rather than measured at one position: the
+        staircase's error is not a bias but a swing, and at a lucky radius
+        and offset a centre-sampled circle can be nearly exact — which is
+        the trouble with it. What sub-sampling buys is that the answer
+        stops depending on where the feature happens to sit.
+        """
+        x = np.linspace(-10, 10, 41)
+        y = np.linspace(-10, 10, 41)
+        cell = (x[1] - x[0]) * (y[1] - y[0])
+        exact = np.pi * 3.3 ** 2 * -0.4
+
+        def worst(subsample):
+            errors = []
+            for shift in np.linspace(0.0, 0.5, 7):
+                circle = CircleFeature2D(shift, 0.0, 3.3, -0.4)
+                V, _ = build_potential_from_features([circle], (x, y),
+                                                     subsample=subsample)
+                errors.append(abs((V / e).sum() * cell - exact))
+            return max(errors)
+
+        # measured: 0.215 -> 0.022 eV nm^2 across the sweep
+        assert worst(4) < worst(1) / 4
+
+    def test_an_axis_of_one_point_is_not_averaged_through(self):
+        """A preview hands the axis it has already cut in as a single sample.
+        Sub-sampling that axis would smear the slice through its neighbours,
+        which is the one thing a slice must not do."""
+        x = np.linspace(-10, 10, 21)
+        z_on = np.array([0.0])       # through the sphere's equator
+        z_off = np.array([4.9])      # a whisker inside its top
+        sphere = SphereFeature3D(0, 0, 0, 5.0, -0.5, 0.067)
+
+        on, _ = build_potential_from_features([sphere], (x, x, z_on),
+                                              subsample=4)
+        off, _ = build_potential_from_features([sphere], (x, x, z_off),
+                                               subsample=4)
+
+        assert on.min() == pytest.approx(-0.5 * e)
+        # the cap at 4.9 nm is tiny, and nothing from the equator leaks in
+        assert (on < -1e-30).sum() > 10 * (off < -1e-30).sum()
 
     def test_sphere_contains_center(self):
         """Sphere feature should contain its own centre."""
