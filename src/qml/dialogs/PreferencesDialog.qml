@@ -7,6 +7,7 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
+import "../components"   // the Theme singleton
 
 Dialog {
     id: preferencesDialog
@@ -15,15 +16,26 @@ Dialog {
     width: 800
     height: 600
 
-    // Theme colors (use passed-in or default)
-    property color bgDark: "#1a1a2e"
-    property color bgMedium: "#2a2a3e"
-    property color bgLight: "#3a3a4e"
-    property color textLight: "#ffffff"
-    property color textMuted: "#cccccc"
-    property color borderColor: "#9B4F96"
-    property color accentPink: "#F5A9B8"
-    property color accentBlue: "#5BCEFA"
+    // Theme colours.
+    //
+    // These were eight bare literals, and the dialog only looked right
+    // because Main.qml reached in on Loader.onLoaded and pushed eight
+    // Qt.binding()s over them by hand. That is fragile in the obvious way —
+    // it missed bgDarker, accentMagenta and accentOrange, so anything here
+    // that wanted one of those got nothing — and it is the imperative wiring
+    // the Theme singleton exists to delete. Bound declaratively they are
+    // correct on their own, whether or not anyone injects anything.
+    property color bgDark: Theme.bgDark
+    property color bgDarker: Theme.bgDarker
+    property color bgMedium: Theme.bgMedium
+    property color bgLight: Theme.bgLight
+    property color textLight: Theme.textLight
+    property color textMuted: Theme.textMuted
+    property color borderColor: Theme.borderColor
+    property color accentPink: Theme.accentPink
+    property color accentBlue: Theme.accentBlue
+    property color accentMagenta: Theme.accentMagenta
+    property color accentOrange: Theme.accentOrange
 
     // Current scheme being edited
     property var currentScheme: ({})
@@ -218,7 +230,7 @@ Dialog {
                                 visible: customMouseArea.containsMouse
 
                                 background: Rectangle {
-                                    color: parent.hovered ? "#ff6666" : "transparent"
+                                    color: parent.hovered ? accentMagenta : "transparent"
                                     radius: 3
                                 }
 

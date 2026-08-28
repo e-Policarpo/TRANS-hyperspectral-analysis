@@ -11,6 +11,7 @@ import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import TransQML 1.0
+import "../components"   // the Theme singleton
 
 Item {
     id: root
@@ -27,14 +28,14 @@ Item {
 
     // Theme colors
     property var mainWin: ApplicationWindow.window
-    property color bgDark: mainWin ? mainWin.bgDark : "#1a1a2e"
-    property color bgMedium: mainWin ? mainWin.bgMedium : "#2a2a3e"
-    property color bgLight: mainWin ? mainWin.bgLight : "#3a3a4e"
-    property color accentPink: mainWin ? mainWin.accentPink : "#F5A9B8"
-    property color accentBlue: mainWin ? mainWin.accentBlue : "#5BCEFA"
-    property color textLight: mainWin ? mainWin.textLight : "#ffffff"
-    property color textMuted: mainWin ? mainWin.textMuted : "#B0A0B8"
-    property color borderColor: mainWin ? mainWin.borderColor : "#7B3F76"
+    property color bgDark: (mainWin && mainWin.bgDark !== undefined) ? mainWin.bgDark : Theme.bgDark
+    property color bgMedium: (mainWin && mainWin.bgMedium !== undefined) ? mainWin.bgMedium : Theme.bgMedium
+    property color bgLight: (mainWin && mainWin.bgLight !== undefined) ? mainWin.bgLight : Theme.bgLight
+    property color accentPink: (mainWin && mainWin.accentPink !== undefined) ? mainWin.accentPink : Theme.accentPink
+    property color accentBlue: (mainWin && mainWin.accentBlue !== undefined) ? mainWin.accentBlue : Theme.accentBlue
+    property color textLight: (mainWin && mainWin.textLight !== undefined) ? mainWin.textLight : Theme.textLight
+    property color textMuted: (mainWin && mainWin.textMuted !== undefined) ? mainWin.textMuted : Theme.textMuted
+    property color borderColor: (mainWin && mainWin.borderColor !== undefined) ? mainWin.borderColor : Theme.borderColor
 
     // True when either block-selection or STS-dot data is displayed.
     property bool hasData: blockCount > 0 || stsPointCount > 0
@@ -120,6 +121,16 @@ Item {
                     anchors.fill: parent
                     anchors.margins: 2
                     visible: hasData
+
+                    // The strip's plot ground matches the panel it sits in.
+                    backgroundColor: root.bgDark
+                    foregroundColor: root.textMuted
+                    // borderColor, not bgLight: this draws the axes frame and the
+                    // gridlines, and bgLight-on-bgDark measures 1.12:1 to 1.54:1 on
+                    // all 22 schemes — the frame came out fainter than either
+                    // candidate and the painted gridline at 1.02–1.08:1, i.e. no
+                    // visible box on any scheme. borderColor wins on 21 of the 22.
+                    gridColor: root.borderColor
                 }
             }
         }
@@ -140,7 +151,7 @@ Item {
             spectrumGraph.addCurve(
                 result.title || "Average Spectrum",
                 result.x, result.y,
-                "#5BCEFA",  // accent blue
+                root.accentBlue,
                 2.0
             )
             spectrumGraph.setLabels(
@@ -169,7 +180,7 @@ Item {
             spectrumGraph.addCurve(
                 result.title || "Average Spectrum",
                 result.x, result.y,
-                "#5BCEFA",
+                root.accentBlue,
                 2.0
             )
             spectrumGraph.setLabels(

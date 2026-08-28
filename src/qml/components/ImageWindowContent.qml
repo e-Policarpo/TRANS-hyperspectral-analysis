@@ -177,14 +177,14 @@ Item {
 
     // Theme colors
     property var mainWin: ApplicationWindow.window
-    property color bgDarker: mainWin ? mainWin.bgDarker : "#0d0d1a"
-    property color bgDark: mainWin ? mainWin.bgDark : "#1a1a2e"
-    property color bgMedium: mainWin ? mainWin.bgMedium : "#2a2a3e"
-    property color accentBlue: mainWin ? mainWin.accentBlue : "#5BCEFA"
-    property color accentPink: mainWin ? mainWin.accentPink : "#F5A9B8"
-    property color textLight: mainWin ? mainWin.textLight : "#ffffff"
-    property color textMuted: mainWin ? mainWin.textMuted : "#cccccc"
-    property color borderColor: mainWin ? mainWin.borderColor : "#9B4F96"
+    property color bgDarker: (mainWin && mainWin.bgDarker !== undefined) ? mainWin.bgDarker : Theme.bgDarker
+    property color bgDark: (mainWin && mainWin.bgDark !== undefined) ? mainWin.bgDark : Theme.bgDark
+    property color bgMedium: (mainWin && mainWin.bgMedium !== undefined) ? mainWin.bgMedium : Theme.bgMedium
+    property color accentBlue: (mainWin && mainWin.accentBlue !== undefined) ? mainWin.accentBlue : Theme.accentBlue
+    property color accentPink: (mainWin && mainWin.accentPink !== undefined) ? mainWin.accentPink : Theme.accentPink
+    property color textLight: (mainWin && mainWin.textLight !== undefined) ? mainWin.textLight : Theme.textLight
+    property color textMuted: (mainWin && mainWin.textMuted !== undefined) ? mainWin.textMuted : Theme.textMuted
+    property color borderColor: (mainWin && mainWin.borderColor !== undefined) ? mainWin.borderColor : Theme.borderColor
 
     implicitWidth: 820
     implicitHeight: 520
@@ -1559,7 +1559,7 @@ Item {
                                 anchors.bottom: parent.bottom
                                 x: histogramView.valueToPixel(displayMin) - 1
                                 width: 2
-                                color: "#5BCEFA"
+                                color: accentBlue
                             }
                             MouseArea {
                                 id: minHandleArea
@@ -1598,7 +1598,7 @@ Item {
                                 anchors.bottom: parent.bottom
                                 x: histogramView.valueToPixel(displayMax) - 1
                                 width: 2
-                                color: "#F5A9B8"
+                                color: accentPink
                             }
                             MouseArea {
                                 id: maxHandleArea

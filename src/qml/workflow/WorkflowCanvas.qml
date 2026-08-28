@@ -10,6 +10,7 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
+import "../components"   // the Theme singleton
 
 Rectangle {
     id: workflowCanvas
@@ -34,31 +35,37 @@ Rectangle {
 
     // Theme colors - reactive bindings to main window
     property var mainWin: ApplicationWindow.window
-    property color bgDark: mainWin ? mainWin.bgDark : "#1a1a2e"
-    property color bgDarker: mainWin ? mainWin.bgDarker : "#0d0d1a"
-    property color bgMedium: mainWin ? mainWin.bgMedium : "#2a2a3e"
-    property color bgLight: mainWin ? mainWin.bgLight : "#3a3a4e"
-    property color accentPink: mainWin ? mainWin.accentPink : "#F5A9B8"
-    property color accentBlue: mainWin ? mainWin.accentBlue : "#5BCEFA"
-    property color accentMagenta: mainWin ? mainWin.accentMagenta : "#D60270"
-    property color accentPurple: mainWin ? mainWin.accentPurple : "#9B4F96"
-    property color accentGreen: "#66ff99"
-    property color textLight: mainWin ? mainWin.textLight : "#ffffff"
-    property color textMuted: mainWin ? mainWin.textMuted : "#cccccc"
-    property color borderColor: mainWin ? mainWin.borderColor : "#9B4F96"
+    property color bgDark: (mainWin && mainWin.bgDark !== undefined) ? mainWin.bgDark : Theme.bgDark
+    property color bgDarker: (mainWin && mainWin.bgDarker !== undefined) ? mainWin.bgDarker : Theme.bgDarker
+    property color bgMedium: (mainWin && mainWin.bgMedium !== undefined) ? mainWin.bgMedium : Theme.bgMedium
+    property color bgLight: (mainWin && mainWin.bgLight !== undefined) ? mainWin.bgLight : Theme.bgLight
+    property color accentPink: (mainWin && mainWin.accentPink !== undefined) ? mainWin.accentPink : Theme.accentPink
+    property color accentBlue: (mainWin && mainWin.accentBlue !== undefined) ? mainWin.accentBlue : Theme.accentBlue
+    property color accentMagenta: (mainWin && mainWin.accentMagenta !== undefined) ? mainWin.accentMagenta : Theme.accentMagenta
+    property color accentPurple: (mainWin && mainWin.accentPurple !== undefined) ? mainWin.accentPurple : Theme.accentPurple
+    // Status colours. Green means "valid / connected", the error red means
+    // "this will not run" — semantics, not decoration, so they keep their
+    // hue rather than taking an accent. They still come from the palette:
+    // every scheme carries a `success` and an `error` key for exactly this,
+    // and Theme publishes them as successColor and accentMagenta. (The amber
+    // warning below has no home on Theme yet; it is left fixed until it does.)
+    property color accentGreen: (mainWin && mainWin.successColor !== undefined) ? mainWin.successColor : Theme.successColor
+    property color textLight: (mainWin && mainWin.textLight !== undefined) ? mainWin.textLight : Theme.textLight
+    property color textMuted: (mainWin && mainWin.textMuted !== undefined) ? mainWin.textMuted : Theme.textMuted
+    property color borderColor: (mainWin && mainWin.borderColor !== undefined) ? mainWin.borderColor : Theme.borderColor
 
-    // Detect light theme
-    property bool isLightTheme: {
-        var hex = bgDark.toString().replace("#", "")
-        if (hex.length >= 2) {
-            var r = parseInt(hex.substring(0, 2), 16)
-            return r > 200
-        }
-        return false
-    }
-
-    // Grid color
-    property color gridColor: isLightTheme ? "#D0D0D8" : "#2a2a3e"
+    // The canvas grid, derived from the palette rather than picked for it.
+    //
+    // This used to sniff bgDark's red channel for "is this a light scheme?"
+    // and choose between two hand-mixed greys — a two-scheme theme inside a
+    // 22-scheme app, and one that got the answer wrong for any scheme whose
+    // background is dark but warm. textMuted at low alpha is right on every
+    // scheme instead, and safely so: textMuted-on-bgDark is one of the
+    // pairings src/utils/color_contrast.py enforces at 4.5:1, so the rule is
+    // always visible against the ground and never loud enough to compete with
+    // the nodes on it. WorkspaceCanvas.qml has drawn its grid this way all
+    // along; this is the same idiom, not a new one.
+    property color gridColor: Qt.rgba(textMuted.r, textMuted.g, textMuted.b, 0.15)
 
     // Port colors
     readonly property var portColors: ({

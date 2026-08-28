@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 
 import numpy as np
-from PySide6.QtCore import Property, Signal, Slot
+from PySide6.QtCore import Slot
 
 from src.widgets.qml_figure_canvas import FigureCanvasItem
 
@@ -29,39 +29,29 @@ logger = logging.getLogger(__name__)
 class SolverCanvas(FigureCanvasItem):
     """A figure that knows how to draw a solved well or dot."""
 
+    #: A level is read as an energy off the y axis, so the panels are
+    #: ruled.
+    SHOW_GRID = True
+
+    #: Four roles drawn in one axes at once: the potential the states sit
+    #: in, the levels, the one level the user picked, and the energies that
+    #: were measured. They are a legend, not decoration — which curve is
+    #: which is the whole reading of the picture — and they have to stay
+    #: mutually distinguishable. That is why none of them is themed: an
+    #: accent taken from the scheme would sooner or later land on the same
+    #: hue as one of the other three (this user's accentPrimary, #66B3FF,
+    #: is a shade of LEVEL_COLOUR), and two roles the same colour is a
+    #: worse picture than four that do not match the panel. The chrome
+    #: around them — spines, ticks, labels, the shell-closing rules —
+    #: follows the theme, which is what makes them readable either way.
     POTENTIAL_COLOUR = "#9B4F96"
     LEVEL_COLOUR = "#5BCEFA"
     SELECTED_COLOUR = "#F5A9B8"
     TARGET_COLOUR = "#FFD700"
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._foreground = "#cccccc"
-        self._grid = "#444444"
-
-    foregroundColorChanged = Signal()
-
-    def _get_foreground(self) -> str:
-        return self._foreground
-
-    def _set_foreground(self, colour: str) -> None:
-        colour = str(colour or "").strip()
-        if colour and colour != self._foreground:
-            self._foreground = colour
-            self.foregroundColorChanged.emit()
-
-    foregroundColor = Property(str, _get_foreground, _set_foreground,
-                               notify=foregroundColorChanged)
-
-    def _style(self, ax) -> None:
-        ax.set_facecolor(self._background)
-        for spine in ax.spines.values():
-            spine.set_color(self._grid)
-        ax.tick_params(colors=self._foreground, labelsize=7)
-        ax.xaxis.label.set_color(self._foreground)
-        ax.yaxis.label.set_color(self._foreground)
-        ax.title.set_color(self._foreground)
-        ax.grid(True, color=self._grid, alpha=0.3, linewidth=0.5)
+    # Each drawing slot records what it was given; the base class draws it
+    # again when a colour changes, so the levels follow the theme's chrome
+    # rather than sitting inside a frame that has moved on without them.
 
     def _legend(self, ax, **kwargs) -> None:
         legend = ax.legend(fontsize=7, facecolor=self._background,
@@ -84,6 +74,7 @@ class SolverCanvas(FigureCanvasItem):
         against the level.
         """
         result = dict(result or {})
+        self._last_draw = ('showWell', (result, int(state_index)))
         self.figure.clf()
         energies = list(result.get('E_eV') or [])
         x = list(result.get('x_nm') or [])
@@ -96,18 +87,21 @@ class SolverCanvas(FigureCanvasItem):
 
         potential = list(result.get('V_eV') or [])
         if len(potential) == len(x):
-            well_ax.plot(x, potential, color=self.POTENTIAL_COLOUR, lw=1.5,
+            well_ax.plot(x, potential,
+                         color=self._seriesColour(self.POTENTIAL_COLOUR), lw=1.5,
                          label="Potential")
 
         index = max(0, min(int(state_index), len(energies) - 1))
         for i, energy in enumerate(energies):
             chosen = (i == index)
             well_ax.axhline(energy,
-                            color=self.SELECTED_COLOUR if chosen
-                            else self.LEVEL_COLOUR,
+                            color=self._seriesColour(
+                                self.SELECTED_COLOUR if chosen
+                                else self.LEVEL_COLOUR),
                             lw=1.6 if chosen else 0.9,
                             alpha=1.0 if chosen else 0.65)
-        well_ax.axhline(energies[index], color=self.SELECTED_COLOUR, lw=1.6,
+        well_ax.axhline(energies[index],
+                        color=self._seriesColour(self.SELECTED_COLOUR), lw=1.6,
                         label=f"E{index + 1} = {energies[index]:.4f} eV")
 
         # The measured energies the candidate was fitted to, if there were
@@ -115,7 +109,8 @@ class SolverCanvas(FigureCanvasItem):
         # the numerical levels land on them.
         comparison = dict(result.get('comparison') or {})
         for target in (comparison.get('targets') or []):
-            well_ax.axhline(float(target), color=self.TARGET_COLOUR, lw=0.8,
+            well_ax.axhline(float(target),
+                            color=self._seriesColour(self.TARGET_COLOUR), lw=0.8,
                             ls="--", alpha=0.9)
         if comparison.get('targets'):
             well_ax.axhline(float(comparison['targets'][0]),
@@ -173,6 +168,7 @@ class SolverCanvas(FigureCanvasItem):
         looks like in radius.
         """
         result = dict(result or {})
+        self._last_draw = ('showDot', (result, int(state_index)))
         self.figure.clf()
         levels = list(result.get('levels') or [])
         if not levels:
@@ -260,17 +256,5 @@ class SolverCanvas(FigureCanvasItem):
         return title
 
     # ── nothing to draw ──────────────────────────────────────────────────
-
-    def _draw_message(self, message: str) -> None:
-        ax = self.figure.add_subplot(111)
-        ax.axis("off")
-        ax.text(0.5, 0.5, message, ha="center", va="center",
-                color=self._foreground, fontsize=10, transform=ax.transAxes)
-        ax.set_facecolor(self._background)
-        self.redraw()
-
-    @Slot(str)
-    def showMessage(self, message: str) -> None:
-        """Put a line of text where a plot would be."""
-        self.figure.clf()
-        self._draw_message(message)
+    #
+    # `_draw_message` and `showMessage` are the base class's.

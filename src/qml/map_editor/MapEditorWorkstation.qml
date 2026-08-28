@@ -13,6 +13,7 @@ import QtQuick.Window 2.15
 import Qt.labs.platform 1.1 as Platform
 import TransQML 1.0
 import "Fmt.js" as Fmt
+import "../components"   // the Theme singleton
 
 // Map Editor Workstation - Gwyddion-style map editing interface
 // Implements TRANS_v3 interactive canvas with spatial-spectral reconstruction
@@ -47,15 +48,17 @@ Item {
 
     // Theme colors - reactive bindings to main window
     property var mainWin: ApplicationWindow.window
-    property color bgDark: mainWin ? mainWin.bgDark : "#1a1a2e"
-    property color bgDarker: mainWin ? mainWin.bgDarker : "#0d0d1a"
-    property color bgMedium: mainWin ? mainWin.bgMedium : "#2a2a3e"
-    property color bgLight: mainWin ? mainWin.bgLight : "#3a3a4e"
-    property color accentPink: mainWin ? mainWin.accentPink : "#F5A9B8"
-    property color accentBlue: mainWin ? mainWin.accentBlue : "#5BCEFA"
-    property color textLight: mainWin ? mainWin.textLight : "#ffffff"
-    property color textMuted: mainWin ? mainWin.textMuted : "#B0A0B8"
-    property color borderColor: mainWin ? mainWin.borderColor : "#7B3F76"
+    property color bgDark: (mainWin && mainWin.bgDark !== undefined) ? mainWin.bgDark : Theme.bgDark
+    property color bgDarker: (mainWin && mainWin.bgDarker !== undefined) ? mainWin.bgDarker : Theme.bgDarker
+    property color bgMedium: (mainWin && mainWin.bgMedium !== undefined) ? mainWin.bgMedium : Theme.bgMedium
+    property color bgLight: (mainWin && mainWin.bgLight !== undefined) ? mainWin.bgLight : Theme.bgLight
+    property color accentPink: (mainWin && mainWin.accentPink !== undefined) ? mainWin.accentPink : Theme.accentPink
+    property color accentBlue: (mainWin && mainWin.accentBlue !== undefined) ? mainWin.accentBlue : Theme.accentBlue
+    property color textLight: (mainWin && mainWin.textLight !== undefined) ? mainWin.textLight : Theme.textLight
+    property color textMuted: (mainWin && mainWin.textMuted !== undefined) ? mainWin.textMuted : Theme.textMuted
+    property color borderColor: (mainWin && mainWin.borderColor !== undefined) ? mainWin.borderColor : Theme.borderColor
+    property color accentMagenta: (mainWin && mainWin.accentMagenta !== undefined) ? mainWin.accentMagenta : Theme.accentMagenta
+    property color accentOrange: (mainWin && mainWin.accentOrange !== undefined) ? mainWin.accentOrange : Theme.accentOrange
     property string monoFont: mainWin ? mainWin.fontFamilyMono : (Qt.platform.os === "osx" ? "Menlo" : "Consolas")
 
     // Backend instance
@@ -490,11 +493,26 @@ Item {
                                                 anchors.leftMargin: 4
 
                                                 // Type indicator
+                                                // Three states, and colour
+                                                // alone cannot carry them: on
+                                                // Gender Who the three accents
+                                                // are 21 apart out of 441, and
+                                                // on both Straight schemes 48 —
+                                                // three indistinguishable grey
+                                                // dots. Shape is a second
+                                                // channel that survives every
+                                                // scheme: square = truncated,
+                                                // ring = discretized, filled
+                                                // circle = untouched.
                                                 Rectangle {
-                                                    width: 6
-                                                    height: 6
-                                                    radius: 3
-                                                    color: model.is_truncated ? "#66ff99" : (model.is_discretized ? "#FFB7C5" : accentPink)
+                                                    width: 7
+                                                    height: 7
+                                                    radius: model.is_truncated ? 0 : 3.5
+                                                    color: model.is_discretized && !model.is_truncated
+                                                           ? "transparent"
+                                                           : (model.is_truncated ? accentOrange : accentPink)
+                                                    border.width: model.is_discretized && !model.is_truncated ? 1.5 : 0
+                                                    border.color: accentBlue
                                                     visible: true
                                                 }
 
@@ -520,19 +538,23 @@ Item {
                                 Layout.fillWidth: true
                                 spacing: 12
 
+                                // The legend carries the same shapes as the
+                                // dots above, or it explains a code the list
+                                // is not using.
                                 RowLayout {
                                     spacing: 3
-                                    Rectangle { width: 6; height: 6; radius: 3; color: "#66ff99" }
+                                    Rectangle { width: 7; height: 7; radius: 0; color: accentOrange }
                                     Label { text: "Truncated"; font.pixelSize: 8; color: textMuted }
                                 }
                                 RowLayout {
                                     spacing: 3
-                                    Rectangle { width: 6; height: 6; radius: 3; color: "#FFB7C5" }
+                                    Rectangle { width: 7; height: 7; radius: 3.5; color: "transparent"
+                                                border.width: 1.5; border.color: accentBlue }
                                     Label { text: "Discretized"; font.pixelSize: 8; color: textMuted }
                                 }
                                 RowLayout {
                                     spacing: 3
-                                    Rectangle { width: 6; height: 6; radius: 3; color: accentPink }
+                                    Rectangle { width: 7; height: 7; radius: 3.5; color: accentPink }
                                     Label { text: "Spectral"; font.pixelSize: 8; color: textMuted }
                                 }
                             }
@@ -678,7 +700,7 @@ Item {
                                     width: 16
                                     height: 16
                                     radius: 8
-                                    color: closeBtnArea.containsMouse ? "#C00260" : "transparent"
+                                    color: closeBtnArea.containsMouse ? accentMagenta : "transparent"
 
                                     Text {
                                         anchors.centerIn: parent
@@ -780,6 +802,19 @@ Item {
                 MapCanvas {
                     id: mapCanvas
                     anchors.fill: parent
+
+                    // The map's own chrome — the margin, the axis ticks and
+                    // the frame — from the scheme. The colormap inside is
+                    // data and is untouched by any of this. gridColor takes
+                    // borderColor — see the note on the binding below.
+                    backgroundColor: root.bgDark
+                    foregroundColor: root.textMuted
+                    // borderColor, not bgLight: this draws the axes frame and the
+                    // gridlines, and bgLight-on-bgDark measures 1.12:1 to 1.54:1 on
+                    // all 22 schemes — the frame came out fainter than either
+                    // candidate and the painted gridline at 1.02–1.08:1, i.e. no
+                    // visible box on any scheme. borderColor wins on 21 of the 22.
+                    gridColor: root.borderColor
 
                     onPointClicked: function(x, y, row, col, value) {
                         coordLabel.text = "(" + row + ", " + col + ") = " + Fmt.sci(value)

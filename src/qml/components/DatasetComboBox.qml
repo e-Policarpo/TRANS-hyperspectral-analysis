@@ -18,12 +18,15 @@ ComboBox {
     property int rollSpeed: 50    // pixels per second
     property string placeholderText: "Select dataset..."
 
-    // Theme colors
-    property color bgColor: "#3a3a4e"
-    property color borderColorNormal: "#9B4F96"
-    property color borderColorFocus: "#F5A9B8"
-    property color textColor: "#ffffff"
-    property color textMutedColor: "#cccccc"
+    // Theme knobs. A host may override any of these; left alone they
+    // follow the scheme, which is what a control dropped into a tool
+    // panel needs — these were the 2018 defaults, so an unoverridden
+    // combo painted itself in a palette the app no longer has.
+    property color bgColor: Theme.bgLight
+    property color borderColorNormal: Theme.borderColor
+    property color borderColorFocus: Theme.accentPink
+    property color textColor: Theme.textLight
+    property color textMutedColor: Theme.textMuted
 
     // Calculate optimal width based on model content.
     // Measured via FontMetrics.advanceWidth(text) — a plain function call.

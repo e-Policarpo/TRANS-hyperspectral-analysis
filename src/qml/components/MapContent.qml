@@ -45,14 +45,14 @@ Item {
 
     // Theme colors - reactive bindings to main window
     property var mainWin: ApplicationWindow.window
-    property color bgDark: mainWin ? mainWin.bgDark : "#1a1a2e"
-    property color bgMedium: mainWin ? mainWin.bgMedium : "#2a2a3e"
-    property color bgLight: mainWin ? mainWin.bgLight : "#3a3a4e"
-    property color textLight: mainWin ? mainWin.textLight : "#ffffff"
-    property color textMuted: mainWin ? mainWin.textMuted : "#cccccc"
-    property color accentPink: mainWin ? mainWin.accentPink : "#F5A9B8"
-    property color accentBlue: mainWin ? mainWin.accentBlue : "#5BCEFA"
-    property color borderColor: mainWin ? mainWin.borderColor : "#9B4F96"
+    property color bgDark: (mainWin && mainWin.bgDark !== undefined) ? mainWin.bgDark : Theme.bgDark
+    property color bgMedium: (mainWin && mainWin.bgMedium !== undefined) ? mainWin.bgMedium : Theme.bgMedium
+    property color bgLight: (mainWin && mainWin.bgLight !== undefined) ? mainWin.bgLight : Theme.bgLight
+    property color textLight: (mainWin && mainWin.textLight !== undefined) ? mainWin.textLight : Theme.textLight
+    property color textMuted: (mainWin && mainWin.textMuted !== undefined) ? mainWin.textMuted : Theme.textMuted
+    property color accentPink: (mainWin && mainWin.accentPink !== undefined) ? mainWin.accentPink : Theme.accentPink
+    property color accentBlue: (mainWin && mainWin.accentBlue !== undefined) ? mainWin.accentBlue : Theme.accentBlue
+    property color borderColor: (mainWin && mainWin.borderColor !== undefined) ? mainWin.borderColor : Theme.borderColor
 
     // Signals
     signal pixelClicked(int x, int y, real value)
@@ -105,6 +105,12 @@ Item {
             }
 
             if (selectedX >= 0 && selectedY >= 0) {
+                // White, and deliberately not from the scheme. This stroke lands
+                // on the colormap, not on the window: its job is to be seen
+                // against viridis or inferno at whatever value happens to be
+                // under it, and a scheme colour has no relationship to that.
+                // (It is genuinely weak over a pale cell — the fix there is a
+                // two-tone stroke, dark under light, not a palette binding.)
                 ctx.strokeStyle = "#ffffff"
                 ctx.lineWidth = 2
                 ctx.strokeRect(selectedX * pixelW, selectedY * pixelH, pixelW, pixelH)

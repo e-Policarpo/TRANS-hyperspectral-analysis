@@ -9,6 +9,7 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
+import "../components"   // the Theme singleton
 
 Rectangle {
     id: nodeRoot
@@ -22,16 +23,23 @@ Rectangle {
     property bool nodeDataValid: nodeData !== null && nodeData !== undefined && typeof nodeData === "object"
 
     // Theme colors - get from parent workflowWindow
-    property color bgDark: workflowWindow ? workflowWindow.bgDark : "#1a1a2e"
-    property color bgMedium: workflowWindow ? workflowWindow.bgMedium : "#2a2a3e"
-    property color bgLight: workflowWindow ? workflowWindow.bgLight : "#3a3a4e"
-    property color accentPink: workflowWindow ? workflowWindow.accentPink : "#F5A9B8"
-    property color accentBlue: workflowWindow ? workflowWindow.accentBlue : "#5BCEFA"
-    property color accentGreen: "#66ff99"   // Keep workflow status colors
+    property color bgDark: (workflowWindow && workflowWindow.bgDark !== undefined) ? workflowWindow.bgDark : Theme.bgDark
+    property color bgMedium: (workflowWindow && workflowWindow.bgMedium !== undefined) ? workflowWindow.bgMedium : Theme.bgMedium
+    property color bgLight: (workflowWindow && workflowWindow.bgLight !== undefined) ? workflowWindow.bgLight : Theme.bgLight
+    property color accentPink: (workflowWindow && workflowWindow.accentPink !== undefined) ? workflowWindow.accentPink : Theme.accentPink
+    property color accentBlue: (workflowWindow && workflowWindow.accentBlue !== undefined) ? workflowWindow.accentBlue : Theme.accentBlue
+    property color accentMagenta: (workflowWindow && workflowWindow.accentMagenta !== undefined) ? workflowWindow.accentMagenta : Theme.accentMagenta
+    // Status colours. Green means "valid / connected", the error red means
+    // "this will not run" — semantics, not decoration, so they keep their
+    // hue rather than taking an accent. They still come from the palette:
+    // every scheme carries a `success` and an `error` key for exactly this,
+    // and Theme publishes them as successColor and accentMagenta. (The amber
+    // warning below has no home on Theme yet; it is left fixed until it does.)
+    property color accentGreen: (workflowWindow && workflowWindow.successColor !== undefined) ? workflowWindow.successColor : Theme.successColor
     property color accentOrange: "#FFB7C5"
-    property color textLight: workflowWindow ? workflowWindow.textLight : "#ffffff"
-    property color textMuted: workflowWindow ? workflowWindow.textMuted : "#cccccc"
-    property color borderColor: workflowWindow ? workflowWindow.borderColor : "#9B4F96"
+    property color textLight: (workflowWindow && workflowWindow.textLight !== undefined) ? workflowWindow.textLight : Theme.textLight
+    property color textMuted: (workflowWindow && workflowWindow.textMuted !== undefined) ? workflowWindow.textMuted : Theme.textMuted
+    property color borderColor: (workflowWindow && workflowWindow.borderColor !== undefined) ? workflowWindow.borderColor : Theme.borderColor
 
     // Port colors are now obtained via getPortColor() function which delegates to workflowWindow
     // Version counter from workflowWindow triggers re-evaluation when theme changes
@@ -170,16 +178,26 @@ Rectangle {
     // Check if this is a comment node
     property bool isCommentNode: nodeDataValid && nodeData.tool_name === "CommentNode"
 
-    // Get comment node background color (using new hex color parameter)
+    // A comment node's colours are the user's: whatever they picked is stored
+    // in nodeData.parameters and is returned untouched. Only the DEFAULT —
+    // what an unconfigured comment gets — comes from the scheme, so a new
+    // comment matches the workflow it was dropped into instead of always
+    // arriving in the 2018 brand pink.
+    //
+    // The default pair is deliberate rather than convenient: accentPink is
+    // the scheme's accentPrimary and bgDark is its window ground, and
+    // bgDark-on-accentPrimary is one of the pairings
+    // src/utils/color_contrast.py enforces at 4.5:1 — the "primary button"
+    // pair. So the default text is guaranteed readable on the default ground
+    // for all 22 schemes, which the old #333333-on-#F5A9B8 was not.
     function getCommentBgColor() {
-        if (!isCommentNode || !nodeData.parameters) return "#F5A9B8"  // Trans pink default
-        return nodeData.parameters.bg_color || "#F5A9B8"
+        if (!isCommentNode || !nodeData.parameters) return accentPink
+        return nodeData.parameters.bg_color || accentPink
     }
 
-    // Get comment node text color
     function getCommentTextColor() {
-        if (!isCommentNode || !nodeData.parameters) return "#333333"
-        return nodeData.parameters.text_color || "#333333"
+        if (!isCommentNode || !nodeData.parameters) return bgDark
+        return nodeData.parameters.text_color || bgDark
     }
 
     // Get comment node opacity
@@ -356,7 +374,7 @@ Rectangle {
                 width: 18
                 height: 18
                 radius: 9
-                color: deleteBtn.containsMouse ? "#D60270" : "transparent"
+                color: deleteBtn.containsMouse ? accentMagenta : "transparent"
                 z: 200
 
                 Text {
@@ -448,7 +466,7 @@ Rectangle {
             width: 20
             height: 20
             radius: 10
-            color: commentDeleteArea.containsMouse ? "#D60270" : Qt.rgba(0, 0, 0, 0.3)
+            color: commentDeleteArea.containsMouse ? accentMagenta : Qt.rgba(0, 0, 0, 0.3)
             z: 200
 
             Text {
@@ -707,7 +725,7 @@ Rectangle {
                 anchors.fill: parent
                 anchors.margins: 3
                 text: { var v = paramsVersion; return getDisplayParameter() }
-                color: isCommentNode ? "#333333" : accentBlue
+                color: isCommentNode ? getCommentTextColor() : accentBlue
                 font.pixelSize: { var v = paramsVersion; return isCommentNode ? getCommentFontSize() : 9 }
                 font.italic: !isCommentNode
                 elide: Text.ElideRight

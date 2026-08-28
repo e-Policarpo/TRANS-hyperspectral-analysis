@@ -12,6 +12,7 @@ import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
 import Qt.labs.platform 1.1 as Platform
 import TransQML 1.0
+import "../components"   // the Theme singleton
 
 // MapViewerPanel - Dockable map viewer with controls
 // Provides colormap selection, color scale adjustment, statistics, and export
@@ -48,15 +49,16 @@ Rectangle {
 
     // Theme colors - reactive bindings to main window
     property var mainWin: ApplicationWindow.window
-    property color bgDark: mainWin ? mainWin.bgDark : "#1a1a2e"
-    property color bgDarker: mainWin ? mainWin.bgDarker : "#0d0d1a"
-    property color bgMedium: mainWin ? mainWin.bgMedium : "#2a2a3e"
-    property color bgLight: mainWin ? mainWin.bgLight : "#3a3a4e"
-    property color accentPink: mainWin ? mainWin.accentPink : "#F5A9B8"
-    property color accentBlue: mainWin ? mainWin.accentBlue : "#5BCEFA"
-    property color textLight: mainWin ? mainWin.textLight : "#ffffff"
-    property color textMuted: mainWin ? mainWin.textMuted : "#B0A0B8"
-    property color borderColor: mainWin ? mainWin.borderColor : "#7B3F76"
+    property color bgDark: (mainWin && mainWin.bgDark !== undefined) ? mainWin.bgDark : Theme.bgDark
+    property color bgDarker: (mainWin && mainWin.bgDarker !== undefined) ? mainWin.bgDarker : Theme.bgDarker
+    property color bgMedium: (mainWin && mainWin.bgMedium !== undefined) ? mainWin.bgMedium : Theme.bgMedium
+    property color bgLight: (mainWin && mainWin.bgLight !== undefined) ? mainWin.bgLight : Theme.bgLight
+    property color accentPink: (mainWin && mainWin.accentPink !== undefined) ? mainWin.accentPink : Theme.accentPink
+    property color accentBlue: (mainWin && mainWin.accentBlue !== undefined) ? mainWin.accentBlue : Theme.accentBlue
+    property color textLight: (mainWin && mainWin.textLight !== undefined) ? mainWin.textLight : Theme.textLight
+    property color textMuted: (mainWin && mainWin.textMuted !== undefined) ? mainWin.textMuted : Theme.textMuted
+    property color borderColor: (mainWin && mainWin.borderColor !== undefined) ? mainWin.borderColor : Theme.borderColor
+    property color accentMagenta: (mainWin && mainWin.accentMagenta !== undefined) ? mainWin.accentMagenta : Theme.accentMagenta
     property string monoFont: mainWin ? mainWin.fontFamilyMono : (Qt.platform.os === "osx" ? "Menlo" : "Consolas")
 
     color: bgMedium
@@ -126,7 +128,7 @@ Rectangle {
                     Layout.preferredHeight: 24
 
                     background: Rectangle {
-                        color: parent.hovered ? "#C00260" : "transparent"
+                        color: parent.hovered ? accentMagenta : "transparent"
                         radius: 3
                     }
 
@@ -165,6 +167,16 @@ Rectangle {
                     id: mapCanvas
                     anchors.fill: parent
                     anchors.margins: 4
+
+                    // Chrome only; the colormap inside is data.
+                    backgroundColor: mapViewerPanel.bgDark
+                    foregroundColor: mapViewerPanel.textMuted
+                    // borderColor, not bgLight: this draws the axes frame and the
+                    // gridlines, and bgLight-on-bgDark measures 1.12:1 to 1.54:1 on
+                    // all 22 schemes — the frame came out fainter than either
+                    // candidate and the painted gridline at 1.02–1.08:1, i.e. no
+                    // visible box on any scheme. borderColor wins on 21 of the 22.
+                    gridColor: mapViewerPanel.borderColor
 
                     onPointClicked: function(x, y, row, col, value) {
                         mapViewerPanel.mapClicked(row, col, value)

@@ -19,16 +19,16 @@ Item {
 
     // Theme colors - reactive bindings to parent DraggableWindow
     property var parentWindow: Window.window
-    property color bgDark: parentWindow ? parentWindow.bgDark : "#1a1a2e"
-    property color bgMedium: parentWindow ? parentWindow.bgMedium : "#2a2a3e"
-    property color bgLight: parentWindow ? parentWindow.bgLight : "#3a3a4e"
-    property color accentPink: parentWindow ? parentWindow.accentPink : "#F5A9B8"
-    property color accentBlue: parentWindow ? parentWindow.accentBlue : "#5BCEFA"
-    property color accentMagenta: parentWindow ? parentWindow.accentMagenta : "#D60270"
-    property color accentPurple: parentWindow ? parentWindow.accentPurple : "#9B4F96"
-    property color textLight: parentWindow ? parentWindow.textLight : "#ffffff"
-    property color textMuted: parentWindow ? parentWindow.textMuted : "#cccccc"
-    property color successColor: parentWindow ? parentWindow.successColor : "#2ECC71"
+    property color bgDark: (parentWindow && parentWindow.bgDark !== undefined) ? parentWindow.bgDark : Theme.bgDark
+    property color bgMedium: (parentWindow && parentWindow.bgMedium !== undefined) ? parentWindow.bgMedium : Theme.bgMedium
+    property color bgLight: (parentWindow && parentWindow.bgLight !== undefined) ? parentWindow.bgLight : Theme.bgLight
+    property color accentPink: (parentWindow && parentWindow.accentPink !== undefined) ? parentWindow.accentPink : Theme.accentPink
+    property color accentBlue: (parentWindow && parentWindow.accentBlue !== undefined) ? parentWindow.accentBlue : Theme.accentBlue
+    property color accentMagenta: (parentWindow && parentWindow.accentMagenta !== undefined) ? parentWindow.accentMagenta : Theme.accentMagenta
+    property color accentPurple: (parentWindow && parentWindow.accentPurple !== undefined) ? parentWindow.accentPurple : Theme.accentPurple
+    property color textLight: (parentWindow && parentWindow.textLight !== undefined) ? parentWindow.textLight : Theme.textLight
+    property color textMuted: (parentWindow && parentWindow.textMuted !== undefined) ? parentWindow.textMuted : Theme.textMuted
+    property color successColor: (parentWindow && parentWindow.successColor !== undefined) ? parentWindow.successColor : Theme.successColor
 
     ColumnLayout {
         anchors.fill: parent
@@ -90,6 +90,17 @@ Item {
                 }
 
                 TextField {
+                    // A bare TextField takes the style's own palette, which under the
+                    // Basic style is a light one — white ground, black text — regardless
+                    // of what the window around it is painted. Say it explicitly.
+                    color: truncateTool.textLight
+                    placeholderTextColor: truncateTool.textMuted
+                    background: Rectangle {
+                        color: truncateTool.bgDark
+                        border.color: truncateTool.bgLight
+                        border.width: 1
+                        radius: 4
+                    }
                     id: minValueField
                     Layout.fillWidth: true
                     placeholderText: "e.g., -2.0"

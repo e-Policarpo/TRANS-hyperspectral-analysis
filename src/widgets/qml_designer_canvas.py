@@ -20,9 +20,9 @@ from __future__ import annotations
 import logging
 
 import numpy as np
-from PySide6.QtCore import Property, Signal, Slot
+from PySide6.QtCore import Slot
 
-from src.widgets.qml_figure_canvas import FigureCanvasItem
+from src.widgets.qml_figure_canvas import FigureCanvasItem, scale_or_default
 
 logger = logging.getLogger(__name__)
 
@@ -30,46 +30,62 @@ logger = logging.getLogger(__name__)
 class DesignerCanvas(FigureCanvasItem):
     """A figure that knows how to draw a designer candidate."""
 
-    #: Error bands, in percent, and the colour each gets. Green is "as good
-    #: as the measurement"; red is a candidate that does not explain a level.
+    #: Both panels are read off their gridlines — an error of 3% is a
+    #: bar height, not a number — so they are ruled.
+    SHOW_GRID = True
+
+    #: Error bands, in percent, and the colour each gets when nothing has
+    #: themed the canvas. Green is "as good as the measurement"; red is a
+    #: candidate that does not explain a level. The *limits* are the physics
+    #: and stay here; the colours are semantic — good / marginal / bad — and
+    #: come from the scheme's success / warning / error when it supplies a
+    #: set that still tells itself apart. Half the schemes carry a real
+    #: green-amber-red; the deliberately monochrome ones ("Straight Dark")
+    #: do not, and `scale_or_default` falls back to these rather than draw
+    #: three greys where the whole point is which band a bar landed in.
     ERROR_BANDS = ((2.0, "#2ECC71"), (5.0, "#FF9800"))
     ERROR_BAD = "#FF6B6B"
 
+    #: Which carrier a bar belongs to. Fixed, not themed: they are a series
+    #: identity, they are read against each other rather than against the
+    #: panel, and a legend that changes colour with the theme is a legend
+    #: nobody can compare against last week's screenshot. Both are light
+    #: enough to sit on a dark ground and saturated enough for a light one.
     ELECTRON_COLOUR = "#5BCEFA"
     HOLE_COLOUR = "#F5A9B8"
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._foreground = "#cccccc"
-        self._grid = "#444444"
+    #: The fitted background curve, likewise a series and likewise fixed —
+    #: it has to stay apart from the raw curve (drawn in the foreground
+    #: colour) and from the corrected one (the electron colour).
+    BASELINE_COLOUR = "#FFD700"
+
+    #: The carrier-split markers, when the theme's accent is too close to a
+    #: curve they are drawn over. They sit in the same axes as the corrected
+    #: dI/dV trace, which is ELECTRON_COLOUR — and the default accent is
+    #: byte-identical to it, while this user's accentPrimary (#66B3FF) is 30
+    #: RGB away, well inside SCALE_MIN_DISTANCE. A marker the same hue as the
+    #: data it marks tells you nothing, so when the accent collides the
+    #: markers keep the purple they had before they were themed at all.
+    SPLIT_COLOUR = "#9B4F96"
 
     # ── palette ──────────────────────────────────────────────────────────
+    #
+    # Each drawing slot records what it was given, and the base class draws
+    # it again when a colour changes. That matters more here than anywhere:
+    # the error bars *are* the good/marginal/bad scale, so recolouring the
+    # axes and leaving the bars alone would say the opposite of the legend.
 
-    foregroundColorChanged = Signal()
+    def _error_scale(self):
+        """The three band colours, themed if the theme kept them distinct."""
+        return scale_or_default(
+            (self._success, self._warning, self._error),
+            (self.ERROR_BANDS[0][1], self.ERROR_BANDS[1][1], self.ERROR_BAD))
 
-    def _get_foreground(self) -> str:
-        return self._foreground
-
-    def _set_foreground(self, colour: str) -> None:
-        colour = str(colour or "").strip()
-        if colour and colour != self._foreground:
-            self._foreground = colour
-            self.foregroundColorChanged.emit()
-
-    #: Text and axis colour, so the figure follows the theme instead of
-    #: painting light grey onto a light panel.
-    foregroundColor = Property(str, _get_foreground, _set_foreground,
-                               notify=foregroundColorChanged)
-
-    def _style(self, ax) -> None:
-        ax.set_facecolor(self._background)
-        for spine in ax.spines.values():
-            spine.set_color(self._grid)
-        ax.tick_params(colors=self._foreground, labelsize=7)
-        ax.xaxis.label.set_color(self._foreground)
-        ax.yaxis.label.set_color(self._foreground)
-        ax.title.set_color(self._foreground)
-        ax.grid(True, color=self._grid, alpha=0.3, linewidth=0.5)
+    def _split_colour(self):
+        """The accent, unless it collides with a curve in the same axes."""
+        return scale_or_default(
+            (self._accent, self.ELECTRON_COLOUR, self.HOLE_COLOUR),
+            (self.SPLIT_COLOUR, self.ELECTRON_COLOUR, self.HOLE_COLOUR))[0]
 
     # ── the candidate ────────────────────────────────────────────────────
 
@@ -82,6 +98,7 @@ class DesignerCanvas(FigureCanvasItem):
         result that a second run has already replaced.
         """
         candidate = dict(candidate or {})
+        self._last_draw = ('showCandidate', (candidate,))
         self.figure.clf()
         if not candidate.get('targets'):
             self._draw_message("No candidate selected")
@@ -103,8 +120,10 @@ class DesignerCanvas(FigureCanvasItem):
             return list(data.get('errors_pct') or [])
 
         errors = _bars(levels_ax, candidate, 0.0,
-                       "electron" if hole else "target", self.ELECTRON_COLOUR)
-        hole_errors = (_bars(levels_ax, hole, 0.45, "hole", self.HOLE_COLOUR)
+                       "electron" if hole else "target",
+                       self._seriesColour(self.ELECTRON_COLOUR))
+        hole_errors = (_bars(levels_ax, hole, 0.45, "hole",
+                              self._seriesColour(self.HOLE_COLOUR))
                        if hole else [])
 
         levels_ax.set_xlabel("Level")
@@ -143,10 +162,11 @@ class DesignerCanvas(FigureCanvasItem):
                color=colours, alpha=0.8, hatch=hatch)
 
     def _error_colour(self, value: float) -> str:
-        for limit, colour in self.ERROR_BANDS:
+        scale = self._error_scale()
+        for (limit, _default), colour in zip(self.ERROR_BANDS, scale):
             if abs(value) < limit:
                 return colour
-        return self.ERROR_BAD
+        return scale[-1]
 
     @staticmethod
     def _dimension_label(candidate: dict) -> str:
@@ -180,6 +200,7 @@ class DesignerCanvas(FigureCanvasItem):
         user notices before the search reports nonsense.
         """
         preview = dict(preview or {})
+        self._last_draw = ('showSpectrum', (preview,))
         self.figure.clf()
         x = list(preview.get('x') or [])
         if not x:
@@ -193,24 +214,31 @@ class DesignerCanvas(FigureCanvasItem):
 
         ax.plot(x, raw, color=self._foreground, lw=1.0, alpha=0.5, label="Raw")
         if len(baseline) == len(x):
-            ax.plot(x, baseline, color="#FFD700", lw=1.0, ls="--",
+            ax.plot(x, baseline, color=self._seriesColour(self.BASELINE_COLOUR),
+                    lw=1.0, ls="--",
                     label="Background")
         if len(corrected) == len(x):
-            ax.plot(x, corrected, color=self.ELECTRON_COLOUR, lw=1.2,
+            ax.plot(x, corrected, color=self._seriesColour(self.ELECTRON_COLOUR),
+                    lw=1.2,
                     label="Corrected")
 
         peaks = list(preview.get('peaks_V') or [])
         if peaks:
             reference = corrected if len(corrected) == len(x) else raw
             heights = np.interp(peaks, x, reference)
-            ax.plot(peaks, heights, "v", color=self.HOLE_COLOUR, ms=5,
+            ax.plot(peaks, heights, "v",
+                    color=self._seriesColour(self.HOLE_COLOUR), ms=5,
                     ls="none", label=f"{len(peaks)} peak(s)")
 
         for value, label in ((preview.get('split_e'), "split e⁻"),
                              (preview.get('split_h'), "split h⁺")):
             if value is None:
                 continue
-            ax.axvline(float(value), color="#9B4F96", lw=0.8, ls=":")
+            # An annotation on top of the data rather than a series of its
+            # own, so it takes the theme's accent — but only while that
+            # accent still reads apart from the two curves it is drawn over.
+            ax.axvline(float(value), color=self._seriesColour(self._split_colour()),
+                       lw=0.8, ls=":")
             ax.annotate(label, (float(value), 0.98), xycoords=("data", "axes fraction"),
                         color=self._foreground, fontsize=7, ha="left", va="top")
 
@@ -243,6 +271,7 @@ class DesignerCanvas(FigureCanvasItem):
         import matplotlib
 
         run = dict(run or {})
+        self._last_draw = ('showLineScan', (run,))
         points = list(run.get('points') or [])
         self.figure.clf()
         if not points:
@@ -267,6 +296,7 @@ class DesignerCanvas(FigureCanvasItem):
         # A masked cell is not drawn at all: the grey comes from the axes
         # background, so "no confinement" reads as outside the scale.
         strip_ax.set_facecolor(self.NO_CONFINEMENT_GREY)
+        setattr(strip_ax, self.KEEP_FACECOLOR, True)
         image = strip_ax.pcolormesh(edges, np.array([0.0, 1.0]),
                                     masked.reshape(1, -1), cmap=cmap,
                                     shading="flat")
@@ -276,13 +306,25 @@ class DesignerCanvas(FigureCanvasItem):
         bar = self.figure.colorbar(image, ax=strip_ax, pad=0.01)
         bar.set_label("size (nm)", fontsize=8, color=self._foreground)
         bar.ax.tick_params(colors=self._foreground, labelsize=7)
+        # A colorbar's axes is not in the tuple handed to ``_style``, so it
+        # keeps matplotlib's defaults unless it is styled here: a pure black
+        # outline framing the one panel in the figure whose every other rule
+        # is the theme's. StatesCanvas._colorbar does this; this copy did not.
+        bar.ax.set_facecolor(self._background)
+        bar.outline.set_edgecolor(self._grid)
+        for spine in bar.ax.spines.values():
+            spine.set_color(self._grid)
 
         # The profile, coloured by group, with the empty stretches shaded.
         for segment in (run.get('segments') or []):
             if segment.get('group') is None or segment.get('group') < 0:
+                # Chrome, not data: a stretch with nothing in it, shaded in
+                # the rule colour. It used to be #3a3a4e — the *old* default
+                # scheme's bgLight — which on any other scheme is a purple
+                # stripe that matches nothing on screen.
                 profile_ax.axvspan(float(segment.get('start', 0.0)) - half,
                                    float(segment.get('end', 0.0)) + half,
-                                   color="#3a3a4e", alpha=0.35, zorder=0)
+                                   color=self._grid, alpha=0.35, zorder=0)
 
         groups = list(run.get('groups') or [])
         if groups:
@@ -316,17 +358,6 @@ class DesignerCanvas(FigureCanvasItem):
         self.redraw()
 
     # ── nothing to draw ──────────────────────────────────────────────────
-
-    def _draw_message(self, message: str) -> None:
-        ax = self.figure.add_subplot(111)
-        ax.axis("off")
-        ax.text(0.5, 0.5, message, ha="center", va="center",
-                color=self._foreground, fontsize=10, transform=ax.transAxes)
-        ax.set_facecolor(self._background)
-        self.redraw()
-
-    @Slot(str)
-    def showMessage(self, message: str) -> None:
-        """Put a line of text where a plot would be — an empty result, or why."""
-        self.figure.clf()
-        self._draw_message(message)
+    #
+    # `_draw_message` and `showMessage` are the base class's: a message is
+    # the same picture whichever canvas has nothing to say.

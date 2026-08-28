@@ -38,9 +38,49 @@ from PySide6.QtQuick import QQuickPaintedItem
 import matplotlib
 matplotlib.use("Agg")
 from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.colors import is_color_like, to_rgba
 from matplotlib.figure import Figure
+from src.widgets.series_palette import readable_on
 
 logger = logging.getLogger(__name__)
+
+#: How far apart, in plain RGB distance (0 … 441), two colours of a *scale*
+#: have to sit before they still read as different marks. A good/marginal/bad
+#: scale carries its meaning in the fact that its three colours differ, so a
+#: scheme whose success/warning/error are three shades of the same grey —
+#: "Straight Dark" has #6a6a6a / #787878 / #8a7070, all within 25 of each
+#: other — has to be refused rather than drawn. RGB distance and not WCAG
+#: contrast: contrast is luminance only, and green against red is a large
+#: difference that no luminance measure sees.
+SCALE_MIN_DISTANCE = 60.0
+
+
+def _rgb_distance(first: str, second: str) -> float:
+    """Straight-line distance between two colours in 0-255 RGB."""
+    a, b = to_rgba(first)[:3], to_rgba(second)[:3]
+    return 255.0 * sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5
+
+
+def scale_or_default(colours, default):
+    """``colours`` when they still tell each other apart, else ``default``.
+
+    Used where the theme is allowed to recolour a semantic scale but not to
+    destroy it. Every pair is checked, not just neighbours: it is the middle
+    band collapsing onto either end that makes a reading wrong, and a scheme
+    that themes two of the three still has to be refused as a whole.
+
+    An unparseable colour counts as a collapse, because a scale that cannot
+    be drawn is not a scale.
+    """
+    colours = tuple(colours)
+    try:
+        for i, one in enumerate(colours):
+            for other in colours[i + 1:]:
+                if _rgb_distance(one, other) < SCALE_MIN_DISTANCE:
+                    return tuple(default)
+    except (ValueError, TypeError):
+        return tuple(default)
+    return colours
 
 
 class FigureCanvasItem(QQuickPaintedItem):
@@ -58,6 +98,35 @@ class FigureCanvasItem(QQuickPaintedItem):
     #: smooth — the same idiom as the other canvases.
     RESIZE_DEBOUNCE_MS = 150
 
+    #: The palette a canvas paints with until something binds it. These are
+    #: the colours this project's figures already carried as literals, so a
+    #: canvas nobody themes looks exactly as it did. They are deliberately
+    #: *not* read from the current colour scheme: a widget that guessed the
+    #: theme would be right on one scheme and wrong on the other twenty-one,
+    #: and there would be nothing to notice. The theme arrives by binding.
+    DEFAULT_BACKGROUND = "#1a1a1a"
+    DEFAULT_FOREGROUND = "#cccccc"
+    DEFAULT_GRID = "#444444"
+    DEFAULT_ACCENT = "#5BCEFA"
+    DEFAULT_SUCCESS = "#2ECC71"
+    DEFAULT_WARNING = "#FF9800"
+    DEFAULT_ERROR = "#FF6B6B"
+
+    #: Whether this canvas's 2-D axes are ruled. A subclass says so once
+    #: rather than every plot repeating ``ax.grid(...)`` with its own colour.
+    SHOW_GRID = False
+
+    #: Tick label sizes, 2-D and mplot3d. The 3-D panels are a quarter of a
+    #: figure and their three axes crowd; they have always been a point down.
+    TICK_LABEL_SIZE = 7
+    TICK_LABEL_SIZE_3D = 6
+
+    #: An axes carrying this attribute keeps the background it was given.
+    #: Set it where the ground itself is data — the line-scan strip paints
+    #: "no confinement" as its own facecolor, and a restyle must not quietly
+    #: turn that into "the smallest well on the line".
+    KEEP_FACECOLOR = "_trans_keep_facecolor"
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFlag(QQuickPaintedItem.ItemHasContents, True)
@@ -70,7 +139,23 @@ class FigureCanvasItem(QQuickPaintedItem):
         except Exception:      # software-only Qt builds
             pass
 
-        self._background = "#1a1a1a"
+        self._background = self.DEFAULT_BACKGROUND
+        self._foreground = self.DEFAULT_FOREGROUND
+        self._grid = self.DEFAULT_GRID
+        self._accent = self.DEFAULT_ACCENT
+        self._success = self.DEFAULT_SUCCESS
+        self._warning = self.DEFAULT_WARNING
+        self._error = self.DEFAULT_ERROR
+        # What QML last *asked* for, which is not always what is painted: a
+        # colour matplotlib cannot parse is remembered so a binding reads
+        # back what it wrote, but is never handed to a draw call.
+        self._requests: dict = {}
+        # The last picture drawn, as (slot name, arguments), so a colour
+        # change can draw it again. Recolouring the frame is not enough on
+        # its own: the marks carry colour too, and a bar in a good/bad
+        # scale that keeps the previous scheme's green says the wrong thing.
+        self._last_draw = None
+
         self.figure = Figure(facecolor=self._background, dpi=self.BASE_DPI)
         self.canvas = FigureCanvasAgg(self.figure)
 
@@ -83,30 +168,281 @@ class FigureCanvasItem(QQuickPaintedItem):
         self._resize_timer.setInterval(self.RESIZE_DEBOUNCE_MS)
         self._resize_timer.timeout.connect(self._on_resize_finished)
 
-    # ── properties ───────────────────────────────────────────────────────
+    # ── the palette ──────────────────────────────────────────────────────
+    #
+    # Seven colours, written out one by one rather than generated: PySide
+    # registers a Signal only when the class body carries it, so a loop
+    # cannot make these, and the repetition is at least readable.
+    #
+    # Every setter has the same shape — record the request, and if the
+    # painted colour actually moved, tell QML and restyle. The restyle is
+    # the part that was missing: setting the figure's facecolor and
+    # re-blitting leaves every *axes* at the previous scheme's colours,
+    # because an axes' background, spines, ticks and labels are set when a
+    # plot is drawn, not when the figure is. That is what produced a light
+    # figure margin around two dark axes on a scheme change.
 
-    def _get_background(self) -> str:
-        return self._background
+    def _set_colour(self, name: str, colour) -> bool:
+        """Record a colour request. True when the painted colour moved.
 
-    def _set_background(self, colour: str) -> None:
+        Empty means "no opinion" — a binding that has not resolved yet
+        arrives as an empty string, and taking it literally would paint the
+        figure black. An unparseable colour is remembered but not painted:
+        handing matplotlib a bad colour raises in the middle of a draw, and
+        that costs the whole figure rather than one wrong shade.
+        """
         colour = str(colour or "").strip()
-        if not colour or colour == self._background:
-            return
-        self._background = colour
-        try:
-            self.figure.set_facecolor(colour)
-        except (ValueError, TypeError):
-            logger.warning("FigureCanvasItem: %r is not a colour", colour)
-            return
-        self.backgroundColorChanged.emit()
-        self.redraw()
+        if not colour:
+            return False
+        self._requests[name] = colour
+        attribute = f"_{name}"
+        if colour == getattr(self, attribute):
+            return False        # idempotent: the same colour twice is a no-op
+        if not is_color_like(colour):
+            logger.warning("%s: %r is not a colour",
+                           type(self).__name__, colour)
+            return False
+        setattr(self, attribute, colour)
+        return True
+
+    def _get_colour(self, name: str) -> str:
+        return self._requests.get(name, getattr(self, f"_{name}"))
 
     backgroundColorChanged = Signal()
+    foregroundColorChanged = Signal()
+    gridColorChanged = Signal()
+    accentColorChanged = Signal()
+    successColorChanged = Signal()
+    warningColorChanged = Signal()
+    errorColorChanged = Signal()
 
-    #: The figure's own background, so a tool can follow the palette instead
-    #: of painting a dark rectangle into a light theme.
+    def _get_background(self) -> str:
+        return self._get_colour("background")
+
+    def _set_background(self, colour: str) -> None:
+        if self._set_colour("background", colour):
+            # The figure's own ground is set here and not in `_restyle`,
+            # because a subclass that restyles by drawing everything again
+            # touches its axes and never the figure around them — which is
+            # exactly the light-margin-round-dark-axes picture, with the
+            # halves the other way about.
+            self.figure.set_facecolor(self._background)
+            self.backgroundColorChanged.emit()
+            self._restyle()
+
+    #: The figure's own ground, so a tool can follow the palette instead of
+    #: painting a dark rectangle into a light theme.
     backgroundColor = Property(str, _get_background, _set_background,
                                notify=backgroundColorChanged)
+
+    def _get_foreground(self) -> str:
+        return self._get_colour("foreground")
+
+    def _set_foreground(self, colour: str) -> None:
+        if self._set_colour("foreground", colour):
+            self.foregroundColorChanged.emit()
+            self._restyle()
+
+    #: Text: titles, axis labels, tick labels, annotations.
+    foregroundColor = Property(str, _get_foreground, _set_foreground,
+                               notify=foregroundColorChanged)
+
+    def _get_grid(self) -> str:
+        return self._get_colour("grid")
+
+    def _set_grid(self, colour: str) -> None:
+        if self._set_colour("grid", colour):
+            self.gridColorChanged.emit()
+            self._restyle()
+
+    #: Rules: spines, gridlines, colorbar outlines, the 3-D pane edges.
+    gridColor = Property(str, _get_grid, _set_grid, notify=gridColorChanged)
+
+    def _get_accent(self) -> str:
+        return self._get_colour("accent")
+
+    def _set_accent(self, colour: str) -> None:
+        if self._set_colour("accent", colour):
+            self.accentColorChanged.emit()
+            self._restyle()
+
+    #: The one colour a figure emphasises with. Not for anything that has to
+    #: stay distinct from a *series* colour — see the notes on each canvas.
+    accentColor = Property(str, _get_accent, _set_accent,
+                           notify=accentColorChanged)
+
+    def _get_success(self) -> str:
+        return self._get_colour("success")
+
+    def _set_success(self, colour: str) -> None:
+        if self._set_colour("success", colour):
+            self.successColorChanged.emit()
+            self._restyle()
+
+    #: "As good as the measurement" / "deeply bound". The scheme's `success`.
+    successColor = Property(str, _get_success, _set_success,
+                            notify=successColorChanged)
+
+    def _get_warning(self) -> str:
+        return self._get_colour("warning")
+
+    def _set_warning(self, colour: str) -> None:
+        if self._set_colour("warning", colour):
+            self.warningColorChanged.emit()
+            self._restyle()
+
+    #: "Marginal". The scheme's `warning`.
+    warningColor = Property(str, _get_warning, _set_warning,
+                            notify=warningColorChanged)
+
+    def _get_error(self) -> str:
+        return self._get_colour("error")
+
+    def _set_error(self, colour: str) -> None:
+        if self._set_colour("error", colour):
+            self.errorColorChanged.emit()
+            self._restyle()
+
+    #: "Does not explain this level" / "unbound". The scheme's `error`.
+    errorColor = Property(str, _get_error, _set_error,
+                          notify=errorColorChanged)
+
+    # ── painting the palette onto a figure ───────────────────────────────
+
+    def _seriesColour(self, colour):
+        """A data colour, adjusted only if it cannot be seen on this ground.
+
+        Identity colours — which feature holds a state, electron vs hole —
+        are chosen by the canvas and must not follow the scheme, or the same
+        feature would be a different colour in two panels. But they were all
+        chosen against a ground that was hardcoded ``#1a1a1a`` and is now the
+        scheme's ``bgDark``, which is near-white on eight of the twenty-two
+        schemes. ``readable_on`` keeps the hue and moves only the lightness,
+        and only when the colour actually falls under 3:1 — so every dark
+        scheme still paints byte-identical values.
+        """
+        return readable_on(str(colour), self._background)
+
+    def _style(self, ax) -> None:
+        """Paint one 2-D axes in the current palette, at drawing time."""
+        self._paint_axes(ax, grid=self.SHOW_GRID)
+
+    def _paint_axes(self, ax, grid: bool) -> None:
+        """The whole of an axes that carries a colour.
+
+        ``grid`` switches the rules on; when it is False a grid that is
+        already there is still *recoloured*. The distinction matters on a
+        restyle, which walks ``figure.axes`` — a colorbar's axes is in that
+        list, and ruling it would be a new drawing decision rather than a
+        colour change.
+        """
+        if not getattr(ax, self.KEEP_FACECOLOR, False):
+            ax.set_facecolor(self._background)
+        for spine in ax.spines.values():
+            spine.set_color(self._grid)
+        ax.tick_params(colors=self._foreground, labelsize=self.TICK_LABEL_SIZE)
+        ax.xaxis.label.set_color(self._foreground)
+        ax.yaxis.label.set_color(self._foreground)
+        ax.title.set_color(self._foreground)
+        if grid:
+            ax.grid(True, color=self._grid, alpha=0.3, linewidth=0.5)
+        else:
+            for line in ax.get_xgridlines() + ax.get_ygridlines():
+                line.set_color(self._grid)
+
+    def _style_3d(self, ax) -> None:
+        """The same treatment for an mplot3d axes, which styles differently.
+
+        Its panes, its axis lines and its grid are three separate things and
+        none of them follows ``set_facecolor``; left alone they are the
+        default light grey, which on a dark palette is a white box around
+        the data.
+        """
+        ax.set_facecolor(self._background)
+        pane = to_rgba(self._background)
+        for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+            try:
+                axis.set_pane_color(pane)
+            except AttributeError:
+                axis.pane.set_facecolor(pane)
+            try:
+                axis.pane.set_edgecolor(self._grid)
+                axis.line.set_color(self._grid)
+                axis._axinfo['grid']['color'] = self._grid
+            except (AttributeError, KeyError, TypeError):
+                pass
+            axis.label.set_color(self._foreground)
+        ax.tick_params(colors=self._foreground,
+                       labelsize=self.TICK_LABEL_SIZE_3D)
+        ax.title.set_color(self._foreground)
+
+    def _replay(self) -> bool:
+        """Draw the last picture again. False when there is nothing to.
+
+        Never raises: this runs from a property write — a QML binding
+        firing — and an exception there is a broken window, not a message
+        anyone can act on. A failed replay falls back to recolouring what
+        is already on the figure.
+        """
+        if not self._last_draw:
+            return False
+        name, arguments = self._last_draw
+        try:
+            getattr(self, name)(*arguments)
+            return True
+        except Exception:
+            logger.exception("%s: the last plot could not be drawn again",
+                             type(self).__name__)
+            return False
+
+    def _restyle(self) -> None:
+        """Re-apply the palette to whatever is already drawn.
+
+        Drawing it again is the honest answer, because the marks carry the
+        theme as well as the frame does. Where there is nothing to replay —
+        a canvas that renders from its own state every frame — recolour the
+        chrome of each existing axes in place instead.
+        """
+        if self._replay():
+            return
+        try:
+            self.figure.set_facecolor(self._background)
+            for ax in list(self.figure.axes):
+                if hasattr(ax, 'zaxis'):
+                    self._style_3d(ax)
+                else:
+                    self._paint_axes(ax, grid=False)
+        except Exception:
+            logger.exception("%s: the palette could not be applied",
+                             type(self).__name__)
+        self.redraw()
+
+    # ── nothing to draw ──────────────────────────────────────────────────
+
+    def _draw_message(self, message: str) -> None:
+        """A line of text where a plot would be.
+
+        Styled like any other axes even though its frame is hidden: the text
+        colour is the whole of what is visible, and it has to be the theme's
+        rather than matplotlib's near-black.
+        """
+        ax = self.figure.add_subplot(111)
+        ax.axis("off")
+        ax.set_facecolor(self._background)
+        ax.text(0.5, 0.5, message, ha="center", va="center",
+                color=self._foreground, fontsize=10, transform=ax.transAxes)
+        self.redraw()
+
+    @Slot(str)
+    def showMessage(self, message: str) -> None:
+        """Put a line of text where a plot would be — an empty result, or why."""
+        message = str(message)
+        # Recorded like any other picture: a message is what is on screen,
+        # so a scheme change has to redraw *it* rather than the plot it
+        # replaced.
+        self._last_draw = ('showMessage', (message,))
+        self.figure.clf()
+        self._draw_message(message)
 
     # ── drawing ──────────────────────────────────────────────────────────
 

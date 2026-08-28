@@ -143,20 +143,41 @@ ApplicationWindow {
     }
 
 
-    // ========== REACTIVE COLOR SCHEME ==========
-    // Colors are now reactive and update when PreferencesManager emits colorSchemeChanged
-    property color bgDark: "#1a1a2e"
-    property color bgDarker: "#0d0d1a"
-    property color bgMedium: "#2a2a3e"
-    property color bgLight: "#3a3a4e"
-    property color accentPink: "#F5A9B8"      // accentPrimary
-    property color accentBlue: "#5BCEFA"      // accentSecondary
-    property color accentMagenta: "#D60270"   // Maps to error color
-    property color accentPurple: "#9B4F96"    // Maps to borderColor
-    property color accentOrange: "#FF9B55"    // accentTertiary (for workflow button)
-    property color textLight: "#ffffff"       // textPrimary
-    property color textMuted: "#cccccc"       // textMuted
-    property color borderColor: "#9B4F96"     // borderColor
+    // ========== COLOUR SCHEME ==========
+    // The scheme itself lives in components/Theme.qml — a singleton, so it is
+    // reachable without locating this window first. These twelve names (plus
+    // successColor) stay published here because nine tool files and every
+    // Tool* component still read them off `Window.window`; they are now
+    // bindings rather than the source of truth, so they follow a live scheme
+    // change without anything being assigned to them.
+    //
+    // The names are aliases in three places — accentPink holds the scheme's
+    // accentPrimary, accentBlue its accentSecondary, accentPurple its
+    // borderColor. See Theme.qml for the full map and why renaming them is a
+    // separate pass.
+    property color bgDark: Theme.bgDark
+    property color bgDarker: Theme.bgDarker
+    property color bgMedium: Theme.bgMedium
+    property color bgLight: Theme.bgLight
+    property color accentPink: Theme.accentPink
+    property color accentBlue: Theme.accentBlue
+    property color accentMagenta: Theme.accentMagenta
+    property color accentPurple: Theme.accentPurple
+    property color accentOrange: Theme.accentOrange
+    property color textLight: Theme.textLight
+    property color textMuted: Theme.textMuted
+    property color borderColor: Theme.borderColor
+    // New here: the schemes have always carried a `success` key and nothing
+    // read it. Published so a child window can bind to it like the rest.
+    property color successColor: Theme.successColor
+    // …and the other two semantic keys, for the same reason. Every scheme has
+    // carried `warning` and `error` all along; `error` was only ever readable
+    // through the misnamed accentMagenta, and `warning` was readable nowhere,
+    // which is why every amber in the tree is still a literal. Canvases bind
+    // these three by meaning (good / marginal / bad), so they need names that
+    // say what they mean.
+    property color warningColor: Theme.warningColor
+    property color errorColor: Theme.errorColor
 
     // ========== CONTROL PALETTE ==========
     // Qt Quick Controls that aren't explicitly styled (plain TextField,
@@ -183,23 +204,35 @@ ApplicationWindow {
     palette.toolTipText: textLight
 
     // ========== FONT SCALING ==========
-    // Global font sizes - components should reference these for consistent scaling
-    property int fontSizeSmall: 10
-    property int fontSizeMedium: 12
-    property int fontSizeLarge: 14
-    property int fontSizeHeader: 16
-    property int fontSizeTitle: 18
-    property string fontFamily: Qt.platform.os === "osx" ? ".AppleSystemUIFont" : "Segoe UI"
-    property string fontFamilyMono: Qt.platform.os === "osx" ? "Menlo" : "Consolas"
+    // Also the scheme's, also owned by Theme; republished here for the same
+    // reason as the colours.
+    property int fontSizeSmall: Theme.fontSizeSmall
+    property int fontSizeMedium: Theme.fontSizeMedium
+    property int fontSizeLarge: Theme.fontSizeLarge
+    property int fontSizeHeader: Theme.fontSizeHeader
+    property int fontSizeTitle: Theme.fontSizeTitle
+    property string fontFamily: Theme.fontFamily
+    property string fontFamilyMono: Theme.fontFamilyMono
 
-    // Computed scaled sizes for convenience
-    property int fontSizeXSmall: Math.max(8, fontSizeSmall - 2)
-    property int fontSizeXLarge: fontSizeHeader + 2
+    property int fontSizeXSmall: Theme.fontSizeXSmall
+    property int fontSizeXLarge: Theme.fontSizeXLarge
 
-    // Port type colors for workflow editor - maximally distinct colors
-    // Port types from PortType enum: dataset, flat_data, image, map, table, number, string, intervals, any
-    // NOTE: Using hardcoded fallback - regeneratePortColors() creates the themed version
-    property var portColors: ({
+    // Port-type colours for the workflow editor.
+    //
+    // Fixed, and deliberately so. A port's colour identifies its TYPE — a
+    // dataset socket must never be mistakable for a map socket — and that has
+    // to hold on all 22 schemes. This map used to theme four of the nine
+    // (dataset from accentBlue, map from accentPurple, number from
+    // accentMagenta, any from textMuted) and leave five fixed, which is only
+    // guaranteed distinct on the scheme it was tuned for: under "Just Dark
+    // Mode" `map` resolved to #555555, the same value as borderColor, and
+    // `any` to #a3a3a3, the same value as textMuted — two ports painted the
+    // colour of the chrome behind them.
+    //
+    // WorkflowWindow.safePortColors is the copy that is actually read; this
+    // one is kept only because older saved layouts may still reach for it, and
+    // the two must not disagree about what colour a `map` port is.
+    readonly property var portColors: ({
         "dataset": "#5BCEFA",       // Cyan/Trans blue - spectral datasets
         "flat_data": "#FFD700",     // Gold/Yellow - flattened data
         "image": "#FF6B6B",         // Coral red - images
@@ -211,114 +244,16 @@ ApplicationWindow {
         "any": "#9E9E9E"            // Gray - any type (flexible)
     })
 
-    // Apply color scheme from PreferencesManager
+    // Hand the Theme singleton its source. Everything else about the scheme —
+    // reading it, following colorSchemeChanged/fontChanged/preferencesLoaded,
+    // republishing it — happens in Theme.qml, so this window no longer needs a
+    // Connections block of its own. Idempotent; safe to call more than once.
     function applyColorScheme() {
         if (!backend || !backend.preferencesManager) {
-            console.log("PreferencesManager not ready, using defaults")
+            console.log("PreferencesManager not ready, Theme keeps its defaults")
             return
         }
-
-        var scheme = backend.preferencesManager.getCurrentScheme()
-        if (!scheme || !scheme.colors) {
-            console.log("No color scheme available")
-            return
-        }
-
-        var c = scheme.colors
-        console.log("Applying color scheme:", backend.preferencesManager.getCurrentSchemeName())
-
-        // Apply background colors
-        bgDark = c.bgDark || "#1a1a2e"
-        bgDarker = c.bgDarker || "#0d0d1a"
-        bgMedium = c.bgMedium || "#2a2a3e"
-        bgLight = c.bgLight || "#3a3a4e"
-
-        // Apply accent colors
-        accentPink = c.accentPrimary || "#F5A9B8"
-        accentBlue = c.accentSecondary || "#5BCEFA"
-        accentOrange = c.accentTertiary || "#FF9B55"
-        accentMagenta = c.error || "#D60270"
-        accentPurple = c.borderColor || "#9B4F96"
-
-        // Apply text colors
-        textLight = c.textPrimary || "#ffffff"
-        textMuted = c.textMuted || "#cccccc"
-
-        // Apply border color
-        borderColor = c.borderColor || "#9B4F96"
-
-        // Apply font settings
-        if (scheme.font) {
-            fontSizeSmall = scheme.font.sizeSmall || 10
-            fontSizeMedium = scheme.font.sizeMedium || 12
-            fontSizeLarge = scheme.font.sizeLarge || 14
-            fontSizeHeader = scheme.font.sizeHeader || 16
-            fontSizeTitle = scheme.font.sizeTitle || 18
-            var ff = scheme.font.family || ""
-            if (!ff || ff === "system-ui")
-                ff = Qt.platform.os === "osx" ? ".AppleSystemUIFont" : "Segoe UI"
-            fontFamily = ff
-            console.log("Applied font sizes: small=" + fontSizeSmall + ", medium=" + fontSizeMedium + ", large=" + fontSizeLarge)
-        }
-
-        // Regenerate portColors object to trigger reactive updates in workflow windows
-        // QML doesn't track changes inside objects, so we must reassign the entire object
-        regeneratePortColors()
-    }
-
-    // Regenerate the portColors object (call after color properties change)
-    // Port types from PortType enum: dataset, flat_data, image, map, table, number, string, intervals, any
-    // Colors are fixed to be maximally distinct - theme affects only dataset/map/number
-    function regeneratePortColors() {
-        try {
-            portColors = {
-                "dataset": accentBlue,              // Theme cyan/blue
-                "flat_data": "#FFD700",             // Fixed gold (distinct from blue)
-                "image": "#FF6B6B",                 // Fixed coral red
-                "map": accentPurple,                // Theme purple
-                "table": "#2ECC71",                 // Fixed emerald green
-                "number": accentMagenta,            // Theme magenta/pink
-                "string": "#FF9800",                // Fixed orange
-                "intervals": "#00BCD4",             // Fixed teal
-                "any": textMuted                    // Theme gray
-            }
-            console.log("Port colors regenerated for theme")
-        } catch (e) {
-            console.log("Error regenerating port colors, using fallback:", e)
-            // Use hardcoded fallback if Qt.lighter fails
-            portColors = {
-                "dataset": "#5BCEFA",
-                "flat_data": "#FFD700",
-                "image": "#FF6B6B",
-                "map": "#9B4F96",
-                "table": "#2ECC71",
-                "number": "#E91E63",
-                "string": "#FF9800",
-                "intervals": "#00BCD4",
-                "any": "#9E9E9E"
-            }
-        }
-    }
-
-    // Listen for color scheme changes from PreferencesManager
-    Connections {
-        target: backend ? backend.preferencesManager : null
-        enabled: backend && backend.preferencesManager
-
-        function onColorSchemeChanged(schemeName) {
-            console.log("Color scheme changed signal received:", schemeName)
-            applyColorScheme()
-        }
-
-        function onPreferencesLoaded() {
-            console.log("Preferences loaded, applying color scheme")
-            applyColorScheme()
-        }
-
-        function onFontChanged() {
-            console.log("Font changed signal received")
-            applyColorScheme()
-        }
+        Theme.attach(backend.preferencesManager)
     }
 
     // Main background - binds to reactive bgDark

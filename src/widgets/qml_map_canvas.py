@@ -45,6 +45,28 @@ import matplotlib.pyplot as plt
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# Theme derivation
+#
+# The same three colours every canvas in TRANS takes from QML — the ground,
+# the text and the rules — and the same reason for deriving the rest: a map's
+# tick marks have to read as dimmer than the numbers beside them, and a fixed
+# grey would be dimmer on a dark scheme and brighter on a light one.
+#
+# The twin of this block lives in ``qml_graph_canvas``; see the longer note
+# there for why it is not a shared module.
+# =============================================================================
+
+def _blend(base: QColor, towards: QColor, amount: float) -> QColor:
+    """``base`` moved ``amount`` (0..1) of the way towards ``towards``."""
+    amount = max(0.0, min(1.0, float(amount)))
+    return QColor(
+        round(base.red() + (towards.red() - base.red()) * amount),
+        round(base.green() + (towards.green() - base.green()) * amount),
+        round(base.blue() + (towards.blue() - base.blue()) * amount),
+    )
+
+
 def _fast_map_render_enabled_default() -> bool:
     """``TRANS_FAST_MAP_RENDER`` toggle. Default ``True`` — set the
     env var to ``0`` / ``false`` / ``no`` / ``off`` to fall back to
@@ -125,6 +147,10 @@ class QMLMapCanvas(QQuickPaintedItem):
     _NATIVE_AX_MARGIN_RIGHT = 16
     _NATIVE_AX_MARGIN_TOP = 12
     _NATIVE_AX_MARGIN_BOTTOM = 30
+    # Only the fallback for an instance that never reached
+    # ``_recomputeThemeColours`` — normally each of these is shadowed by an
+    # instance attribute derived from backgroundColor / foregroundColor /
+    # gridColor.
     _NATIVE_BG_COLOR = QColor("#1a1a1a")
     _NATIVE_AXIS_COLOR = QColor("#444444")
     _NATIVE_TICK_COLOR = QColor("#888888")
@@ -145,17 +171,28 @@ class QMLMapCanvas(QQuickPaintedItem):
         except Exception:
             pass  # Software-only Qt builds don't support FBO targets
 
+        # Theme. The defaults reproduce the palette this canvas shipped with,
+        # so a host that binds nothing looks exactly as it did; QML overwrites
+        # all three from the colour scheme. Set before the Figure exists
+        # because the Figure's own facecolor is one of the derived roles.
+        self._background: str = "#1a1a1a"
+        self._foreground: str = "#cccccc"
+        self._grid_colour: str = "#444444"
+        self._recomputeThemeColours()
+
         # Matplotlib setup
         self._dpi = 100
-        self.figure = Figure(facecolor='#1a1a1a', dpi=self._dpi)
+        self.figure = Figure(facecolor=self._background, dpi=self._dpi)
         self.axes = self.figure.add_subplot(111)
         self.canvas = FigureCanvasAgg(self.figure)
 
-        # Configure axes style
-        self.axes.set_facecolor('#1a1a1a')
-        self.axes.tick_params(colors='#888888')
-        for spine in self.axes.spines.values():
-            spine.set_color('#444444')
+        # Configure axes style. This used to set the facecolor, ticks and
+        # spines but not the label or title text, which left them at
+        # matplotlib's default black — invisible against the dark ground until
+        # the first physical-units render reached the label colour further
+        # down. ``_applyAxesStyle`` styles all of it, in one place, from the
+        # same derived roles the native path paints with.
+        self._applyAxesStyle()
 
         # Map data
         self._map_data: Optional[np.ndarray] = None
@@ -279,6 +316,116 @@ class QMLMapCanvas(QQuickPaintedItem):
             logger.debug("MapCanvas cleaned up matplotlib resources")
         except Exception as e:
             logger.warning(f"Error during MapCanvas cleanup: {e}")
+
+    # =========================================================================
+    # Theme (QML-bindable)
+    # =========================================================================
+
+    def _recomputeThemeColours(self) -> None:
+        """Derive every painted role from the three colours QML supplies.
+
+        A map has no legend and no title, so it needs four roles rather than
+        the graph canvas's eight, but the reasoning is the same one:
+
+        * **background** — the ground, straight from ``backgroundColor``.
+        * **axis frame** — ``gridColor``. A frame is a rule.
+        * **tick marks** — the foreground pulled 40% back towards the ground,
+          so the structure stays quieter than the numbers on it.
+        * **tick labels and axis unit titles** — the foreground exactly, the
+          pairing ``src/utils/color_contrast.py`` already enforces.
+        """
+        background = QColor(self._background)
+        foreground = QColor(self._foreground)
+        rules = QColor(self._grid_colour)
+
+        self._tick_colour = _blend(foreground, background, 0.40)
+
+        self._NATIVE_BG_COLOR = background
+        self._NATIVE_AXIS_COLOR = rules
+        self._NATIVE_TICK_COLOR = self._tick_colour
+        self._NATIVE_LABEL_COLOR = foreground
+
+    def _applyAxesStyle(self) -> None:
+        """Push the derived roles onto the matplotlib figure and axes.
+
+        Called at construction and again after every ``axes.clear()`` in
+        ``_render``, because clearing drops the styling with it.
+        """
+        if getattr(self, 'axes', None) is None:
+            return
+        if getattr(self, 'figure', None) is not None:
+            self.figure.set_facecolor(self._background)
+        self.axes.set_facecolor(self._background)
+        self.axes.tick_params(colors=self._tick_colour.name(), labelsize=8)
+        for spine in self.axes.spines.values():
+            spine.set_color(self._grid_colour)
+        self.axes.xaxis.label.set_color(self._foreground)
+        self.axes.yaxis.label.set_color(self._foreground)
+        self.axes.title.set_color(self._foreground)
+
+    def _setThemeColour(self, attribute: str, colour, changed) -> None:
+        """Idempotent, garbage-tolerant setter shared by the three roles.
+
+        An empty string is an unresolved QML binding rather than a choice, and
+        an unparseable one is a typo; neither should repaint the map in a
+        half-applied palette, so both leave the current colour alone. The
+        comparison is on the canonical ``#rrggbb`` form so ``"#1A1A1A"`` and
+        ``"#1a1a1a"`` count as no change.
+        """
+        text = str(colour or "").strip()
+        if not text:
+            return
+        parsed = QColor(text)
+        if not parsed.isValid():
+            logger.warning("MapCanvas: %r is not a colour", text)
+            return
+        canonical = parsed.name()
+        if canonical == QColor(getattr(self, attribute)).name():
+            return
+        setattr(self, attribute, canonical)
+        self._recomputeThemeColours()
+        # The native path re-reads the ``_NATIVE_*`` attributes every frame,
+        # but the matplotlib figure holds its styling, so push it now —
+        # otherwise ``exportImage`` writes the previous scheme's chrome.
+        self._applyAxesStyle()
+        self._needs_redraw = True
+        changed.emit()
+        self.update()
+
+    backgroundColorChanged = Signal()
+    foregroundColorChanged = Signal()
+    gridColorChanged = Signal()
+
+    def _get_background_colour(self) -> str:
+        return self._background
+
+    def _set_background_colour(self, colour: str) -> None:
+        self._setThemeColour('_background', colour, self.backgroundColorChanged)
+
+    def _get_foreground_colour(self) -> str:
+        return self._foreground
+
+    def _set_foreground_colour(self, colour: str) -> None:
+        self._setThemeColour('_foreground', colour, self.foregroundColorChanged)
+
+    def _get_grid_colour(self) -> str:
+        return self._grid_colour
+
+    def _set_grid_colour(self, colour: str) -> None:
+        self._setThemeColour('_grid_colour', colour, self.gridColorChanged)
+
+    #: The margin around the map — the scheme's window background.
+    backgroundColor = Property(str, _get_background_colour,
+                               _set_background_colour,
+                               notify=backgroundColorChanged)
+    #: Text: tick labels and the axis unit titles; the tick marks are derived
+    #: from it.
+    foregroundColor = Property(str, _get_foreground_colour,
+                               _set_foreground_colour,
+                               notify=foregroundColorChanged)
+    #: Rules: the axes frame.
+    gridColor = Property(str, _get_grid_colour, _set_grid_colour,
+                         notify=gridColorChanged)
 
     # =========================================================================
     # Properties exposed to QML
@@ -1368,7 +1515,7 @@ class QMLMapCanvas(QQuickPaintedItem):
 
         # Clear and redraw
         self.axes.clear()
-        self.axes.set_facecolor('#1a1a1a')
+        self._applyAxesStyle()
 
         # Compute value range
         if self._vmin is not None and self._vmax is not None:
@@ -1395,14 +1542,17 @@ class QMLMapCanvas(QQuickPaintedItem):
             extent=extent,
         )
 
-        # Style axes
-        self.axes.tick_params(colors='#888888', labelsize=8)
-        for spine in self.axes.spines.values():
-            spine.set_color('#444444')
+        # Style axes. ``imshow`` can reset the spines, so re-apply after it.
+        self._applyAxesStyle()
 
         if extent is not None:
-            self.axes.set_xlabel(f"x ({phys[2]})", color='#888888', fontsize=8)
-            self.axes.set_ylabel(f"y ({phys[2]})", color='#888888', fontsize=8)
+            # The unit titles used to be forced to the tick grey while the
+            # native path drew the same strings in the label colour. They are
+            # text, so they take the label colour on both paths now.
+            self.axes.set_xlabel(f"x ({phys[2]})", color=self._foreground,
+                                 fontsize=8)
+            self.axes.set_ylabel(f"y ({phys[2]})", color=self._foreground,
+                                 fontsize=8)
 
         # Ported pyqtgraph tick layout — keeps axis labelling consistent
         # across the graph/profile/map canvases. Linear axes, so log is off.
@@ -2079,7 +2229,10 @@ class QMLMapCanvas(QQuickPaintedItem):
                 path,
                 dpi=300,
                 bbox_inches='tight',
-                facecolor='#0d0d0d',
+                # The figure's own ground, not a fourth hardcoded one: the
+                # export used to come out #0d0d0d while everything on screen
+                # was #1a1a1a.
+                facecolor=self.figure.get_facecolor(),
                 edgecolor='none'
             )
             logger.info(f"Map exported to: {path}")

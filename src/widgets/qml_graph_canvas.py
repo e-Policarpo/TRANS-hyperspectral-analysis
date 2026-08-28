@@ -63,6 +63,7 @@ from src.widgets._pyqtgraph_ports.legend import (
     LegendEntry,
 )
 from src.widgets._pyqtgraph_ports.mpl_apply import apply_pyqtgraph_ticks
+from src.widgets.series_palette import readable_on
 from src.widgets._pyqtgraph_ports.ticks import (
     format_tick_strings,
     minor_tick_values,
@@ -94,6 +95,53 @@ def _fast_render_enabled_default() -> bool:
     return True
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Theme derivation
+#
+# QML hands a canvas three colours — the ground, the text and the rules —
+# because that is what a colour scheme actually distinguishes. A plot needs
+# more roles than three: a title has to read as more emphatic than a tick
+# label, and a grid line has to sit *under* the data rather than compete with
+# it. Rather than demand eight colours a scheme does not have, the extra roles
+# are derived from the three by blending towards the ground (dimmer) or away
+# from it (brighter). Deriving rather than hardcoding is what makes the
+# hierarchy survive a light scheme: on white, "dimmer" means darker, and a
+# fixed #888888 tick would have been the wrong direction.
+#
+# The twin of this block lives in ``qml_map_canvas``. The two canvases share
+# no base class, and thirty lines of colour arithmetic did not justify a third
+# module that both would have to import.
+# =============================================================================
+
+def _blend(base: QColor, towards: QColor, amount: float) -> QColor:
+    """``base`` moved ``amount`` (0..1) of the way towards ``towards``."""
+    amount = max(0.0, min(1.0, float(amount)))
+    return QColor(
+        round(base.red() + (towards.red() - base.red()) * amount),
+        round(base.green() + (towards.green() - base.green()) * amount),
+        round(base.blue() + (towards.blue() - base.blue()) * amount),
+    )
+
+
+def _with_alpha(colour: QColor, alpha: int) -> QColor:
+    """A copy of ``colour`` at ``alpha`` (0-255)."""
+    faded = QColor(colour)
+    faded.setAlpha(int(alpha))
+    return faded
+
+
+def _contrast_pole(background: QColor) -> QColor:
+    """White over a dark ground, black over a light one.
+
+    Relative luminance rather than a mean of the channels: green carries most
+    of the perceived brightness, so a mean calls a saturated blue "light".
+    """
+    luminance = (0.2126 * background.redF()
+                 + 0.7152 * background.greenF()
+                 + 0.0722 * background.blueF())
+    return QColor("#ffffff") if luminance < 0.5 else QColor("#000000")
 
 
 @dataclass
@@ -194,9 +242,18 @@ class QMLGraphCanvas(QQuickPaintedItem):
         except Exception:
             pass  # Software-only Qt builds don't support FBO targets
 
+        # Theme. The defaults reproduce the palette this canvas shipped with,
+        # so a host that binds nothing looks exactly as it did; QML overwrites
+        # all three from the colour scheme. Set before the Figure exists
+        # because the Figure's own facecolor is one of the derived roles.
+        self._background: str = "#1a1a1a"
+        self._foreground: str = "#cccccc"
+        self._grid_colour: str = "#444444"
+        self._recomputeThemeColours()
+
         # Matplotlib setup
         self._dpi = 100
-        self.figure = Figure(facecolor='#1a1a1a', dpi=self._dpi)
+        self.figure = Figure(facecolor=self._background, dpi=self._dpi)
         self.axes = self.figure.add_subplot(111)
         self.canvas = FigureCanvasAgg(self.figure)
 
@@ -393,14 +450,152 @@ class QMLGraphCanvas(QQuickPaintedItem):
             logger.warning(f"Error during GraphCanvas cleanup: {e}")
 
     def _setupAxesStyle(self):
-        """Configure axes appearance for dark theme"""
-        self.axes.set_facecolor('#1a1a1a')
-        self.axes.tick_params(colors='#888888', labelsize=9)
+        """Push the derived theme roles onto the matplotlib axes.
+
+        Called after every ``axes.clear()`` in ``_renderForExport`` as well as
+        at construction, because clearing an axes drops its styling — which is
+        also why a colour change only has to invalidate, not re-render.
+        """
+        if getattr(self, 'axes', None) is None:
+            return
+        if getattr(self, 'figure', None) is not None:
+            self.figure.set_facecolor(self._background)
+        self.axes.set_facecolor(self._background)
+        self.axes.tick_params(colors=self._tick_colour.name(), labelsize=9)
         for spine in self.axes.spines.values():
-            spine.set_color('#444444')
-        self.axes.xaxis.label.set_color('#cccccc')
-        self.axes.yaxis.label.set_color('#cccccc')
-        self.axes.title.set_color('#ffffff')
+            spine.set_color(self._grid_colour)
+        self.axes.xaxis.label.set_color(self._foreground)
+        self.axes.yaxis.label.set_color(self._foreground)
+        self.axes.title.set_color(self._title_colour.name())
+
+    # =========================================================================
+    # Theme (QML-bindable)
+    # =========================================================================
+
+    def _recomputeThemeColours(self) -> None:
+        """Derive every painted role from the three colours QML supplies.
+
+        The mapping, and why each one is what it is:
+
+        * **background** — the ground, straight from ``backgroundColor``.
+        * **axis frame / legend border** — ``gridColor``. The frame is a rule,
+          which is what that colour names.
+        * **grid lines** — ``gridColor`` at 45% alpha. Majors run across the
+          whole plot; at full strength they read as data.
+        * **tick marks** — the foreground pulled 40% back towards the ground.
+          Ticks are structure, not text, and the numbers next to them have to
+          win. 40% is the ratio the hand-picked pair (#cccccc label against a
+          #888888 tick on #1a1a1a) used, kept so nothing shifts on the dark
+          scheme this replaces.
+        * **tick and axis labels** — the foreground exactly. This is the one
+          pairing the WCAG guard in ``src/utils/color_contrast.py`` already
+          enforces (textMuted on bgDark, 4.5:1 over all 22 schemes), so
+          routing label text here inherits a checked contrast rather than
+          inventing an unchecked one.
+        * **title** — the foreground pushed 55% towards white on a dark ground
+          or black on a light one, so it reads brighter than the labels
+          without needing a fourth property the scheme would have to supply.
+        * **legend ground** — the background lifted 10% towards the foreground
+          so the panel separates from the plot, at alpha 230 as before.
+        """
+        background = QColor(self._background)
+        foreground = QColor(self._foreground)
+        rules = QColor(self._grid_colour)
+
+        self._tick_colour = _blend(foreground, background, 0.40)
+        self._title_colour = _blend(foreground, _contrast_pole(background), 0.55)
+        self._legend_bg_colour = _blend(background, foreground, 0.10)
+
+        # The ``_NATIVE_*`` names are class constants on the class and instance
+        # attributes here: assigning them shadows the defaults, so the fifteen
+        # paint sites that read ``self._NATIVE_...`` keep working untouched and
+        # a canvas that never receives a colour still has the old palette.
+        self._NATIVE_BG_COLOR = background
+        self._NATIVE_AXIS_COLOR = rules
+        self._NATIVE_TICK_COLOR = self._tick_colour
+        self._NATIVE_LABEL_COLOR = foreground
+        self._NATIVE_TITLE_COLOR = self._title_colour
+        self._NATIVE_GRID_COLOR = _with_alpha(rules, 115)
+        self._NATIVE_LEGEND_BG = _with_alpha(self._legend_bg_colour, 230)
+        self._NATIVE_LEGEND_BORDER = rules
+
+    def _seriesColour(self, colour):
+        """A curve colour, adjusted only if it cannot be seen on this ground.
+
+        Series colours are identity — they come from the caller (the QML
+        palette, a user's picker, a tool) and this canvas does not choose
+        them. But the ground is no longer fixed: it follows the scheme, and
+        eight of the twenty-two schemes are near-white, where nine of the ten
+        stock hues fall under the 3:1 threshold for a graphical mark. The hue
+        is preserved and only the lightness moves, so the identity survives
+        and a colour that already reads is returned byte-identical.
+        """
+        return readable_on(str(colour), self._background)
+
+    def _setThemeColour(self, attribute: str, colour, changed) -> None:
+        """Idempotent, garbage-tolerant setter shared by the three roles.
+
+        An empty string is an unresolved QML binding rather than a choice, and
+        an unparseable one is a typo; neither should repaint the canvas in a
+        half-applied palette, so both leave the current colour alone. The
+        comparison is on the canonical ``#rrggbb`` form so ``"#1A1A1A"`` and
+        ``"#1a1a1a"`` — or ``"red"`` twice — count as no change.
+        """
+        text = str(colour or "").strip()
+        if not text:
+            return
+        parsed = QColor(text)
+        if not parsed.isValid():
+            logger.warning("GraphCanvas: %r is not a colour", text)
+            return
+        canonical = parsed.name()
+        if canonical == QColor(getattr(self, attribute)).name():
+            return
+        setattr(self, attribute, canonical)
+        self._recomputeThemeColours()
+        # Both render paths have to follow: ``_renderNative`` reads the
+        # ``_NATIVE_*`` attributes on every frame, but the matplotlib figure
+        # holds its styling, so push it now — otherwise a PNG export carries
+        # the previous scheme's chrome.
+        self._setupAxesStyle()
+        self._needs_redraw = True
+        changed.emit()
+        self.update()
+
+    backgroundColorChanged = Signal()
+    foregroundColorChanged = Signal()
+    gridColorChanged = Signal()
+
+    def _get_background_colour(self) -> str:
+        return self._background
+
+    def _set_background_colour(self, colour: str) -> None:
+        self._setThemeColour('_background', colour, self.backgroundColorChanged)
+
+    def _get_foreground_colour(self) -> str:
+        return self._foreground
+
+    def _set_foreground_colour(self, colour: str) -> None:
+        self._setThemeColour('_foreground', colour, self.foregroundColorChanged)
+
+    def _get_grid_colour(self) -> str:
+        return self._grid_colour
+
+    def _set_grid_colour(self, colour: str) -> None:
+        self._setThemeColour('_grid_colour', colour, self.gridColorChanged)
+
+    #: The plot ground — the scheme's window background.
+    backgroundColor = Property(str, _get_background_colour,
+                               _set_background_colour,
+                               notify=backgroundColorChanged)
+    #: Text: tick labels, axis labels, legend entries; the title and the tick
+    #: marks are derived from it.
+    foregroundColor = Property(str, _get_foreground_colour,
+                               _set_foreground_colour,
+                               notify=foregroundColorChanged)
+    #: Rules: the axes frame, the grid, the legend border.
+    gridColor = Property(str, _get_grid_colour, _set_grid_colour,
+                         notify=gridColorChanged)
 
     # =========================================================================
     # Properties (QML accessible)
@@ -1054,7 +1249,7 @@ class QMLGraphCanvas(QQuickPaintedItem):
                 continue
 
             line_kwargs = {
-                'color': curve.color,
+                'color': self._seriesColour(curve.color),
                 'linewidth': curve.linewidth,
                 'linestyle': curve.linestyle,
                 'alpha': curve.alpha,
@@ -1080,7 +1275,10 @@ class QMLGraphCanvas(QQuickPaintedItem):
 
         # Grid
         if self._show_grid:
-            self.axes.grid(True, color='#333333', linestyle='-', linewidth=0.5, alpha=0.5)
+            # alpha 0.45 mirrors the native path's 115/255 grid alpha, so the
+            # exported PNG and the on-screen render agree.
+            self.axes.grid(True, color=self._grid_colour, linestyle='-',
+                           linewidth=0.5, alpha=0.45)
 
         # Labels
         self.axes.set_xlabel(self._x_label, fontsize=10)
@@ -1096,9 +1294,9 @@ class QMLGraphCanvas(QQuickPaintedItem):
                 self.axes.legend(
                     loc='best',
                     fontsize=9,
-                    facecolor='#2a2a2a',
-                    edgecolor='#444444',
-                    labelcolor='#cccccc',
+                    facecolor=self._legend_bg_colour.name(),
+                    edgecolor=self._grid_colour,
+                    labelcolor=self._foreground,
                     framealpha=0.9
                 )
 
@@ -1148,8 +1346,12 @@ class QMLGraphCanvas(QQuickPaintedItem):
     # Min log-axis value (avoid log10(0) when the user fills a zero-floor curve).
     _LOG_EPS = 1e-30
 
-    # Dark-theme colours (mirror the matplotlib path so the visuals
-    # match when the user toggles ``TRANS_FAST_RENDER``).
+    # Painted colours for the native path (they mirror the matplotlib path so
+    # the visuals match when the user toggles ``TRANS_FAST_RENDER``). These
+    # class-level values are only the fallback for an instance that never
+    # reached ``_recomputeThemeColours`` — normally every one of them is
+    # shadowed by an instance attribute derived from backgroundColor /
+    # foregroundColor / gridColor.
     _NATIVE_BG_COLOR = QColor("#1a1a1a")
     _NATIVE_AXIS_COLOR = QColor("#444444")
     _NATIVE_TICK_COLOR = QColor("#888888")
@@ -1258,7 +1460,7 @@ class QMLGraphCanvas(QQuickPaintedItem):
             path = self._native_get_path(cid, curve, x_log, y_log)
             if path is None or path.elementCount() == 0:
                 continue
-            pen = QPen(QColor(curve.color))
+            pen = QPen(QColor(self._seriesColour(curve.color)))
             width = float(curve.linewidth)
             if cid == self._selected_curve_id:
                 width += 1.0
@@ -2054,7 +2256,7 @@ class QMLGraphCanvas(QQuickPaintedItem):
             LegendEntry(
                 curve_id=cid,
                 label=curve.label,
-                color=curve.color,
+                color=self._seriesColour(curve.color),
                 linewidth=float(curve.linewidth),
                 linestyle=curve.linestyle or "-",
             )

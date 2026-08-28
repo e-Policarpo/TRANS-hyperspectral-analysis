@@ -657,6 +657,21 @@ class AppBackend(ToolImplementations, QObject):
         """Expose workflow manager to QML."""
         return self.workflow_manager
 
+    def _scheme_colours(self) -> dict:
+        """The active scheme's colours, for a plain-QWidget window.
+
+        Qt Style Sheets and matplotlib do not see the QML Theme singleton, so
+        a window built out of QWidgets has to be handed the palette. Anything
+        going wrong here must not stop a map opening, hence the guard.
+        """
+        try:
+            scheme = self._preferences_manager.getCurrentScheme() or {}
+            return dict(scheme.get('colors') or {})
+        except Exception:
+            logger.debug("Could not read the colour scheme for a map window",
+                         exc_info=True)
+            return {}
+
     @Property(QObject, constant=True)
     def preferencesManager(self):
         """Expose preferences manager to QML."""
@@ -5341,7 +5356,9 @@ class AppBackend(ToolImplementations, QObject):
         try:
             logger.info(f"Opening map visualization window: {map_title}")
 
-            map_window = MapVisualizationWindow(map_path=map_path, title=map_title)
+            map_window = MapVisualizationWindow(
+                map_path=map_path, title=map_title,
+                colors=self._scheme_colours())
 
             # Track window
             self.open_windows.append(map_window)
@@ -6192,9 +6209,9 @@ class AppBackend(ToolImplementations, QObject):
             title = Path(output_path).stem
 
             map_window = MapVisualizationWindow(
-                data={'values': data},
+                map_data=data,
                 title=title,
-                colormap='viridis'
+                colors=self._scheme_colours()
             )
             map_window.show()
             self.open_windows.append(map_window)

@@ -12,6 +12,7 @@ import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
 import TransQML 1.0
 import "Fmt.js" as Fmt
+import "../components"   // the Theme singleton
 
 // Profile Viewer for Map Editor
 // Displays line profiles extracted from the map
@@ -33,16 +34,21 @@ Rectangle {
 
     // Theme colors - reactive bindings to main window
     property var mainWin: ApplicationWindow.window
-    property color bgDark: mainWin ? mainWin.bgDark : "#1a1a2e"
-    property color bgMedium: mainWin ? mainWin.bgMedium : "#2a2a3e"
-    property color bgLight: mainWin ? mainWin.bgLight : "#3a3a4e"
-    property color accentPink: mainWin ? mainWin.accentPink : "#F5A9B8"
-    property color accentBlue: mainWin ? mainWin.accentBlue : "#5BCEFA"
-    property color textLight: mainWin ? mainWin.textLight : "#ffffff"
-    property color textMuted: mainWin ? mainWin.textMuted : "#B0A0B8"
-    property color borderColor: mainWin ? mainWin.borderColor : "#7B3F76"
+    property color bgDark: (mainWin && mainWin.bgDark !== undefined) ? mainWin.bgDark : Theme.bgDark
+    property color bgMedium: (mainWin && mainWin.bgMedium !== undefined) ? mainWin.bgMedium : Theme.bgMedium
+    property color bgLight: (mainWin && mainWin.bgLight !== undefined) ? mainWin.bgLight : Theme.bgLight
+    property color accentPink: (mainWin && mainWin.accentPink !== undefined) ? mainWin.accentPink : Theme.accentPink
+    property color accentBlue: (mainWin && mainWin.accentBlue !== undefined) ? mainWin.accentBlue : Theme.accentBlue
+    property color textLight: (mainWin && mainWin.textLight !== undefined) ? mainWin.textLight : Theme.textLight
+    property color textMuted: (mainWin && mainWin.textMuted !== undefined) ? mainWin.textMuted : Theme.textMuted
+    property color borderColor: (mainWin && mainWin.borderColor !== undefined) ? mainWin.borderColor : Theme.borderColor
     property string monoFont: mainWin ? mainWin.fontFamilyMono : (Qt.platform.os === "osx" ? "Menlo" : "Consolas")
-    property color profileColor: "#ff6b6b"  // Keep profile-specific color
+    // The profile trace. A knob a host can override; on its own it takes
+    // the scheme's primary accent, which is what makes the trace stand off
+    // the plot ground on every scheme rather than only on a dark one.
+    // (This property existed but was wired to nothing — the canvas kept
+    // its own private default. It now drives the canvas.)
+    property color profileColor: accentPink
 
     color: bgMedium
     height: 200
@@ -153,6 +159,20 @@ Rectangle {
                 anchors.fill: parent
                 anchors.margins: 4
                 visible: hasProfile
+
+                backgroundColor: profileViewer.bgDark
+                foregroundColor: profileViewer.textMuted
+                // borderColor, not bgLight: this draws the axes frame and the
+                // gridlines, and bgLight-on-bgDark measures 1.12:1 to 1.54:1 on
+                // all 22 schemes — the frame came out fainter than either
+                // candidate and the painted gridline at 1.02–1.08:1, i.e. no
+                // visible box on any scheme. borderColor wins on 21 of the 22.
+                gridColor: profileViewer.borderColor
+                // The profile trace itself and the two overlays are picked
+                // out against that ground rather than blending into it.
+                lineColor: profileViewer.profileColor
+                accentColor: profileViewer.accentBlue
+                cursorColor: profileViewer.textLight
             }
 
             // Empty state

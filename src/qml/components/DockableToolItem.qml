@@ -19,13 +19,13 @@ Rectangle {
 
     // Theme colors - reactive bindings to main window
     property var mainWin: ApplicationWindow.window
-    property color bgDark: mainWin ? mainWin.bgDark : "#1a1a2e"
-    property color bgMedium: mainWin ? mainWin.bgMedium : "#2a2a3e"
-    property color bgLight: mainWin ? mainWin.bgLight : "#2d2d3e"
-    property color textLight: mainWin ? mainWin.textLight : "#e0e0e0"
-    property color textMuted: mainWin ? mainWin.textMuted : "#B0A0B8"
-    property color accentPink: mainWin ? mainWin.accentPink : "#F5A9B8"
-    property color borderColor: mainWin ? mainWin.borderColor : "#7B3F76"
+    property color bgDark: (mainWin && mainWin.bgDark !== undefined) ? mainWin.bgDark : Theme.bgDark
+    property color bgMedium: (mainWin && mainWin.bgMedium !== undefined) ? mainWin.bgMedium : Theme.bgMedium
+    property color bgLight: (mainWin && mainWin.bgLight !== undefined) ? mainWin.bgLight : Theme.bgLight
+    property color textLight: (mainWin && mainWin.textLight !== undefined) ? mainWin.textLight : Theme.textLight
+    property color textMuted: (mainWin && mainWin.textMuted !== undefined) ? mainWin.textMuted : Theme.textMuted
+    property color accentPink: (mainWin && mainWin.accentPink !== undefined) ? mainWin.accentPink : Theme.accentPink
+    property color borderColor: (mainWin && mainWin.borderColor !== undefined) ? mainWin.borderColor : Theme.borderColor
 
     color: bgLight
     border.color: borderColor
@@ -67,7 +67,7 @@ Rectangle {
                     onClicked: toolItem.closeRequested()
 
                     background: Rectangle {
-                        color: parent.pressed ? accentPink : (parent.hovered ? "#3a3a4e" : "transparent")
+                        color: parent.pressed ? accentPink : (parent.hovered ? bgLight : "transparent")
                         radius: 3
                         opacity: parent.pressed ? 0.3 : 1
                     }

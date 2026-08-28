@@ -6,10 +6,15 @@
  * License: GPL
  */
 
-import QtQuick 2.15
-import QtQuick.Controls 2.15
+// QtQuick.Window is imported UNVERSIONED on purpose. `Window.palette` arrived
+// in revision 6.0, and a pinned `import QtQuick.Window 2.15` hides it — with
+// the pin in place the palette block below was not a silent no-op but a hard
+// load error, "Cannot assign to non-existent property \"palette\"", which took
+// this whole component (and tools/ToolWindow.qml with it) out of the build.
+import QtQuick
+import QtQuick.Controls
 import QtQuick.Layouts 1.15
-import QtQuick.Window 2.15
+import QtQuick.Window
 
 Window {
     id: draggableWindow
@@ -23,35 +28,29 @@ Window {
     property bool dockable: true
     property bool isDocked: false
 
-    // Theme colors - find main window for reactive bindings
-    property var mainWin: null
-
-    function findMainWindow() {
-        for (var i = 0; i < Qt.application.allWindows.length; i++) {
-            var win = Qt.application.allWindows[i]
-            if (win.objectName === "mainWindow") {
-                mainWin = win
-                break
-            }
-        }
-    }
-
-    Component.onCompleted: findMainWindow()
-
-    // Theme colors - reactive bindings from mainWin (MainWindow)
-    property color bgDark: mainWin ? mainWin.bgDark : "#1a1a2e"
-    property color bgDarker: mainWin ? mainWin.bgDarker : "#0d0d1a"
-    property color bgMedium: mainWin ? mainWin.bgMedium : "#2a2a3e"
-    property color bgLight: mainWin ? mainWin.bgLight : "#3a3a4e"
-    property color accentPink: mainWin ? mainWin.accentPink : "#F5A9B8"
-    property color accentBlue: mainWin ? mainWin.accentBlue : "#5BCEFA"
-    property color accentMagenta: mainWin ? mainWin.accentMagenta : "#D60270"
-    property color accentPurple: mainWin ? mainWin.accentPurple : "#9B4F96"
-    property color accentOrange: mainWin ? mainWin.accentOrange : "#FF9B55"
-    property color textLight: mainWin ? mainWin.textLight : "#e8e8e8"
-    property color textMuted: mainWin ? mainWin.textMuted : "#a0a0a0"
-    property color borderColor: mainWin ? mainWin.borderColor : "#8B4F86"
-    property color successColor: "#2ECC71"  // Emerald green for success states
+    // Theme colours, straight from the Theme singleton.
+    //
+    // This used to scan Qt.application.allWindows for objectName "mainWindow",
+    // once, in Component.onCompleted. A scan that ran before the main window
+    // existed — or on a build where it is not the one being searched — left
+    // mainWin null with nothing to retry it, and all twelve colours (and the
+    // palette below with them) sat on fallbacks from a scheme that no longer
+    // exists for the rest of the session. A singleton has no window to find.
+    property color bgDark: Theme.bgDark
+    property color bgDarker: Theme.bgDarker
+    property color bgMedium: Theme.bgMedium
+    property color bgLight: Theme.bgLight
+    property color accentPink: Theme.accentPink
+    property color accentBlue: Theme.accentBlue
+    property color accentMagenta: Theme.accentMagenta
+    property color accentPurple: Theme.accentPurple
+    property color accentOrange: Theme.accentOrange
+    property color textLight: Theme.textLight
+    property color textMuted: Theme.textMuted
+    property color borderColor: Theme.borderColor
+    // The schemes have always carried a `success` key; this was an emerald
+    // literal that no scheme could move.
+    property color successColor: Theme.successColor
 
     width: 600
     height: 500

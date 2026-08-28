@@ -20,15 +20,21 @@ Item {
     property var closeWindow: null
 
     // Theme colors
-    property var parentWindow: ApplicationWindow.window
-    property color bgDark: parentWindow ? parentWindow.bgDark : "#1a1a2e"
-    property color bgMedium: parentWindow ? parentWindow.bgMedium : "#2a2a3e"
-    property color bgLight: parentWindow ? parentWindow.bgLight : "#3a3a4e"
-    property color accentPink: parentWindow ? parentWindow.accentPink : "#F5A9B8"
-    property color accentBlue: parentWindow ? parentWindow.accentBlue : "#5BCEFA"
-    property color accentPurple: parentWindow ? parentWindow.accentPurple : "#9B4F96"
-    property color textLight: parentWindow ? parentWindow.textLight : "#ffffff"
-    property color textMuted: parentWindow ? parentWindow.textMuted : "#cccccc"
+    // `Window.window`, not `ApplicationWindow.window`: a tool is hosted
+    // either by the embedded window (whose root IS the ApplicationWindow) or
+    // by ToolWindow, whose root is a plain Window. The ApplicationWindow
+    // attached property resolves to null in the second case, and every colour
+    // below then falls through to the singleton instead of following the
+    // host. Window.window resolves in both.
+    property var parentWindow: Window.window
+    property color bgDark: (parentWindow && parentWindow.bgDark !== undefined) ? parentWindow.bgDark : Theme.bgDark
+    property color bgMedium: (parentWindow && parentWindow.bgMedium !== undefined) ? parentWindow.bgMedium : Theme.bgMedium
+    property color bgLight: (parentWindow && parentWindow.bgLight !== undefined) ? parentWindow.bgLight : Theme.bgLight
+    property color accentPink: (parentWindow && parentWindow.accentPink !== undefined) ? parentWindow.accentPink : Theme.accentPink
+    property color accentBlue: (parentWindow && parentWindow.accentBlue !== undefined) ? parentWindow.accentBlue : Theme.accentBlue
+    property color accentPurple: (parentWindow && parentWindow.accentPurple !== undefined) ? parentWindow.accentPurple : Theme.accentPurple
+    property color textLight: (parentWindow && parentWindow.textLight !== undefined) ? parentWindow.textLight : Theme.textLight
+    property color textMuted: (parentWindow && parentWindow.textMuted !== undefined) ? parentWindow.textMuted : Theme.textMuted
 
     implicitWidth: mainLayout.implicitWidth + 20
     implicitHeight: mainLayout.implicitHeight + 20

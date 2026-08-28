@@ -20,9 +20,11 @@ from PySide6.QtQuick import QQuickPaintedItem
 
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.colors import is_color_like
 
 from src.widgets._pyqtgraph_ports.mpl_apply import apply_pyqtgraph_ticks
 from src.widgets._pyqtgraph_ports.viewbox import ViewBoxState
+from src.widgets.series_palette import readable_on
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +52,16 @@ class QMLProfileCanvas(QQuickPaintedItem):
     rangeSelected = Signal(float, float, arguments=['x1', 'x2'])
     dataChanged = Signal()
 
+    # Palette change notifications. QML needs these for a two-way binding to
+    # settle; nothing inside this class listens to them, because the palette
+    # is re-applied wholesale on every render rather than patched in a
+    # handler (see _setupAxesStyle).
+    backgroundColorChanged = Signal()
+    foregroundColorChanged = Signal()
+    gridColorChanged = Signal()
+    accentColorChanged = Signal()
+    cursorColorChanged = Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAcceptedMouseButtons(Qt.AllButtons)
@@ -58,7 +70,23 @@ class QMLProfileCanvas(QQuickPaintedItem):
 
         # Matplotlib setup
         self._dpi = 100
-        self.figure = Figure(facecolor='#1a1a1a', dpi=self._dpi)
+
+        # Palette. These are only the colours the canvas falls back to when
+        # nothing binds it — ProfileViewer binds them to the active colour
+        # scheme. They are deliberately not read as one-off construction
+        # arguments: every one is re-applied on each render, so a scheme
+        # change cannot leave the axes showing the previous scheme.
+        self._background: str = '#1a1a1a'
+        self._foreground: str = '#aaaaaa'
+        self._grid: str = '#444444'
+        # Interaction chrome, drawn by QPainter over the finished figure.
+        # These two are separate properties rather than one accent because
+        # a drag shows both at once — the band and the cursor line inside
+        # it — and one colour would merge them.
+        self._accent: str = '#64c8ff'
+        self._cursor: str = '#ffff64'
+
+        self.figure = Figure(facecolor=self._background, dpi=self._dpi)
         self.axes = self.figure.add_subplot(111)
         self.canvas = FigureCanvasAgg(self.figure)
 
@@ -123,14 +151,124 @@ class QMLProfileCanvas(QQuickPaintedItem):
             logger.warning(f"Error during ProfileCanvas cleanup: {e}")
 
     def _setupAxesStyle(self):
-        """Configure axes appearance for dark theme"""
-        self.axes.set_facecolor('#1a1a1a')
-        self.axes.tick_params(colors='#888888', labelsize=8)
+        """Re-apply the palette to the figure and the axes.
+
+        _renderMatplotlib calls this after every axes.clear(), which is why
+        the colour setters below only have to ask for a redraw. There is no
+        separate restyle path that a scheme change could miss, and no state
+        that survives a frame: whatever the properties hold when a frame is
+        drawn is what that frame shows.
+
+        This used to hardcode five distinct greys — #1a1a1a ground, #444444
+        spines, #888888 ticks, #aaaaaa labels, #cccccc title. They collapse
+        onto the three themed roles, which costs the title its slight
+        emphasis over the tick labels but buys a canvas that is legible on a
+        light scheme instead of being a black box in a white window. The
+        grid keeps its subordinate weight through alpha rather than through
+        a second, darker grey (see _renderMatplotlib).
+        """
+        self.figure.set_facecolor(self._background)
+        self.axes.set_facecolor(self._background)
+        self.axes.tick_params(colors=self._foreground, labelsize=8)
         for spine in self.axes.spines.values():
-            spine.set_color('#444444')
-        self.axes.xaxis.label.set_color('#aaaaaa')
-        self.axes.yaxis.label.set_color('#aaaaaa')
-        self.axes.title.set_color('#cccccc')
+            spine.set_color(self._grid)
+        self.axes.xaxis.label.set_color(self._foreground)
+        self.axes.yaxis.label.set_color(self._foreground)
+        self.axes.title.set_color(self._foreground)
+
+    # =========================================================================
+    # Palette
+    # =========================================================================
+
+    def _setThemeColour(self, attr: str, value, signal) -> None:
+        """Assign one palette colour, ignoring anything unusable.
+
+        A QML binding can hand us an empty string while its host window is
+        still resolving its own colours, and an unresolved colour arrives as
+        a nonsense string rather than as an exception. Either would make
+        matplotlib raise from inside paint(), which leaves a blank widget
+        with no way back; keeping the previous colour instead degrades to a
+        canvas that is merely a scheme behind. is_color_like is the right
+        test because matplotlib, not Qt, is what finally consumes these.
+
+        Assigning the value the canvas already holds does nothing at all, so
+        a binding that re-evaluates to the same colour costs no redraw.
+        """
+        colour = str(value or "").strip()
+        if not colour:
+            return
+        if not is_color_like(colour):
+            logger.warning("ProfileCanvas: %r is not a colour", colour)
+            return
+        if colour == getattr(self, attr):
+            return
+        setattr(self, attr, colour)
+        signal.emit()
+        self._needs_redraw = True
+        self.update()
+
+    def _overlayColour(self, colour: str, alpha: int) -> QColor:
+        """A palette colour as a QPainter colour at a fixed alpha.
+
+        The overlays are drawn by QPainter on top of the rendered figure,
+        not by matplotlib, so they need the Qt form; the alpha is the
+        overlay's own weight and does not come from the scheme."""
+        qc = QColor(colour)
+        if not qc.isValid():
+            qc = QColor(255, 255, 255)
+        qc.setAlpha(alpha)
+        return qc
+
+    def _get_background(self) -> str:
+        return self._background
+
+    def _set_background(self, value: str) -> None:
+        self._setThemeColour('_background', value, self.backgroundColorChanged)
+
+    #: The figure and axes ground — bind to the scheme's bgDark.
+    backgroundColor = Property(str, _get_background, _set_background,
+                               notify=backgroundColorChanged)
+
+    def _get_foreground(self) -> str:
+        return self._foreground
+
+    def _set_foreground(self, value: str) -> None:
+        self._setThemeColour('_foreground', value, self.foregroundColorChanged)
+
+    #: Ticks, tick labels, axis labels and title — the scheme's textMuted.
+    foregroundColor = Property(str, _get_foreground, _set_foreground,
+                               notify=foregroundColorChanged)
+
+    def _get_grid(self) -> str:
+        return self._grid
+
+    def _set_grid(self, value: str) -> None:
+        self._setThemeColour('_grid', value, self.gridColorChanged)
+
+    #: Spines, gridlines and the legend frame — the scheme's borderColor.
+    gridColor = Property(str, _get_grid, _set_grid, notify=gridColorChanged)
+
+    def _get_accent(self) -> str:
+        return self._accent
+
+    def _set_accent(self, value: str) -> None:
+        self._setThemeColour('_accent', value, self.accentColorChanged)
+
+    #: The rubber-band range selection. Optional — the default matches what
+    #: this canvas drew before it was themed.
+    accentColor = Property(str, _get_accent, _set_accent,
+                           notify=accentColorChanged)
+
+    def _get_cursor(self) -> str:
+        return self._cursor
+
+    def _set_cursor(self, value: str) -> None:
+        self._setThemeColour('_cursor', value, self.cursorColorChanged)
+
+    #: The hover cursor line. Optional, and deliberately a different hue
+    #: from accentColor: both can be on screen at once.
+    cursorColor = Property(str, _get_cursor, _set_cursor,
+                           notify=cursorColorChanged)
 
     # =========================================================================
     # Properties
@@ -310,6 +448,10 @@ class QMLProfileCanvas(QQuickPaintedItem):
         w, h = int(self.width()), int(self.height())
         if w <= 0 or h <= 0:
             return
+        # cleanup() drops the figure, and a colour binding settling after
+        # that would otherwise schedule a paint into nothing.
+        if self.figure is None or self.axes is None:
+            return
 
         self.figure.set_size_inches(w / self._dpi, h / self._dpi)
 
@@ -321,7 +463,7 @@ class QMLProfileCanvas(QQuickPaintedItem):
         if self._x_data is not None and self._y_data is not None:
             self.axes.plot(
                 self._x_data, self._y_data,
-                color=self._line_color,
+                color=readable_on(self._line_color, self._background),
                 linewidth=self._line_width,
                 label='Profile'
             )
@@ -330,7 +472,7 @@ class QMLProfileCanvas(QQuickPaintedItem):
         for curve in self._curves:
             self.axes.plot(
                 curve['x'], curve['y'],
-                color=curve['color'],
+                color=readable_on(curve['color'], self._background),
                 linewidth=self._line_width,
                 label=curve['name'],
                 alpha=0.8
@@ -338,7 +480,10 @@ class QMLProfileCanvas(QQuickPaintedItem):
 
         # Configure axes
         if self._show_grid:
-            self.axes.grid(True, color='#333333', linestyle='-', linewidth=0.5, alpha=0.5)
+            # Same colour as the spines; the alpha is what keeps the grid
+            # from competing with them, and it does that on any scheme.
+            self.axes.grid(True, color=self._grid, linestyle='-',
+                           linewidth=0.5, alpha=0.5)
 
         self.axes.set_xlabel(self._x_label, fontsize=9)
         self.axes.set_ylabel(self._y_label, fontsize=9)
@@ -355,9 +500,13 @@ class QMLProfileCanvas(QQuickPaintedItem):
 
         # Legend if multiple curves
         if self._curves:
+            # The legend sits on the plot ground rather than a shade of its
+            # own, because the three themed roles carry no mid-tone. Near-
+            # opaque so curves running underneath do not show through the
+            # text; the frame is what separates it from the plot.
             self.axes.legend(loc='upper right', fontsize=8,
-                            facecolor='#2a2a2a', edgecolor='#444444',
-                            labelcolor='#cccccc')
+                            facecolor=self._background, edgecolor=self._grid,
+                            labelcolor=self._foreground, framealpha=0.92)
 
         # Apply the ported pyqtgraph tick layout for parity with the
         # graph canvas (1/2/5 × 10ⁿ family, sensible decimal places).
@@ -461,7 +610,7 @@ class QMLProfileCanvas(QQuickPaintedItem):
             px = d['ax_left'] + norm_x * ax_width
 
             if d['ax_left'] <= px <= d['ax_right']:
-                pen = QPen(QColor(255, 255, 100, 150))
+                pen = QPen(self._overlayColour(self._cursor, 150))
                 pen.setWidth(1)
                 painter.setPen(pen)
                 painter.drawLine(int(px), int(d['ax_top']),
@@ -483,10 +632,10 @@ class QMLProfileCanvas(QQuickPaintedItem):
                 rect = QRectF(min(px1, px2), d['ax_top'],
                              abs(px2 - px1), d['ax_bottom'] - d['ax_top'])
 
-                pen = QPen(QColor(100, 200, 255, 150))
+                pen = QPen(self._overlayColour(self._accent, 150))
                 pen.setWidth(1)
                 painter.setPen(pen)
-                painter.setBrush(QBrush(QColor(100, 200, 255, 40)))
+                painter.setBrush(QBrush(self._overlayColour(self._accent, 40)))
                 painter.drawRect(rect)
 
     # =========================================================================

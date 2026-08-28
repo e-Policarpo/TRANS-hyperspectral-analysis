@@ -6,10 +6,16 @@
  * License: GPL
  */
 
-import QtQuick 2.15
+// QtQuick and QtQuick.Window are imported UNVERSIONED on purpose. `palette`
+// on a Window arrived in QML revision 6.0, and a pinned `import ... 2.15`
+// hides every property added after 2.15 — with the pin in place the palette
+// block below is a hard load error ("Cannot assign to non-existent property"),
+// which takes the whole workflow editor out of the build rather than warning.
+import QtQuick
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
-import QtQuick.Window 2.15
+import QtQuick.Window
+import "../components"   // the Theme singleton
 
 Window {
     id: workflowWindowRoot
@@ -56,20 +62,26 @@ Window {
     }
 
     // Reactive color properties with fallbacks
-    property color bgDark: mainWin ? mainWin.bgDark : "#1a1a2e"
-    property color bgDarker: mainWin ? mainWin.bgDarker : "#0d0d1a"
-    property color bgMedium: mainWin ? mainWin.bgMedium : "#2a2a3e"
-    property color bgLight: mainWin ? mainWin.bgLight : "#3a3a4e"
-    property color accentPink: mainWin ? mainWin.accentPink : "#F5A9B8"
-    property color accentBlue: mainWin ? mainWin.accentBlue : "#5BCEFA"
-    property color accentMagenta: mainWin ? mainWin.accentMagenta : "#D60270"
-    property color accentPurple: mainWin ? mainWin.accentPurple : "#9B4F96"
-    property color accentGreen: "#66ff99"  // Keep workflow-specific colors
+    property color bgDark: (mainWin && mainWin.bgDark !== undefined) ? mainWin.bgDark : Theme.bgDark
+    property color bgDarker: (mainWin && mainWin.bgDarker !== undefined) ? mainWin.bgDarker : Theme.bgDarker
+    property color bgMedium: (mainWin && mainWin.bgMedium !== undefined) ? mainWin.bgMedium : Theme.bgMedium
+    property color bgLight: (mainWin && mainWin.bgLight !== undefined) ? mainWin.bgLight : Theme.bgLight
+    property color accentPink: (mainWin && mainWin.accentPink !== undefined) ? mainWin.accentPink : Theme.accentPink
+    property color accentBlue: (mainWin && mainWin.accentBlue !== undefined) ? mainWin.accentBlue : Theme.accentBlue
+    property color accentMagenta: (mainWin && mainWin.accentMagenta !== undefined) ? mainWin.accentMagenta : Theme.accentMagenta
+    property color accentPurple: (mainWin && mainWin.accentPurple !== undefined) ? mainWin.accentPurple : Theme.accentPurple
+    // Status colours. Green means "valid / connected", the error red means
+    // "this will not run" — semantics, not decoration, so they keep their
+    // hue rather than taking an accent. They still come from the palette:
+    // every scheme carries a `success` and an `error` key for exactly this,
+    // and Theme publishes them as successColor and accentMagenta. (The amber
+    // warning below has no home on Theme yet; it is left fixed until it does.)
+    property color accentGreen: (mainWin && mainWin.successColor !== undefined) ? mainWin.successColor : Theme.successColor
     property color accentOrange: "#FFB7C5"
     property color accentYellow: "#FFE5B4"
-    property color textLight: mainWin ? mainWin.textLight : "#ffffff"
-    property color textMuted: mainWin ? mainWin.textMuted : "#cccccc"
-    property color borderColor: mainWin ? mainWin.borderColor : "#9B4F96"
+    property color textLight: (mainWin && mainWin.textLight !== undefined) ? mainWin.textLight : Theme.textLight
+    property color textMuted: (mainWin && mainWin.textMuted !== undefined) ? mainWin.textMuted : Theme.textMuted
+    property color borderColor: (mainWin && mainWin.borderColor !== undefined) ? mainWin.borderColor : Theme.borderColor
 
     // Detect if we're in a light theme by checking bgDark luminance
     // Light themes have bgDark values like "#F5F0F8" (high luminance)
@@ -82,8 +94,18 @@ Window {
         return false
     }
 
-    // Grid color - reactive to theme
-    property color gridColor: isLightTheme ? "#D0D0D8" : "#2a2a3e"
+    // The canvas grid, derived from the palette rather than picked for it.
+    //
+    // This used to choose between two hand-mixed greys off isLightTheme — a
+    // two-scheme theme inside a 22-scheme app, wrong for any scheme whose
+    // background is dark but warm. textMuted at low alpha is right on every
+    // scheme instead, and safely so: textMuted-on-bgDark is one of the
+    // pairings src/utils/color_contrast.py enforces at 4.5:1, so the rule is
+    // always visible against the ground and never loud enough to compete with
+    // the nodes on it. WorkspaceCanvas.qml has drawn its grid this way all
+    // along; this is the same idiom, not a new one. (isLightTheme itself
+    // stays — refreshColors() repaints off it.)
+    property color gridColor: Qt.rgba(textMuted.r, textMuted.g, textMuted.b, 0.15)
 
     // Version counter to force re-evaluation of port colors when theme changes
     property int portColorVersion: 0
@@ -103,65 +125,27 @@ Window {
         "any": "#9E9E9E"            // Gray - any type (flexible)
     })
 
-    // Safe getPortColor function - computes themed colors dynamically each call
-    // This ensures colors are always current (readonly property would freeze at init time)
+    // A port's colour identifies its TYPE — a dataset socket must never be
+    // mistakable for a map socket, and that has to hold on all 22 schemes.
+    // safePortColors is therefore fixed by design, exactly like the curve
+    // palette a graph hands out: it encodes what a thing IS, not what the
+    // window is painted.
+    //
+    // What this used to do was theme four of the nine — dataset from
+    // accentBlue, map from accentPurple, number from accentMagenta, any from
+    // textMuted — and leave five fixed. Half a palette follows the scheme and
+    // half does not, so the set is only guaranteed distinct on the scheme it
+    // was tuned for. Measured under "Just Dark Mode": map came out #555555,
+    // the same value as borderColor, and `any` came out #a3a3a3, the same
+    // value as textMuted — two ports the same colour as the chrome behind
+    // them. Nine fixed hues are distinct on every scheme; four themed ones
+    // are distinct on one.
     function getPortColor(portType) {
-        // Debug: check accent colors (uncomment to troubleshoot)
-        // console.log("getPortColor:", portType, "accentBlue:", accentBlue.toString(), "accentPink:", accentPink.toString())
-
-        // If accent colors aren't initialized yet (black), use safe fallback directly
-        var blueStr = accentBlue.toString()
-        if (blueStr === "#000000" || blueStr === "") {
-            console.log("WorkflowWindow.getPortColor: accentBlue not initialized, using fallback for", portType)
-            return safePortColors[portType] || safePortColors["any"] || "#888888"
-        }
-
-        // Compute themed color dynamically - fixed distinct colors with some theme accents
-        var themedColor = null
-        try {
-            switch (portType) {
-                case "dataset":
-                    themedColor = accentBlue.toString()       // Theme cyan/blue
-                    break
-                case "flat_data":
-                    themedColor = "#FFD700"                   // Fixed gold (distinct)
-                    break
-                case "image":
-                    themedColor = "#FF6B6B"                   // Fixed coral red
-                    break
-                case "map":
-                    themedColor = accentPurple.toString()     // Theme purple
-                    break
-                case "table":
-                    themedColor = "#2ECC71"                   // Fixed emerald green
-                    break
-                case "number":
-                    themedColor = accentMagenta.toString()    // Theme magenta/pink
-                    break
-                case "string":
-                    themedColor = "#FF9800"                   // Fixed orange
-                    break
-                case "intervals":
-                    themedColor = "#00BCD4"                   // Fixed teal
-                    break
-                case "any":
-                    themedColor = textMuted.toString()        // Theme gray
-                    break
-                default:
-                    // Unknown port type - log it
-                    console.log("WorkflowWindow.getPortColor: unknown port type:", portType)
-                    break
-            }
-        } catch (e) {
-            console.log("WorkflowWindow.getPortColor: error for", portType, ":", e)
-            // Fall through to safe colors
-        }
-
-        // Return themed color if valid, otherwise fallback to safe hardcoded colors
-        if (themedColor && themedColor !== "" && themedColor !== "undefined" && themedColor !== "#000000") {
-            return themedColor
-        }
-        return safePortColors[portType] || safePortColors["any"] || "#888888"
+        var colour = safePortColors[portType]
+        if (colour)
+            return colour
+        console.log("WorkflowWindow.getPortColor: unknown port type:", portType)
+        return safePortColors["any"]
     }
 
     // Legacy portColors for backwards compatibility
@@ -193,6 +177,31 @@ Window {
     minimumHeight: 600
     title: "Workflow Editor - " + workflowName
     color: bgDark
+
+    // This is a real top-level Window, not an Item inside the application
+    // window, so it does NOT inherit Main.qml's palette. Without this block
+    // every unstyled Qt Quick Control inside it — the zoom Slider, the toolbar
+    // Buttons, the DialogButtonBox of the delete-node and run-result dialogs —
+    // falls back to the Basic style's built-in light palette and stays there
+    // in every scheme. Measured before: palette.window #ffffff, button
+    // #e0e0e0, buttonText #26282a, identical on "Just Dark Mode" and on
+    // "Just Light Mode", i.e. a light-grey Yes/No strip inside an explicitly
+    // dark #2a2a2a dialog body. Mirrors DraggableWindow and Main.qml.
+    palette.window: bgDark
+    palette.windowText: textLight
+    palette.base: bgDarker
+    palette.alternateBase: bgMedium
+    palette.text: textLight
+    palette.button: bgLight
+    palette.buttonText: textLight
+    palette.highlight: accentPink
+    palette.highlightedText: bgDark
+    palette.placeholderText: textMuted
+    palette.mid: borderColor
+    palette.dark: bgDarker
+    palette.light: bgLight
+    palette.toolTipBase: bgMedium
+    palette.toolTipText: textLight
 
     Component.onCompleted: {
         // mainWin is now passed directly when creating WorkflowWindow
@@ -1388,7 +1397,7 @@ Window {
                 resultDialog.open()
             } else {
                 validationStatus.text = "Failed: " + errors.join("; ")
-                validationStatus.color = "#D60270"
+                validationStatus.color = accentMagenta
                 resultDialog.isSuccess = false
                 resultDialog.workflowName = name
                 resultDialog.resultMessage = "Workflow execution failed:\n\n" + errors.join("\n")
@@ -1508,7 +1517,7 @@ Window {
 
         background: Rectangle {
             color: bgMedium
-            border.color: resultDialog.isSuccess ? accentGreen : "#D60270"
+            border.color: resultDialog.isSuccess ? accentGreen : accentMagenta
             border.width: 2
             radius: 8
         }
@@ -1525,7 +1534,7 @@ Window {
                     width: 40
                     height: 40
                     radius: 20
-                    color: resultDialog.isSuccess ? accentGreen : "#D60270"
+                    color: resultDialog.isSuccess ? accentGreen : accentMagenta
 
                     Text {
                         anchors.centerIn: parent

@@ -20,15 +20,22 @@ Rectangle {
     property var toolInfo: ({})
 
     // Theme colors - get from parent workflowWindow
-    property color bgDark: workflowWindow ? workflowWindow.bgDark : "#1a1a2e"
-    property color bgMedium: workflowWindow ? workflowWindow.bgMedium : "#2a2a3e"
-    property color bgLight: workflowWindow ? workflowWindow.bgLight : "#3a3a4e"
-    property color accentPink: workflowWindow ? workflowWindow.accentPink : "#F5A9B8"
-    property color accentBlue: workflowWindow ? workflowWindow.accentBlue : "#5BCEFA"
-    property color accentGreen: "#66ff99"   // Keep workflow status color
-    property color textLight: workflowWindow ? workflowWindow.textLight : "#ffffff"
-    property color textMuted: workflowWindow ? workflowWindow.textMuted : "#cccccc"
-    property color borderColor: workflowWindow ? workflowWindow.borderColor : "#9B4F96"
+    property color bgDark: (workflowWindow && workflowWindow.bgDark !== undefined) ? workflowWindow.bgDark : Theme.bgDark
+    property color bgMedium: (workflowWindow && workflowWindow.bgMedium !== undefined) ? workflowWindow.bgMedium : Theme.bgMedium
+    property color bgLight: (workflowWindow && workflowWindow.bgLight !== undefined) ? workflowWindow.bgLight : Theme.bgLight
+    property color accentPink: (workflowWindow && workflowWindow.accentPink !== undefined) ? workflowWindow.accentPink : Theme.accentPink
+    property color accentBlue: (workflowWindow && workflowWindow.accentBlue !== undefined) ? workflowWindow.accentBlue : Theme.accentBlue
+    property color accentMagenta: (workflowWindow && workflowWindow.accentMagenta !== undefined) ? workflowWindow.accentMagenta : Theme.accentMagenta
+    // Status colours. Green means "valid / connected", the error red means
+    // "this will not run" — semantics, not decoration, so they keep their
+    // hue rather than taking an accent. They still come from the palette:
+    // every scheme carries a `success` and an `error` key for exactly this,
+    // and Theme publishes them as successColor and accentMagenta. (The amber
+    // warning below has no home on Theme yet; it is left fixed until it does.)
+    property color accentGreen: (workflowWindow && workflowWindow.successColor !== undefined) ? workflowWindow.successColor : Theme.successColor
+    property color textLight: (workflowWindow && workflowWindow.textLight !== undefined) ? workflowWindow.textLight : Theme.textLight
+    property color textMuted: (workflowWindow && workflowWindow.textMuted !== undefined) ? workflowWindow.textMuted : Theme.textMuted
+    property color borderColor: (workflowWindow && workflowWindow.borderColor !== undefined) ? workflowWindow.borderColor : Theme.borderColor
     property string monoFont: Qt.platform.os === "osx" ? "Menlo" : "Consolas"
 
     color: "transparent"
@@ -214,9 +221,16 @@ Rectangle {
             Layout.fillWidth: true
             Layout.preferredHeight: 24
             visible: currentNode !== null
-            color: "#1a3322"  // Dark green background
+            // A tint of the status green over the panel's own ground, rather
+            // than the two hand-mixed dark greens this used to hold — those
+            // exist in no scheme and are unreadable on a light one. Mixing
+            // keeps the "this is the saved-state strip" reading on every
+            // scheme, and the text on it is accentGreen either way.
+            color: Qt.tint(bgMedium, Qt.rgba(accentGreen.r, accentGreen.g,
+                                             accentGreen.b, 0.12))
             radius: 4
-            border.color: "#2a5533"
+            border.color: Qt.tint(bgLight, Qt.rgba(accentGreen.r, accentGreen.g,
+                                                   accentGreen.b, 0.25))
             border.width: 1
 
             Row {
@@ -883,7 +897,7 @@ Rectangle {
 
                             contentItem: Text {
                                 text: parent.text
-                                color: parent.hovered ? "#D60270" : textMuted
+                                color: parent.hovered ? accentMagenta : textMuted
                                 font.pixelSize: 10
                                 horizontalAlignment: Text.AlignHCenter
                             }
@@ -1316,12 +1330,12 @@ Rectangle {
                         width: 8
                         height: 8
                         radius: 4
-                        color: validationIndicator.isValid ? accentGreen : "#D60270"
+                        color: validationIndicator.isValid ? accentGreen : accentMagenta
                     }
 
                     Text {
                         text: validationIndicator.message || (validationIndicator.isValid ? "Valid equation" : "Invalid syntax")
-                        color: validationIndicator.isValid ? accentGreen : "#D60270"
+                        color: validationIndicator.isValid ? accentGreen : accentMagenta
                         font.pixelSize: 9
                     }
                 }

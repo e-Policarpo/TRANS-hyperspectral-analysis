@@ -1,17 +1,27 @@
 /*
  * T.R.A.N.S. — shared tool palette.
  *
- * Tools live in embedded windows, so `Window.window` is the application
- * window: reading a colour it does not carry yields `undefined`, which lands
- * as an invalid QColor and paints text black-on-black. Every colour is
- * resolved through pick() with an explicit fallback instead.
+ * A thin adapter, kept for the tools that already use it. The colours now come
+ * from the Theme singleton, which no window has to be located for; `win` stays
+ * as an override for a host that publishes a colour of its own (the Workflow
+ * editor does), and as the reason this file still exists at all.
+ *
+ * Every colour is still resolved through pick() with a fallback rather than
+ * read straight off `win`: a name the host does not carry yields `undefined`,
+ * which lands as an invalid QColor and paints text black-on-black. Note the
+ * fallback argument is what ties each binding to the singleton — pick() reads
+ * win[name] by string, and a dynamic lookup is not something the binding can
+ * depend on, so naming Theme.<colour> in the call is what makes a live scheme
+ * change reach these properties.
  */
 import QtQuick 2.15
 
 QtObject {
     id: theme
 
-    // The window whose palette to follow — pass `Window.window`.
+    // Optional host override — pass `Window.window`. Left null, everything
+    // comes from the singleton. (A QtObject cannot read the Window attached
+    // property itself, which is why this is handed in from outside.)
     property var win: null
 
     function pick(name, fallback) {
@@ -19,13 +29,17 @@ QtObject {
                 ? win[name] : fallback
     }
 
-    readonly property color bgDark: pick("bgDark", "#1a1a2e")
-    readonly property color bgMedium: pick("bgMedium", "#2a2a3e")
-    readonly property color bgLight: pick("bgLight", "#3a3a4e")
-    readonly property color accentPink: pick("accentPink", "#F5A9B8")
-    readonly property color accentBlue: pick("accentBlue", "#5BCEFA")
-    readonly property color accentPurple: pick("accentPurple", "#9B4F96")
-    readonly property color textLight: pick("textLight", "#ffffff")
-    readonly property color textMuted: pick("textMuted", "#cccccc")
-    readonly property color borderColor: pick("borderColor", "#9B4F96")
+    readonly property color bgDark: pick("bgDark", Theme.bgDark)
+    readonly property color bgDarker: pick("bgDarker", Theme.bgDarker)
+    readonly property color bgMedium: pick("bgMedium", Theme.bgMedium)
+    readonly property color bgLight: pick("bgLight", Theme.bgLight)
+    readonly property color accentPink: pick("accentPink", Theme.accentPink)
+    readonly property color accentBlue: pick("accentBlue", Theme.accentBlue)
+    readonly property color accentMagenta: pick("accentMagenta", Theme.accentMagenta)
+    readonly property color accentPurple: pick("accentPurple", Theme.accentPurple)
+    readonly property color accentOrange: pick("accentOrange", Theme.accentOrange)
+    readonly property color textLight: pick("textLight", Theme.textLight)
+    readonly property color textMuted: pick("textMuted", Theme.textMuted)
+    readonly property color borderColor: pick("borderColor", Theme.borderColor)
+    readonly property color successColor: pick("successColor", Theme.successColor)
 }

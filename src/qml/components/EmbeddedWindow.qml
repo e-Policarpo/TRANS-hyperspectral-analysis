@@ -8,8 +8,12 @@
  * License: GPL
  */
 
-import QtQuick 2.15
-import QtQuick.Controls 2.15
+// QtQuick is imported UNVERSIONED on purpose. `Item.palette` arrived in
+// revision 6.0, and a pinned `import QtQuick 2.15` hides every property added
+// after 2.15 — with the pin in place the palette block below is a hard load
+// error ("Cannot assign to non-existent property"), not a silent no-op.
+import QtQuick
+import QtQuick.Controls
 import QtQuick.Layouts 1.15
 
 Item {
@@ -56,17 +60,55 @@ Item {
     // Backend reference for tool content
     property var backend: null
 
-    // Theme colors - reactive bindings to main window
+    // Theme colours. Straight from the Theme singleton rather than from
+    // `ApplicationWindow.window`: this Item is created with createObject() by
+    // WindowManager, so its host is whatever it happens to be reparented into,
+    // and an attached-property lookup that comes back null used to drop all
+    // nine colours onto fallbacks from a scheme that no longer exists.
+    // The full palette is carried, not the nine it used to have, so a tool
+    // hosted here can reach every colour through its host.
+    property color bgDark: Theme.bgDark
+    property color bgDarker: Theme.bgDarker
+    property color bgMedium: Theme.bgMedium
+    property color bgLight: Theme.bgLight
+    property color textLight: Theme.textLight
+    property color textMuted: Theme.textMuted
+    property color accentPink: Theme.accentPink
+    property color accentBlue: Theme.accentBlue
+    property color accentMagenta: Theme.accentMagenta
+    property color accentPurple: Theme.accentPurple
+    property color accentOrange: Theme.accentOrange
+    property color borderColor: Theme.borderColor
+    property color successColor: Theme.successColor
+
+    // Kept so anything still reading `embeddedWindow.mainWin` keeps working.
+    // Nothing here depends on it any more.
     property var mainWin: ApplicationWindow.window
-    property color bgDark: mainWin ? mainWin.bgDark : "#1a1a2e"
-    property color bgDarker: mainWin ? mainWin.bgDarker : "#0d0d1a"
-    property color bgMedium: mainWin ? mainWin.bgMedium : "#2a2a3e"
-    property color bgLight: mainWin ? mainWin.bgLight : "#3a3a4e"
-    property color textLight: mainWin ? mainWin.textLight : "#ffffff"
-    property color textMuted: mainWin ? mainWin.textMuted : "#cccccc"
-    property color accentPink: mainWin ? mainWin.accentPink : "#F5A9B8"
-    property color accentBlue: mainWin ? mainWin.accentBlue : "#5BCEFA"
-    property color borderColor: mainWin ? mainWin.borderColor : "#9B4F96"
+
+    // ── The control palette ──────────────────────────────────────────────
+    // Unstyled Qt Quick Controls (a plain TextField, a plain Label, a GroupBox
+    // title) take their colours from the nearest ancestor that sets a palette
+    // role, and paint with the system appearance for every role nobody sets.
+    // In practice the application window's palette does reach this far — but
+    // only while this Item's chain of parents leads back to it. Setting the
+    // palette here makes a tool correct by construction: it no longer matters
+    // what it is reparented into, or whether the host is an ApplicationWindow
+    // at all. Roles not listed keep inheriting.
+    palette.window: bgDark
+    palette.windowText: textLight
+    palette.base: bgDarker            // editable field background
+    palette.alternateBase: bgMedium
+    palette.text: textLight
+    palette.button: bgLight
+    palette.buttonText: textLight
+    palette.highlight: accentPink     // selection
+    palette.highlightedText: bgDark
+    palette.placeholderText: textMuted
+    palette.mid: borderColor
+    palette.dark: bgDarker
+    palette.light: bgLight
+    palette.toolTipBase: bgMedium
+    palette.toolTipText: textLight
 
     // Z-order management
     property int baseZ: 100
@@ -190,6 +232,17 @@ Item {
                 radius: windowFrame.radius
                 z: 10  // Ensure title bar is above content
 
+                // The ink for everything drawn on the title bar. The three
+                // window-control glyphs used to be a hardcoded #FFFFFF, which
+                // is fine over the darkened accent of an active window and
+                // invisible over the bgLight of an inactive one on the eight
+                // light schemes — measured at 1.62:1 (Sunshine Valid) to
+                // 2.11:1 (Blahaj Light), i.e. you cannot see the close button
+                // on any tool window that is not focused. textPrimary on
+                // bgLight is an enforced pairing and clears 10:1 on every
+                // scheme, so the glyphs now use the same ink as the title.
+                readonly property color inkColor: isActive ? bgDarker : textLight
+
                 // Square off bottom corners
                 Rectangle {
                     anchors.bottom: parent.bottom
@@ -221,7 +274,7 @@ Item {
                         Text {
                             anchors.centerIn: parent
                             text: windowState === EmbeddedWindow.WindowState.Minimized ? "▢" : "−"
-                            color: "#FFFFFF"
+                            color: titleBar.inkColor
                             font.pixelSize: 14
                             font.bold: true
                         }
@@ -251,7 +304,7 @@ Item {
                         Text {
                             anchors.centerIn: parent
                             text: windowState === EmbeddedWindow.WindowState.Fullscreen ? "❐" : "□"
-                            color: "#FFFFFF"
+                            color: titleBar.inkColor
                             font.pixelSize: 12
                         }
 
@@ -274,7 +327,9 @@ Item {
                         Text {
                             anchors.centerIn: parent
                             text: "✕"
-                            color: "#FFFFFF"
+                            // White only over the red hover fill, which is
+                            // fixed and dark; the resting state follows the bar.
+                            color: closeArea.containsMouse ? "#FFFFFF" : titleBar.inkColor
                             font.pixelSize: 12
                             font.bold: true
                         }
@@ -427,16 +482,24 @@ Item {
                                 if (item.hasOwnProperty("closeWindow")) {
                                     item.closeWindow = function() { embeddedWindow.close() }
                                 }
-                                // Pass theme colors if the item expects them
-                                if (item.hasOwnProperty("bgDark")) item.bgDark = embeddedWindow.bgDark
-                                if (item.hasOwnProperty("bgMedium")) item.bgMedium = embeddedWindow.bgMedium
-                                if (item.hasOwnProperty("bgLight")) item.bgLight = embeddedWindow.bgLight
-                                if (item.hasOwnProperty("textLight")) item.textLight = embeddedWindow.textLight
-                                if (item.hasOwnProperty("textMuted")) item.textMuted = embeddedWindow.textMuted
-                                if (item.hasOwnProperty("accentPink")) item.accentPink = embeddedWindow.accentPink
-                                if (item.hasOwnProperty("accentBlue")) item.accentBlue = embeddedWindow.accentBlue
-                                if (item.hasOwnProperty("accentPurple")) item.accentPurple = embeddedWindow.borderColor
-                                if (item.hasOwnProperty("borderColor")) item.borderColor = embeddedWindow.borderColor
+                                // Theme colours are NOT pushed here, and must
+                                // not be. An imperative assignment in QML
+                                // destroys whatever binding the property held,
+                                // permanently — so nine lines of
+                                // `item.bgDark = embeddedWindow.bgDark` froze
+                                // every hosted tool on the scheme that was
+                                // current the moment its window opened, while
+                                // the four colours the push did NOT cover
+                                // (bgDarker, accentMagenta, accentOrange,
+                                // successColor) and every Tool* component went
+                                // on tracking the scheme. The result was two
+                                // palettes in one panel: near-white ToolSection
+                                // boxes carrying frozen white labels at 1.28:1.
+                                //
+                                // Every tool now declares its colours as
+                                // bindings against its host with the Theme
+                                // singleton as the fallback, so there is
+                                // nothing left to push.
                             }
                         }
                     }

@@ -104,6 +104,12 @@ FloatingEntity {
 
                     // Draw selection
                     if (selectedX >= 0 && selectedY >= 0) {
+                        // White, and deliberately not from the scheme. This stroke lands
+                        // on the colormap, not on the window: its job is to be seen
+                        // against viridis or inferno at whatever value happens to be
+                        // under it, and a scheme colour has no relationship to that.
+                        // (It is genuinely weak over a pale cell — the fix there is a
+                        // two-tone stroke, dark under light, not a palette binding.)
                         ctx.strokeStyle = "#ffffff"
                         ctx.lineWidth = 2
                         ctx.strokeRect(selectedX * pixelW, selectedY * pixelH, pixelW, pixelH)

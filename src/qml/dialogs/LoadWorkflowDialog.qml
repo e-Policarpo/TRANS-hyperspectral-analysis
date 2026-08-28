@@ -11,6 +11,7 @@ import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
 import Qt.labs.platform 1.1 as Platform
+import "../components"   // the Theme singleton
 
 Dialog {
     id: dialog
@@ -27,15 +28,20 @@ Dialog {
 
     // Theme colors - reactive bindings to main window
     property var mainWin: ApplicationWindow.window
-    property color bgDark: mainWin ? mainWin.bgDark : "#1a1a2e"
-    property color bgMedium: mainWin ? mainWin.bgMedium : "#2a2a3e"
-    property color bgLight: mainWin ? mainWin.bgLight : "#2d2d3e"
-    property color textLight: mainWin ? mainWin.textLight : "#e0e0e0"
-    property color textMuted: mainWin ? mainWin.textMuted : "#B0A0B8"
-    property color accentPink: mainWin ? mainWin.accentPink : "#F5A9B8"
-    property color accentBlue: mainWin ? mainWin.accentBlue : "#5BCEFA"
-    property color accentGreen: "#66ff99"  // Keep status color
-    property color borderColor: mainWin ? mainWin.borderColor : "#7B3F76"
+    property color bgDark: (mainWin && mainWin.bgDark !== undefined) ? mainWin.bgDark : Theme.bgDark
+    property color bgMedium: (mainWin && mainWin.bgMedium !== undefined) ? mainWin.bgMedium : Theme.bgMedium
+    property color bgLight: (mainWin && mainWin.bgLight !== undefined) ? mainWin.bgLight : Theme.bgLight
+    property color textLight: (mainWin && mainWin.textLight !== undefined) ? mainWin.textLight : Theme.textLight
+    property color textMuted: (mainWin && mainWin.textMuted !== undefined) ? mainWin.textMuted : Theme.textMuted
+    property color accentPink: (mainWin && mainWin.accentPink !== undefined) ? mainWin.accentPink : Theme.accentPink
+    property color accentBlue: (mainWin && mainWin.accentBlue !== undefined) ? mainWin.accentBlue : Theme.accentBlue
+    // "It worked" — semantic, so it stays green, but from the scheme's
+    // `success` key rather than a fixed one.
+    property color accentGreen: (mainWin && mainWin.successColor !== undefined) ? mainWin.successColor : Theme.successColor
+    property color borderColor: (mainWin && mainWin.borderColor !== undefined) ? mainWin.borderColor : Theme.borderColor
+    // The scheme's `error` key. Delete affordances read off it so a
+    // destructive button stays a warning colour without spelling one out.
+    property color accentMagenta: (mainWin && mainWin.accentMagenta !== undefined) ? mainWin.accentMagenta : Theme.accentMagenta
 
     background: Rectangle {
         color: bgLight
@@ -141,8 +147,8 @@ Dialog {
                                 }
 
                                 background: Rectangle {
-                                    color: parent.pressed ? "#C00260" :
-                                           (parent.hovered ? "#D60270" : bgLight)
+                                    color: parent.pressed ? Qt.darker(accentMagenta, 1.3) :
+                                           (parent.hovered ? accentMagenta : bgLight)
                                     border.color: borderColor
                                     border.width: 1
                                     radius: 3
@@ -220,7 +226,7 @@ Dialog {
                 }
 
                 background: Rectangle {
-                    color: parent.hovered ? "#8B4F86" : bgDark
+                    color: parent.hovered ? bgLight : bgDark
                     border.color: accentGreen
                     border.width: 2
                     radius: 4

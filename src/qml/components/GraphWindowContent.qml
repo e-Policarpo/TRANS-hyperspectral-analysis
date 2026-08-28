@@ -36,16 +36,20 @@ Item {
 
     // Theme colors - reactive bindings to main window
     property var mainWin: ApplicationWindow.window
-    property color bgDark: mainWin ? mainWin.bgDark : "#1a1a2e"
-    property color bgDarker: mainWin ? mainWin.bgDarker : "#0d0d1a"
-    property color bgMedium: mainWin ? mainWin.bgMedium : "#2a2a3e"
-    property color bgLight: mainWin ? mainWin.bgLight : "#3a3a4e"
-    property color accentPink: mainWin ? mainWin.accentPink : "#F5A9B8"
-    property color accentBlue: mainWin ? mainWin.accentBlue : "#5BCEFA"
-    property color accentPurple: mainWin ? mainWin.accentPurple : "#9B4F96"
-    property color textLight: mainWin ? mainWin.textLight : "#ffffff"
-    property color textMuted: mainWin ? mainWin.textMuted : "#cccccc"
-    property color borderColor: mainWin ? mainWin.borderColor : "#9B4F96"
+    property color bgDark: (mainWin && mainWin.bgDark !== undefined) ? mainWin.bgDark : Theme.bgDark
+    property color bgDarker: (mainWin && mainWin.bgDarker !== undefined) ? mainWin.bgDarker : Theme.bgDarker
+    property color bgMedium: (mainWin && mainWin.bgMedium !== undefined) ? mainWin.bgMedium : Theme.bgMedium
+    property color bgLight: (mainWin && mainWin.bgLight !== undefined) ? mainWin.bgLight : Theme.bgLight
+    property color accentPink: (mainWin && mainWin.accentPink !== undefined) ? mainWin.accentPink : Theme.accentPink
+    property color accentBlue: (mainWin && mainWin.accentBlue !== undefined) ? mainWin.accentBlue : Theme.accentBlue
+    property color accentPurple: (mainWin && mainWin.accentPurple !== undefined) ? mainWin.accentPurple : Theme.accentPurple
+    property color textLight: (mainWin && mainWin.textLight !== undefined) ? mainWin.textLight : Theme.textLight
+    property color textMuted: (mainWin && mainWin.textMuted !== undefined) ? mainWin.textMuted : Theme.textMuted
+    property color borderColor: (mainWin && mainWin.borderColor !== undefined) ? mainWin.borderColor : Theme.borderColor
+    // The scheme's `error` key, for destructive affordances — delete
+    // buttons and invalid-state warnings. Semantic, so it keeps the
+    // warning reading; from the scheme, so it is not a fixed red.
+    property color accentMagenta: (mainWin && mainWin.accentMagenta !== undefined) ? mainWin.accentMagenta : Theme.accentMagenta
     property string monoFont: mainWin ? mainWin.fontFamilyMono : (Qt.platform.os === "osx" ? "Menlo" : "Consolas")
 
     // Define size for scrolling
@@ -389,6 +393,16 @@ Item {
                             showGrid: true
                             showLegend: true
 
+                            // Chrome from the scheme.
+                            backgroundColor: root.bgDark
+                            foregroundColor: root.textMuted
+                            // borderColor, not bgLight: this draws the axes frame and the
+                            // gridlines, and bgLight-on-bgDark measures 1.12:1 to 1.54:1 on
+                            // all 22 schemes — the frame came out fainter than either
+                            // candidate and the painted gridline at 1.02–1.08:1, i.e. no
+                            // visible box on any scheme. borderColor wins on 21 of the 22.
+                            gridColor: root.borderColor
+
                             onCursorMoved: function(x, y) {
                                 cursorDisplay.text = "X: " + x.toFixed(4) + ", Y: " + y.toExponential(3)
                             }
@@ -630,7 +644,7 @@ Item {
                                         graphCanvas.removeCurve(model.curveId)
                                     }
                                     background: Rectangle {
-                                        color: parent.hovered ? "#FF6B6B" : "transparent"
+                                        color: parent.hovered ? accentMagenta : "transparent"
                                         radius: 3
                                     }
                                     contentItem: Text {
@@ -666,9 +680,9 @@ Item {
                                 graphCanvas.clearCurves()
                             }
                             background: Rectangle {
-                                color: parent.hovered ? "#FF6B6B" : bgLight
+                                color: parent.hovered ? accentMagenta : bgLight
                                 radius: 4
-                                border.color: "#FF6B6B"
+                                border.color: accentMagenta
                             }
                             contentItem: Text {
                                 text: parent.text

@@ -25,13 +25,16 @@ Item {
 
     signal selectionChanged()
 
-    // Theme colors (same knobs as DatasetComboBox so tools can theme both alike)
-    property color bgColor: "#3a3a4e"
-    property color borderColorNormal: "#9B4F96"
-    property color borderColorFocus: "#F5A9B8"
-    property color textColor: "#ffffff"
-    property color textMutedColor: "#cccccc"
-    property color selectionColor: "#F5A9B8"
+    // Same knobs as DatasetComboBox so tools can theme both alike.
+    // follow the scheme, which is what a control dropped into a tool
+    // panel needs — these were the 2018 defaults, so an unoverridden
+    // combo painted itself in a palette the app no longer has.
+    property color bgColor: Theme.bgLight
+    property color borderColorNormal: Theme.borderColor
+    property color borderColorFocus: Theme.accentPink
+    property color textColor: Theme.textLight
+    property color textMutedColor: Theme.textMuted
+    property color selectionColor: Theme.accentPink
 
     implicitHeight: layout.implicitHeight
     implicitWidth: 220

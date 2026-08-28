@@ -31,18 +31,31 @@ Item {
     function acceptDatasetDrop(names) { datasetList.addToSelection(names) }
 
     property var parentWindow: Window.window
-    function themeColor(name, fallback) {
-        return (parentWindow && parentWindow[name] !== undefined
-                && parentWindow[name] !== null) ? parentWindow[name] : fallback
-    }
-    property color bgDark: themeColor("bgDark", "#1a1a2e")
-    property color bgMedium: themeColor("bgMedium", "#2a2a3e")
-    property color bgLight: themeColor("bgLight", "#3a3a4e")
-    property color accentPink: themeColor("accentPink", "#F5A9B8")
-    property color accentBlue: themeColor("accentBlue", "#5BCEFA")
-    property color accentPurple: themeColor("accentPurple", "#9B4F96")
-    property color textLight: themeColor("textLight", "#ffffff")
-    property color textMuted: themeColor("textMuted", "#cccccc")
+    // Each colour is resolved explicitly, and the property is named as a
+    // literal rather than looked up by string.
+    //
+    // That distinction is the whole point. This used to read
+    // parentWindow[name] inside a themeColor() helper, and a subscript is
+    // something QML cannot register as a binding dependency — so the binding
+    // was evaluated once and never again. Measured: switching the scheme from
+    // "Just Dark Mode" to a light one moved the window's own bgDark from
+    // #1a1a1a to #f5f0f8 while this tool's bgDark stayed #1a1a1a, and the
+    // canvases under it stayed dark inside a light window. Naming the
+    // property directly makes it a real dependency, so a scheme change
+    // arrives here the moment the window sees it.
+    //
+    // The `!== undefined` guard stays: reading a colour the host does not
+    // carry yields undefined, which lands as an invalid QColor and paints
+    // text black-on-black. Theme is the fallback — a singleton nothing has to
+    // locate, so it cannot be missing.
+    property color bgDark: (parentWindow && parentWindow.bgDark !== undefined) ? parentWindow.bgDark : Theme.bgDark
+    property color bgMedium: (parentWindow && parentWindow.bgMedium !== undefined) ? parentWindow.bgMedium : Theme.bgMedium
+    property color bgLight: (parentWindow && parentWindow.bgLight !== undefined) ? parentWindow.bgLight : Theme.bgLight
+    property color accentPink: (parentWindow && parentWindow.accentPink !== undefined) ? parentWindow.accentPink : Theme.accentPink
+    property color accentBlue: (parentWindow && parentWindow.accentBlue !== undefined) ? parentWindow.accentBlue : Theme.accentBlue
+    property color accentPurple: (parentWindow && parentWindow.accentPurple !== undefined) ? parentWindow.accentPurple : Theme.accentPurple
+    property color textLight: (parentWindow && parentWindow.textLight !== undefined) ? parentWindow.textLight : Theme.textLight
+    property color textMuted: (parentWindow && parentWindow.textMuted !== undefined) ? parentWindow.textMuted : Theme.textMuted
 
     property bool running: false
 

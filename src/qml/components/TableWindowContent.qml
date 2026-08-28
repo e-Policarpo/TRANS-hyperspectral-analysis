@@ -32,16 +32,20 @@ Item {
 
     // Theme colors - reactive bindings to main window
     property var mainWin: ApplicationWindow.window
-    property color bgDark: mainWin ? mainWin.bgDark : "#1a1a2e"
-    property color bgDarker: mainWin ? mainWin.bgDarker : "#0d0d1a"
-    property color bgMedium: mainWin ? mainWin.bgMedium : "#2a2a3e"
-    property color bgLight: mainWin ? mainWin.bgLight : "#3a3a4e"
-    property color accentPink: mainWin ? mainWin.accentPink : "#F5A9B8"
-    property color accentBlue: mainWin ? mainWin.accentBlue : "#5BCEFA"
-    property color accentPurple: mainWin ? mainWin.accentPurple : "#9B4F96"
-    property color textLight: mainWin ? mainWin.textLight : "#ffffff"
-    property color textMuted: mainWin ? mainWin.textMuted : "#cccccc"
-    property color borderColor: mainWin ? mainWin.borderColor : "#9B4F96"
+    property color bgDark: (mainWin && mainWin.bgDark !== undefined) ? mainWin.bgDark : Theme.bgDark
+    property color bgDarker: (mainWin && mainWin.bgDarker !== undefined) ? mainWin.bgDarker : Theme.bgDarker
+    property color bgMedium: (mainWin && mainWin.bgMedium !== undefined) ? mainWin.bgMedium : Theme.bgMedium
+    property color bgLight: (mainWin && mainWin.bgLight !== undefined) ? mainWin.bgLight : Theme.bgLight
+    property color accentPink: (mainWin && mainWin.accentPink !== undefined) ? mainWin.accentPink : Theme.accentPink
+    property color accentBlue: (mainWin && mainWin.accentBlue !== undefined) ? mainWin.accentBlue : Theme.accentBlue
+    property color accentPurple: (mainWin && mainWin.accentPurple !== undefined) ? mainWin.accentPurple : Theme.accentPurple
+    property color textLight: (mainWin && mainWin.textLight !== undefined) ? mainWin.textLight : Theme.textLight
+    property color textMuted: (mainWin && mainWin.textMuted !== undefined) ? mainWin.textMuted : Theme.textMuted
+    property color borderColor: (mainWin && mainWin.borderColor !== undefined) ? mainWin.borderColor : Theme.borderColor
+    // The scheme's `error` key, for destructive affordances — delete
+    // buttons and invalid-state warnings. Semantic, so it keeps the
+    // warning reading; from the scheme, so it is not a fixed red.
+    property color accentMagenta: (mainWin && mainWin.accentMagenta !== undefined) ? mainWin.accentMagenta : Theme.accentMagenta
     property string monoFont: mainWin ? mainWin.fontFamilyMono : (Qt.platform.os === "osx" ? "Menlo" : "Consolas")
 
     implicitWidth: mainLayout.implicitWidth
@@ -509,7 +513,7 @@ Item {
                                    inRange   ? Qt.rgba(0.357, 0.808, 0.98, 0.13) :
                                                (gridRow % 2 === 0) ? bgDark : bgDarker
 
-                            border.color: isCurrent ? accentBlue : "#333333"
+                            border.color: isCurrent ? accentBlue : borderColor
                             border.width: isCurrent ? 2 : 0.5
 
                             Text {
@@ -1343,7 +1347,10 @@ Item {
                                 Text {
                                     anchors.centerIn: parent
                                     text: "X"
-                                    color: model.assignment === "x" ? "#000000" : textMuted
+                                    // Not a fixed ink: which of the two reads on this fill depends
+                                    // on the scheme (bgDark on accentSecondary is 2.42:1 on
+                                    // Tropical Panchito and 12.06:1 on Attracted to Pans).
+                                    color: model.assignment === "x" ? Theme.ink(accentBlue) : textMuted
                                     font.pixelSize: 10
                                     font.bold: model.assignment === "x"
                                 }
@@ -1379,7 +1386,7 @@ Item {
                                 Text {
                                     anchors.centerIn: parent
                                     text: "Y"
-                                    color: model.assignment === "y" ? "#000000" : textMuted
+                                    color: model.assignment === "y" ? Theme.ink(accentPink) : textMuted
                                     font.pixelSize: 10
                                     font.bold: model.assignment === "y"
                                 }
@@ -1433,7 +1440,7 @@ Item {
                     text: plotDialog.plotXCol >= 0
                           ? (plotDialog.plotYCount > 0 ? plotDialog.plotYCount + " curve(s) ready" : "Select Y column(s)")
                           : "Select an X column"
-                    color: (plotDialog.plotXCol >= 0 && plotDialog.plotYCount > 0) ? accentBlue : "#ff6666"
+                    color: (plotDialog.plotXCol >= 0 && plotDialog.plotYCount > 0) ? accentBlue : accentMagenta
                     font.pixelSize: 10
                 }
             }

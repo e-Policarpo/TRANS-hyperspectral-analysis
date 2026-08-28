@@ -24,18 +24,35 @@ Item {
     property var closeWindow: null
 
     property var parentWindow: Window.window
-    function themeColor(name, fallback) {
-        return (parentWindow && parentWindow[name] !== undefined
-                && parentWindow[name] !== null) ? parentWindow[name] : fallback
-    }
-    property color bgDark: themeColor("bgDark", "#1a1a2e")
-    property color bgMedium: themeColor("bgMedium", "#2a2a3e")
-    property color bgLight: themeColor("bgLight", "#3a3a4e")
-    property color accentPink: themeColor("accentPink", "#F5A9B8")
-    property color accentBlue: themeColor("accentBlue", "#5BCEFA")
-    property color accentPurple: themeColor("accentPurple", "#9B4F96")
-    property color textLight: themeColor("textLight", "#ffffff")
-    property color textMuted: themeColor("textMuted", "#cccccc")
+    // Each colour is resolved explicitly, and the property is named as a
+    // literal rather than looked up by string.
+    //
+    // That distinction is the whole point. This used to read
+    // parentWindow[name] inside a themeColor() helper, and a subscript is
+    // something QML cannot register as a binding dependency — so the binding
+    // was evaluated once and never again. Measured: switching the scheme from
+    // "Just Dark Mode" to a light one moved the window's own bgDark from
+    // #1a1a1a to #f5f0f8 while this tool's bgDark stayed #1a1a1a, and the
+    // canvases under it stayed dark inside a light window. Naming the
+    // property directly makes it a real dependency, so a scheme change
+    // arrives here the moment the window sees it.
+    //
+    // The `!== undefined` guard stays: reading a colour the host does not
+    // carry yields undefined, which lands as an invalid QColor and paints
+    // text black-on-black. Theme is the fallback — a singleton nothing has to
+    // locate, so it cannot be missing.
+    property color bgDark: (parentWindow && parentWindow.bgDark !== undefined) ? parentWindow.bgDark : Theme.bgDark
+    property color bgMedium: (parentWindow && parentWindow.bgMedium !== undefined) ? parentWindow.bgMedium : Theme.bgMedium
+    property color bgLight: (parentWindow && parentWindow.bgLight !== undefined) ? parentWindow.bgLight : Theme.bgLight
+    property color accentPink: (parentWindow && parentWindow.accentPink !== undefined) ? parentWindow.accentPink : Theme.accentPink
+    property color accentBlue: (parentWindow && parentWindow.accentBlue !== undefined) ? parentWindow.accentBlue : Theme.accentBlue
+    property color accentPurple: (parentWindow && parentWindow.accentPurple !== undefined) ? parentWindow.accentPurple : Theme.accentPurple
+    property color textLight: (parentWindow && parentWindow.textLight !== undefined) ? parentWindow.textLight : Theme.textLight
+    property color textMuted: (parentWindow && parentWindow.textMuted !== undefined) ? parentWindow.textMuted : Theme.textMuted
+    // The rule colour. Declared because the canvas below binds gridColor to
+    // it — undeclared, that binding assigns `undefined`, which QML reports
+    // once at load and then leaves the canvas on its default grid forever.
+    property color borderColor: (parentWindow && parentWindow.borderColor !== undefined) ? parentWindow.borderColor : Theme.borderColor
 
     // The measured energies a candidate was fitted to, when the window was
     // opened from the designer. Drawn across the well so the numerical
@@ -338,6 +355,30 @@ Item {
             Layout.fillHeight: true
             backgroundColor: root.bgDark
             foregroundColor: root.textMuted
+            // gridColor draws the spines and the gridlines. borderColor —
+            // which is what a rule IS in this scheme — and NOT bgLight.
+            // bgLight was chosen to dodge the advisory borderColor pairing,
+            // but measured on all 22 schemes bgLight-on-bgDark runs
+            // 1.12:1 to 1.54:1, so the frame was fainter than either
+            // candidate and the painted gridline came out at 1.02–1.08:1:
+            // no visible box at all, on every scheme. borderColor is the
+            // higher-contrast choice in 21 of the 22.
+            gridColor: root.borderColor
+            // The semantic scale. These four were added to FigureCanvasItem and
+            // bound at no site at all, so every canvas painted the class defaults
+            // (#5BCEFA / #2ECC71 / #FF9800 / #FF6B6B) whatever the scheme said —
+            // dark-tuned marks at 1.6:1 to 2.6:1 on a light scheme's near-white
+            // ground, and #5BCEFA is byte-identical to a series colour it is
+            // meant to be read against.
+            //
+            // They bind to the Theme singleton directly rather than through the
+            // host: these are meanings, not decoration, and no window overrides
+            // them. The canvas guards them — if a scheme's three scale colours
+            // are too close to tell apart it keeps the fixed triple instead.
+            accentColor: Theme.accentPink
+            successColor: Theme.successColor
+            warningColor: Theme.warningColor
+            errorColor: Theme.errorColor
         }
     }
 }

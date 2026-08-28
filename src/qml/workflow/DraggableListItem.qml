@@ -10,6 +10,7 @@ import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
+import "../components"   // the Theme singleton
 
 Rectangle {
     id: dragItem
@@ -22,15 +23,21 @@ Rectangle {
 
     // Theme colors - find parent window
     property var parentWindow: Window.window
-    property color bgDark: parentWindow && parentWindow.bgDark ? parentWindow.bgDark : "#1a1a2e"
-    property color bgMedium: parentWindow && parentWindow.bgMedium ? parentWindow.bgMedium : "#2a2a3e"
-    property color bgLight: parentWindow && parentWindow.bgLight ? parentWindow.bgLight : "#3a3a4e"
-    property color accentPink: parentWindow && parentWindow.accentPink ? parentWindow.accentPink : "#F5A9B8"
-    property color accentBlue: parentWindow && parentWindow.accentBlue ? parentWindow.accentBlue : "#5BCEFA"
-    property color accentGreen: "#66ff99"  // Keep status color
-    property color textLight: parentWindow && parentWindow.textLight ? parentWindow.textLight : "#ffffff"
-    property color textMuted: parentWindow && parentWindow.textMuted ? parentWindow.textMuted : "#cccccc"
-    property color borderColor: parentWindow && parentWindow.borderColor ? parentWindow.borderColor : "#9B4F96"
+    property color bgDark: (parentWindow && parentWindow.bgDark !== undefined) ? parentWindow.bgDark : Theme.bgDark
+    property color bgMedium: (parentWindow && parentWindow.bgMedium !== undefined) ? parentWindow.bgMedium : Theme.bgMedium
+    property color bgLight: (parentWindow && parentWindow.bgLight !== undefined) ? parentWindow.bgLight : Theme.bgLight
+    property color accentPink: (parentWindow && parentWindow.accentPink !== undefined) ? parentWindow.accentPink : Theme.accentPink
+    property color accentBlue: (parentWindow && parentWindow.accentBlue !== undefined) ? parentWindow.accentBlue : Theme.accentBlue
+    // Status colours. Green means "valid / connected", the error red means
+    // "this will not run" — semantics, not decoration, so they keep their
+    // hue rather than taking an accent. They still come from the palette:
+    // every scheme carries a `success` and an `error` key for exactly this,
+    // and Theme publishes them as successColor and accentMagenta. (The amber
+    // warning below has no home on Theme yet; it is left fixed until it does.)
+    property color accentGreen: (parentWindow && parentWindow.successColor !== undefined) ? parentWindow.successColor : Theme.successColor
+    property color textLight: (parentWindow && parentWindow.textLight !== undefined) ? parentWindow.textLight : Theme.textLight
+    property color textMuted: (parentWindow && parentWindow.textMuted !== undefined) ? parentWindow.textMuted : Theme.textMuted
+    property color borderColor: (parentWindow && parentWindow.borderColor !== undefined) ? parentWindow.borderColor : Theme.borderColor
 
     signal itemMoved(int fromIndex, int toIndex)
     signal itemEnabledToggled(int index, bool enabled)

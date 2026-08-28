@@ -11,6 +11,7 @@ import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Dialogs
 import QtQuick.Window 2.15
+import "../components"   // the Theme singleton
 
 // Map Discretizer Tool
 Item {
@@ -19,14 +20,14 @@ Item {
 
     // Theme colors - reactive bindings to parent DraggableWindow
     property var parentWindow: Window.window
-    property color bgDark: parentWindow ? parentWindow.bgDark : "#1a1a2e"
-    property color bgMedium: parentWindow ? parentWindow.bgMedium : "#2a2a3e"
-    property color bgLight: parentWindow ? parentWindow.bgLight : "#3a3a4e"
-    property color accentPink: parentWindow ? parentWindow.accentPink : "#F5A9B8"
-    property color accentBlue: parentWindow ? parentWindow.accentBlue : "#5BCEFA"
-    property color accentPurple: parentWindow ? parentWindow.accentPurple : "#9B4F96"
-    property color textLight: parentWindow ? parentWindow.textLight : "#ffffff"
-    property color textMuted: parentWindow ? parentWindow.textMuted : "#cccccc"
+    property color bgDark: (parentWindow && parentWindow.bgDark !== undefined) ? parentWindow.bgDark : Theme.bgDark
+    property color bgMedium: (parentWindow && parentWindow.bgMedium !== undefined) ? parentWindow.bgMedium : Theme.bgMedium
+    property color bgLight: (parentWindow && parentWindow.bgLight !== undefined) ? parentWindow.bgLight : Theme.bgLight
+    property color accentPink: (parentWindow && parentWindow.accentPink !== undefined) ? parentWindow.accentPink : Theme.accentPink
+    property color accentBlue: (parentWindow && parentWindow.accentBlue !== undefined) ? parentWindow.accentBlue : Theme.accentBlue
+    property color accentPurple: (parentWindow && parentWindow.accentPurple !== undefined) ? parentWindow.accentPurple : Theme.accentPurple
+    property color textLight: (parentWindow && parentWindow.textLight !== undefined) ? parentWindow.textLight : Theme.textLight
+    property color textMuted: (parentWindow && parentWindow.textMuted !== undefined) ? parentWindow.textMuted : Theme.textMuted
 
     FileDialog {
         id: imageFileDialog
@@ -64,6 +65,17 @@ Item {
                 anchors.fill: parent
 
                 TextField {
+                    // A bare TextField takes the style's own palette, which under the
+                    // Basic style is a light one — white ground, black text — regardless
+                    // of what the window around it is painted. Say it explicitly.
+                    color: root.textLight
+                    placeholderTextColor: root.textMuted
+                    background: Rectangle {
+                        color: root.bgDark
+                        border.color: root.bgLight
+                        border.width: 1
+                        radius: 4
+                    }
                     id: imagePathField
                     Layout.fillWidth: true
                     placeholderText: "Select map image..."
@@ -89,6 +101,17 @@ Item {
 
                 Label { text: "Target Size X:" }
                 TextField {
+                    // A bare TextField takes the style's own palette, which under the
+                    // Basic style is a light one — white ground, black text — regardless
+                    // of what the window around it is painted. Say it explicitly.
+                    color: root.textLight
+                    placeholderTextColor: root.textMuted
+                    background: Rectangle {
+                        color: root.bgDark
+                        border.color: root.bgLight
+                        border.width: 1
+                        radius: 4
+                    }
                     id: targetXField
                     Layout.preferredWidth: 80
                     text: "50"
@@ -100,6 +123,17 @@ Item {
 
                 Label { text: "Target Size Y:" }
                 TextField {
+                    // A bare TextField takes the style's own palette, which under the
+                    // Basic style is a light one — white ground, black text — regardless
+                    // of what the window around it is painted. Say it explicitly.
+                    color: root.textLight
+                    placeholderTextColor: root.textMuted
+                    background: Rectangle {
+                        color: root.bgDark
+                        border.color: root.bgLight
+                        border.width: 1
+                        radius: 4
+                    }
                     id: targetYField
                     Layout.preferredWidth: 80
                     text: "50"

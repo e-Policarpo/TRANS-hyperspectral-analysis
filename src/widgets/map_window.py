@@ -26,10 +26,40 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 
+#: The palette this window falls back to when nobody hands it the scheme.
+#: These are the values it used to hardcode, so a caller that has not been
+#: updated gets exactly the window it got before.
+FALLBACK_COLORS = {
+    'bgDark': '#1a1a1a',
+    'bgDarker': '#0d0d0d',
+    'bgMedium': '#2a2a2a',
+    'bgLight': '#3a3a3a',
+    'textPrimary': '#ffffff',
+    'textMuted': '#cccccc',
+    'borderColor': '#555555',
+    'accentPrimary': '#ff66b2',
+}
+
+
+def _palette(colors):
+    """A complete palette from whatever the caller supplied.
+
+    A scheme dict straight off ``PreferencesManager.getCurrentScheme()`` has
+    every key; a partial dict, or None, is filled from the values this window
+    used to hardcode. Missing a key must never leave a colour unset — an
+    unset colour here is a black label on a black ground.
+    """
+    palette = dict(FALLBACK_COLORS)
+    if isinstance(colors, dict):
+        palette.update({k: v for k, v in colors.items() if v})
+    return palette
+
+
 class MapCanvas(FigureCanvasQTAgg):
     """Matplotlib canvas for map visualization"""
 
-    def __init__(self, parent=None, width=8, height=6, dpi=100):
+    def __init__(self, parent=None, width=8, height=6, dpi=100, colors=None):
+        self.colors = _palette(colors)
         self.figure = Figure(figsize=(width, height), dpi=dpi)
         self.axes = self.figure.add_subplot(111)
         super().__init__(self.figure)
@@ -40,19 +70,27 @@ class MapCanvas(FigureCanvasQTAgg):
         self.colorbar = None
         self.current_cmap = 'viridis'
 
-        self._apply_dark_theme()
+        self._apply_theme()
         self.figure.tight_layout()
 
-    def _apply_dark_theme(self):
-        """Apply dark theme to plot"""
-        self.axes.set_facecolor('#1a1a1a')
-        self.figure.patch.set_facecolor('#0d0d0d')
-        self.axes.tick_params(colors='#ffffff', which='both')
+    def _apply_theme(self):
+        """Paint the plot chrome in the scheme the caller handed over.
+
+        This used to be ``_apply_dark_theme`` and was exactly that: a figure
+        nailed to #0d0d0d with white ink, on a window nailed to #1a1a1a. It
+        is the last plotting surface in the app that did not follow the
+        colour scheme, and on any of the eight light schemes it opened as a
+        near-black rectangle on top of a near-white application.
+        """
+        c = self.colors
+        self.axes.set_facecolor(c['bgDark'])
+        self.figure.patch.set_facecolor(c['bgDarker'])
+        self.axes.tick_params(colors=c['textMuted'], which='both')
         for spine in self.axes.spines.values():
-            spine.set_color('#ffffff')
-        self.axes.xaxis.label.set_color('#ffffff')
-        self.axes.yaxis.label.set_color('#ffffff')
-        self.axes.title.set_color('#ffffff')
+            spine.set_color(c['borderColor'])
+        self.axes.xaxis.label.set_color(c['textMuted'])
+        self.axes.yaxis.label.set_color(c['textMuted'])
+        self.axes.title.set_color(c['textPrimary'])
 
     def load_map(self, map_path: str):
         """Load map from file (supports PNG, TIFF, CSV)"""
@@ -99,7 +137,7 @@ class MapCanvas(FigureCanvasQTAgg):
             self.current_cmap = cmap
 
         self.axes.clear()
-        self._apply_dark_theme()
+        self._apply_theme()
 
         # Display image
         self.image_obj = self.axes.imshow(
@@ -114,15 +152,14 @@ class MapCanvas(FigureCanvasQTAgg):
             self.colorbar.remove()
 
         self.colorbar = self.figure.colorbar(self.image_obj, ax=self.axes)
-        self.colorbar.ax.yaxis.set_tick_params(color='#ffffff')
-        self.colorbar.ax.yaxis.set_ticklabels(
-            [t.get_text() for t in self.colorbar.ax.yaxis.get_ticklabels()],
-            color='#ffffff'
-        )
+        self.colorbar.ax.yaxis.set_tick_params(color=self.colors['textMuted'],
+                                               labelcolor=self.colors['textMuted'])
+        self.colorbar.ax.set_facecolor(self.colors['bgDark'])
+        self.colorbar.outline.set_edgecolor(self.colors['borderColor'])
 
         # Labels
-        self.axes.set_xlabel('X (pixels)', color='#ffffff')
-        self.axes.set_ylabel('Y (pixels)', color='#ffffff')
+        self.axes.set_xlabel('X (pixels)', color=self.colors['textMuted'])
+        self.axes.set_ylabel('Y (pixels)', color=self.colors['textMuted'])
 
         self.figure.tight_layout()
         self.draw()
@@ -162,62 +199,72 @@ class MapVisualizationWindow(QMainWindow):
 
     closed = Signal()
 
-    def __init__(self, parent=None, map_path: str = None, map_data: np.ndarray = None, title: str = "Map"):
+    def __init__(self, parent=None, map_path: str = None, map_data: np.ndarray = None,
+                 title: str = "Map", colors: dict = None):
         super().__init__(parent)
 
+        # The scheme, handed in by whoever opens the window. It is passed
+        # rather than looked up because this is a plain QWidget window with no
+        # route to the QML engine's Theme singleton; AppBackend has the
+        # PreferencesManager and hands its colours over at both call sites.
+        self.colors = _palette(colors)
         self.map_path = map_path
         self.setWindowTitle(f"Map: {title}")
         self.resize(900, 700)
 
         # Apply dark theme
-        self.setStyleSheet("""
-            QMainWindow, QWidget {
-                background-color: #1a1a1a;
-                color: #ffffff;
-            }
-            QToolBar {
-                background-color: #2d2d2d;
-                border: 1px solid #404040;
+        # One f-string rather than nine literals: Qt Style Sheets do not
+        # cascade from the QML palette, so every colour in this window has to
+        # be written out, and writing them out is how it fell behind.
+        c = self.colors
+        self.setStyleSheet(f"""
+            QMainWindow, QWidget {{
+                background-color: {c['bgDark']};
+                color: {c['textPrimary']};
+            }}
+            QToolBar {{
+                background-color: {c['bgMedium']};
+                border: 1px solid {c['borderColor']};
                 spacing: 5px;
                 padding: 5px;
-            }
-            QComboBox, QPushButton, QSpinBox, QDoubleSpinBox {
-                background-color: #3a3a3a;
-                color: #ffffff;
-                border: 1px solid #555555;
+            }}
+            QComboBox, QPushButton, QSpinBox, QDoubleSpinBox {{
+                background-color: {c['bgLight']};
+                color: {c['textPrimary']};
+                border: 1px solid {c['borderColor']};
                 padding: 5px;
                 min-width: 80px;
-            }
-            QComboBox:hover, QPushButton:hover {
-                background-color: #4a4a4a;
-            }
-            QLabel {
-                color: #ffffff;
+            }}
+            QComboBox:hover, QPushButton:hover {{
+                background-color: {c['bgMedium']};
+            }}
+            QLabel {{
+                color: {c['textPrimary']};
                 padding: 2px;
-            }
-            QSlider::groove:horizontal {
-                background: #3a3a3a;
+            }}
+            QSlider::groove:horizontal {{
+                background: {c['bgLight']};
                 height: 6px;
                 border-radius: 3px;
-            }
-            QSlider::handle:horizontal {
-                background: #ff66b2;
+            }}
+            QSlider::handle:horizontal {{
+                background: {c['accentPrimary']};
                 width: 14px;
                 margin: -4px 0;
                 border-radius: 7px;
-            }
-            QGroupBox {
-                color: #ffffff;
-                border: 1px solid #404040;
+            }}
+            QGroupBox {{
+                color: {c['textPrimary']};
+                border: 1px solid {c['borderColor']};
                 border-radius: 3px;
                 margin-top: 10px;
                 padding-top: 10px;
-            }
-            QGroupBox::title {
+            }}
+            QGroupBox::title {{
                 subcontrol-origin: margin;
                 left: 10px;
                 padding: 0 3px;
-            }
+            }}
         """)
 
         self._setup_ui()
@@ -231,6 +278,7 @@ class MapVisualizationWindow(QMainWindow):
 
     def _setup_ui(self):
         """Setup user interface"""
+        c = self.colors
         # Central widget
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -241,15 +289,17 @@ class MapVisualizationWindow(QMainWindow):
         canvas_layout = QVBoxLayout()
 
         # Canvas
-        self.canvas = MapCanvas(self)
+        self.canvas = MapCanvas(self, colors=self.colors)
         canvas_layout.addWidget(self.canvas)
 
         # Matplotlib toolbar
         self.toolbar = NavigationToolbar2QT(self.canvas, self)
-        self.toolbar.setStyleSheet("""
-            QToolBar { background-color: #2d2d2d; border: none; }
-            QToolButton { background-color: #3a3a3a; border: 1px solid #555; margin: 2px; padding: 3px; }
-            QToolButton:hover { background-color: #4a4a4a; }
+        self.toolbar.setStyleSheet(f"""
+            QToolBar {{ background-color: {c['bgMedium']}; border: none; }}
+            QToolButton {{ background-color: {c['bgLight']};
+                           border: 1px solid {c['borderColor']};
+                           margin: 2px; padding: 3px; }}
+            QToolButton:hover {{ background-color: {c['bgMedium']}; }}
         """)
         canvas_layout.addWidget(self.toolbar)
 
@@ -405,7 +455,7 @@ class MapVisualizationWindow(QMainWindow):
 
             self.canvas.figure.savefig(
                 file_path, dpi=300, bbox_inches='tight',
-                facecolor='#0d0d0d', edgecolor='none'
+                facecolor=self.canvas.colors['bgDarker'], edgecolor='none'
             )
             logger.info(f"Map exported to: {file_path}")
 

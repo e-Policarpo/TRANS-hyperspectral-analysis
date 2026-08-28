@@ -1,4 +1,9 @@
 module components
+
+# The colour scheme, as one bindable object. Declared first because every
+# other component in here binds to it.
+singleton Theme 1.0 Theme.qml
+
 ProjectBrowser 1.0 ProjectBrowser.qml
 UnifiedWorkspace 1.0 UnifiedWorkspace.qml
 WindowManager 1.0 WindowManager.qml
