@@ -249,6 +249,9 @@ class QMLGraphCanvas(QQuickPaintedItem):
         self._background: str = "#1a1a1a"
         self._foreground: str = "#cccccc"
         self._grid_colour: str = "#444444"
+        # Interaction chrome. The default is the rubber band's own former
+        # literal, so a canvas nobody binds paints exactly what it used to.
+        self._accent: str = "#64c8ff"
         self._recomputeThemeColours()
 
         # Matplotlib setup
@@ -519,6 +522,22 @@ class QMLGraphCanvas(QQuickPaintedItem):
         self._NATIVE_LEGEND_BG = _with_alpha(self._legend_bg_colour, 230)
         self._NATIVE_LEGEND_BORDER = rules
 
+        # Interaction chrome. Both were literals tuned for the hardcoded
+        # #1a1a1a ground and washed out on the eight light schemes.
+        #
+        # The crosshair keeps its own hue: it is identity, like a series
+        # colour — the yellow dashed line IS the cursor — so it goes through
+        # readable_on rather than becoming the accent, and every dark scheme
+        # gets it back byte-identical. The selection box has no identity to
+        # protect; a selection is the canonical accent-coloured thing, so it
+        # follows accentColor. They stay tellable apart by form regardless:
+        # the cursor is a dashed rule, the selection a filled rectangle.
+        self._cursor_colour = _with_alpha(
+            QColor(readable_on(self._CURSOR_HUE, self._background)), 100)
+        selection = QColor(readable_on(self._accent, self._background))
+        self._selection_edge = _with_alpha(selection, 180)
+        self._selection_fill = _with_alpha(selection, 40)
+
     def _seriesColour(self, colour):
         """A curve colour, adjusted only if it cannot be seen on this ground.
 
@@ -565,6 +584,7 @@ class QMLGraphCanvas(QQuickPaintedItem):
     backgroundColorChanged = Signal()
     foregroundColorChanged = Signal()
     gridColorChanged = Signal()
+    accentColorChanged = Signal()
 
     def _get_background_colour(self) -> str:
         return self._background
@@ -584,6 +604,12 @@ class QMLGraphCanvas(QQuickPaintedItem):
     def _set_grid_colour(self, colour: str) -> None:
         self._setThemeColour('_grid_colour', colour, self.gridColorChanged)
 
+    def _get_accent_colour(self) -> str:
+        return self._accent
+
+    def _set_accent_colour(self, colour: str) -> None:
+        self._setThemeColour('_accent', colour, self.accentColorChanged)
+
     #: The plot ground — the scheme's window background.
     backgroundColor = Property(str, _get_background_colour,
                                _set_background_colour,
@@ -596,6 +622,10 @@ class QMLGraphCanvas(QQuickPaintedItem):
     #: Rules: the axes frame, the grid, the legend border.
     gridColor = Property(str, _get_grid_colour, _set_grid_colour,
                          notify=gridColorChanged)
+    #: Interaction chrome: the rubber-band selection box. Not data and not
+    #: structure — the colour the app uses to say "you are doing this".
+    accentColor = Property(str, _get_accent_colour, _set_accent_colour,
+                           notify=accentColorChanged)
 
     # =========================================================================
     # Properties (QML accessible)
@@ -1360,6 +1390,9 @@ class QMLGraphCanvas(QQuickPaintedItem):
     _NATIVE_GRID_COLOR = QColor(51, 51, 51, 127)
     _NATIVE_LEGEND_BG = QColor(42, 42, 42, 230)
     _NATIVE_LEGEND_BORDER = QColor(68, 68, 68)
+    #: The cursor's identity hue, corrected per ground in
+    #: ``_recomputeThemeColours`` and never themed away.
+    _CURSOR_HUE = "#ffff64"
 
     def _renderNative(self, painter: QPainter) -> None:
         """Render the entire plot with QPainter primitives.
@@ -2426,7 +2459,7 @@ class QMLGraphCanvas(QQuickPaintedItem):
             cpx, cpy = self._dataToPixel(self._cursor_x, self._cursor_y or 0)
 
             if d['ax_left'] <= cpx <= d['ax_right']:
-                pen = QPen(QColor(255, 255, 100, 100))
+                pen = QPen(self._cursor_colour)
                 pen.setWidth(1)
                 pen.setStyle(Qt.DashLine)
                 painter.setPen(pen)
@@ -2445,10 +2478,10 @@ class QMLGraphCanvas(QQuickPaintedItem):
                 min(px1, px2), min(py1, py2),
                 abs(px2 - px1), abs(py2 - py1),
             )
-            pen = QPen(QColor(100, 200, 255, 180))
+            pen = QPen(self._selection_edge)
             pen.setWidth(1)
             painter.setPen(pen)
-            painter.setBrush(QBrush(QColor(100, 200, 255, 40)))
+            painter.setBrush(QBrush(self._selection_fill))
             painter.drawRect(rect)
 
     # =========================================================================

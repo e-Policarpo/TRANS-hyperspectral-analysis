@@ -14,6 +14,7 @@ import logging
 from pathlib import Path
 from PySide6.QtWidgets import QApplication
 from PySide6.QtQml import QQmlApplicationEngine, qmlRegisterType
+from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtCore import QUrl, Qt
 from PySide6.QtGui import QIcon
 
@@ -32,7 +33,6 @@ from src.widgets.qml_solver_canvas import SolverCanvas
 from src.widgets.qml_potential_canvas import PotentialCanvas
 from src.widgets.qml_states_canvas import StatesCanvas
 from src.backend.modeling_backend import ModelingBackend
-from src.widgets.qml_image_canvas import QMLImageCanvas
 from src.widgets.image_provider import TransImageProvider
 from src.backend.map_editor_backend import MapEditorBackend
 
@@ -48,14 +48,16 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+# The Basic style is the only one that honours `palette`; the native macOS
+# style ignores it outright and paints TextField/Label/GroupBox light. This
+# has to run at IMPORT time, not inside main(), so a test harness or a frozen
+# build that never calls main() still gets a themeable app.
+QQuickStyle.setStyle("Basic")
+
 
 def main():
     """Main application entry point."""
     logger.info("Starting TRANS-QML Application")
-
-    # Set Qt Quick Controls style BEFORE creating QApplication
-    import os
-    os.environ['QT_QUICK_CONTROLS_STYLE'] = 'Basic'
 
     # macOS: Set application name in menu bar (requires PyObjC)
     # This must be done BEFORE creating QApplication
@@ -101,7 +103,6 @@ def main():
     qmlRegisterType(QMLMapCanvas, "TransQML", 1, 0, "MapCanvas")
     qmlRegisterType(QMLProfileCanvas, "TransQML", 1, 0, "ProfileCanvas")
     qmlRegisterType(QMLGraphCanvas, "TransQML", 1, 0, "GraphCanvas")
-    qmlRegisterType(QMLImageCanvas, "TransQML", 1, 0, "ImageCanvas")
     qmlRegisterType(MapEditorBackend, "TransQML", 1, 0, "MapEditorBackend")
     # A matplotlib figure hosted in QML, and the designer plots drawn into
     # one. Any tool that wants a real matplotlib plot — colorbars, 3-D

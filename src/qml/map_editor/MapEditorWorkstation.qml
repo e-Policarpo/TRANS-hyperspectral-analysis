@@ -815,6 +815,11 @@ Item {
                     // candidate and the painted gridline at 1.02–1.08:1, i.e. no
                     // visible box on any scheme. borderColor wins on 21 of the 22.
                     gridColor: root.borderColor
+                    // Interaction chrome — the rubber-band selection box, the
+                    // STS line band and the hover chips. accentBlue matches
+                    // what ProfileViewer already passes, so the three canvases
+                    // in the map editor agree about what "selected" looks like.
+                    accentColor: root.accentBlue
 
                     onPointClicked: function(x, y, row, col, value) {
                         coordLabel.text = "(" + row + ", " + col + ") = " + Fmt.sci(value)

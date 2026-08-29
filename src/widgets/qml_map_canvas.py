@@ -40,6 +40,7 @@ from src.widgets._pyqtgraph_ports.ticks import (
     tick_values,
 )
 from src.widgets.lut import get_lut
+from src.widgets.series_palette import readable_on
 import matplotlib.pyplot as plt
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,20 @@ logger = logging.getLogger(__name__)
 # The twin of this block lives in ``qml_graph_canvas``; see the longer note
 # there for why it is not a shared module.
 # =============================================================================
+
+def _alpha(colour: QColor, a: int) -> QColor:
+    """The same colour at a given alpha, without mutating the original."""
+    out = QColor(colour)
+    out.setAlpha(a)
+    return out
+
+
+def _contrast_pole(background: QColor) -> QColor:
+    """White on a dark ground, black on a light one."""
+    luminance = (0.299 * background.redF() + 0.587 * background.greenF()
+                 + 0.114 * background.blueF())
+    return QColor('#ffffff') if luminance < 0.5 else QColor('#000000')
+
 
 def _blend(base: QColor, towards: QColor, amount: float) -> QColor:
     """``base`` moved ``amount`` (0..1) of the way towards ``towards``."""
@@ -178,6 +193,9 @@ class QMLMapCanvas(QQuickPaintedItem):
         self._background: str = "#1a1a1a"
         self._foreground: str = "#cccccc"
         self._grid_colour: str = "#444444"
+        # Interaction chrome. Default is the former literal, so an unbound
+        # canvas paints exactly what it painted before.
+        self._accent: str = "#5bcefa"
         self._recomputeThemeColours()
 
         # Matplotlib setup
@@ -345,6 +363,31 @@ class QMLMapCanvas(QQuickPaintedItem):
         self._NATIVE_TICK_COLOR = self._tick_colour
         self._NATIVE_LABEL_COLOR = foreground
 
+        # The hover/tag chips are UI panels, not marks on the data, so they
+        # are the one piece of map chrome a palette can legitimately drive:
+        # the chip supplies its own ground, and the label sits on THAT, not
+        # on whatever colormap value happens to be underneath.
+        self._chip_bg = _blend(background, _contrast_pole(background), 0.06)
+        self._chip_ink = QColor(readable_on(self._accent, self._chip_bg.name()))
+        self._roi_colour = QColor(self._accent)
+
+        # WHAT IS DELIBERATELY NOT THEMED, AND WHY.
+        #
+        # Every other overlay in this file — the STS rings and dots, the map
+        # grid, the line-profile trace, the region/line/target marks — is drawn
+        # ON TOP OF COLORMAP IMAGE DATA, not on the scheme's background. Their
+        # ground is whatever value the user's data happens to take under the
+        # mark, which a palette colour has no relationship to: binding them to
+        # the scheme would trade a colour that is wrong on eight schemes for one
+        # that is wrong on an arbitrary subset of pixels in all twenty-two, and
+        # readable_on() cannot help because there is no single ground to be
+        # readable against. They are also identity — the yellow ring IS the idle
+        # STS marker — so recolouring them per scheme costs meaning as well.
+        #
+        # The fix those marks actually need is a two-tone stroke (a dark halo
+        # under a light core, legible over any value), which is a visual design
+        # change to every mark rather than a binding, and is left as such.
+
     def _applyAxesStyle(self) -> None:
         """Push the derived roles onto the matplotlib figure and axes.
 
@@ -395,6 +438,7 @@ class QMLMapCanvas(QQuickPaintedItem):
     backgroundColorChanged = Signal()
     foregroundColorChanged = Signal()
     gridColorChanged = Signal()
+    accentColorChanged = Signal()
 
     def _get_background_colour(self) -> str:
         return self._background
@@ -414,6 +458,12 @@ class QMLMapCanvas(QQuickPaintedItem):
     def _set_grid_colour(self, colour: str) -> None:
         self._setThemeColour('_grid_colour', colour, self.gridColorChanged)
 
+    def _get_accent_colour(self) -> str:
+        return self._accent
+
+    def _set_accent_colour(self, colour: str) -> None:
+        self._setThemeColour('_accent', colour, self.accentColorChanged)
+
     #: The margin around the map — the scheme's window background.
     backgroundColor = Property(str, _get_background_colour,
                                _set_background_colour,
@@ -426,6 +476,9 @@ class QMLMapCanvas(QQuickPaintedItem):
     #: Rules: the axes frame.
     gridColor = Property(str, _get_grid_colour, _set_grid_colour,
                          notify=gridColorChanged)
+    #: Interaction chrome: the STS line band and the hover/tag chips.
+    accentColor = Property(str, _get_accent_colour, _set_accent_colour,
+                           notify=accentColorChanged)
 
     # =========================================================================
     # Properties exposed to QML
@@ -1708,7 +1761,7 @@ class QMLMapCanvas(QQuickPaintedItem):
                 pts = [self._dataToPixel(r, c) for r, c in ln['path']]
                 poly = QPolygonF([QPointF(x, y) for x, y in pts])
 
-                band = QPen(QColor(91, 206, 250, 70))     # accent blue, soft
+                band = QPen(_alpha(self._roi_colour, 70))
                 band.setWidth(14)
                 band.setCapStyle(Qt.RoundCap)
                 band.setJoinStyle(Qt.RoundJoin)
@@ -1716,7 +1769,7 @@ class QMLMapCanvas(QQuickPaintedItem):
                 painter.setPen(band)
                 painter.drawPolyline(poly)
 
-                edge = QPen(QColor(91, 206, 250, 220))
+                edge = QPen(_alpha(self._roi_colour, 220))
                 edge.setWidth(2)
                 edge.setCapStyle(Qt.RoundCap)
                 painter.setPen(edge)
@@ -1744,9 +1797,9 @@ class QMLMapCanvas(QQuickPaintedItem):
                     placed_chips)
                 placed_chips.append(chip)
                 painter.setPen(Qt.NoPen)
-                painter.setBrush(QBrush(QColor(20, 20, 30, 225)))
+                painter.setBrush(QBrush(_alpha(self._chip_bg, 225)))
                 painter.drawRoundedRect(chip, 4, 4)
-                painter.setPen(QPen(QColor(91, 206, 250, 255)))
+                painter.setPen(QPen(self._chip_ink))
                 painter.drawText(chip, Qt.AlignCenter, label)
 
         # Draw STS point markers — where spectra were taken on this scan image.
@@ -1798,9 +1851,9 @@ class QMLMapCanvas(QQuickPaintedItem):
                     by = hy + 12
                 chip = QRectF(bx, by, tw + 2 * pad, th + 2 * pad)
                 painter.setPen(Qt.NoPen)
-                painter.setBrush(QBrush(QColor(20, 20, 30, 235)))
+                painter.setBrush(QBrush(_alpha(self._chip_bg, 235)))
                 painter.drawRoundedRect(chip, 4, 4)
-                painter.setPen(QPen(QColor(91, 206, 250, 255)))  # accent blue
+                painter.setPen(QPen(self._chip_ink))
                 painter.drawText(chip, Qt.AlignCenter, text)
 
         # Draw grid overlay for discretization
