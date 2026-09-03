@@ -2281,6 +2281,19 @@ class ToolImplementations:
                 self.errorOccurred.emit("Error", "Dataset not found")
                 return empty
 
+            # Claim the output folder FIRST. It is the one step that can fail
+            # for a reason having nothing to do with the data -- no project is
+            # open, so there is nowhere to write -- and it used to be the last
+            # step before the files were written, roughly two minutes in: peak
+            # detection over every spectrum, then a full background correction
+            # over every spectrum, and only then "No project set". Multiply by
+            # a batch of three datasets and the run looks like it worked and
+            # quietly produced nothing.
+            #
+            # mkdir is idempotent, so doing it here costs nothing but an empty
+            # directory in the case where a later stage has no intervals.
+            folders = self._map_output_folders(dataset_name)
+
             spectral_data = self._datasets[dataset_name]
             independent_var = np.asarray(spectral_data.independent_var, dtype=np.float64)
             spectra = np.asarray(spectral_data.spectra.values, dtype=np.float64)
@@ -2347,8 +2360,6 @@ class ToolImplementations:
             dx = float(np.median(steps)) if steps.size else 0.0
             min_width = 2.0 * dx
             widened = 0
-
-            folders = self._map_output_folders(dataset_name)
 
             # Noise floor, in multiples of each spectrum's own sigma. Only
             # what stands above it is integrated.
@@ -4550,6 +4561,11 @@ class ToolImplementations:
             independent_var = np.asarray(spectral_data.independent_var, dtype=np.float64)
             spectra = np.asarray(spectral_data.spectra.values, dtype=np.float64)
 
+            # Same reason as the Map Generator: nowhere to write is not a
+            # property of the data, so it must not be found out after every
+            # spectrum has been reduced.
+            out_dir = self._ensure_output_dir('peaks')
+
             config = _feature_config(params)
             config.validate()
 
@@ -4573,7 +4589,7 @@ class ToolImplementations:
             # destined for PCA. Both are kept in the CSV for inspection.
             columns = [c for c in feature_columns(config) if c in (rows[0] if rows else {})]
             frame = pd.DataFrame(rows)
-            csv_path = self._ensure_output_dir('peaks') / \
+            csv_path = out_dir / \
                 f"{self._apply_naming_convention(dataset_name, operation='Features')}.csv"
             frame.to_csv(csv_path, index=False)
 
@@ -4717,6 +4733,11 @@ class ToolImplementations:
                     "resolution-limited and the level errors fall back to the "
                     "modulation width alone.", dataset_name)
 
+            # Claim the output directory before fitting anything: with no
+            # project open there is nowhere to write, and discovering that
+            # after a per-spectrum fit over the whole dataset wastes the run.
+            out_dir = self._ensure_output_dir('peaks')
+
             spectral_data = self._datasets[dataset_name]
             x = np.asarray(spectral_data.independent_var, dtype=np.float64)
             spectra = np.asarray(spectral_data.spectra.values, dtype=np.float64)
@@ -4788,7 +4809,7 @@ class ToolImplementations:
                 return empty
 
             frame = pd.DataFrame(rows)
-            csv_path = self._ensure_output_dir('peaks') / \
+            csv_path = out_dir / \
                 f"{self._apply_naming_convention(dataset_name, operation='Dimensionality')}.csv"
             frame.to_csv(csv_path, index=False)
 

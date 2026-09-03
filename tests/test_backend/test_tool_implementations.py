@@ -2910,3 +2910,96 @@ class TestConfinementDimensionality(TestToolImplementationsSetup):
         h_res = honest['dimensionality'].metadata.additional_info['resolution_fwhm']
         assert h_res > n_res
         assert h_res / n_res > 1.3
+
+
+class TestNoProjectFailsBeforeTheWork(TestToolImplementationsSetup):
+    """Nowhere to write is not a property of the data, so it must be found out
+    first rather than after every spectrum has been processed.
+
+    The Map Generator used to claim its output folder as the last step before
+    writing: peak detection over every spectrum, then a full background
+    correction over every spectrum, and only THEN "No project set". On 10 000
+    spectra that is about two minutes per dataset, and over a batch of three
+    the run looks like it worked and quietly produces nothing.
+    """
+
+    @pytest.fixture
+    def no_project(self, tool_impl):
+        """A backend with no project open, which is what a fresh session is."""
+        def _raise(subdir):
+            raise ValueError("No project set. Please create or open a project first.")
+        tool_impl._ensure_output_dir = _raise
+        return tool_impl
+
+    @pytest.fixture
+    def big_dataset(self):
+        """Wide enough that doing the work first would be obvious."""
+        rng = np.random.default_rng(3)
+        x = np.linspace(-1.0, 1.0, 256)
+        n = 400
+        y = np.exp(np.abs(x))[:, None] * (1 + 0.05 * rng.normal(size=(x.size, n)))
+        df = pd.DataFrame(y, columns=[f"S{i}" for i in range(n)])
+        df.insert(0, "V", x)
+        return SpectralData(df, SpectralMetadata(
+            source_type="sts", dimensions=(20, 20), scan_mode="map_meander",
+            units={"x": "V"}, additional_info={}))
+
+    def test_the_map_generator_gives_up_before_correcting_anything(
+            self, no_project, big_dataset, monkeypatch):
+        """analyze_many is the expensive step. It must never be reached."""
+        import src.backend.tool_implementations as ti
+
+        called = []
+        monkeypatch.setattr(ti, "analyze_many",
+                            lambda *a, **k: called.append(1) or [])
+
+        no_project._datasets['sts'] = big_dataset
+        result = no_project.generate_maps_from_spectra(
+            MockTask(), 'sts',
+            {'interval_source': 'manual', 'intervals': [[-0.5, -0.4], [0.4, 0.5]]})
+
+        assert result['n_maps'] == 0
+        assert not called, "background correction ran despite nowhere to write"
+        assert no_project.errorOccurred.emit.called
+        assert "No project" in str(no_project.errorOccurred.emit.call_args)
+
+    def test_the_dimensionality_tool_gives_up_before_fitting_anything(
+            self, no_project, big_dataset, monkeypatch):
+        import src.backend.tool_implementations as ti
+
+        called = []
+        real = ti.edge_summary
+        monkeypatch.setattr(ti, "edge_summary",
+                            lambda *a, **k: called.append(1) or real(*a, **k))
+
+        no_project._datasets['sts'] = big_dataset
+        result = no_project.analyze_confinement_dimensionality(
+            MockTask(), 'sts', {'temperature_k': 94.0})
+
+        assert result['dimensionality'] is None
+        assert not called, "per-spectrum fitting ran despite nowhere to write"
+
+    def test_spectral_features_gives_up_before_reducing_anything(
+            self, no_project, big_dataset, monkeypatch):
+        import src.backend.tool_implementations as ti
+
+        called = []
+        monkeypatch.setattr(ti, "feature_table",
+                            lambda *a, **k: called.append(1) or [])
+
+        no_project._datasets['sts'] = big_dataset
+        result = no_project.extract_spectral_features(MockTask(), 'sts', params={})
+
+        assert result['features'] is None
+        assert not called, "the feature table was built despite nowhere to write"
+
+    def test_a_project_that_is_open_still_works_normally(
+            self, tool_impl, big_dataset):
+        """The guard must not break the ordinary path."""
+        tool_impl._datasets['sts'] = big_dataset
+        result = tool_impl.generate_maps_from_spectra(
+            MockTask(), 'sts',
+            {'interval_source': 'manual', 'intervals': [[-0.5, -0.4], [0.4, 0.5]]})
+
+        assert result['n_maps'] == 2
+        assert result['output_folder']

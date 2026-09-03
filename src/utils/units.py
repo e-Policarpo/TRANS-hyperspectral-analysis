@@ -80,6 +80,20 @@ def scale_from_metadata(info: Optional[dict], shape=None):
     3. ``width_m`` / ``height_m`` + array shape (Omicron MATRIX scans)
     4. ``scan_width_um`` / ``scan_height_um`` + array shape (Park AFM)
     5. ``physical_size`` — ``(height, width)`` + ``units`` (TopographyData)
+    6. ``map_geometry`` — ``{'x_start','x_end','y_start','y_end','nx','ny'}``
+       in metres (Nanosurf spectroscopy grids)
+    7. ``topo_geometry`` — ``{'scan_range_x','scan_range_y'}`` in metres
+       (Nanosurf topography) + array shape
+
+    The last two are nested dicts rather than flat keys, which is why they
+    were invisible here for so long: the Nanosurf loader has recorded both
+    since it was written, and every map generated from that data still
+    exported as bare pixels because nothing looked inside them.
+
+    ``map_geometry`` is preferred over ``topo_geometry`` when both are
+    present. It describes the spectroscopy grid — the thing actually being
+    mapped — while the topography range describes the scan the grid sits in,
+    and the two are routinely different.
 
     ``shape`` is ``(rows, cols)`` and is required for the extent-based forms,
     which divide the total scan size by the pixel count. Returns
@@ -130,6 +144,34 @@ def scale_from_metadata(info: Optional[dict], shape=None):
                 if isinstance(unit, dict):
                     unit = unit.get("x") or unit.get("y")
                 return (pw / cols, ph / rows, str(unit or "µm"))
+
+    # Nested forms. x_start/x_end are the FIRST and LAST spectrum positions,
+    # so the step between neighbours divides by (nx - 1), not by nx: a 100
+    # point line spanning 1 µm has 99 gaps. Dividing by nx would shrink every
+    # pixel by 1 % on a 100 wide grid and by 10 % on a 10 wide one.
+    mg = info.get("map_geometry")
+    if isinstance(mg, dict):
+        try:
+            x0, x1 = float(mg.get("x_start")), float(mg.get("x_end"))
+            y0, y1 = float(mg.get("y_start")), float(mg.get("y_end"))
+            nx, ny = int(mg.get("nx") or 0), int(mg.get("ny") or 0)
+        except (TypeError, ValueError):
+            nx = ny = 0
+        if nx > 1 and ny > 1:
+            dx, dy = abs(x1 - x0) / (nx - 1), abs(y1 - y0) / (ny - 1)
+            if dx > 0 and dy > 0:
+                return (dx, dy, "m")
+
+    # A scan RANGE is the full field, so this one does divide by the pixel
+    # count rather than by the gaps.
+    tg = info.get("topo_geometry")
+    if isinstance(tg, dict) and rows and cols:
+        try:
+            rx, ry = float(tg.get("scan_range_x") or 0), float(tg.get("scan_range_y") or 0)
+        except (TypeError, ValueError):
+            rx = ry = 0.0
+        if rx > 0 and ry > 0:
+            return (rx / cols, ry / rows, "m")
 
     return (None, None, None)
 

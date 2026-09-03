@@ -2,7 +2,8 @@
 
 import pytest
 
-from src.utils.units import nm_factor, pixel_size_to_nm, to_nm
+from src.utils.units import (nm_factor, pixel_size_to_nm, scale_from_metadata,
+                             to_nm)
 
 
 class TestNmFactor:
@@ -49,3 +50,62 @@ class TestPixelSizeToNm:
     ])
     def test_bad_input_leaves_calibration_unset(self, dx, dy, unit):
         assert pixel_size_to_nm(dx, dy, unit) is None
+
+
+class TestNanosurfNestedGeometry:
+    """Nanosurf records its scan geometry in NESTED dicts, which is why every
+    map generated from that data exported as bare pixels: the loader had the
+    numbers all along and nothing here looked inside them.
+    """
+
+    def test_a_spectroscopy_grid_gives_the_step_between_spectra(self):
+        """x_start/x_end are the first and LAST spectrum, so a 100 wide grid
+        spanning 1 µm has 99 gaps. Dividing by nx would shrink every pixel by
+        1 % here and by 10 % on a 10 wide grid."""
+        info = {"map_geometry": {"x_start": 0.0, "x_end": 1e-6,
+                                 "y_start": 0.0, "y_end": 1e-6,
+                                 "nx": 100, "ny": 100}}
+        dx, dy, unit = scale_from_metadata(info)
+
+        assert unit == "m"
+        assert dx == pytest.approx(1e-6 / 99)
+        assert dy == pytest.approx(1e-6 / 99)
+
+    def test_a_topography_range_is_the_whole_field(self):
+        """A scan RANGE is the full extent, so this one divides by the pixel
+        count rather than by the gaps."""
+        info = {"topo_geometry": {"scan_range_x": 1e-7, "scan_range_y": 1e-7}}
+        dx, dy, unit = scale_from_metadata(info, shape=(100, 100))
+
+        assert unit == "m"
+        assert dx == pytest.approx(1e-9)
+        assert dy == pytest.approx(1e-9)
+
+    def test_the_spectroscopy_grid_wins_over_the_topography_scan(self):
+        """They describe different things: the grid is what is being mapped,
+        the scan range is the frame it sits in, and they routinely differ."""
+        info = {"map_geometry": {"x_start": 0.0, "x_end": 1e-6,
+                                 "y_start": 0.0, "y_end": 1e-6,
+                                 "nx": 11, "ny": 11},
+                "topo_geometry": {"scan_range_x": 5e-6, "scan_range_y": 5e-6}}
+        dx, _dy, _unit = scale_from_metadata(info, shape=(11, 11))
+
+        assert dx == pytest.approx(1e-6 / 10)
+
+    def test_a_flat_key_still_wins_over_both(self):
+        """Order of directness is unchanged: an explicit pixel size is not
+        second-guessed by an extent."""
+        info = {"pixel_size": {"dx": 2.0, "dy": 2.0, "unit": "nm"},
+                "map_geometry": {"x_start": 0.0, "x_end": 1e-6, "y_start": 0.0,
+                                 "y_end": 1e-6, "nx": 100, "ny": 100}}
+        assert scale_from_metadata(info) == (2.0, 2.0, "nm")
+
+    @pytest.mark.parametrize("mg", [
+        {"x_start": 0.0, "x_end": 0.0, "y_start": 0.0, "y_end": 1e-6, "nx": 10, "ny": 10},
+        {"x_start": 0.0, "x_end": 1e-6, "y_start": 0.0, "y_end": 1e-6, "nx": 1, "ny": 1},
+        {"x_start": "?", "x_end": 1e-6, "y_start": 0.0, "y_end": 1e-6, "nx": 10, "ny": 10},
+        {},
+    ])
+    def test_an_unusable_grid_is_declined_rather_than_invented(self, mg):
+        """Don't invent a scale you don't have — the export warns instead."""
+        assert scale_from_metadata({"map_geometry": mg}) == (None, None, None)
