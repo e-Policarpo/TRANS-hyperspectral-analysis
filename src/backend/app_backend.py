@@ -6340,6 +6340,41 @@ class AppBackend(ToolImplementations, QObject):
                            else f"{label} complete — {done} datasets "
                                 f"(results are in the project browser)")
 
+    def _on_dimensionality_completed(self, output):
+        """Register one Confinement Dimensionality run.
+
+        The tool has already put its table in ``_datasets`` and emitted
+        ``dataLoaded``, so there is nothing to publish here -- what this adds
+        is the whole-set verdicts, which are the part a user needs told rather
+        than left in the metadata. They are properties of the set, so they
+        cannot be a column and would otherwise go unseen.
+        """
+        if not isinstance(output, dict):
+            logger.warning("Dimensionality completion got %r, not a result dict",
+                           type(output).__name__)
+            return
+        name = output.get('dataset_name', '')
+        path = output.get('table_path', '')
+        coherence = output.get('coherence') or {}
+
+        e0 = coherence.get('e0_verdict', 'undetermined')
+        v0 = coherence.get('v0_verdict', 'undetermined')
+        bits = [f"{output.get('n_valid', 0)}/{output.get('n_total', 0)} spectra"]
+        if e0 == 'varying':
+            bits.append("E0 varies across the sample (compositional disorder)")
+        elif e0 == 'uniform':
+            bits.append("E0 uniform across the sample")
+        if v0 == 'resolved':
+            xi = coherence.get('v0_correlation_length_m')
+            if isinstance(xi, float) and math.isfinite(xi):
+                bits.append(f"band edge correlated over {xi * 1e9:.1f} nm")
+        elif v0 == 'unresolved':
+            bits.append("band edge correlated beyond the scan")
+
+        logger.info("Dimensionality complete: '%s' — %s", name, "; ".join(bits))
+        self.status = f"Confinement Dimensionality complete — {'; '.join(bits)}"
+        self.toolCompleted.emit("Confinement Dimensionality", str(path))
+
     def _on_derivative_completed(self, output_path: str):
         """Called when derivative calculation completes."""
         logger.info(f"Derivative calculation completed: {output_path}")

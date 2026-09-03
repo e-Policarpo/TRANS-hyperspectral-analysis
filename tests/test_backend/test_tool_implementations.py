@@ -2683,3 +2683,192 @@ class TestPositionsSurviveDerivedDatasets(TestToolImplementationsSetup):
             info = dataset.metadata.additional_info
             if 'spectrum_meta' in info:
                 assert len(info['spectrum_meta']) == dataset.num_spectra
+
+
+class TestConfinementDimensionality(TestToolImplementationsSetup):
+    """The dimensionality table: a band-edge fit and a geometry ranking per
+    spectrum, emitted flat so ``confined_dims`` is a spatial map.
+
+    Built on synthetic spectra whose answer is known: an exponential band tail
+    of a stated decay energy, and states planted at a stated geometry's level
+    ratios. What is asserted is that the tool recovers what was planted, and
+    that it declines where it should -- a pixel with too few states must come
+    back 'underdetermined', not with a confident dimension.
+    """
+
+    TEMPERATURE_K = 94.0
+    TAIL_EV = 0.022
+    EDGE_EV = 0.05
+
+    @pytest.fixture
+    def sts_dataset(self):
+        from src.physics.level_patterns import pattern
+
+        rng = np.random.default_rng(7)
+        x = np.linspace(-0.6, 0.6, 1024)
+
+        def curve(name, n_states, scale=0.075):
+            # The two-regime shape the real data has: inside the gap the
+            # conductance decays toward zero bias with the tail energy, and
+            # outside the edge it rises again far more gently. A flat gap
+            # floor would not exercise the breakpoint at all -- e_in would
+            # correctly report the flat region and mean nothing.
+            u = np.abs(x)
+            inside = np.clip(self.EDGE_EV - u, 0.0, None)
+            outside = np.clip(u - self.EDGE_EV, 0.0, None)
+            y = 3e-9 * np.exp(-inside / self.TAIL_EV) * np.exp(outside / 0.15)
+            if name is not None:
+                ratios = pattern(name).ratios[:n_states]
+                for r in ratios:
+                    centre = self.EDGE_EV + scale * r
+                    for sign in (-1.0, 1.0):
+                        y = y + 4e-8 * np.exp(
+                            -0.5 * ((x - sign * centre) / 0.012) ** 2)
+            return y * (1.0 + rng.normal(0.0, 0.01, x.size))
+
+        df = pd.DataFrame({
+            "V": x,
+            "square": curve("box_2d_square", 4),
+            "line": curve("box_1d", 4),
+            "bare": curve(None, 0),          # no states: must decline
+        })
+        return SpectralData(df, SpectralMetadata(
+            source_type="sts", dimensions=(3, 1), scan_mode="line",
+            units={"x": "V"},
+            additional_info={"position_m": [0.0, 5e-9, 10e-9]}))
+
+    def _run(self, tool_impl, dataset, **params):
+        tool_impl._datasets['sts'] = dataset
+        params.setdefault('temperature_k', self.TEMPERATURE_K)
+        params.setdefault('v_mod', 0.010)
+        return tool_impl.analyze_confinement_dimensionality(
+            MockTask(), 'sts', params=params)
+
+    def test_emits_a_flat_dimensionality_dataset(self, tool_impl, sts_dataset):
+        result = self._run(tool_impl, sts_dataset)
+        table = result['dimensionality']
+
+        assert table is not None
+        assert result['dataset_name'] == 'sts - Dimensionality'
+        assert result['n_total'] == 3
+        assert len(table.data) == 3
+        assert table.metadata.data_type == 'flat'
+        # Not an overlay: a feature table must not land on the source's graph.
+        assert 'original' not in table.metadata.additional_info
+
+    def test_the_map_columns_are_all_present_and_numeric(self, tool_impl, sts_dataset):
+        table = self._run(tool_impl, sts_dataset)['dimensionality']
+        cols = set(table.data.columns)
+
+        for key in ('e0_neg', 'e0_pos', 'v_edge_neg', 'v_edge_pos',
+                    'thermally_limited_neg', 'thermally_limited_pos',
+                    'confined_dims', 'ratio_21_corrected', 'delta_aic',
+                    'verdict_code', 'n_levels'):
+            assert key in cols, key
+        # Labels stay out of the numeric table and live in the CSV.
+        assert 'best_pattern' not in cols and 'verdict' not in cols
+        assert all(np.issubdtype(t, np.number) for t in table.data.dtypes)
+
+    def test_the_planted_tail_energy_is_recovered(self, tool_impl, sts_dataset):
+        table = self._run(tool_impl, sts_dataset)['dimensionality']
+        e0 = pd.to_numeric(table.data['e0_neg'], errors='coerce').dropna()
+
+        assert len(e0) >= 1
+        assert float(e0.median()) == pytest.approx(self.TAIL_EV, rel=0.5)
+
+    def test_a_spectrum_with_no_states_declines_rather_than_guessing(
+            self, tool_impl, sts_dataset):
+        """The failure that matters: a featureless pixel must not be handed a
+        dimension. Two free parameters fit any two levels exactly."""
+        result = self._run(tool_impl, sts_dataset)
+        frame = pd.read_csv(result['table_path'])
+        bare = frame.iloc[2]
+
+        assert bare['n_levels'] < 3 or bare['verdict'] == 'underdetermined'
+        if bare['n_levels'] < 3:
+            assert not np.isfinite(bare['confined_dims'])
+
+    def test_the_verdict_code_tracks_the_verdict_label(self, tool_impl, sts_dataset):
+        result = self._run(tool_impl, sts_dataset)
+        frame = pd.read_csv(result['table_path'])
+        codes = tool_impl.DIMENSIONALITY_VERDICT_CODES
+
+        for _, row in frame.iterrows():
+            assert row['verdict_code'] == codes[row['verdict']]
+
+    def test_the_whole_set_statistics_land_in_the_metadata(
+            self, tool_impl, sts_dataset):
+        """E0 uniformity and the band-edge correlation length are properties of
+        the SET, so they cannot be columns and would otherwise go unseen."""
+        result = self._run(tool_impl, sts_dataset)
+        coherence = result['coherence']
+
+        assert coherence, "the coherence summary must be computed"
+        assert 'e0_verdict' in coherence and 'v0_verdict' in coherence
+        stored = result['dimensionality'].metadata.additional_info
+        assert stored['spatial_coherence'] == coherence
+        assert stored['temperature_k'] == self.TEMPERATURE_K
+
+    def test_spatial_keys_are_carried_so_the_columns_map(
+            self, tool_impl, sts_dataset):
+        info = self._run(tool_impl, sts_dataset)['dimensionality'] \
+            .metadata.additional_info
+        assert info.get('position_m') == [0.0, 5e-9, 10e-9]
+
+    def test_a_missing_temperature_still_measures_the_tails(
+            self, tool_impl, sts_dataset):
+        """Without a temperature nothing can be called resolution-limited, but
+        the tail energies are still real measurements and must survive."""
+        result = self._run(tool_impl, sts_dataset, temperature_k=0.0)
+        frame = pd.read_csv(result['table_path'])
+
+        assert result['dimensionality'] is not None
+        assert frame['thermally_limited_neg'].isna().all()
+        assert frame['resolution_fwhm'].isna().all()
+        assert np.isfinite(frame['e0_neg']).any()
+
+    def test_an_unknown_dataset_and_a_cancelled_run_return_empty(
+            self, tool_impl, sts_dataset):
+        class Cancelled:
+            cancelled = True
+            progress = 0
+
+        assert tool_impl.analyze_confinement_dimensionality(
+            MockTask(), 'nope', params={})['dimensionality'] is None
+
+        tool_impl._datasets['sts'] = sts_dataset
+        assert tool_impl.analyze_confinement_dimensionality(
+            Cancelled(), 'sts', params={'temperature_k': 94.0}
+        )['dimensionality'] is None
+
+    def test_it_is_registered_as_a_batch_tool(self):
+        """Multi-dataset support is one BATCH_TOOLS entry plus the QML swap."""
+        from src.backend import batch_tools
+        spec = batch_tools.get_spec('confinement_dimensionality')
+
+        assert spec is not None
+        assert spec.method == 'analyze_confinement_dimensionality'
+        assert spec.takes_task and spec.params_as_dict
+        # Returns a result dict, not a path: without its own completion the
+        # generic handler would try to make a Path out of a dict.
+        assert spec.completion == '_on_dimensionality_completed'
+
+    def test_the_loaders_modulation_amplitude_is_used_when_none_is_typed(
+            self, tool_impl, sts_dataset):
+        """The MATRIX loader reads V_mod out of the parameter tree, so leaving
+        the field alone must pick up the real number rather than zero."""
+        sts_dataset.metadata.additional_info['v_mod'] = 0.020
+        sts_dataset.metadata.additional_info['v_mod_convention'] = 'rms'
+
+        result = self._run(tool_impl, sts_dataset, v_mod=0.0)
+        info = result['dimensionality'].metadata.additional_info
+
+        assert info['v_mod'] == pytest.approx(0.020)
+        assert info['mod_convention'] == 'rms'
+
+    def test_a_typed_modulation_amplitude_wins_over_the_loaders(
+            self, tool_impl, sts_dataset):
+        sts_dataset.metadata.additional_info['v_mod'] = 0.020
+        result = self._run(tool_impl, sts_dataset, v_mod=0.005)
+        assert result['dimensionality'].metadata.additional_info['v_mod'] \
+            == pytest.approx(0.005)

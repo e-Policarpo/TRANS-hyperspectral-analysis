@@ -566,6 +566,7 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
                     'parent_image': curve['parent_image'],
                     'parent_run': curve['parent_run'],
                     'channel': curve['channel'],
+                    'lockin': curve.get('lockin') or {},
                     'V': curve['V'],
                     'first_run': run,
                     'forward': [], 'backward': [], 'mixed': [], 'rep_V': [],
@@ -1089,9 +1090,83 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
             'parent_image': parent_image,
             'parent_run': parent_run,
             'channel': md.channel_name or self._ext_channel(filepath),
+            'lockin': self._lockin_settings(md.param),
             'sample_name': getattr(md, 'sample_name', '') or '',
             'dataset_name': getattr(md, 'data_set_name', '') or '',
         }
+
+    # Parameter-name fragments that identify a lock-in amplitude. MATRIX
+    # names parameters "<Device>.<Property>", and the device name for the
+    # lock-in is not fixed across MATRIX versions and instrument
+    # configurations -- which is why this matches on fragments and records
+    # the key it actually used, instead of hard-coding a name that would
+    # silently find nothing on the next machine.
+    _LOCKIN_DEVICE_HINTS = ('lockin', 'lock_in', 'lock-in', 'modulation')
+    _LOCKIN_AMPLITUDE_HINTS = ('amplitude', 'ampl', 'deviation')
+    _LOCKIN_FREQUENCY_HINTS = ('frequency', 'freq')
+
+    @classmethod
+    def _lockin_settings(cls, param: dict) -> dict:
+        """Lock-in amplitude and frequency out of the MATRIX parameter tree.
+
+        The whole tree is parsed into ``md.param`` already and only the STS
+        location was ever read out of it. The modulation amplitude matters
+        because it sets the energy resolution alongside temperature: the
+        lock-in convolves dI/dV with a semi-ellipse of FWHM ``sqrt(3) V_mod``,
+        so without it the resolution of a spectrum cannot be stated.
+
+        **The convention is recorded as an assumption, not as a fact.** MATRIX
+        does not say whether its amplitude is zero-to-peak, RMS or
+        peak-to-peak, and the three differ by up to 40% in the resolution they
+        imply. ``v_mod_convention_assumed`` is therefore True whenever a value
+        was found, so a caller can see that the number needs confirming rather
+        than reading a default as a measurement.
+
+        Returns an empty dict when nothing matched -- never a zero, which
+        would read as "no modulation" rather than "not recorded".
+        """
+        if not isinstance(param, dict):
+            return {}
+
+        def _number(value):
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return float(value)
+            if isinstance(value, (tuple, list)) and value:
+                return _number(value[0])
+            if isinstance(value, str):
+                try:
+                    return float(value.strip().split()[0])
+                except (ValueError, IndexError):
+                    return None
+            return None
+
+        found = {}
+        for key, value in param.items():
+            low = str(key).lower()
+            if not any(h in low for h in cls._LOCKIN_DEVICE_HINTS):
+                continue
+            number = _number(value)
+            if number is None:
+                continue
+            if any(h in low for h in cls._LOCKIN_AMPLITUDE_HINTS):
+                found.setdefault('v_mod', number)
+                found.setdefault('v_mod_source_key', str(key))
+            elif any(h in low for h in cls._LOCKIN_FREQUENCY_HINTS):
+                found.setdefault('lockin_frequency_hz', number)
+                found.setdefault('lockin_frequency_source_key', str(key))
+
+        if 'v_mod' in found:
+            found['v_mod_convention'] = 'zero_to_peak'
+            found['v_mod_convention_assumed'] = True
+            logger.info("MATRIX lock-in: V_mod = %.6g V from %r (convention "
+                        "assumed zero-to-peak)", found['v_mod'],
+                        found['v_mod_source_key'])
+        else:
+            # Only worth a debug line: plenty of MATRIX experiments are run
+            # with no lock-in at all, and this is not a fault.
+            logger.debug("MATRIX lock-in: no modulation amplitude in %d "
+                         "parameters", len(param))
+        return found
 
     def _apply_rail_mask(self, scaled: np.ndarray, raw_segment: np.ndarray
                          ) -> np.ndarray:
@@ -1563,6 +1638,9 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
             matrix_kind='overview',
             spectrum_meta=spectrum_meta,
             sweep_channels=sweep_channels,
+            # Resolution needs the modulation as much as the temperature;
+            # without it a spectrum's energy resolution cannot be stated.
+            **next((b['lockin'] for b in batches if b.get('lockin')), {}),
         )
         return SpectralData(df, metadata)
 
@@ -1609,6 +1687,7 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
                             for t in batch['rep_timestamps']],
             rep_files=list(batch['rep_files']),
             sweep_channels=sweep_channels,
+            **(batch.get('lockin') or {}),
         )
         return SpectralData(df, metadata)
 
@@ -1763,7 +1842,7 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
             'V': V, 'forward': forward, 'backward': backward, 'mixed': mixed,
             'n_points': n_half, 'timestamp': ts,
             'location_px': None, 'location_m': None, 'parent_image': None,
-            'channel': self._ext_channel(filepath),
+            'channel': self._ext_channel(filepath), 'lockin': {},
         }
 
     def _mask_adc_rails(self, raw: np.ndarray) -> np.ndarray:

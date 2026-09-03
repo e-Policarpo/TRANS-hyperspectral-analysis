@@ -1533,3 +1533,64 @@ class TestLocationsOnGrid:
         locs = [self._loc(1, (500, 500))]
         assert sts_loader._locations_on_grid(locs, None) == locs
         assert sts_loader._locations_on_grid(locs, (0, 0)) == locs
+
+
+class TestLockInSettings:
+    """The modulation amplitude out of the MATRIX parameter tree.
+
+    The whole tree is parsed into ``md.param`` already and only the STS
+    location was ever read from it. Resolution needs the modulation as much as
+    it needs the temperature -- the lock-in convolves dI/dV with a semi-ellipse
+    of FWHM sqrt(3)*V_mod -- so a spectrum whose amplitude nobody carried
+    across cannot have its resolution stated at all.
+    """
+
+    @staticmethod
+    def _extract(param):
+        from src.data_loaders.omicron_mtrx_loader import OmicronMatrixSTSLoader
+        return OmicronMatrixSTSLoader._lockin_settings(param)
+
+    def test_the_amplitude_and_its_source_key_are_both_recorded(self):
+        """The key is recorded because the device name is not fixed across
+        MATRIX versions: without it there is no way to check that the number
+        came from the right parameter."""
+        got = self._extract({'LockIn.Amplitude': (0.012, 'V'),
+                             'LockIn.Frequency': 731.0,
+                             'XYScanner.Width': 2.5e-8})
+
+        assert got['v_mod'] == pytest.approx(0.012)
+        assert got['v_mod_source_key'] == 'LockIn.Amplitude'
+        assert got['lockin_frequency_hz'] == pytest.approx(731.0)
+
+    def test_the_convention_is_flagged_as_an_assumption(self):
+        """MATRIX does not say whether its amplitude is zero-to-peak, RMS or
+        peak-to-peak, and the three imply resolutions differing by up to 40%.
+        Recording the guess as a fact would be worse than not recording it."""
+        got = self._extract({'LockIn.Amplitude': 0.010})
+
+        assert got['v_mod_convention'] == 'zero_to_peak'
+        assert got['v_mod_convention_assumed'] is True
+
+    @pytest.mark.parametrize("key", [
+        'LockIn.Amplitude', 'Lock-In.Amplitude', 'Lock_In.Ampl',
+        'Spectroscopy.Modulation_Amplitude', 'LOCKIN.DEVIATION',
+    ])
+    def test_the_device_name_is_matched_on_fragments_not_hard_coded(self, key):
+        assert self._extract({key: 0.008})['v_mod'] == pytest.approx(0.008)
+
+    @pytest.mark.parametrize("value,expected", [
+        (0.012, 0.012), ((0.012, 'V'), 0.012), ([0.012], 0.012),
+        ('0.012', 0.012), ('0.012 V', 0.012),
+    ])
+    def test_the_value_shapes_matrix_actually_uses_are_all_read(self, value, expected):
+        assert self._extract({'LockIn.Amplitude': value})['v_mod'] == pytest.approx(expected)
+
+    def test_nothing_recorded_gives_nothing_back_rather_than_zero(self):
+        """A zero would read as 'no modulation was applied', which is a
+        measurement. 'Not recorded' is not."""
+        for param in ({'XYScanner.Width': 2.5e-8}, {}, None, "not a dict"):
+            assert self._extract(param) == {}
+
+    def test_an_unparseable_value_is_skipped_not_guessed(self):
+        assert self._extract({'LockIn.Amplitude': 'off'}) == {}
+        assert self._extract({'LockIn.Enabled': True}) == {}

@@ -85,10 +85,17 @@ class TestTheThreeGroups:
 
     def test_the_composite_group_is_the_composite_tools(self, tools_menu):
         assert set(_group(tools_menu, "Composite tools")) == {
-            "Map Generator", "Confinement Analysis", "Spectral Features",
+            "Map Generator", "Confinement Analysis",
+            "Confinement Dimensionality", "Spectral Features",
             "Confinement Designer", "Line Scan Designer",
             "Quantum Well Solver", "Quantum Dot Solver", "Multi-Peak Fitting",
             "Detect Bandgap & Doping", "Dirac Point Estimator"}
+
+    def test_the_dimensionality_tool_is_composite(self, tools_menu):
+        """Background, peak search, a segmented band-edge fit and a model
+        selection over five geometries, in one pass — several operations with
+        decisions between them, which is what puts a tool in this group."""
+        assert "Confinement Dimensionality" in _group(tools_menu, "Composite tools")
 
     def test_the_solvers_are_composite_too(self, tools_menu):
         """Each does several things in one pass — build the potential, solve

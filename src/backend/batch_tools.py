@@ -85,6 +85,18 @@ BATCH_TOOLS: Dict[str, BatchToolSpec] = {
         params_as_dict=True,
         completion="_on_line_scan_design_completed",
     ),
+    'confinement_dimensionality': BatchToolSpec(
+        label="Confinement Dimensionality",
+        method="analyze_confinement_dimensionality",
+        takes_task=True,
+        # The knobs are a map -- temperature, modulation, and every peak-search
+        # default -- rather than a fixed keyword list, and the tool coerces
+        # them itself against CONFINEMENT_DEFAULTS.
+        params_as_dict=True,
+        # Returns a dict (dataset, table path, and the whole-set coherence
+        # statistics), not a path, so it needs its own registration.
+        completion="_on_dimensionality_completed",
+    ),
     'derivative': BatchToolSpec(
         label="Derivative Calculator",
         method="calculate_derivative",

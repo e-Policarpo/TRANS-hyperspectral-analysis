@@ -8,6 +8,8 @@ Date: December 2025
 License: GPL
 """
 
+import math
+
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -24,8 +26,23 @@ from src.processing.spectral_features import (
     feature_table,
 )
 from src.processing.positivity import positive_integral, positive_mask
+from src.processing.edge_analysis import (
+    edge_summary,
+    edge_columns,
+    resolution_fwhm,
+)
+from src.processing.spatial_coherence import coherence_summary
+from src.physics.level_patterns import all_patterns
+from src.physics.level_ratio_fit import (
+    CONCLUSIVE,
+    AMBIGUOUS,
+    REJECTED,
+    UNDERDETERMINED,
+    rank_patterns,
+)
 from src.processing.peak_detection import (
     Analysis,
+    analyze,
     noise_sigma,
     BASELINE_KINDS,
     POLYNOMIAL_BASES,
@@ -4585,6 +4602,311 @@ class ToolImplementations:
             logger.error(f"Spectral feature extraction error: {e}", exc_info=True)
             self.errorOccurred.emit("Spectral Features Error", str(e))
             return empty
+
+    # ------------------------------------------------------------------
+    # Confinement dimensionality
+    # ------------------------------------------------------------------
+
+    #: Verdict as a number, so the column is a map rather than a label. The
+    #: order is "how much the fit committed to", which is what a colour scale
+    #: should read as: nothing said, said no, said maybe, said yes.
+    DIMENSIONALITY_VERDICT_CODES = {
+        UNDERDETERMINED: 0.0,
+        REJECTED: 1.0,
+        AMBIGUOUS: 2.0,
+        CONCLUSIVE: 3.0,
+    }
+
+    def analyze_confinement_dimensionality(self, task, dataset_name: str,
+                                           params: Optional[dict] = None) -> dict:
+        """Per-spectrum band-edge fit and confinement-geometry ranking.
+
+        Two questions per spectrum, both answered against the temperature:
+
+        * **Where is the band edge, and how disordered is it?**
+          :func:`~src.processing.edge_analysis.fit_two_regime` locates the
+          edge as the breakpoint between the steep in-gap tail and the
+          shallower regime outside it, and reports the tail decay energy
+          ``E0``. A single exponential branch cannot give an edge position --
+          ``ln g = c - |V - V0|/E0`` is degenerate in ``(c, V0)`` -- so the
+          breakpoint is the only estimator offered, and it is withheld
+          entirely when the two regimes are not distinguishable.
+        * **Which confinement geometry do the states fit?**
+          :func:`~src.physics.level_ratio_fit.rank_patterns` compares the
+          detected level positions against the dimensionless ladders of a 1D
+          well, a square 2D box, a 2D disc, a cubic 3D box and a sphere. The
+          ratios are size- and mass-independent and survive broadening,
+          because a symmetric kernel preserves feature positions even where
+          it destroys onset shapes.
+
+        The per-level uncertainty is the resolution and the disorder added in
+        quadrature: a level cannot be located better than the thermal and
+        modulation width, and the local potential moves it again by about
+        ``E0``. Both are measured from the same spectrum rather than assumed.
+
+        Emits ``<base> - Dimensionality``, one row per spectrum, so every
+        column is a spatial map. ``confined_dims`` is the dimensionality map
+        itself; ``verdict_code`` says how much each pixel's answer is worth
+        and should be read alongside it, since a confident-looking dimension
+        on an ``underdetermined`` pixel means nothing.
+
+        Whole-dataset statistics -- whether ``E0`` is the same everywhere, and
+        the correlation length of the band-edge landscape -- are computed by
+        :mod:`src.processing.spatial_coherence` and stored in the metadata,
+        because they are properties of the set and not of any one spectrum.
+
+        Parameters
+        ----------
+        params : dict
+            ``temperature_k`` (required for any thermal statement),
+            ``v_mod`` and ``mod_convention`` (lock-in amplitude),
+            ``n_kt`` (how far from zero the fit window starts),
+            ``max_skips`` (unresolved levels the ladder fit may invent),
+            ``use_edge_as_offset`` (fix the ratio fit's offset to the measured
+            band edge, which buys back a degree of freedom), plus any
+            :data:`CONFINEMENT_DEFAULTS` peak-search knob.
+        """
+        empty = {'dimensionality': None, 'dataset_name': '',
+                 'table_path': '', 'n_valid': 0, 'n_total': 0, 'coherence': {}}
+        try:
+            if dataset_name not in self._datasets:
+                self.errorOccurred.emit("Error", "Dataset not found")
+                return empty
+
+            raw = dict(params or {})
+            temperature_k = float(raw.get('temperature_k') or 0.0)
+            v_mod = float(raw.get('v_mod') or 0.0)
+            convention = str(raw.get('mod_convention') or 'zero_to_peak')
+            n_kt = float(raw.get('n_kt') or 3.0)
+            max_skips = int(float(raw.get('max_skips') or 2))
+            use_edge_offset = bool(raw.get('use_edge_as_offset', False))
+            if temperature_k <= 0:
+                logger.warning(
+                    "Dimensionality: no temperature given for '%s'. The tail "
+                    "energies are still measured, but nothing can be called "
+                    "resolution-limited and the level errors fall back to the "
+                    "modulation width alone.", dataset_name)
+
+            spectral_data = self._datasets[dataset_name]
+            x = np.asarray(spectral_data.independent_var, dtype=np.float64)
+            spectra = np.asarray(spectral_data.spectra.values, dtype=np.float64)
+            n_spectra = int(spectra.shape[1])
+
+            # Fall back to whatever the loader recorded. The MATRIX loader
+            # reads the lock-in amplitude out of the parameter tree, so a
+            # user who leaves the field alone gets the real number rather than
+            # zero -- and is told when the convention behind it was assumed
+            # rather than stated by the instrument.
+            info = getattr(spectral_data.metadata, 'additional_info', None) or {}
+            if v_mod <= 0 and info.get('v_mod'):
+                v_mod = float(info['v_mod'])
+                convention = str(info.get('v_mod_convention') or convention)
+                logger.info(
+                    "Dimensionality: using the loader's V_mod = %.4g V (%s%s)",
+                    v_mod, convention,
+                    ", convention ASSUMED, not stated by the instrument"
+                    if info.get('v_mod_convention_assumed') else "")
+
+            search = params_from_dict({**CONFINEMENT_DEFAULTS, **raw})
+            search.validate()
+            patterns = tuple(all_patterns())
+            fwhm = resolution_fwhm(temperature_k, v_mod, convention)
+            # FWHM -> Gaussian sigma. A level is not locatable to better than
+            # the width of the kernel that smeared it.
+            resolution_sigma = (fwhm / 2.3548 if math.isfinite(fwhm) and fwhm > 0
+                                else 0.0)
+
+            logger.info(
+                "Dimensionality: %s — %d spectra at %.4g K, V_mod = %.4g V "
+                "(%s), resolution %.4g eV",
+                dataset_name, n_spectra, temperature_k, v_mod, convention, fwhm)
+
+            rows = []
+            for i in range(n_spectra):
+                if getattr(task, 'cancelled', False):
+                    logger.info("Dimensionality cancelled after %d/%d spectra",
+                                i, n_spectra)
+                    return empty
+                y = spectra[:, i]
+                row = {'Spectrum_Index': float(i)}
+                row.update(edge_summary(x, y, temperature_k, v_mod=v_mod,
+                                        convention=convention, n_kt=n_kt))
+                row.update(self._rank_one_spectrum(
+                    x, y, row, search, patterns, resolution_sigma,
+                    max_skips, use_edge_offset))
+                rows.append(row)
+
+            if not rows:
+                return empty
+
+            frame = pd.DataFrame(rows)
+            csv_path = self._ensure_output_dir('peaks') / \
+                f"{self._apply_naming_convention(dataset_name, operation='Dimensionality')}.csv"
+            frame.to_csv(csv_path, index=False)
+
+            coherence = self._dimensionality_coherence(spectral_data, frame)
+
+            # Text columns stay in the CSV: 'best_pattern' and 'verdict' are
+            # labels, and a map wants 'confined_dims' and 'verdict_code'.
+            columns = [c for c in self._dimensionality_columns() if c in frame]
+            numeric = frame[columns].apply(pd.to_numeric, errors='coerce')
+            n_valid = int(numeric['valid'].sum()) if 'valid' in numeric else 0
+
+            base_name = self._extract_clean_base_name(dataset_name)
+            name = f"{base_name} - Dimensionality"
+            metadata = SpectralMetadata(
+                source_type='confinement_dimensionality',
+                dimensions=spectral_data.metadata.dimensions,
+                scan_mode=spectral_data.metadata.scan_mode,
+                units={'independent': 'Index', 'dependent': 'Feature'},
+                additional_info={
+                    'created_from': 'confinement_dimensionality',
+                    'source_dataset': dataset_name,
+                    'feature_columns': [c for c in columns if c != 'Spectrum_Index'],
+                    'temperature_k': temperature_k,
+                    'v_mod': v_mod,
+                    'mod_convention': convention,
+                    'resolution_fwhm': fwhm,
+                    'n_valid': n_valid,
+                    'n_total': n_spectra,
+                    'table_path': str(csv_path),
+                    'spatial_coherence': coherence,
+                    # A feature table is not a spectrum, so no 'original' key:
+                    # it must not be overlaid on the source's graph window.
+                    **self._carry_spatial_info(spectral_data.metadata),
+                },
+                data_type='flat',
+            )
+            try:
+                dataset = SpectralData(numeric, metadata,
+                                       topography=getattr(spectral_data, 'topography', None))
+            except (ValueError, TypeError) as exc:
+                logger.warning("Dimensionality table could not be promoted: %s", exc)
+                return empty
+
+            self._datasets[name] = dataset
+            if not self._workflow_mode:
+                self.dataLoaded.emit(name)
+
+            logger.info("Dimensionality: '%s' created (%d spectra, %d valid). "
+                        "E0 %s; band edge %s",
+                        name, n_spectra, n_valid,
+                        coherence.get('e0_verdict', '?'),
+                        coherence.get('v0_verdict', '?'))
+            return {'dimensionality': dataset, 'dataset_name': name,
+                    'table_path': str(csv_path), 'n_valid': n_valid,
+                    'n_total': n_spectra, 'coherence': coherence}
+
+        except Exception as e:
+            logger.error(f"Confinement dimensionality error: {e}", exc_info=True)
+            self.errorOccurred.emit("Dimensionality Error", str(e))
+            return empty
+
+    @staticmethod
+    def _dimensionality_columns() -> list:
+        """Numeric column order of the emitted table. Stable, so a map built
+        on one run lines up with the next."""
+        return (['Spectrum_Index'] + list(edge_columns())
+                + ['n_levels', 'confined_dims', 'ratio_21',
+                   'ratio_21_corrected', 'ratio_21_corrected_err',
+                   'delta_aic', 'pattern_p_value', 'scale_ev', 'offset_ev',
+                   'verdict_code'])
+
+    def _rank_one_spectrum(self, x, y, edge_row, search, patterns,
+                           resolution_sigma, max_skips, use_edge_offset) -> dict:
+        """Detect the states in one spectrum and rank the geometries.
+
+        Kept separate so the level uncertainty is stated in one place: it is
+        the resolution and the disorder in quadrature, both measured from this
+        spectrum rather than assumed.
+        """
+        blank = {'n_levels': 0.0, 'confined_dims': float('nan'),
+                 'ratio_21': float('nan'), 'ratio_21_corrected': float('nan'),
+                 'ratio_21_corrected_err': float('nan'),
+                 'delta_aic': float('nan'), 'pattern_p_value': float('nan'),
+                 'scale_ev': float('nan'), 'offset_ev': float('nan'),
+                 'best_pattern': '', 'verdict': UNDERDETERMINED,
+                 'verdict_code': self.DIMENSIONALITY_VERDICT_CODES[UNDERDETERMINED]}
+        try:
+            result = analyze(x, y, search)
+        except Exception:
+            logger.debug("Dimensionality: peak search failed", exc_info=True)
+            return blank
+
+        levels = np.array(sorted(float(pk.x) for pk in result.peaks),
+                          dtype=np.float64)
+        if levels.size < 2:
+            return blank
+
+        # A level is uncertain by the width of the kernel that smeared it and
+        # again by how far the local potential moved it. E0 is this
+        # spectrum's own measure of the second; fall back to the resolution
+        # alone where no tail energy could be fitted.
+        e0s = [edge_row.get('e0_neg'), edge_row.get('e0_pos')]
+        e0s = [v for v in e0s if isinstance(v, float) and math.isfinite(v) and v > 0]
+        disorder = float(np.mean(e0s)) if e0s else 0.0
+        sigma = math.hypot(resolution_sigma, disorder)
+        if sigma <= 0:
+            sigma = max(float(np.median(np.abs(np.diff(x)))), 1e-6)
+
+        offset_fixed = None
+        if use_edge_offset:
+            edges = [edge_row.get('v_edge_neg'), edge_row.get('v_edge_pos')]
+            edges = [v for v in edges if isinstance(v, float) and math.isfinite(v)]
+            if edges:
+                offset_fixed = float(np.mean(edges))
+
+        verdict = rank_patterns(levels, sigma, patterns=patterns,
+                                offset_fixed=offset_fixed, max_skips=max_skips)
+        best = verdict.best
+        return {
+            'n_levels': float(verdict.n_levels),
+            'confined_dims': float(best.confined_dims) if best else float('nan'),
+            'ratio_21': verdict.ratio_21,
+            'ratio_21_corrected': verdict.ratio_21_corrected,
+            'ratio_21_corrected_err': verdict.ratio_21_corrected_err,
+            'delta_aic': verdict.delta_aic,
+            'pattern_p_value': verdict.p_value,
+            'scale_ev': float(best.scale_ev) if best else float('nan'),
+            'offset_ev': float(best.offset_ev) if best else float('nan'),
+            'best_pattern': best.pattern if best else '',
+            'verdict': verdict.verdict,
+            'verdict_code': self.DIMENSIONALITY_VERDICT_CODES.get(
+                verdict.verdict, float('nan')),
+        }
+
+    def _dimensionality_coherence(self, spectral_data, frame) -> dict:
+        """Whether E0 is uniform, and how far the band edge stays correlated.
+
+        Properties of the SET of spectra, not of any one, so they live in the
+        metadata rather than in a column. Positions come from whatever the
+        loader recorded; without them only the uniformity half can be
+        answered, which is still the half that separates compositional
+        disorder from a uniform zero-point term.
+        """
+        try:
+            e0 = pd.to_numeric(frame.get('e0_neg'), errors='coerce')
+            e0_pos = pd.to_numeric(frame.get('e0_pos'), errors='coerce')
+            # One tail energy per spectrum: the mean of the two branches where
+            # both were fitted, otherwise whichever one was.
+            e0 = pd.concat([e0, e0_pos], axis=1).mean(axis=1, skipna=True)
+            v0 = pd.to_numeric(frame.get('v_edge_neg'), errors='coerce')
+
+            # No per-point error bar is available from a single spectrum, so
+            # the resolution stands in for it: two points differing by less
+            # than that are not distinguishable anyway.
+            info = getattr(spectral_data.metadata, 'additional_info', None) or {}
+            err = info.get('resolution_fwhm')
+            positions = self._line_positions_m(spectral_data)
+            return coherence_summary(
+                e0.to_numpy(dtype=np.float64),
+                float(err) / 2.3548 if err else None,
+                positions if positions is not None else None,
+                v0.to_numpy(dtype=np.float64) if positions is not None else None,
+            )
+        except Exception:
+            logger.debug("Spatial coherence summary failed", exc_info=True)
+            return {}
 
     def _merge_peak_intervals(self, raw_intervals: list, independent_var: np.ndarray) -> list:
         """

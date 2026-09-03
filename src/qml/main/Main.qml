@@ -124,6 +124,7 @@ ApplicationWindow {
                 "Derivative Calculator", "Curve Fitting", "Gradient Filter",
                 "Integration Utility", "Map Generator", "Spatial Average",
                 "Truncate Data", "Curve Analysis", "Confinement Analysis",
+                "Confinement Dimensionality",
                 "Spectral Features", "Confinement Designer",
                 "Line Scan Designer", "Quantum Well Solver",
                 "Quantum Dot Solver", "Peak Indexing",
@@ -133,7 +134,7 @@ ApplicationWindow {
                 "Spectral Axis Converter", "Multi-Peak Fitting"
             ]
         } else if (currentTabIndex === 1) {
-            return ["Confinement Analysis", "Spectral Features", "Image Smoothing", "Gradient Filter", "Map Discretizer", "Map Processing"]
+            return ["Confinement Analysis", "Confinement Dimensionality", "Spectral Features", "Image Smoothing", "Gradient Filter", "Map Discretizer", "Map Processing"]
         } else if (currentTabIndex === 2) {
             // The Modeling tab is a workstation: everything it does is in the
             // workstation itself, so the tool palette has nothing to offer.
@@ -643,6 +644,16 @@ ApplicationWindow {
                 // turns a map's spectra into the peak-occupancy table.
             MenuItem {
                 text: "Confinement Analysis"
+                visible: currentTabIndex === 0 || currentTabIndex === 1
+                height: visible ? implicitHeight : 0
+                onTriggered: openToolWindow(text)
+            }
+                // Reads the same peaks, but asks a different question of them:
+                // Confinement Analysis reports WHICH levels a spectrum has,
+                // this one asks which geometry that ladder of levels belongs
+                // to — and fits the band edge that the ladder is measured from.
+            MenuItem {
+                text: "Confinement Dimensionality"
                 visible: currentTabIndex === 0 || currentTabIndex === 1
                 height: visible ? implicitHeight : 0
                 onTriggered: openToolWindow(text)
@@ -1836,13 +1847,15 @@ ApplicationWindow {
     }
 
     property var multiTabTools: ({ "Confinement Analysis": true, "Spectral Features": true,
+                                   "Confinement Dimensionality": true,
                                    "Line Scan Designer": true })
     property var toolWindowSizes: ({ "Confinement Analysis": { width: 1000, height: 700 },
                                      "Confinement Designer": { width: 1120, height: 760 },
                                      "Line Scan Designer": { width: 1080, height: 740 },
                                      "Quantum Well Solver": { width: 1000, height: 700 },
                                      "Quantum Dot Solver": { width: 1060, height: 720 },
-                                     "Spectral Features": { width: 1020, height: 720 } })
+                                     "Spectral Features": { width: 1020, height: 720 },
+                                     "Confinement Dimensionality": { width: 640, height: 780 } })
 
     function toolWindowSize(toolName) {
         return toolWindowSizes[toolName] || { width: 450, height: 550 }
@@ -1872,6 +1885,7 @@ ApplicationWindow {
             "Curve Analysis": "../tools/CurveAnalysisTool.qml",
             "Truncate Data": "../tools/TruncateTool.qml",
             "Confinement Analysis": "../tools/ConfinementAnalysisTool.qml",
+            "Confinement Dimensionality": "../tools/ConfinementDimensionalityTool.qml",
             "Confinement Designer": "../tools/ConfinementDesignerTool.qml",
             "Line Scan Designer": "../tools/LineScanDesignerTool.qml",
             "Quantum Well Solver": "../tools/QuantumWellSolverTool.qml",
