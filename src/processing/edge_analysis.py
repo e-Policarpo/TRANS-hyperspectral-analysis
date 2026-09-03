@@ -123,22 +123,125 @@ MODULATION_CONVENTIONS = {
 }
 
 
+#: FWHM of a Savitzky-Golay derivative's response to a step, as a fraction of
+#: the window length. **Measured, not a rule of thumb**: a step in I(V) is a
+#: delta in dI/dV, so pushing one through the filter and reading the width of
+#: what comes out gives the instrument function directly, exactly as the
+#: lock-in semi-ellipse is one. The value depends only on the polynomial
+#: order, and only through whether it is quadratic or cubic -- orders 1 and 2
+#: share a filter, as do 3 and 4.
+#:
+#:     N       poly 1-2      poly 3-4
+#:     11      0.727         0.364
+#:     21      0.667         0.381
+#:     51      0.706         0.431
+#:     101     0.713         0.416
+DERIVATIVE_FWHM_FRACTION = {1: 0.71, 2: 0.71, 3: 0.41, 4: 0.41}
+
+#: The same measurement for a *smooth -> gradient -> smooth* pipeline, which
+#: is what :meth:`ToolImplementations.calculate_derivative` runs and what most
+#: hand-rolled dI/dV scripts do. Measured across N = 11 to 101: 0.55 N with
+#: one smoothing pass, 0.50 N with two, against 0.41 N for a single-pass
+#: Savitzky-Golay derivative at the same window and order.
+#:
+#: **A one-pass SG derivative is about 30 % sharper for the same window**, and
+#: for the same reason: it differentiates the fitted polynomial instead of
+#: filtering twice around a bare gradient. Worth knowing before choosing how
+#: to make a dI/dV, though it is not something this module can fix after the
+#: fact.
+#:
+#: 0.55 is the conservative end of the measured range. Erring toward a wider
+#: instrument function means declaring fewer states resolved, which is the
+#: safe direction for a number whose job is to say what may be believed.
+PIPELINE_FWHM_FRACTION = 0.55
+
+#: FWHM of a bare two-point gradient, in grid steps. Independent of any
+#: window, because there is none.
+GRADIENT_FWHM_STEPS = 2.0
+
+DERIVATIVE_KINDS = ("savgol_deriv", "smooth_gradient")
+
+
+def differentiation_fwhm(window_v: float, polyorder: int = 2,
+                         kind: str = "savgol_deriv") -> float:
+    """Resolution cost of computing dI/dV by differentiating I(V), in volts.
+
+    A measurement taken **without a lock-in** has no modulation kernel, but it
+    is not therefore thermally limited: the derivative has to be smoothed or
+    it is pure noise, and that smoothing is an instrument function like any
+    other. Its width is what this returns, so it can go into the resolution
+    budget beside the thermal term instead of being quietly omitted.
+
+    ``window_v`` is the differentiation window in volts (the Savitzky-Golay
+    window length times the bias step). A higher ``polyorder`` follows the
+    curve more closely and costs roughly half as much width, which is the one
+    free improvement available here.
+
+``kind`` says how the derivative was taken, because the two routes cost
+    different amounts at the same window:
+
+    * ``'savgol_deriv'`` -- one Savitzky-Golay pass with ``deriv=1``, which
+      differentiates the fitted polynomial. 0.41 N at order 3.
+    * ``'smooth_gradient'`` -- smooth, take a bare gradient, smooth again.
+      What :meth:`ToolImplementations.calculate_derivative` does, and what
+      most hand-rolled dI/dV scripts do. 0.55 N, about 30 % wider.
+
+    Returns ``0.0`` for a non-positive window -- an exact analytic derivative,
+    which no real measurement has.
+    """
+    if kind not in DERIVATIVE_KINDS:
+        raise ValueError(
+            f"kind must be one of {DERIVATIVE_KINDS}, got {kind!r}")
+    window_v = abs(float(window_v))
+    if window_v <= 0.0:
+        return 0.0
+    if kind == "smooth_gradient":
+        return float(PIPELINE_FWHM_FRACTION * window_v)
+    order = int(polyorder)
+    try:
+        fraction = DERIVATIVE_FWHM_FRACTION[order]
+    except KeyError:
+        raise ValueError(
+            f"polyorder must be one of {tuple(DERIVATIVE_FWHM_FRACTION)}, "
+            f"got {polyorder!r}")
+    return float(fraction * window_v)
+
+
 def resolution_fwhm(temperature_k: float, v_mod: float = 0.0,
-                    convention: str = "zero_to_peak") -> float:
+                    convention: str = "zero_to_peak",
+                    deriv_window_v: float = 0.0,
+                    deriv_polyorder: int = 2,
+                    deriv_kind: str = "savgol_deriv") -> float:
     """Narrowest feature the instrument can draw, in volts.
 
-    Thermal smearing and lock-in modulation are independent, so their widths
-    are combined in quadrature. **This is an approximation**: neither kernel
-    is Gaussian -- the thermal one is ``sech^2`` and the modulation one a
-    semi-ellipse -- and quadrature addition is exact only for Gaussians. It is
-    accurate to a few percent when one term dominates and errs on the
-    optimistic side by roughly 5 % when the two are comparable. Use it as the
-    resolution *scale*, not as a deconvolution kernel.
+    Three independent widths, combined in quadrature:
 
-    ``v_mod`` is the lock-in amplitude in volts, quoted in whichever
-    ``convention`` the acquisition software uses; ``0`` (the default) means an
-    unmodulated or numerically differentiated measurement, leaving the thermal
-    term alone. A non-positive temperature contributes nothing, matching
+    * **Thermal.** ``4 ln(1 + sqrt 2) k_B T``, always present.
+    * **Lock-in modulation.** ``v_mod`` in whichever ``convention`` the
+      acquisition software quotes. Zero for a measurement taken without one.
+    * **Numerical differentiation.** ``deriv_window_v``, the window used to
+      get dI/dV out of I(V). Zero when a lock-in supplied dI/dV directly.
+
+    The last two are alternatives in practice: dI/dV is either detected at the
+    modulation frequency or computed from I(V), never both. Passing both is
+    allowed and simply adds their widths, but it usually means one of them was
+    filled in by mistake.
+
+    **Not having a lock-in does not make a measurement thermally limited.**
+    That is the trap this argument exists to close: with no ``v_mod`` to quote,
+    the modulation term is zero and the resolution looks like the thermal one
+    alone -- while the differentiation window that actually produced the curve,
+    often wider than ``3.5 k_B T``, goes unrecorded. At 94 K the thermal width
+    is 28.6 mV, so a 50 mV window contributes 36 mV and *dominates* it.
+
+    **This is an approximation**: none of the three kernels is Gaussian -- the
+    thermal one is ``sech^2``, the modulation one a semi-ellipse -- and
+    quadrature addition is exact only for Gaussians. Accurate to a few percent
+    when one term dominates, optimistic by roughly 5 % when two are
+    comparable. Use it as the resolution *scale*, not as a deconvolution
+    kernel.
+
+    A non-positive temperature contributes nothing, matching
     :func:`~src.processing.peak_detection.thermal_broadening`, so
     ``resolution_fwhm(0, 0)`` is ``0.0`` -- "no known limit", not "perfect".
 
@@ -160,7 +263,9 @@ def resolution_fwhm(temperature_k: float, v_mod: float = 0.0,
     # it is answered one layer up in :func:`edge_summary`.
     thermal = THERMAL_FWHM_FACTOR * thermal_broadening(temperature_k, "eV")
     modulation = factor * abs(float(v_mod)) if v_mod else 0.0
-    return float(math.hypot(thermal, modulation))
+    numerical = differentiation_fwhm(deriv_window_v, deriv_polyorder,
+                                     deriv_kind)
+    return float(math.sqrt(thermal ** 2 + modulation ** 2 + numerical ** 2))
 
 
 def thermal_slope_ceiling(temperature_k: float) -> Tuple[float, float]:
@@ -726,7 +831,9 @@ def edge_summary(v: np.ndarray, g: np.ndarray, temperature_k: float,
                  v_mod: float = 0.0, current: Optional[np.ndarray] = None,
                  convention: str = "zero_to_peak",
                  broadening_v: float = 0.0, n_kt: float = 3.0,
-                 min_points: int = 8) -> Dict[str, float]:
+                 min_points: int = 8, deriv_window_v: float = 0.0,
+                 deriv_polyorder: int = 2,
+                 deriv_kind: str = "savgol_deriv") -> Dict[str, float]:
     """Both branches' edge and tail numbers as one flat row.
 
     Every value is a scalar, so the row drops straight into a feature table
@@ -766,7 +873,9 @@ def edge_summary(v: np.ndarray, g: np.ndarray, temperature_k: float,
         # temperature: a row saying "resolution = 17 meV" for a measurement
         # whose thermal kernel is unknown is a confident number standing in
         # for a missing one, and this row is what a map is coloured by.
-        "resolution_fwhm": (resolution_fwhm(temperature_k, v_mod, convention)
+        "resolution_fwhm": (resolution_fwhm(temperature_k, v_mod, convention,
+                                            deriv_window_v, deriv_polyorder,
+                                            deriv_kind)
                             if temperature_k and temperature_k > 0
                             else float("nan")),
         "slope_ceiling": ceiling,

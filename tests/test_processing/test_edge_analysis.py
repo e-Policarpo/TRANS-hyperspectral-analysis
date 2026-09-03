@@ -43,6 +43,7 @@ from src.processing import edge_analysis as ea
 from src.processing.edge_analysis import (
     MODULATION_CONVENTIONS,
     THERMAL_FWHM_FACTOR,
+    differentiation_fwhm,
     edge_columns,
     edge_summary,
     feenstra_normalize,
@@ -727,3 +728,134 @@ def test_an_unknown_temperature_reports_no_resolution_in_the_summary_row():
     assert math.isnan(unknown["slope_ceiling"])
     # The primitive is untouched: T=0 still isolates the modulation kernel.
     assert resolution_fwhm(0.0, 0.010) == pytest.approx(math.sqrt(3) * 0.010)
+
+
+# ---------------------------------------------------------------------------
+# dI/dV without a lock-in: the differentiation window IS an instrument function
+# ---------------------------------------------------------------------------
+
+def _sg_derivative_step_fwhm(window, polyorder):
+    """FWHM, in samples, of a Savitzky-Golay derivative's response to a step.
+
+    The oracle for :func:`differentiation_fwhm`, and it is the definition
+    rather than a model of it: a step in I(V) is a delta in dI/dV, so what the
+    filter makes of one IS the instrument function.
+    """
+    from scipy.signal import savgol_filter
+
+    n = 4001
+    current = np.zeros(n)
+    current[n // 2:] = 1.0
+    deriv = savgol_filter(current, window, polyorder, deriv=1, delta=1.0,
+                          mode="interp")
+    above = np.flatnonzero(deriv >= 0.5 * deriv.max())
+    return above[-1] - above[0] + 1
+
+
+@pytest.mark.parametrize("window", [11, 21, 51, 101])
+@pytest.mark.parametrize("polyorder", [1, 2, 3, 4])
+def test_the_differentiation_width_matches_the_filter_it_models(window, polyorder):
+    """Measured against the actual filter, not against a rule of thumb."""
+    dv = 1e-3
+    measured = _sg_derivative_step_fwhm(window, polyorder) * dv
+
+    assert differentiation_fwhm(window * dv, polyorder) == pytest.approx(
+        measured, rel=0.25)
+
+
+def test_the_two_filter_families_are_the_two_that_exist():
+    """Orders 1 and 2 share a filter, and so do 3 and 4 — a quadratic fitted
+    to a symmetric window has the same first-derivative coefficients as a
+    linear one. Two constants, not four."""
+    assert differentiation_fwhm(0.05, 1) == differentiation_fwhm(0.05, 2)
+    assert differentiation_fwhm(0.05, 3) == differentiation_fwhm(0.05, 4)
+    # And the cubic family really is the cheaper one.
+    assert differentiation_fwhm(0.05, 3) < differentiation_fwhm(0.05, 2)
+
+
+def test_no_window_means_an_exact_derivative():
+    assert differentiation_fwhm(0.0) == 0.0
+    assert differentiation_fwhm(-0.05) == pytest.approx(differentiation_fwhm(0.05))
+
+
+def test_an_unsupported_polynomial_order_is_refused():
+    with pytest.raises(ValueError, match="polyorder"):
+        differentiation_fwhm(0.05, 7)
+
+
+def test_a_measurement_without_a_lock_in_is_not_thermally_limited():
+    """The trap this exists to close. With no lock-in there is no V_mod to
+    quote, so the resolution *looks* thermal — while the window that actually
+    produced the curve, wider than the thermal kernel, goes unrecorded.
+
+    At 94 K the thermal width is 28.6 mV. A 50 mV window contributes 36 mV and
+    dominates it.
+    """
+    thermal_only = resolution_fwhm(94.0)
+    with_window = resolution_fwhm(94.0, deriv_window_v=0.050)
+
+    assert thermal_only == pytest.approx(0.0286, abs=5e-4)
+    assert differentiation_fwhm(0.050) > thermal_only, (
+        "a 50 mV window should dominate the 94 K thermal kernel")
+    assert with_window == pytest.approx(
+        math.hypot(thermal_only, differentiation_fwhm(0.050)), rel=1e-9)
+    assert with_window > 1.5 * thermal_only
+
+
+def test_the_three_widths_add_in_quadrature():
+    total = resolution_fwhm(94.0, 0.010, "rms", 0.020, 2)
+    thermal = resolution_fwhm(94.0)
+    modulation = math.sqrt(6.0) * 0.010
+    numerical = differentiation_fwhm(0.020, 2)
+
+    assert total == pytest.approx(
+        math.sqrt(thermal ** 2 + modulation ** 2 + numerical ** 2), rel=1e-9)
+
+
+def test_the_window_defaults_to_zero_so_existing_callers_are_unchanged():
+    assert resolution_fwhm(94.0, 0.010, "rms") == pytest.approx(
+        resolution_fwhm(94.0, 0.010, "rms", 0.0, 2), rel=1e-12)
+
+
+def _smooth_gradient_step_fwhm(window, polyorder=3):
+    """FWHM of TRANS's own derivative pipeline: smooth, gradient, smooth."""
+    from scipy.signal import savgol_filter
+
+    n = 4001
+    current = np.zeros(n)
+    current[n // 2:] = 1.0
+    deriv = np.gradient(savgol_filter(current, window, polyorder))
+    deriv = savgol_filter(deriv, window, polyorder)
+    above = np.flatnonzero(deriv >= 0.5 * deriv.max())
+    return above[-1] - above[0] + 1
+
+
+@pytest.mark.parametrize("window", [21, 51, 101])
+def test_the_smooth_gradient_pipeline_is_modelled_from_its_own_response(window):
+    dv = 1e-3
+    measured = _smooth_gradient_step_fwhm(window) * dv
+    modelled = differentiation_fwhm(window * dv, 3, "smooth_gradient")
+
+    assert modelled == pytest.approx(measured, rel=0.2)
+    # Conservative by construction: erring wide means declaring fewer states
+    # resolved, which is the safe direction for a resolution figure.
+    assert modelled >= measured * 0.95
+
+
+@pytest.mark.parametrize("window", [21, 51, 101])
+def test_one_pass_is_sharper_than_smooth_gradient_smooth(window):
+    """The finding behind offering both: TRANS's Derivative tool filters twice
+    around a bare gradient, which is ~30% wider than differentiating the
+    fitted polynomial once at the same window."""
+    dv = 1e-3
+    one_pass = _sg_derivative_step_fwhm(window, 3) * dv
+    pipeline = _smooth_gradient_step_fwhm(window) * dv
+
+    assert pipeline > one_pass
+    assert differentiation_fwhm(window * dv, 3, "smooth_gradient") > \
+        differentiation_fwhm(window * dv, 3, "savgol_deriv")
+
+
+def test_an_unknown_derivative_kind_is_refused():
+    with pytest.raises(ValueError, match="kind"):
+        differentiation_fwhm(0.05, 3, "magic")

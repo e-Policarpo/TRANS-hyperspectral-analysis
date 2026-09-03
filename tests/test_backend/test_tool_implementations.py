@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import Mock, MagicMock, patch
 
 from src.models.spectral_data import SpectralData, SpectralMetadata
+from src.processing.edge_analysis import resolution_fwhm
 
 
 class MockTask:
@@ -2872,3 +2873,40 @@ class TestConfinementDimensionality(TestToolImplementationsSetup):
         result = self._run(tool_impl, sts_dataset, v_mod=0.005)
         assert result['dimensionality'].metadata.additional_info['v_mod'] \
             == pytest.approx(0.005)
+
+    def test_a_recorded_differentiation_window_is_picked_up(
+            self, tool_impl, sts_dataset):
+        """A curve that came through the Derivative tool carries the window
+        that made it, so nobody has to remember it. Without this the tool
+        reports a thermally limited resolution for a measurement whose
+        dominant broadening is the smoothing."""
+        sts_dataset.metadata.additional_info.update({
+            'deriv_window_v': 0.050, 'deriv_polyorder': 3,
+            'deriv_kind': 'smooth_gradient'})
+
+        # v_mod=0 because the scenario IS "no lock-in": comparing against a
+        # baseline that still carries a modulation would not be the trap.
+        info = self._run(tool_impl, sts_dataset, v_mod=0.0)['dimensionality'] \
+            .metadata.additional_info
+
+        assert info['deriv_window_v'] == pytest.approx(0.050)
+        assert info['deriv_kind'] == 'smooth_gradient'
+        # 0.55 * 50 mV = 27.5 mV against a 28.6 mV thermal kernel: comparable,
+        # so the total must be clearly above thermal alone.
+        thermal_only = resolution_fwhm(self.TEMPERATURE_K)
+        assert info['resolution_fwhm'] > 1.3 * thermal_only
+
+    def test_no_lock_in_does_not_mean_thermally_limited(
+            self, tool_impl, sts_dataset):
+        """The trap: with no lock-in there is no V_mod to type, so leaving
+        both fields empty reports the thermal width as the resolution while
+        the window that actually produced the curve goes unrecorded."""
+        naive = self._run(tool_impl, sts_dataset, v_mod=0.0)
+        honest = self._run(tool_impl, sts_dataset, v_mod=0.0,
+                           deriv_window_v=0.050, deriv_kind='smooth_gradient',
+                           deriv_polyorder=3)
+
+        n_res = naive['dimensionality'].metadata.additional_info['resolution_fwhm']
+        h_res = honest['dimensionality'].metadata.additional_info['resolution_fwhm']
+        assert h_res > n_res
+        assert h_res / n_res > 1.3

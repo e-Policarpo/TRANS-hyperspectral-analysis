@@ -76,9 +76,22 @@ Item {
     readonly property real modFactor: modCombo.currentIndex === 0 ? 1.7320508075688772
                                     : modCombo.currentIndex === 1 ? 2.449489742783178
                                                                   : 0.8660254037844386
-    readonly property real modFwhm: modFactor * modSpin.realValue
+    readonly property bool usingLockIn: sourceCombo.currentIndex === 1
+    readonly property real modFwhm: usingLockIn ? modFactor * modSpin.realValue : 0.0
+
+    // dI/dV computed from I(V) is NOT thermally limited. The differentiation
+    // window is an instrument function like any other, and at 94 K a 50 mV
+    // window contributes 36 mV against a 28.6 mV thermal kernel — it
+    // dominates. Fraction measured by pushing a step in I through the filter
+    // and reading the width of what comes out: 0.71·N for polynomial order
+    // 1–2, 0.41·N for 3–4.
+    readonly property real derivFraction: derivKindCombo.currentIndex === 0
+        ? 0.55 : (derivOrderSpin.value >= 3 ? 0.41 : 0.71)
+    readonly property real derivFwhm: usingLockIn
+        ? 0.0 : derivFraction * derivWindowSpin.realValue
     readonly property real totalFwhm: temperatureK > 0
-        ? Math.sqrt(thermalFwhm * thermalFwhm + modFwhm * modFwhm) : NaN
+        ? Math.sqrt(thermalFwhm * thermalFwhm + modFwhm * modFwhm
+                    + derivFwhm * derivFwhm) : NaN
     // A thermally broadened edge can never fall faster than this.
     readonly property real slopeCeiling: temperatureK > 0
         ? 1.0 / (Math.LN10 * kBoltzEv * temperatureK) : NaN
@@ -88,11 +101,23 @@ Item {
             return "No temperature: the tail energies are still measured, but " +
                    "nothing can be called resolution-limited."
         var txt = "Resolution " + (totalFwhm * 1000).toFixed(1) + " meV" +
-                  "  ·  ceiling " + slopeCeiling.toFixed(1) + " decades/V"
-        if (modFwhm < 0.25 * thermalFwhm)
-            txt += "\nThermally limited — the modulation contributes nothing here."
+                  "  ·  ceiling " + slopeCeiling.toFixed(1) + " decades/V" +
+                  "  ·  thermal alone " + (thermalFwhm * 1000).toFixed(1) + " meV"
+        var broadening = usingLockIn ? modFwhm : derivFwhm
+        var label = usingLockIn ? "Modulation" : "Differentiation window"
+        if (broadening <= 0)
+            txt += "\nThermally limited — but only because nothing else was " +
+                   "entered. A curve differentiated from I(V) has a window, " +
+                   "and leaving it at zero hides it rather than removing it."
+        else if (broadening < 0.25 * thermalFwhm)
+            txt += "\nThermally limited — " + label.toLowerCase() +
+                   " contributes only " + (broadening * 1000).toFixed(1) + " meV."
+        else if (broadening > thermalFwhm)
+            txt += "\n" + label + " DOMINATES at " + (broadening * 1000).toFixed(1) +
+                   " meV — wider than the thermal kernel. States closer than " +
+                   "this are being merged before you see them."
         else
-            txt += "\nModulation contributes " + (modFwhm * 1000).toFixed(1) +
+            txt += "\n" + label + " contributes " + (broadening * 1000).toFixed(1) +
                    " meV of the total."
         return txt
     }
@@ -100,8 +125,16 @@ Item {
     function analysisParams() {
         return {
             "temperature_k": tempSpin.realValue,
-            "v_mod": modSpin.realValue,
+            "v_mod": root.usingLockIn ? modSpin.realValue : 0.0,
             "mod_convention": ["zero_to_peak", "rms", "peak_to_peak"][modCombo.currentIndex],
+            "deriv_window_v": root.usingLockIn ? 0.0 : derivWindowSpin.realValue,
+            "deriv_polyorder": derivOrderSpin.value,
+            // How the derivative was taken. The smooth-gradient-smooth route
+            // that TRANS's own Derivative tool (and most scripts) use is ~30%
+            // wider than a single-pass Savitzky-Golay derivative at the same
+            // window, so the two cannot share one number.
+            "deriv_kind": derivKindCombo.currentIndex === 0
+                          ? "smooth_gradient" : "savgol_deriv",
             "n_kt": nKtSpin.realValue,
             "max_skips": maxSkipsSpin.value,
             "use_edge_as_offset": edgeOffsetCheck.checked,
@@ -246,18 +279,79 @@ Item {
                                 from: 0; to: 100000; value: 9400; stepSize: 100; decimals: 2
                             }
 
-                            Label { text: "Modulation V_mod (V):"; color: textLight }
+                            Label { text: "dI/dV came from:"; color: textLight }
+                            ToolComboBox {
+                                id: sourceCombo
+                                Layout.fillWidth: true
+                                model: ["Differentiating I(V)", "A lock-in"]
+                                // Defaults to the differentiated case because
+                                // that is the one whose instrument function is
+                                // easy to forget: with no lock-in there is no
+                                // V_mod to type, and the resolution then looks
+                                // thermal when it is not.
+                                currentIndex: 0
+                            }
+
+                            Label {
+                                text: "Differentiation window (V):"
+                                color: textLight
+                                visible: !root.usingLockIn
+                            }
+                            ToolSpinBox {
+                                id: derivWindowSpin
+                                from: 0; to: 5000; value: 0; stepSize: 5; decimals: 4
+                                visible: !root.usingLockIn
+                            }
+
+                            Label {
+                                text: "Derivative method:"
+                                color: textLight
+                                visible: !root.usingLockIn
+                            }
+                            ToolComboBox {
+                                id: derivKindCombo
+                                Layout.fillWidth: true
+                                model: ["Smooth, gradient, smooth", "One-pass Savitzky-Golay"]
+                                currentIndex: 0
+                                visible: !root.usingLockIn
+                            }
+
+                            Label {
+                                text: "Polynomial order:"
+                                color: textLight
+                                visible: !root.usingLockIn
+                            }
+                            ToolSpinBox {
+                                id: derivOrderSpin
+                                from: 1; to: 4; value: 2; stepSize: 1; decimals: 0
+                                visible: !root.usingLockIn
+                            }
+
+                            Label {
+                                text: "Modulation V_mod (V):"
+                                color: textLight
+                                visible: root.usingLockIn
+                            }
                             ToolSpinBox {
                                 id: modSpin
                                 from: 0; to: 5000; value: 0; stepSize: 5; decimals: 4
+                                visible: root.usingLockIn
                             }
 
-                            Label { text: "Amplitude convention:"; color: textLight }
+                            Label {
+                                text: "Amplitude convention:"
+                                color: textLight
+                                visible: root.usingLockIn
+                            }
                             ToolComboBox {
                                 id: modCombo
                                 Layout.fillWidth: true
                                 model: ["Zero-to-peak", "RMS", "Peak-to-peak"]
-                                currentIndex: 0
+                                // RMS: what the instrument in use here quotes.
+                                // Check it per instrument — the three differ by
+                                // 40% in the resolution they imply.
+                                currentIndex: 1
+                                visible: root.usingLockIn
                             }
                         }
 
@@ -273,10 +367,18 @@ Item {
                         Label {
                             Layout.fillWidth: true
                             Layout.minimumWidth: 0
-                            text: "The convention is not cosmetic: the lock-in kernel's " +
-                                  "FWHM is sqrt(3)·V_mod zero-to-peak but sqrt(6)·V_rms, " +
-                                  "so picking the wrong one is a 40% error in the " +
-                                  "resolution. Check what your instrument reports."
+                            text: root.usingLockIn
+                                  ? "The convention is not cosmetic: the kernel's FWHM " +
+                                    "is sqrt(3)·V_mod zero-to-peak but sqrt(6)·V_rms, so " +
+                                    "picking the wrong one is a 40% error in the " +
+                                    "resolution. Check what your instrument reports."
+                                  : "The window is the Savitzky-Golay length times the " +
+                                    "bias step — the same window that produced the " +
+                                    "curve. It is not optional: differentiating I(V) " +
+                                    "without smoothing gives noise, and the smoothing " +
+                                    "is an instrument function. A higher polynomial " +
+                                    "order follows the curve more closely and costs " +
+                                    "about half the width."
                             font.pixelSize: 10
                             color: textMuted
                             wrapMode: Text.Wrap

@@ -744,6 +744,12 @@ class ToolImplementations:
             else:
                 window_length = default_window
 
+            # Bias step, for turning the window from samples into volts. The
+            # median absorbs the odd duplicated or missing point without
+            # letting it decide the answer.
+            steps = np.abs(np.diff(np.asarray(independent_var, dtype=np.float64)))
+            step_v = float(np.median(steps)) if steps.size else 0.0
+
             # Smooth before if requested
             if smooth_before and n_points > 3:
                 spectra = signal.savgol_filter(spectra, window_length, 3, axis=0)
@@ -788,6 +794,22 @@ class ToolImplementations:
                 additional_info={
                     **self._carry_spatial_info(spectral_data.metadata),
                     'derivative_order': order,
+                    # The smoothing that made this curve differentiable is an
+                    # instrument function, and downstream it decides what
+                    # counts as resolved. Recording it here means a tool that
+                    # needs the resolution can read it instead of asking the
+                    # user to remember. The pipeline is smooth -> gradient ->
+                    # smooth, which is ~0.55 * window wide; a single-pass
+                    # Savitzky-Golay derivative would be ~0.41 * window.
+                    **({'deriv_window_points': int(window_length),
+                        'deriv_window_v': float(window_length) * float(step_v),
+                        'deriv_polyorder': 3,
+                        'deriv_kind': 'smooth_gradient'}
+                       if (smooth_before or smooth_after) and step_v > 0 else
+                       {'deriv_window_points': 2,
+                        'deriv_window_v': 2.0 * float(step_v),
+                        'deriv_polyorder': 1,
+                        'deriv_kind': 'smooth_gradient'} if step_v > 0 else {}),
                     'original': dataset_name
                 }
             )
@@ -4678,6 +4700,14 @@ class ToolImplementations:
             v_mod = float(raw.get('v_mod') or 0.0)
             convention = str(raw.get('mod_convention') or 'zero_to_peak')
             n_kt = float(raw.get('n_kt') or 3.0)
+            # dI/dV taken WITHOUT a lock-in is not thermally limited: the
+            # window used to differentiate I(V) is an instrument function too,
+            # and at 94 K a 50 mV window is wider than the 28.6 mV thermal
+            # kernel. Recording zero modulation and stopping there would hide
+            # the dominant term.
+            deriv_window_v = float(raw.get('deriv_window_v') or 0.0)
+            deriv_polyorder = int(float(raw.get('deriv_polyorder') or 2))
+            deriv_kind = str(raw.get('deriv_kind') or 'savgol_deriv')
             max_skips = int(float(raw.get('max_skips') or 2))
             use_edge_offset = bool(raw.get('use_edge_as_offset', False))
             if temperature_k <= 0:
@@ -4698,6 +4728,19 @@ class ToolImplementations:
             # zero -- and is told when the convention behind it was assumed
             # rather than stated by the instrument.
             info = getattr(spectral_data.metadata, 'additional_info', None) or {}
+            # Same for the differentiation window. When TRANS took the
+            # derivative itself it recorded the window it used, so a curve
+            # that came through the Derivative tool carries its own
+            # instrument function and nobody has to remember it.
+            if deriv_window_v <= 0 and info.get('deriv_window_v'):
+                deriv_window_v = float(info['deriv_window_v'])
+                deriv_polyorder = int(info.get('deriv_polyorder') or deriv_polyorder)
+                deriv_kind = str(info.get('deriv_kind') or deriv_kind)
+                logger.info(
+                    "Dimensionality: using the recorded differentiation "
+                    "window = %.4g V (%s, order %d)",
+                    deriv_window_v, deriv_kind, deriv_polyorder)
+
             if v_mod <= 0 and info.get('v_mod'):
                 v_mod = float(info['v_mod'])
                 convention = str(info.get('v_mod_convention') or convention)
@@ -4710,7 +4753,8 @@ class ToolImplementations:
             search = params_from_dict({**CONFINEMENT_DEFAULTS, **raw})
             search.validate()
             patterns = tuple(all_patterns())
-            fwhm = resolution_fwhm(temperature_k, v_mod, convention)
+            fwhm = resolution_fwhm(temperature_k, v_mod, convention,
+                                   deriv_window_v, deriv_polyorder, deriv_kind)
             # FWHM -> Gaussian sigma. A level is not locatable to better than
             # the width of the kernel that smeared it.
             resolution_sigma = (fwhm / 2.3548 if math.isfinite(fwhm) and fwhm > 0
@@ -4718,8 +4762,9 @@ class ToolImplementations:
 
             logger.info(
                 "Dimensionality: %s — %d spectra at %.4g K, V_mod = %.4g V "
-                "(%s), resolution %.4g eV",
-                dataset_name, n_spectra, temperature_k, v_mod, convention, fwhm)
+                "(%s), derivative window %.4g V (order %d), resolution %.4g eV",
+                dataset_name, n_spectra, temperature_k, v_mod, convention,
+                deriv_window_v, deriv_polyorder, fwhm)
 
             rows = []
             for i in range(n_spectra):
@@ -4730,7 +4775,10 @@ class ToolImplementations:
                 y = spectra[:, i]
                 row = {'Spectrum_Index': float(i)}
                 row.update(edge_summary(x, y, temperature_k, v_mod=v_mod,
-                                        convention=convention, n_kt=n_kt))
+                                        convention=convention, n_kt=n_kt,
+                                        deriv_window_v=deriv_window_v,
+                                        deriv_polyorder=deriv_polyorder,
+                                        deriv_kind=deriv_kind))
                 row.update(self._rank_one_spectrum(
                     x, y, row, search, patterns, resolution_sigma,
                     max_skips, use_edge_offset))
@@ -4766,6 +4814,9 @@ class ToolImplementations:
                     'temperature_k': temperature_k,
                     'v_mod': v_mod,
                     'mod_convention': convention,
+                    'deriv_window_v': deriv_window_v,
+                    'deriv_polyorder': deriv_polyorder,
+                    'deriv_kind': deriv_kind,
                     'resolution_fwhm': fwhm,
                     'n_valid': n_valid,
                     'n_total': n_spectra,
