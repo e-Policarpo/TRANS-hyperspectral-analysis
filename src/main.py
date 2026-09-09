@@ -9,6 +9,34 @@ Date: December 2025
 License: GPL
 """
 
+import os
+
+# Keep BLAS single-threaded. This has to run before anything imports numpy,
+# which is why it is the first statement in the file.
+#
+# OpenBLAS's *parallel* LU wants far more stack than a secondary thread has.
+# Qt paints in QSGRenderThread, matplotlib's 3-D projection inverts its
+# projection matrix while painting, and the modelling workstation therefore
+# crashed the whole process the moment it opened:
+#
+#   np.linalg.inv -> dgesv_64_ -> dgetrf_parallel -> ___chkstk_darwin
+#   EXC_BAD_ACCESS (SIGBUS) on QSGRenderThread
+#
+# macOS reports that as "excessive recursion"; it is not — the stack was 46
+# frames deep. It is one BLAS call that does not fit in a 512 KB stack.
+# Every worker thread runs the same risk, so the limit is process-wide
+# rather than something the render path opts into.
+#
+# It costs nothing at the sizes this application works at. Measured on the
+# arm64 build: a dense eigh(600) takes 0.42 s with threading and 0.05 s
+# without, because the thread-pool overhead dominates; a sparse eigsh of the
+# modelling solver's 6400x6400 Hamiltonian is 0.05 s either way. On x86_64
+# both are unchanged.
+for _blas_var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS",
+                  "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS",
+                  "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_blas_var, "1")
+
 import sys
 import logging
 from pathlib import Path
