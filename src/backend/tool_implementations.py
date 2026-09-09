@@ -26,6 +26,7 @@ from src.processing.spectral_features import (
     feature_table,
 )
 from src.processing.positivity import positive_integral, positive_mask
+from src.utils.naming import pad as _pad
 from src.processing.edge_analysis import (
     edge_summary,
     edge_columns,
@@ -5587,6 +5588,9 @@ class ToolImplementations:
             }
             outlier_messages: List[str] = []
             outlier_kind_of: Dict[str, str] = {}
+            # Which columns belong to which point, kept past the outlier block
+            # so the per-point averages below can be built from it.
+            group_columns: Dict[str, List[str]] = {}
             if any(outlier_enabled.values()) and len(good_indices) >= 3:
                 from src.processing import curve_outliers as _outliers
 
@@ -5596,6 +5600,8 @@ class ToolImplementations:
                     spectral_data.metadata.additional_info.get('spectrum_meta'),
                     mode=str(outlier_group_by or 'point'),
                 )
+                group_columns = {label: [surviving[i] for i in indices]
+                                 for label, indices in groups.items()}
                 analyses = _outliers.analyze_grouped(
                     independent_var, spectra[surviving].values, surviving, groups,
                     n_intervals=int(outlier_intervals),
@@ -5719,6 +5725,115 @@ class ToolImplementations:
                     self.dataLoaded.emit(good_name)
             else:
                 report_lines.append("No good spectra found — 'Good Data' dataset not created.")
+
+            # Per-point averages, with the outliers left out.
+            #
+            # This is the dataset the outlier pass exists to produce. An
+            # overview holds every repetition at every point; what the
+            # analysis actually wants is one curve per point, and an average
+            # is only worth taking once the curves that would drag it are
+            # gone. One column per point, each the NaN-aware mean of the
+            # repetitions that survived both the per-spectrum tests and the
+            # outlier pass.
+            averaged_name = f"{base_name} - Outliers Removed"
+            if group_columns and good_indices:
+                surviving_cols = {spectra.columns[i] for i in good_indices}
+                source_meta = {
+                    entry.get('column'): entry
+                    for entry in (spectral_data.metadata.additional_info.get(
+                        'spectrum_meta') or []) if isinstance(entry, dict)
+                }
+
+                def _point_of(label: str, members: List[str]):
+                    """Point index for a group, for naming and ordering."""
+                    for member in members:
+                        entry = source_meta.get(member) or {}
+                        for key in ('point_index', 'line_pos'):
+                            if entry.get(key) is not None:
+                                return int(entry[key])
+                    return None
+
+                kept: List[tuple] = []
+                for label, members in group_columns.items():
+                    alive = [c for c in members if c in surviving_cols]
+                    if not alive:
+                        continue          # every repetition here was rejected
+                    kept.append((_point_of(label, alive), label, alive))
+
+                # Acquisition order, with any unidentified group last.
+                kept.sort(key=lambda item: (item[0] is None, item[0], item[1]))
+                max_point = max((p for p, _, _ in kept if p is not None),
+                                default=len(kept))
+
+                avg_cols: Dict[str, np.ndarray] = {}
+                avg_meta: List[dict] = []
+                for point, label, alive in kept:
+                    name = f"P{_pad(point, max_point)}" if point is not None else label
+                    with warnings.catch_warnings():
+                        # An all-NaN bias step is a real reading of "nothing
+                        # survived here", not something to warn about.
+                        warnings.simplefilter('ignore', category=RuntimeWarning)
+                        avg_cols[name] = np.nanmean(spectra[alive].values, axis=1)
+                    template = source_meta.get(alive[0]) or {}
+                    # Three numbers, because "13 averaged" on its own is
+                    # ambiguous: how many the input held at this point, how
+                    # many the per-spectrum tests had already taken out, and
+                    # how many the outlier pass took.
+                    n_input = sum(
+                        1 for entry_ in source_meta.values()
+                        if entry_.get('point_index') is not None
+                        and entry_.get('point_index') == template.get('point_index')
+                    ) or len(group_columns[label])
+                    entry = {
+                        'column': name,
+                        'group': label,
+                        'n_averaged': len(alive),
+                        'n_input': n_input,
+                        'n_outliers_removed': len(group_columns[label]) - len(alive),
+                        'n_rejected_by_tests': max(
+                            0, n_input - len(group_columns[label])),
+                        'source_columns': alive,
+                    }
+                    for key in ('point_index', 'line_pos', 'location_px',
+                                'location_m', 'parent_image'):
+                        if template.get(key) is not None:
+                            entry[key] = template[key]
+                    avg_meta.append(entry)
+
+                if avg_cols:
+                    avg_df = pd.DataFrame(avg_cols)
+                    avg_df.insert(0, spectral_data.independent_var_name,
+                                  independent_var)
+                    src_info = spectral_data.metadata.additional_info
+                    avg_metadata = SpectralMetadata(
+                        source_type=spectral_data.metadata.source_type,
+                        # One column per point now, not per repetition.
+                        dimensions=(len(avg_cols), 1),
+                        scan_mode=spectral_data.metadata.scan_mode,
+                        units=spectral_data.metadata.units.copy(),
+                        additional_info={
+                            'original': dataset_name,
+                            'filter': 'outliers_removed',
+                            'averaged_over_reps': True,
+                            'count': len(avg_cols),
+                            'spectrum_meta': avg_meta,
+                            'spatial_layout': src_info.get('spatial_layout')
+                                              or ('line' if len(avg_cols) > 1 else 'point'),
+                            'instrument': src_info.get('instrument'),
+                            'session_label': src_info.get('session_label'),
+                        },
+                    )
+                    averaged_dataset = SpectralData(avg_df, avg_metadata)
+                    self._datasets[averaged_name] = averaged_dataset
+                    _write_dataset(averaged_dataset, 'Outliers_Removed')
+                    if not self._workflow_mode:
+                        self.dataLoaded.emit(averaged_name)
+                    report_lines.append(
+                        f"Per-point averages ('{averaged_name}'): {len(avg_cols)} point(s), "
+                        f"{sum(e['n_averaged'] for e in avg_meta)} curve(s) averaged, "
+                        f"{sum(e['n_outliers_removed'] for e in avg_meta)} dropped as "
+                        f"outliers, {sum(e['n_rejected_by_tests'] for e in avg_meta)} "
+                        f"already rejected by the per-spectrum tests.")
 
             # Build bad dataset (always original, uncorrected spectra)
             bad_name = f"{base_name} - Bad Data"

@@ -825,3 +825,104 @@ class TestOutlierRemoval(TestFilterBadDataSetup):
         assert coerced['outlier_group_by'] == 'dataset'
         assert coerced['outlier_intervals'] == 12
         assert coerced['filter_bandgap_outliers'] is False
+
+
+class TestPerPointAverages(TestOutlierRemoval):
+    """The dataset the outlier pass exists to produce.
+
+    An overview holds every repetition at every point; what the analysis
+    wants is one curve per point, and that average is only worth taking once
+    the curves that would drag it are gone.
+    """
+
+    def test_written_when_outliers_are_filtered(self, tool_impl):
+        tool_impl._datasets['OV'] = self._overview()
+        tool_impl.filter_bad_data(MockTask(), 'OV', filter_offset_outliers=True)
+        assert 'OV - Outliers Removed' in tool_impl._datasets
+
+    def test_not_written_when_outlier_filtering_is_off(self, tool_impl):
+        tool_impl._datasets['OV'] = self._overview()
+        tool_impl.filter_bad_data(MockTask(), 'OV')
+        assert 'OV - Outliers Removed' not in tool_impl._datasets
+
+    def test_one_column_per_point(self, tool_impl):
+        tool_impl._datasets['OV'] = self._overview(points=(1, 2, 3), reps=15)
+        tool_impl.filter_bad_data(MockTask(), 'OV', filter_offset_outliers=True)
+        averaged = tool_impl._datasets['OV - Outliers Removed']
+        assert list(averaged.spectra.columns) == ['P01', 'P02', 'P03']
+
+    def test_the_average_excludes_the_outlier(self, tool_impl):
+        """The whole point: one curve at 400x must not drag the mean."""
+        tool_impl._datasets['OV'] = self._overview(n_offset=1)
+        tool_impl.filter_bad_data(MockTask(), 'OV', filter_offset_outliers=True)
+
+        averaged = tool_impl._datasets['OV - Outliers Removed']
+        good = tool_impl._datasets['OV - Good Data'].spectra
+        survivors = [c for c in good.columns if c.startswith('P02')]
+        np.testing.assert_allclose(
+            averaged.spectra['P02'].values,
+            np.nanmean(good[survivors].values, axis=1), equal_nan=True)
+
+    def test_the_counts_are_fully_accounted_for(self, tool_impl):
+        """"13 averaged" alone is ambiguous — say how many the input held,
+        how many the tests took, and how many the outlier pass took."""
+        tool_impl._datasets['OV'] = self._overview(n_offset=1, reps=20)
+        tool_impl.filter_bad_data(MockTask(), 'OV', filter_offset_outliers=True)
+
+        for entry in (tool_impl._datasets['OV - Outliers Removed']
+                      .metadata.additional_info['spectrum_meta']):
+            assert entry['n_input'] == 20
+            assert (entry['n_averaged'] + entry['n_outliers_removed']
+                    + entry['n_rejected_by_tests']) == entry['n_input']
+
+    def test_a_point_keeps_its_position(self, tool_impl):
+        """Without this the averages map onto point indices, not nanometres."""
+        dataset = self._overview()
+        for entry in dataset.metadata.additional_info['spectrum_meta']:
+            entry['location_m'] = [entry['point_index'] * 1e-9, 0.0]
+        tool_impl._datasets['OV'] = dataset
+        tool_impl.filter_bad_data(MockTask(), 'OV', filter_offset_outliers=True)
+
+        meta = (tool_impl._datasets['OV - Outliers Removed']
+                .metadata.additional_info['spectrum_meta'])
+        assert [e['location_m'] for e in meta] == [[1e-9, 0.0], [2e-9, 0.0]]
+
+    def test_it_records_where_it_came_from(self, tool_impl):
+        tool_impl._datasets['OV'] = self._overview()
+        tool_impl.filter_bad_data(MockTask(), 'OV', filter_offset_outliers=True)
+        info = tool_impl._datasets['OV - Outliers Removed'].metadata.additional_info
+        assert info['original'] == 'OV'
+        assert info['averaged_over_reps'] is True
+        assert info['filter'] == 'outliers_removed'
+
+    def test_a_csv_is_written_beside_the_others(self, tool_impl):
+        tool_impl._datasets['OV'] = self._overview()
+        report = Path(tool_impl.filter_bad_data(
+            MockTask(), 'OV', filter_offset_outliers=True))
+        written = {f.name for f in report.parent.glob('*.csv')}
+        assert any('Outliers_Removed' in name for name in written), written
+
+    def test_the_report_says_what_was_averaged(self, tool_impl):
+        tool_impl._datasets['OV'] = self._overview()
+        report = Path(tool_impl.filter_bad_data(
+            MockTask(), 'OV', filter_offset_outliers=True)).read_text()
+        assert 'Per-point averages' in report
+
+    def test_a_point_whose_curves_all_failed_is_skipped(self, tool_impl):
+        """No column rather than a column of NaN."""
+        dataset = self._overview(points=(1, 2), reps=20)
+        values = dataset.data
+        for column in [c for c in values.columns if c.startswith('P01')]:
+            values[column] = np.nan
+        tool_impl._datasets['OV'] = SpectralData(values, dataset.metadata)
+        tool_impl.filter_bad_data(MockTask(), 'OV', filter_offset_outliers=True)
+
+        averaged = tool_impl._datasets['OV - Outliers Removed']
+        assert list(averaged.spectra.columns) == ['P02']
+
+    def test_whole_dataset_grouping_gives_one_average(self, tool_impl):
+        tool_impl._datasets['OV'] = self._overview()
+        tool_impl.filter_bad_data(MockTask(), 'OV', filter_offset_outliers=True,
+                                  outlier_group_by='dataset')
+        averaged = tool_impl._datasets['OV - Outliers Removed']
+        assert averaged.num_spectra == 1

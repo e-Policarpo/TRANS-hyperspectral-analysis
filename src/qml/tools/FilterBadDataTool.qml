@@ -432,6 +432,9 @@ Item {
                               "coherence and noise σ.\n\n" +
                               "A spectrum with too few finite points is rejected outright, whatever " +
                               "the weights say — there is nothing in it to measure.\n\n" +
+                              "With outlier filtering on, an 'Outliers Removed' dataset is written too: " +
+                              "one curve per point, each the average of the repetitions that survived. " +
+                              "That is the average the outlier pass exists to protect.\n\n" +
                               "Select several datasets to filter them one after another."
                         wrapMode: Text.Wrap
                         font.pixelSize: 10
