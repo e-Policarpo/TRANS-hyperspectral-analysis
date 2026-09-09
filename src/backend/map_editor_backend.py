@@ -638,7 +638,7 @@ class MapEditorBackend(QObject):
             # _on_sts_marker_clicked.
             markers.append({
                 'col': int(px[0]), 'row': int(px[1]),
-                'label': str(L.get('point_index', '')), 'index': i,
+                'label': self._sts_marker_label(L), 'index': i,
             })
         if off_grid:
             logger.warning("%d STS point(s) fall outside this %s map and were "
@@ -689,6 +689,24 @@ class MapEditorBackend(QObject):
                              'y_offset': float(axis[0] - step / 2.0)})
 
         self._canvas.setAxisMetadata(meta)
+
+    @staticmethod
+    def _sts_marker_label(location: dict) -> str:
+        """Label for one STS dot on a scan image.
+
+        A point in a line scan reads ``203(01)``: the session-wide index it is
+        known by everywhere else, then its position along its own line. On a
+        62-point line the absolute indices alone say nothing about where along
+        the line a dot sits, and they no longer match the ``P01``-style column
+        names of the line's own dataset.
+        """
+        index = location.get('point_index')
+        if index is None:
+            return ''
+        position = location.get('line_pos')
+        if location.get('line_scan_id') is None or position is None:
+            return str(index)
+        return f"{index}({int(position) + 1:02d})"
 
     def _push_sts_lines(self, mcm):
         """Outline and tag each line scan taken on this scan image.

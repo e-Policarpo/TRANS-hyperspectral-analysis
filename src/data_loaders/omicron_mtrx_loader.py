@@ -588,6 +588,7 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
 
         # Order points by acquisition order (first run index) and index them.
         ordered = sorted(batches.values(), key=lambda b: b['first_run'])
+        ordered = self._rejoin_moved_tail(ordered)
         for i, b in enumerate(ordered, start=1):
             b['point_index'] = i
             b['first_timestamp'] = next(
@@ -643,6 +644,78 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
     _LINE_PERP_TOL_PX = 6.0
     _LINE_EVEN_RATIO = 3.0
 
+    @staticmethod
+    def _rejoin_moved_tail(ordered: List[dict]) -> List[dict]:
+        """Give a position back the repetition that trailed into it.
+
+        The tip can move during the **last scan cycle** of a run, so that
+        cycle is written with the old run number but taken at the *new*
+        position. Keyed by ``(run, location)``, a position then arrives as two
+        batches — one holding a single repetition under run R, another holding
+        the rest under run R+1 — and both the repetition count and the point
+        count come out wrong. Measured on 21-Jul-2026: 150 of 178 locations
+        split this way, and a line of 64 positions x 64 repetitions was read
+        as two interleaved lines of 62 positions with 63 and 1 repetitions.
+
+        Only a **consecutive-run duplicate at the same pixel** is rejoined.
+        That is deliberately narrower than keying on location alone, which was
+        tried and reverted (027c2f8): returning to an already-measured spot
+        later in a session is a genuinely separate experiment, and those are
+        many runs apart, not adjacent.
+
+        The tail's repetitions are prepended, since they were taken first.
+        """
+        by_location: Dict[Any, List[dict]] = {}
+        for batch in ordered:
+            by_location.setdefault(batch['location_px'], []).append(batch)
+
+        merged_away = set()
+        for location, group in by_location.items():
+            if location is None or len(group) < 2:
+                continue
+            group.sort(key=lambda b: b['first_run'])
+            for earlier, later in zip(group, group[1:]):
+                if id(earlier) in merged_away:
+                    continue
+                # Adjacent runs only, and only a tail short enough to be the
+                # end of a cycle rather than a measurement in its own right.
+                if later['first_run'] != earlier['first_run'] + 1:
+                    continue
+                if len(earlier['mixed']) >= len(later['mixed']):
+                    continue
+                for field in ('forward', 'backward', 'mixed', 'rep_V',
+                              'rep_timestamps', 'rep_files', 'rep_runscan'):
+                    later[field][:0] = earlier[field]
+                later['first_run'] = earlier['first_run']
+                merged_away.add(id(earlier))
+
+        if not merged_away:
+            return ordered
+        logger.info("Rejoined %d trailing repetition batch(es) to the position "
+                    "they were taken at", len(merged_away))
+        return [b for b in ordered if id(b) not in merged_away]
+
+    # Repetition counts within this factor of each other describe the same
+    # acquisition; a parallel single sweep beside a 64-rep scan is two orders
+    # of magnitude away, so the separation that matters is never this close.
+    _REP_BUCKET_RATIO = 1.25
+
+    @classmethod
+    def _rep_buckets(cls, counts) -> Dict[int, int]:
+        """Map each repetition count to a bucket key, joining near-equal ones.
+
+        ``{1, 63, 64, 65}`` -> ``{1: 1, 63: 63, 64: 63, 65: 63}``: the single
+        sweep stays on its own, while the three that are plainly the same
+        measurement share a bucket.
+        """
+        out: Dict[int, int] = {}
+        current = None
+        for count in sorted(counts):
+            if current is None or count > max(current + 2, current * cls._REP_BUCKET_RATIO):
+                current = count
+            out[count] = current
+        return out
+
     def _detect_line_scans(self, batches: List[dict]) -> List[dict]:
         """Identify line scans among the session's points.
 
@@ -660,10 +733,19 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
             b['line_scan_id'] = None
             b['line_pos'] = None
 
+        # Group by repetition count, but with tolerance. The point of the
+        # grouping is to keep a parallel single-sweep away from a multi-rep
+        # scan, where the counts differ by a factor of tens. Requiring them
+        # to be *equal* also splits a line wherever one position ended up
+        # with one repetition more or fewer than its neighbours, which is
+        # routine at the ends of a run: on 21-Jul-2026 a 64-position line
+        # came out as 57 because a handful of positions held 63 or 65.
         groups: Dict[int, List[dict]] = defaultdict(list)
+        buckets = self._rep_buckets(
+            {len(b['mixed']) for b in batches if b.get('location_px') is not None})
         for b in batches:
             if b.get('location_px') is not None:
-                groups[len(b['mixed'])].append(b)
+                groups[buckets[len(b['mixed'])]].append(b)
 
         line_scans: List[dict] = []
         next_id = 1
@@ -685,9 +767,12 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
                     for pos, b in enumerate(run):
                         b['line_scan_id'] = lid
                         b['line_pos'] = pos
+                    # The bucket key is the smallest count in the bucket, not
+                    # what the line actually holds; report the commonest.
+                    run_reps = [len(b['mixed']) for b in run]
                     line_scans.append({
                         'id': lid,
-                        'reps': reps,
+                        'reps': max(set(run_reps), key=run_reps.count),
                         'n_points': len(run),
                         'point_indices': [b['point_index'] for b in run],
                         'px_start': list(run[0]['location_px']),
