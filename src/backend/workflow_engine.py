@@ -1221,7 +1221,7 @@ TOOL_DEFINITIONS = {
     "FilterBadData": {
         "display_name": "Filter Bad Data",
         "category": "Processing",
-        "description": "Classify and separate bad spectra (saturation, noise, linear artifacts, periodic noise)",
+        "description": "Classify and separate bad spectra (saturation, noise, linear artifacts, periodic noise, featureless curves)",
         "inputs": [
             {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
         ],
@@ -1237,8 +1237,20 @@ TOOL_DEFINITIONS = {
             "weight_linear": {"type": "float", "default": 1.0, "min": 0.0, "max": 1.0, "label": "Linear Artifact Weight"},
             "weight_periodic": {"type": "float", "default": 1.0, "min": 0.0, "max": 1.0, "label": "Periodic Noise Weight"},
             "weight_partial_noise": {"type": "float", "default": 1.0, "min": 0.0, "max": 1.0, "label": "Partial Noise Weight"},
+            "weight_featureless": {"type": "float", "default": 1.0, "min": 0.0, "max": 1.0, "label": "Featureless Weight"},
             "threshold": {"type": "float", "default": 0.5, "min": 0.0, "max": 1.0, "label": "Quality Threshold"},
-            "correct_periodic": {"type": "bool", "default": False, "label": "Correct Periodic Noise"}
+            "min_structure_ratio": {"type": "float", "default": 3.0, "min": 1.0, "max": 20.0, "label": "Min Structure Ratio"},
+            "min_coherence": {"type": "float", "default": 0.12, "min": 0.01, "max": 1.0, "label": "Min Coherence"},
+            "correct_periodic": {"type": "bool", "default": False, "label": "Correct Periodic Noise"},
+            "filter_offset_outliers": {"type": "bool", "default": False, "label": "Remove Offset Outliers"},
+            "filter_bandgap_outliers": {"type": "bool", "default": False, "label": "Remove Band-gap Outliers"},
+            "filter_saturation_outliers": {"type": "bool", "default": False, "label": "Remove Saturation Outliers"},
+            "max_offset_outliers": {"type": "int", "default": 5, "min": 0, "max": 999, "label": "Max Offset Outliers"},
+            "max_bandgap_outliers": {"type": "int", "default": 5, "min": 0, "max": 999, "label": "Max Band-gap Outliers"},
+            "max_saturation_outliers": {"type": "int", "default": 5, "min": 0, "max": 999, "label": "Max Saturation Outliers"},
+            "outlier_group_by": {"type": "select", "default": "point", "options": ["point", "dataset"], "label": "Compare Within"},
+            "outlier_intervals": {"type": "int", "default": 8, "min": 2, "max": 64, "label": "Outlier Intervals"},
+            "outlier_z": {"type": "float", "default": 3.5, "min": 1.0, "max": 20.0, "label": "Outlier z Threshold"}
         }
     },
 

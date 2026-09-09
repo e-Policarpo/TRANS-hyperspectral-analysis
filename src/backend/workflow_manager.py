@@ -1297,8 +1297,20 @@ class WorkflowExecutor:
                     weight_linear=params.get('weight_linear', 1.0),
                     weight_periodic=params.get('weight_periodic', 1.0),
                     weight_partial_noise=params.get('weight_partial_noise', 1.0),
+                    weight_featureless=params.get('weight_featureless', 1.0),
                     threshold=params.get('threshold', 0.5),
-                    correct_periodic=params.get('correct_periodic', False)
+                    correct_periodic=params.get('correct_periodic', False),
+                    min_structure_ratio=params.get('min_structure_ratio', 3.0),
+                    min_coherence=params.get('min_coherence', 0.12),
+                    filter_offset_outliers=params.get('filter_offset_outliers', False),
+                    filter_bandgap_outliers=params.get('filter_bandgap_outliers', False),
+                    filter_saturation_outliers=params.get('filter_saturation_outliers', False),
+                    max_offset_outliers=params.get('max_offset_outliers', 5),
+                    max_bandgap_outliers=params.get('max_bandgap_outliers', 5),
+                    max_saturation_outliers=params.get('max_saturation_outliers', 5),
+                    outlier_group_by=params.get('outlier_group_by', 'point'),
+                    outlier_intervals=params.get('outlier_intervals', 8),
+                    outlier_z=params.get('outlier_z', 3.5)
                 )
 
                 # Get output datasets by their actual names
@@ -1514,10 +1526,11 @@ class WorkflowManager(QObject):
             workflows_dir.mkdir(parents=True, exist_ok=True)
             return workflows_dir
         else:
-            # Fallback to app directory if no project is open
-            fallback_dir = Path("workflows")
-            fallback_dir.mkdir(exist_ok=True)
-            return fallback_dir
+            # No project open: fall back to the user's settings directory.
+            # A bare relative Path("workflows") resolved against the working
+            # directory, which for an app launched from Finder is "/".
+            from src.utils.app_paths import fallback_workflows_dir
+            return fallback_workflows_dir()
 
     @Slot(str, result=str)
     def createWorkflow(self, name: str) -> str:

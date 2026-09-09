@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+from datetime import datetime
 
 from src.data_loaders.witec_wip_loader import WitecWipLoader
 from src.models.image_data import ImageData
@@ -28,6 +29,9 @@ from tests.test_data_loaders.test_witec_wip_parser import WipBuilder
 
 def _resolve_real_wip() -> Path:
     candidates = [
+        # Current location; the two below are where it used to live.
+        Path("/Users/eduardapolicarpo/Documents/Doutorado/Colab Sheffield/"
+             "PL/DtBuTPZ series.wip"),
         Path("/Users/eduardapolicarpo/Documents/Doutorado/Sheffield - UFMG/"
              "Raman/DtBuTPZ series.wip"),
         Path("/Users/eduardapolicarpo/Documents/Doutorado/Colab Sheffield - UFMG/"
@@ -502,3 +506,88 @@ def test_real_file_notes_carry_rtf(real_load):
     # And the stripped body is meaningful.
     bodies = " ".join(n.get("text", "") for n in notes)
     assert "System ID" in bodies or "Start Time" in bodies
+
+
+# =============================================================================
+# Session organisation
+#
+# A .wip is a session container, so everything it produces belongs in one
+# browser folder. The per-spectrum facts it already extracted lived in parallel
+# lists only this loader could line up; they are now also published as
+# ``spectrum_meta``, the form the rest of TRANS carries across a tool.
+# =============================================================================
+
+from src.data_loaders.witec_wip_loader import _iso_timestamp   # noqa: E402
+
+
+class TestIsoTimestamp:
+    """WITec writes the date the way a person would, so it must be parsed."""
+
+    @pytest.mark.parametrize("date_text,time_text,expected", [
+        ("Thursday, May 7, 2026", "16:26", "2026-05-07T16:26:00"),
+        ("May 7, 2026", "16:26:31", "2026-05-07T16:26:31"),
+        ("2026-05-07", "16:26", "2026-05-07T16:26:00"),
+        ("7 May 2026", "16:26", "2026-05-07T16:26:00"),
+    ])
+    def test_parses_the_forms_witec_writes(self, date_text, time_text, expected):
+        assert _iso_timestamp(date_text, time_text) == expected
+
+    def test_a_comma_in_the_date_is_not_a_weekday(self):
+        """Cutting at the first comma would leave just the year."""
+        assert _iso_timestamp("May 7, 2026", "16:26") == "2026-05-07T16:26:00"
+
+    @pytest.mark.parametrize("date_text,time_text", [
+        (None, "16:26"), ("May 7, 2026", None), ("not a date", "16:26"),
+    ])
+    def test_returns_none_rather_than_a_lookalike(self, date_text, time_text):
+        assert _iso_timestamp(date_text, time_text) is None
+
+
+@pytest.mark.skipif(not _resolve_real_wip().exists(),
+                    reason="real .wip file not available")
+class TestRealWipSessionOrganization:
+    """Against the real DtBuTPZ project file."""
+
+    @pytest.fixture(scope="class")
+    def loaded(self):
+        loader = WitecWipLoader()
+        return loader.load_single_file(_resolve_real_wip())
+
+    def test_every_channel_carries_the_session_label(self, loaded):
+        """AppBackend._group_label reads the dataset it is filing, so a
+        channel without the label would be filed somewhere else."""
+        channels = loaded.metadata.additional_info.get('channels') or {}
+        assert channels
+        label = loaded.metadata.additional_info['session_label']
+        for channel in channels.values():
+            assert channel.metadata.additional_info['session_label'] == label
+
+    def test_spectrum_meta_matches_the_columns(self, loaded):
+        for channel in (loaded.metadata.additional_info.get('channels') or {}).values():
+            meta = channel.metadata.additional_info.get('spectrum_meta') or []
+            assert [e['column'] for e in meta] == list(channel.spectra.columns)
+
+    def test_positions_are_converted_to_metres(self, loaded):
+        """WITec works in µm; every spatial consumer in TRANS expects metres."""
+        for channel in (loaded.metadata.additional_info.get('channels') or {}).values():
+            for entry in channel.metadata.additional_info.get('spectrum_meta') or []:
+                if 'location_m' not in entry:
+                    continue
+                metres = entry['location_m']
+                world = entry['location_world']
+                assert metres[0] == pytest.approx(world[0] * 1e-6)
+                assert metres[1] == pytest.approx(world[1] * 1e-6)
+
+    def test_timestamps_are_iso(self, loaded):
+        seen = 0
+        for channel in (loaded.metadata.additional_info.get('channels') or {}).values():
+            for entry in channel.metadata.additional_info.get('spectrum_meta') or []:
+                if 'timestamp' in entry:
+                    datetime.fromisoformat(entry['timestamp'])
+                    seen += 1
+        assert seen > 0
+
+    def test_session_span_comes_from_the_spectra(self, loaded):
+        info = loaded.metadata.additional_info
+        assert info['session_started'] <= info['session_ended']
+        assert info['session_duration_s'] >= 0

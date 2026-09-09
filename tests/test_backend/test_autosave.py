@@ -184,3 +184,140 @@ class TestAutosaveManager:
         mock_backend.openProjectFile = MagicMock()
         manager.recoverFromAutosave("/tmp/test.autosave.hrt")
         mock_backend.openProjectFile.assert_called_once_with("/tmp/test.autosave.hrt")
+
+
+# =============================================================================
+# The dirty flag is the only gate on autosaving
+#
+# A real project was lost to this: after the first autosave of a session
+# cleared the flag, no tool result ever set it again, so every later tick hit
+# "no changes since last save" and returned. Twenty-two hours of derivatives,
+# filtered datasets and maps existed only in memory, next to a .hrt holding an
+# empty project — and nothing said so, because the skip logs at DEBUG.
+# =============================================================================
+
+import numpy as np                                    # noqa: E402
+import pandas as pd                                   # noqa: E402
+
+from src.models.spectral_data import (                # noqa: E402
+    SpectralData, SpectralMetadata,
+)
+
+
+@pytest.fixture(scope="module")
+def qt_app():
+    from PySide6.QtWidgets import QApplication
+    return QApplication.instance() or QApplication([])
+
+
+@pytest.fixture
+def backend(tmp_path, qt_app):
+    """A real AppBackend with an open project in a temp directory.
+
+    Import CSV persistence is stubbed out: it queues work on the I/O worker,
+    which these tests neither need nor wait for — and letting real background
+    tasks start and be garbage-collected mid-test segfaulted the suite.
+    """
+    from src.backend.app_backend import AppBackend
+
+    app_backend = AppBackend()
+    app_backend.createProject(str(tmp_path), "DirtyFlag")
+    app_backend._persist_imported_datasets = lambda *a, **k: None
+    yield app_backend
+    app_backend.worker_manager.shutdown()
+
+
+def _dataset():
+    x = np.linspace(-1, 1, 32)
+    df = pd.DataFrame({"V": x, "S1": np.sin(x)})
+    meta = SpectralMetadata(
+        source_type='test', dimensions=(1, 1), scan_mode='point',
+        units={'independent': 'V', 'dependent': 'A'}, additional_info={})
+    return SpectralData(df, meta)
+
+
+class TestProjectModifiedTracking:
+    """Every path that adds project state must mark it unsaved."""
+
+    def test_import_marks_modified(self, backend):
+        backend._on_file_loaded({'datasets': {'A': _dataset()},
+                                 'active_dataset': 'A'})
+        assert backend._autosave_manager._dirty
+
+    def test_tool_result_marks_modified(self, backend, tmp_path):
+        """The regression: this is how most datasets in a project are made."""
+        backend._autosave_manager._dirty = False
+        backend._datasets['A - Derivative'] = _dataset()
+        backend._on_tool_completed("Derivative Calculator", str(tmp_path / "d.csv"))
+        assert backend._autosave_manager._dirty
+
+    def test_tool_result_marks_modified_after_an_autosave(self, backend, tmp_path):
+        """An autosave clears the flag at submit time; later work must re-set
+        it, or the autosave never runs again for the rest of the session."""
+        backend._on_file_loaded({'datasets': {'A': _dataset()},
+                                 'active_dataset': 'A'})
+        backend._autosave_manager._dirty = False          # the autosave ticked
+        backend._datasets['A - Filtered'] = _dataset()
+        backend._on_tool_completed("Filter Bad Data", str(tmp_path / "f.txt"))
+        assert backend._autosave_manager._dirty
+
+    def test_folder_import_marks_modified(self, backend):
+        backend._autosave_manager._dirty = False
+        backend._on_folder_loaded({'datasets': {'B': _dataset()},
+                                   'active_dataset': 'B'})
+        assert backend._autosave_manager._dirty
+
+    def test_empty_folder_result_does_not_mark(self, backend):
+        backend._autosave_manager._dirty = False
+        backend._on_folder_loaded({'datasets': {}, 'active_dataset': None})
+        assert not backend._autosave_manager._dirty
+
+    def test_helper_is_inert_without_a_project(self, tmp_path, qt_app):
+        from src.backend.app_backend import AppBackend
+
+        app_backend = AppBackend()
+        app_backend._persist_imported_datasets = lambda *a, **k: None
+        try:
+            assert not app_backend._project_ready
+            app_backend._mark_project_modified()          # must not raise
+            assert not app_backend._autosave_manager._dirty
+        finally:
+            app_backend.worker_manager.shutdown()
+
+
+class TestAutosaveGate:
+    """What _do_autosave does with the flag."""
+
+    @pytest.fixture
+    def mock_backend(self):
+        return MockAppBackend()
+
+    @pytest.fixture
+    def manager(self, mock_backend):
+        return AutosaveManager(mock_backend)
+
+    def test_skips_when_clean(self, manager, mock_backend, tmp_path):
+        mock_backend._project_ready = True
+        mock_backend._project_path = tmp_path
+        manager._dirty = False
+        manager._do_autosave()
+        mock_backend.worker_manager.submit_io.assert_not_called()
+
+    def test_writes_when_dirty(self, manager, mock_backend, tmp_path):
+        mock_backend._project_ready = True
+        mock_backend._project_path = tmp_path
+        mock_backend.workflow_manager = MagicMock()
+        manager._dirty = True
+        manager._do_autosave()
+        mock_backend.worker_manager.submit_io.assert_called_once()
+
+    def test_flag_clears_at_submit_so_later_edits_are_not_lost(
+            self, manager, mock_backend, tmp_path):
+        mock_backend._project_ready = True
+        mock_backend._project_path = tmp_path
+        mock_backend.workflow_manager = MagicMock()
+        manager._dirty = True
+        manager._do_autosave()
+        assert not manager._dirty
+        manager._on_modified_changed(True)     # a change during the write
+        assert manager._dirty

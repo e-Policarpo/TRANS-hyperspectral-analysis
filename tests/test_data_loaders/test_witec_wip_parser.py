@@ -50,6 +50,9 @@ from src.data_loaders.witec_wip.wip_parser import (
 def _resolve_real_wip() -> Path:
     """Find the user's WITec test file across known locations."""
     candidates = [
+        # Current location; the two below are where it used to live.
+        Path("/Users/eduardapolicarpo/Documents/Doutorado/Colab Sheffield/"
+             "PL/DtBuTPZ series.wip"),
         Path("/Users/eduardapolicarpo/Documents/Doutorado/Sheffield - UFMG/"
              "Raman/DtBuTPZ series.wip"),
         Path("/Users/eduardapolicarpo/Documents/Doutorado/Colab Sheffield - UFMG/"

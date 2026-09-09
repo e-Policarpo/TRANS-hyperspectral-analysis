@@ -569,3 +569,232 @@ class TestValidateLdos:
         y[::10] = np.nan  # 10 NaN out of 100
         is_valid, reason = validate_ldos(x, y)
         assert is_valid is True
+
+
+# =============================================================================
+# structure_metrics / detect_featureless
+#
+# The reported defect: a dI/dV spectrum that is flat above the noise floor was
+# classified as good, because no detector asked whether the curve carries any
+# structure at all. Calibrated against real STS data (two MATRIX overview maps,
+# 1877 spectra), where the dead population sits at coherence 0.04-0.08 and the
+# structured one above 0.09.
+# =============================================================================
+
+from src.backend.sts_algorithms import (        # noqa: E402
+    structure_metrics,
+    detect_featureless,
+    robust_sigma,
+)
+
+
+def _band_edges(v):
+    """A tunnelling dI/dV: flat gap between two rising band edges."""
+    return (np.exp((v - 0.8) / 0.08) / (1 + np.exp((v - 0.8) / 0.08))
+            + np.exp(-(v + 0.7) / 0.08) / (1 + np.exp(-(v + 0.7) / 0.08)))
+
+
+class TestRobustSigma:
+    """Tests for the robust noise estimate."""
+
+    def test_recovers_white_noise_level(self):
+        rng = np.random.default_rng(0)
+        assert robust_sigma(rng.normal(0, 0.01, 500)) == pytest.approx(0.01, rel=0.15)
+
+    def test_ignores_smooth_structure(self):
+        """A band edge must not be mistaken for noise."""
+        v = np.linspace(-1.5, 1.5, 401)
+        rng = np.random.default_rng(1)
+        clean = robust_sigma(_band_edges(v) + rng.normal(0, 0.01, 401))
+        assert clean == pytest.approx(0.01, rel=0.3)
+
+    def test_noiseless_is_zero(self):
+        assert robust_sigma(np.linspace(0, 1, 100)) == pytest.approx(0.0, abs=1e-12)
+
+    def test_too_few_points(self):
+        assert robust_sigma(np.array([1.0, 2.0])) == 0.0
+
+
+class TestStructureMetrics:
+    """Tests for the structure/noise split."""
+
+    def test_flat_noise_has_ratio_near_one(self):
+        """A constant plus noise departs from a line by only what noise gives."""
+        rng = np.random.default_rng(2)
+        m = structure_metrics(0.5 + rng.normal(0, 0.01, 401))
+        assert 0.5 < m['ratio'] < 2.0
+
+    def test_band_edges_have_large_ratio(self):
+        v = np.linspace(-1.5, 1.5, 401)
+        rng = np.random.default_rng(3)
+        m = structure_metrics(_band_edges(v) + rng.normal(0, 0.01, 401))
+        assert m['ratio'] > 20
+
+    def test_coherence_high_for_a_single_rise(self):
+        """A curve that rises once and stays up travels no further than it goes."""
+        v = np.linspace(-1.5, 1.5, 401)
+        rng = np.random.default_rng(4)
+        m = structure_metrics(_band_edges(v) + rng.normal(0, 0.01, 401))
+        assert m['coherence'] > 0.2
+
+    def test_coherence_low_for_wandering_noise(self):
+        rng = np.random.default_rng(5)
+        m = structure_metrics(0.5 + rng.normal(0, 0.01, 401))
+        assert m['coherence'] < 0.09
+
+    def test_span_ignores_a_single_spike(self):
+        """The derivative of a sweep often spikes at an end; that is not structure."""
+        rng = np.random.default_rng(6)
+        y = 0.5 + rng.normal(0, 0.005, 400)
+        y[-3] = 50.0
+        m = structure_metrics(y)
+        assert m['span'] < 0.1 * m['amplitude']
+
+    def test_perfectly_flat_line(self):
+        m = structure_metrics(np.full(200, 5.0))
+        assert m['ratio'] == 0.0
+        assert m['amplitude'] == pytest.approx(0.0, abs=1e-9)
+
+    def test_too_few_points(self):
+        assert structure_metrics(np.array([1.0, 2.0, 3.0]))['n'] == 3
+
+
+class TestDetectFeatureless:
+    """Tests for the featureless detector — the reported defect."""
+
+    @pytest.fixture
+    def v(self):
+        return np.linspace(-1.5, 1.5, 401)
+
+    def test_flat_above_the_noise_floor_is_flagged(self, v):
+        """The reported case: dI/dV sitting at a level, with only noise on it."""
+        rng = np.random.default_rng(10)
+        assert detect_featureless(v, 0.5 + rng.normal(0, 0.01, 401)) > 0.9
+
+    def test_flat_at_zero_is_flagged(self, v):
+        rng = np.random.default_rng(11)
+        assert detect_featureless(v, rng.normal(0, 0.01, 401)) > 0.9
+
+    def test_slow_drift_is_not_structure(self, v):
+        """Thermal drift is an artifact of the measurement, not a feature."""
+        rng = np.random.default_rng(12)
+        y = 0.5 + 0.08 * np.tanh(v / 3.0) + rng.normal(0, 0.01, 401)
+        assert detect_featureless(v, y) > 0.9
+
+    def test_correlated_noise_is_flagged(self, v):
+        """Real dead spectra wander far above the white-noise sigma but hold
+        no shape; the coherence half of the test is what catches them.
+
+        The correlation length here (~8 points) is the one measured on the
+        calibration data, whose FFT peaks sit at a period of 10-13 points.
+        """
+        from scipy import ndimage
+        rng = np.random.default_rng(30)
+        wander = ndimage.gaussian_filter1d(rng.normal(0, 1, 401), 8 / 2.355)
+        wander /= wander.std()
+        y = 0.5 + 0.01 * wander + rng.normal(0, 0.002, 401)
+        assert structure_metrics(y)['ratio'] > 3.0      # amplitude test alone fails
+        assert detect_featureless(v, y) > 0.5           # coherence catches it
+
+    def test_slow_wander_is_left_alone(self, v):
+        """A curve that moves once, slowly, is not noise — whatever caused it,
+        the detector's contract is 'no shape', and this has one."""
+        rng = np.random.default_rng(13)
+        wander = np.cumsum(rng.normal(0, 1.0, 401))
+        wander -= np.linspace(wander[0], wander[-1], 401)
+        y = 0.5 + 0.001 * wander + rng.normal(0, 0.002, 401)
+        assert detect_featureless(v, y) == 0.0
+
+    def test_band_edges_with_empty_gap_are_kept(self, v):
+        """A clean gap spectrum is good data and must survive."""
+        rng = np.random.default_rng(14)
+        assert detect_featureless(v, _band_edges(v) + rng.normal(0, 0.01, 401)) == 0.0
+
+    def test_states_in_a_gap_are_kept(self, v):
+        rng = np.random.default_rng(15)
+        y = (0.02 + 0.3 * np.exp(-((v - 0.4) / 0.06) ** 2)
+             + 0.25 * np.exp(-((v + 0.5) / 0.06) ** 2) + rng.normal(0, 0.01, 401))
+        assert detect_featureless(v, y) == 0.0
+
+    def test_many_states_are_kept(self, v):
+        rng = np.random.default_rng(16)
+        y = _band_edges(v) + rng.normal(0, 0.01, 401)
+        for centre in np.linspace(-0.6, 0.6, 9):
+            y = y + 0.15 * np.exp(-((v - centre) / 0.04) ** 2)
+        assert detect_featureless(v, y) < 0.5
+
+    def test_a_lone_spike_is_not_this_detectors_business(self, v):
+        """A flat curve with one glitch reads as structured, deliberately.
+
+        Widening the percentile trim until a smoothed spike fell outside it
+        would also erase a genuine narrow state, which is only ~2.5% of a
+        sweep. Spikes are ``src/processing/cosmic_ray.py``'s job; this
+        detector answers "is there any shape", and a spike is one.
+        """
+        rng = np.random.default_rng(17)
+        y = 0.5 + rng.normal(0, 0.005, 401)
+        y[200] = 20.0
+        assert detect_featureless(v, y) == 0.0
+
+    def test_perfectly_flat_line(self, v):
+        assert detect_featureless(v, np.full(401, 0.5)) == 1.0
+
+    def test_thresholds_are_tunable(self, v):
+        rng = np.random.default_rng(18)
+        y = _band_edges(v) + rng.normal(0, 0.01, 401)
+        assert detect_featureless(v, y) == 0.0
+        # Demanding far more coherence than a real spectrum has flags everything
+        assert detect_featureless(v, y, min_coherence=0.95) > 0.5
+
+    def test_too_few_points(self, v):
+        assert detect_featureless(v[:4], np.ones(4)) == 0.0
+
+    def test_score_range(self, v):
+        rng = np.random.default_rng(19)
+        for _ in range(20):
+            score = detect_featureless(v, rng.normal(0, 1, 401))
+            assert 0.0 <= score <= 1.0
+
+
+class TestDetectorsOnRealisticSpectra:
+    """No detector may condemn a clean, gapped dI/dV curve.
+
+    Each of these fired on real STS data before the revamp: saturation on any
+    low-noise gap (the gap floor is a plateau), partial noise on the quiet gap
+    itself, and periodic noise on 91% of the spectra in the calibration set.
+    """
+
+    @pytest.fixture
+    def v(self):
+        return np.linspace(-1.5, 1.5, 401)
+
+    @pytest.mark.parametrize("sigma", [0.05, 0.01, 0.002, 0.0005])
+    def test_clean_gap_spectrum_passes_every_detector(self, v, sigma):
+        rng = np.random.default_rng(20)
+        y = _band_edges(v) + rng.normal(0, sigma, 401)
+        assert detect_saturation(y) < 0.5, "gap floor read as a clipped rail"
+        assert detect_partial_noise(v, y) < 0.5, "quiet gap read as a noise burst"
+        assert detect_periodic_noise(y)[0] < 0.5, "smooth spectrum read as periodic"
+        assert detect_featureless(v, y) < 0.5
+        assert detect_noise(y) < 0.5
+
+    def test_real_clipping_is_still_caught(self, v):
+        """Railing kills the noise along with the signal."""
+        rng = np.random.default_rng(21)
+        y = np.clip(3 * _band_edges(v) - 0.5 + rng.normal(0, 0.005, 401), -0.4, 0.9)
+        assert detect_saturation(y) > 0.9
+
+    def test_periodic_artifact_is_still_caught(self, v):
+        """A sine at 1% of the signal amplitude is still a line in the FFT."""
+        rng = np.random.default_rng(22)
+        t = np.linspace(0, 1, 401)
+        y = (_band_edges(v) + 0.01 * np.sin(2 * np.pi * 40 * t)
+             + rng.normal(0, 0.005, 401))
+        assert detect_periodic_noise(y)[0] > 0.5
+
+    def test_noise_burst_partway_through_is_caught(self, v):
+        """Tip instability over part of the sweep, not a quiet gap."""
+        rng = np.random.default_rng(23)
+        y = _band_edges(v) + rng.normal(0, 0.002, 401)
+        y[150:250] += rng.normal(0, 0.2, 100)
+        assert detect_partial_noise(v, y) > 0.0

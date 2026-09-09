@@ -18,9 +18,13 @@ from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtCore import QUrl, Qt
 from PySide6.QtGui import QIcon
 
-# Setup Python path for imports - add parent directory (TRANS_QML) to path
+# Setup Python path for imports - add parent directory (TRANS_QML) to path.
+# Harmless when frozen (PyInstaller has already set the search path up), and
+# required when running from source.
 app_dir = Path(__file__).parent.parent  # Go up one level from src/
 sys.path.insert(0, str(app_dir))
+
+from src.utils.app_paths import is_frozen, log_file, resource_path
 
 # Now we can import from src as a package
 from src.backend.app_backend import AppBackend
@@ -37,11 +41,15 @@ from src.widgets.image_provider import TransImageProvider
 from src.backend.map_editor_backend import MapEditorBackend
 
 # Configure logging
+# The file handler writes to the user's log directory, never to the working
+# directory: an app launched from Finder starts in "/", where creating
+# trans_qml.log raises PermissionError — at import time, before there is a
+# window to report it in, so the app would simply never appear.
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('trans_qml.log'),
+        logging.FileHandler(str(log_file())),
         logging.StreamHandler()
     ]
 )
@@ -88,10 +96,9 @@ def main():
     # Set application icon. Lives in <project>/assets/; the bare parent-dir
     # path is the pre-reorganisation location, kept as a fallback so a
     # checkout that predates the move still finds it.
-    project_root = Path(__file__).parent.parent
-    icon_path = project_root / "assets" / "icon.png"
+    icon_path = resource_path("assets", "icon.png")
     if not icon_path.exists():
-        icon_path = project_root / "icon.png"
+        icon_path = resource_path("icon.png")
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
         logger.info(f"Application icon set: {icon_path}")
@@ -192,7 +199,7 @@ def main():
     app.aboutToQuit.connect(cleanup)
 
     # Load main QML file (now relative to src/ directory)
-    qml_file = Path(__file__).parent / "qml" / "main" / "Main.qml"
+    qml_file = resource_path("src", "qml", "main", "Main.qml")
     import time
     t0 = time.time()
     engine.load(QUrl.fromLocalFile(str(qml_file)))
