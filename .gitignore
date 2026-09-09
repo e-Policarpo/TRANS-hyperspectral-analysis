@@ -44,3 +44,8 @@ projects/
 .env
 .venv/
 venv/
+
+# macOS packaging. The build happens in ~/Library/Caches/TRANS-build (outside
+# iCloud — see packaging/build_macos.sh); build/ and dist/ are already ignored
+# above. This one is generated from assets/icon.png by packaging/make_icns.sh.
+assets/icon.icns
