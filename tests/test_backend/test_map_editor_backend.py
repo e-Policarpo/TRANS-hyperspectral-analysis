@@ -1356,3 +1356,35 @@ class TestLineScanAxes:
 
         backend._canvas = OldCanvas()
         backend._push_line_scan_axes(self._dataset(), 'kymograph')   # no raise
+
+
+class TestStsMarkerLabels:
+    """A dot on a scan image says which point it is, and where along its line.
+
+    On a 64-point line the session-wide indices alone say nothing about
+    position, and they no longer match the P01-style column names of that
+    line's own dataset.
+    """
+
+    def test_a_line_point_carries_its_position(self):
+        from src.backend.map_editor_backend import MapEditorBackend
+
+        assert MapEditorBackend._sts_marker_label(
+            {'point_index': 203, 'line_scan_id': 3, 'line_pos': 0}) == '203(01)'
+
+    def test_the_position_is_one_based_and_padded(self):
+        from src.backend.map_editor_backend import MapEditorBackend
+
+        assert MapEditorBackend._sts_marker_label(
+            {'point_index': 266, 'line_scan_id': 3, 'line_pos': 63}) == '266(64)'
+
+    def test_an_isolated_point_keeps_a_bare_index(self):
+        from src.backend.map_editor_backend import MapEditorBackend
+
+        assert MapEditorBackend._sts_marker_label(
+            {'point_index': 201, 'line_scan_id': None, 'line_pos': None}) == '201'
+
+    def test_a_point_without_an_index_has_no_label(self):
+        from src.backend.map_editor_backend import MapEditorBackend
+
+        assert MapEditorBackend._sts_marker_label({}) == ''

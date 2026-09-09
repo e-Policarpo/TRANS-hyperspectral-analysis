@@ -741,6 +741,116 @@ class TestOmicronLineScanDetection:
         assert all(l['n_points'] == 10 for l in ls)
 
 
+class TestRejoinMovedTail:
+    """A position's last repetition, filed under the previous run.
+
+    The tip can move during the final scan cycle of a run, so that spectrum
+    carries the old run number but was taken at the new position. Keyed by
+    (run, location) it arrives as a separate one-repetition batch, and both
+    the repetition count and the point count come out wrong. Measured on
+    21-Jul-2026: 150 of 178 locations split this way, and a 64-position line
+    of 64 repetitions read as two interleaved lines of 62 with 63 and 1.
+    """
+
+    @staticmethod
+    def _batch(run, px, n_reps):
+        return {
+            'location_px': px, 'location_m': [0.0, 0.0], 'first_run': run,
+            'forward': [f"f{run}.{i}" for i in range(n_reps)],
+            'backward': [f"b{run}.{i}" for i in range(n_reps)],
+            'mixed': [f"m{run}.{i}" for i in range(n_reps)],
+            'rep_V': [None] * n_reps, 'rep_timestamps': [None] * n_reps,
+            'rep_files': [f"{run}_{i}" for i in range(n_reps)],
+            'rep_runscan': [(run, i + 1) for i in range(n_reps)],
+        }
+
+    def test_the_trailing_repetition_rejoins_its_position(self, sts_loader):
+        batches = [self._batch(1, (0, 0), 63), self._batch(1, (5, 5), 1),
+                   self._batch(2, (5, 5), 63)]
+        out = sts_loader._rejoin_moved_tail(batches)
+        assert len(out) == 2
+        rejoined = [b for b in out if b['location_px'] == (5, 5)][0]
+        assert len(rejoined['mixed']) == 64
+
+    def test_it_is_prepended_because_it_was_taken_first(self, sts_loader):
+        batches = [self._batch(1, (5, 5), 1), self._batch(2, (5, 5), 63)]
+        out = sts_loader._rejoin_moved_tail(batches)
+        assert out[0]['mixed'][0] == 'm1.0'
+        assert out[0]['rep_runscan'][0] == (1, 1)
+
+    def test_the_merged_point_keeps_the_earlier_run(self, sts_loader):
+        """Acquisition order must still put it where it was taken."""
+        batches = [self._batch(1, (5, 5), 1), self._batch(2, (5, 5), 63)]
+        assert sts_loader._rejoin_moved_tail(batches)[0]['first_run'] == 1
+
+    def test_a_revisit_many_runs_later_stays_separate(self, sts_loader):
+        """Keying on location alone was tried and reverted (027c2f8):
+        returning to a spot later is a distinct experiment."""
+        batches = [self._batch(1, (5, 5), 60), self._batch(9, (5, 5), 60)]
+        assert len(sts_loader._rejoin_moved_tail(batches)) == 2
+
+    def test_two_full_batches_in_adjacent_runs_stay_separate(self, sts_loader):
+        """Only a short tail is a stray cycle; two real acquisitions are two
+        points even when they follow each other."""
+        batches = [self._batch(1, (5, 5), 60), self._batch(2, (5, 5), 60)]
+        assert len(sts_loader._rejoin_moved_tail(batches)) == 2
+
+    def test_different_locations_are_never_merged(self, sts_loader):
+        batches = [self._batch(1, (0, 0), 1), self._batch(2, (5, 5), 63)]
+        assert len(sts_loader._rejoin_moved_tail(batches)) == 2
+
+    def test_nothing_to_do_returns_the_same_list(self, sts_loader):
+        batches = [self._batch(1, (0, 0), 64), self._batch(2, (5, 5), 64)]
+        assert sts_loader._rejoin_moved_tail(batches) is batches
+
+    def test_a_location_of_none_is_left_alone(self, sts_loader):
+        batches = [self._batch(1, None, 1), self._batch(2, None, 63)]
+        assert len(sts_loader._rejoin_moved_tail(batches)) == 2
+
+
+class TestRepBuckets:
+    """Line detection groups by repetition count, but near-equal counts are
+    the same acquisition: one position ending with 63 or 65 instead of 64 must
+    not break the line it belongs to."""
+
+    def test_near_equal_counts_share_a_bucket(self, sts_loader):
+        assert sts_loader._rep_buckets({63, 64, 65}) == {63: 63, 64: 63, 65: 63}
+
+    def test_a_parallel_single_sweep_stays_apart(self, sts_loader):
+        buckets = sts_loader._rep_buckets({1, 63, 64})
+        assert buckets[1] != buckets[64]
+
+    def test_far_apart_counts_stay_apart(self, sts_loader):
+        buckets = sts_loader._rep_buckets({16, 64})
+        assert buckets[16] != buckets[64]
+
+    def test_a_single_count_is_its_own_bucket(self, sts_loader):
+        assert sts_loader._rep_buckets({64}) == {64: 64}
+
+    def test_empty(self, sts_loader):
+        assert sts_loader._rep_buckets(set()) == {}
+
+
+class TestLineScanReportsRealRepetitions:
+    def test_reps_is_the_commonest_not_the_bucket_key(self, sts_loader):
+        """The bucket key is the smallest count in the bucket; a line of
+        mostly-64 points must not report 63."""
+        V = np.linspace(-1.0, 1.0, 8)
+
+        def pt(pi, px, n):
+            return {'point_index': pi, 'location_px': px, 'location_m': [0, 0],
+                    'V': V, 'forward': [V] * n, 'backward': [V] * n,
+                    'mixed': [V] * n, 'rep_V': [V] * n, 'first_timestamp': None}
+
+        batches = [pt(i + 1, (i * 5, 0), 64) for i in range(6)]
+        batches[0]['mixed'] = [V] * 63          # one short position
+        batches[0]['forward'] = [V] * 63
+        batches[0]['backward'] = [V] * 63
+        lines = sts_loader._detect_line_scans(batches)
+        assert lines and lines[0]['n_points'] == 6
+        assert lines[0]['reps'] == 64
+
+
 class TestOmicronLineScanOverviewDataset:
     """build_line_scan_overview_dataset — every repetition, not their mean.
 
