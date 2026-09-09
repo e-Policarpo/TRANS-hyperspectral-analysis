@@ -46,6 +46,7 @@ from .base_loader import BaseDataLoader
 from ..models.spectral_data import SpectralData
 from ..utils.naming import pad as _pad
 from ..utils.naming import strip_acquisition_time as _strip_time
+from .session_organization import disambiguate_labels
 from ..models.topography_data import TopographyData
 
 logger = logging.getLogger(__name__)
@@ -112,14 +113,15 @@ def _session_labels(bases) -> Dict[str, str]:
     Times are stripped, **except** where two sessions share a date — dropping it
     there would merge two distinct measurement sessions into one browser folder
     and collide their scan names. Those keep the full date-time.
+
+    The rule itself lives in :mod:`session_organization` so every loader
+    labels its sessions the same way.
     """
-    short = {base: _session_label(base) for base in bases}
-    counts: Dict[str, int] = {}
-    for label in short.values():
-        counts[label] = counts.get(label, 0) + 1
-    return {base: (label if counts[label] == 1
-                   else _session_label(base, keep_time=True))
-            for base, label in short.items()}
+    return disambiguate_labels(
+        list(bases),
+        lambda base: _session_label(base),
+        lambda base: _session_label(base, keep_time=True),
+    )
 
 
 def _parse_run_scan(filename: str) -> Tuple[int, int]:
@@ -1752,6 +1754,85 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
             sweep_direction=sweep,
             averaged_over_reps=True,
             spectrum_meta=spectrum_meta,
+        )
+        return SpectralData(df, metadata)
+
+    def build_line_scan_overview_dataset(self, session: dict, line_scan: dict,
+                                         name: str, sweep: str = 'Mixed'
+                                         ) -> SpectralData:
+        """Every individual spectrum of one line scan, for the given ``sweep``.
+
+        The companion to :meth:`build_line_scan_dataset`, which averages each
+        position's repetitions into a single column. This one keeps them all —
+        one column per (position, repetition), named ``P1R1``, ``P1R2``, … —
+        so the repetitions at a position can be compared, a drifting or
+        unstable one spotted, and the raw curves exported.
+
+        Columns are numbered by **position along the line**, not by the
+        session-wide point index, so ``P1`` is where the line starts. The true
+        point index stays in ``spectrum_meta``.
+        """
+        key = self._SWEEPS.get(sweep, 'mixed')
+        by_idx = {b['point_index']: b for b in session['batches']}
+        pts = [by_idx[pi] for pi in line_scan['point_indices'] if pi in by_idx]
+        pts.sort(key=lambda b: b.get('line_pos') or 0)
+
+        # Same modal-length rule as everywhere else here: a session can mix
+        # bias setups and a single aborted sweep can come back short, and a
+        # shared V axis cannot hold both.
+        lengths = [len(b['V']) for b in pts]
+        modal = max(set(lengths), key=lengths.count)
+        pts = [b for b in pts if len(b['V']) == modal]
+        V = pts[0]['V']
+
+        cols: Dict[str, np.ndarray] = {}
+        spectrum_meta: List[dict] = []
+        max_pos = len(pts)
+        max_rep = max((len(b['mixed']) for b in pts), default=1)
+        for pos, b in enumerate(pts, start=1):
+            # A batch built by an older path may not carry the per-rep
+            # timestamp/file lists; the spectra are still worth having.
+            stamps = b.get('rep_timestamps') or []
+            files = b.get('rep_files') or []
+            for r, spec in enumerate(b[key], start=1):
+                if len(spec) != modal:
+                    continue
+                col = f"P{_pad(pos, max_pos)}R{_pad(r, max_rep)}"
+                cols[col] = spec
+                ts = stamps[r - 1] if r - 1 < len(stamps) else None
+                spectrum_meta.append({
+                    'column': col,
+                    'point_index': b['point_index'],
+                    'line_pos': pos - 1,
+                    'rep': r,
+                    'location_px': list(b['location_px']) if b['location_px'] else None,
+                    'location_m': list(b['location_m']) if b['location_m'] else None,
+                    'timestamp': ts.isoformat() if ts else None,
+                    'parent_image': b.get('parent_image'),
+                    'file': files[r - 1] if r - 1 < len(files) else None,
+                })
+
+        df = self._sweep_df(V, cols)
+        metadata = self.create_metadata(
+            # Every spectrum is its own column here, so this is an ordered set
+            # of curves rather than the line's N positions: the Hyperspectral
+            # tab should not read it as a kymograph of the line.
+            dimensions=(len(cols), 1),
+            scan_mode='line',
+            units=dict(self._UNITS),
+            source_directory=session['source_dir'],
+            instrument='Omicron Matrix',
+            sample_name=session['sample_name'],
+            dataset_name=session['dataset_name'],
+            session_label=session['label'],
+            matrix_kind='line_scan_overview',
+            line_scan_id=line_scan['id'],
+            line_scan_reps=line_scan['reps'],
+            line_scan_points=len(pts),
+            sweep_direction=sweep,
+            averaged_over_reps=False,
+            spectrum_meta=spectrum_meta,
+            **next((b['lockin'] for b in pts if b.get('lockin')), {}),
         )
         return SpectralData(df, metadata)
 

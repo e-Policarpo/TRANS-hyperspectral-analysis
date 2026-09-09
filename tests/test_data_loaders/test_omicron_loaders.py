@@ -741,6 +741,121 @@ class TestOmicronLineScanDetection:
         assert all(l['n_points'] == 10 for l in ls)
 
 
+class TestOmicronLineScanOverviewDataset:
+    """build_line_scan_overview_dataset — every repetition, not their mean.
+
+    The averaged line dataset is the kymograph; this is the raw material
+    behind it, so a drifting or unstable repetition at a position can be seen
+    instead of being averaged away.
+    """
+
+    @pytest.fixture
+    def session_and_line(self):
+        V = np.linspace(-1.0, 1.0, 6)
+
+        def pt(pi, px, fwd, bwd, mix, pos):
+            return {'point_index': pi, 'location_px': px, 'location_m': [pi, 0],
+                    'V': V, 'forward': fwd, 'backward': bwd, 'mixed': mix,
+                    'rep_V': [V] * len(mix), 'first_timestamp': None,
+                    'line_pos': pos, 'rep_timestamps': [None] * len(mix),
+                    'rep_files': [f"f{pi}_{r}" for r in range(len(mix))]}
+
+        batches = [
+            pt(1, (0, 0), [np.full(6, 1.0), np.full(6, 3.0)],
+                          [np.full(6, 9.0), np.full(6, 11.0)],
+                          [np.full(6, 5.0), np.full(6, 7.0)], 0),
+            pt(2, (5, 0), [np.full(6, 2.0), np.full(6, 4.0)],
+                          [np.full(6, 8.0), np.full(6, 10.0)],
+                          [np.full(6, 5.0), np.full(6, 9.0)], 1),
+        ]
+        session = {'batches': batches, 'source_dir': '/d', 'sample_name': 'S',
+                   'dataset_name': 'D', 'label': 'L'}
+        ls = {'id': 1, 'reps': 2, 'n_points': 2, 'point_indices': [1, 2]}
+        return session, ls
+
+    def test_one_column_per_position_and_repetition(self, session_and_line):
+        session, ls = session_and_line
+        ds = OmicronMatrixSTSLoader().build_line_scan_overview_dataset(session, ls, 'ov')
+        assert list(ds.data.columns) == ['V', 'P01R01', 'P01R02', 'P02R01', 'P02R02']
+        assert ds.num_spectra == 4
+
+    def test_repetitions_are_not_averaged(self, session_and_line):
+        session, ls = session_and_line
+        ds = OmicronMatrixSTSLoader().build_line_scan_overview_dataset(session, ls, 'ov')
+        assert np.allclose(ds.data['P01R01'], 5.0)
+        assert np.allclose(ds.data['P01R02'], 7.0)
+
+    def test_matches_the_averaged_dataset(self, session_and_line):
+        """Each averaged column must be the mean of its own repetitions."""
+        session, ls = session_and_line
+        loader = OmicronMatrixSTSLoader()
+        avg = loader.build_line_scan_dataset(session, ls, 'avg')
+        ov = loader.build_line_scan_overview_dataset(session, ls, 'ov')
+        assert np.allclose(avg.data['P1'],
+                           np.nanmean(ov.data[['P01R01', 'P01R02']].values, axis=1))
+
+    def test_sweeps_select_the_right_curves(self, session_and_line):
+        session, ls = session_and_line
+        loader = OmicronMatrixSTSLoader()
+        f = loader.build_line_scan_overview_dataset(session, ls, 'o', 'Forward')
+        b = loader.build_line_scan_overview_dataset(session, ls, 'o', 'Backward')
+        m = loader.build_line_scan_overview_dataset(session, ls, 'o', 'Mixed')
+        assert np.allclose(f.data['P01R01'], 1.0)
+        assert np.allclose(b.data['P01R01'], 9.0)
+        assert np.allclose(m.data['P01R01'], 5.0)
+        assert f.metadata.additional_info['sweep_direction'] == 'Forward'
+
+    def test_columns_are_numbered_along_the_line(self, session_and_line):
+        """P1 is where the line starts, whatever the session-wide indices."""
+        session, ls = session_and_line
+        session['batches'][0]['point_index'] = 42
+        session['batches'][1]['point_index'] = 7
+        session['batches'][0]['line_pos'] = 0
+        session['batches'][1]['line_pos'] = 1
+        ls['point_indices'] = [42, 7]
+        ds = OmicronMatrixSTSLoader().build_line_scan_overview_dataset(session, ls, 'ov')
+        assert list(ds.data.columns)[1] == 'P01R01'
+        meta = ds.metadata.additional_info['spectrum_meta']
+        assert meta[0]['point_index'] == 42      # the real index is kept
+        assert meta[0]['line_pos'] == 0
+
+    def test_metadata_marks_it_unaveraged(self, session_and_line):
+        session, ls = session_and_line
+        ai = OmicronMatrixSTSLoader().build_line_scan_overview_dataset(
+            session, ls, 'ov').metadata.additional_info
+        assert ai['matrix_kind'] == 'line_scan_overview'
+        assert ai['averaged_over_reps'] is False
+        assert ai['line_scan_id'] == 1
+        assert ai['line_scan_points'] == 2
+        assert len(ai['spectrum_meta']) == 4
+
+    def test_spectrum_meta_records_position_rep_and_file(self, session_and_line):
+        session, ls = session_and_line
+        meta = OmicronMatrixSTSLoader().build_line_scan_overview_dataset(
+            session, ls, 'ov').metadata.additional_info['spectrum_meta']
+        second = meta[1]
+        assert second['column'] == 'P01R02'
+        assert second['rep'] == 2
+        assert second['line_pos'] == 0
+        assert second['file'] == 'f1_1'
+
+    def test_odd_length_repetitions_are_dropped(self, session_and_line):
+        """A shorter aborted sweep cannot share the frame's V axis."""
+        session, ls = session_and_line
+        session['batches'][0]['mixed'][1] = np.full(3, 99.0)
+        ds = OmicronMatrixSTSLoader().build_line_scan_overview_dataset(session, ls, 'ov')
+        assert 'P01R02' not in ds.data.columns
+        assert 'P01R01' in ds.data.columns
+
+    def test_batches_without_per_rep_files_still_build(self, session_and_line):
+        session, ls = session_and_line
+        for b in session['batches']:
+            b.pop('rep_files'); b.pop('rep_timestamps')
+        ds = OmicronMatrixSTSLoader().build_line_scan_overview_dataset(session, ls, 'ov')
+        assert ds.num_spectra == 4
+        assert ds.metadata.additional_info['spectrum_meta'][0]['file'] is None
+
+
 class TestOmicronLineScanDataset:
     """Tests for build_line_scan_dataset (one column per position = rep mean)."""
 
@@ -1403,6 +1518,7 @@ class TestLineScanDatasetNaming:
 
         loader = SimpleNamespace(
             build_line_scan_dataset=lambda session, ls, name, sweep: _ds(),
+            build_line_scan_overview_dataset=lambda session, ls, name, sweep: _ds(),
             build_point_dataset=lambda session, batch, name: _ds(),
             build_overview_dataset=lambda session, name: _ds(),
         )
@@ -1423,8 +1539,23 @@ class TestLineScanDatasetNaming:
 
         names = list(result['datasets'])
         assert any("line1 (57pts_3reps_pt20->pt76)" in n for n in names), names
-        # One dataset per sweep direction, all sharing the same base name.
-        assert len([n for n in names if "line1" in n]) == 3
+        # Per sweep direction: the per-position averages, and the overview
+        # holding every repetition behind them.
+        line_names = [n for n in names if "line1" in n]
+        assert len(line_names) == 6, line_names
+        for sweep in ('Mixed', 'Forward', 'Backward'):
+            assert any(n.endswith(f"· {sweep}") and "overview" not in n
+                       for n in line_names), sweep
+            assert any(n.endswith(f"· overview · {sweep}")
+                       for n in line_names), sweep
+
+    def test_averaged_line_stays_the_active_dataset(self):
+        """The kymograph is what the user works with; the overview is extra."""
+        result = self._expand([self._session([
+            {'id': 1, 'n_points': 4, 'reps': 2, 'point_indices': [1, 2, 3, 4]}])])
+
+        assert "overview" not in result['active_dataset']
+        assert result['active_dataset'].endswith("· Mixed")
 
     def test_each_line_gets_its_own_span(self):
         result = self._expand([self._session([

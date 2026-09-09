@@ -1557,15 +1557,85 @@ class AppBackend(ToolImplementations, QObject):
             filepath, progress_callback=progress_callback
         )
 
-        result = {'datasets': {}, 'active_dataset': None}
-        folder_name = filepath.parent.name
-        channels = spectral_data.metadata.additional_info.get('channels', {})
+        info = spectral_data.metadata.additional_info
+        channels = info.get('channels', {}) or {'Mixed': spectral_data}
+        # The smart import already resolved which session the picked file
+        # belongs to; name its datasets after that session so they match what
+        # a folder import of the same directory produces.
+        label = info.get('session_label') or filepath.parent.name
+        tag = info.get('session_tag') or ''
+        base = f"{label} · {tag}" if tag else label
+
+        result = {'datasets': {}, 'active_dataset': None, 'browser_folders': {}}
         for channel_name, channel_data in channels.items():
-            dataset_name = f"{folder_name}_{channel_name}"
+            dataset_name = f"{base} · {channel_name}"
             result['datasets'][dataset_name] = channel_data
+            result['browser_folders'][f"dataset:{dataset_name}"] = label
             logger.info(f"Loaded dataset: {dataset_name}")
 
-        result['active_dataset'] = f"{folder_name}_Mixed"
+        result['active_dataset'] = (
+            f"{base} · Mixed" if f"{base} · Mixed" in result['datasets']
+            else next(iter(result['datasets']), None))
+        return result
+
+    def _nanosurf_result_from_spectral(self, spectral_data, source) -> dict:
+        """Expand a loaded Nanosurf primary into a per-session import result.
+
+        A ``.nid`` folder holds a day's work — several acquisition passes with
+        different settings. Each becomes its own browser folder holding its
+        Forward/Backward/Mixed datasets, exactly as an Omicron MATRIX session
+        does, instead of the whole directory collapsing to one name (which
+        could only ever have described one of them).
+
+        Falls back to the single-session layout when the loader reports no
+        session breakdown, so an older loader or a synthetic dataset still
+        imports.
+        """
+        info = spectral_data.metadata.additional_info
+        sessions = info.get('sessions') or []
+        result = {
+            'datasets': {}, 'active_dataset': None, 'browser_folders': {},
+        }
+
+        if not sessions:
+            channels = info.get('channels', {}) or {'Mixed': spectral_data}
+            label = self._group_label(info) or Path(source).name
+            for channel_name, channel_data in channels.items():
+                name = f"{Path(source).name}_{channel_name}"
+                result['datasets'][name] = channel_data
+                result['browser_folders'][f"dataset:{name}"] = label
+            result['active_dataset'] = (
+                f"{Path(source).name}_Mixed"
+                if f"{Path(source).name}_Mixed" in result['datasets']
+                else next(iter(result['datasets']), None))
+            return result
+
+        # Largest session first only for choosing what to open; the datasets
+        # themselves are registered in acquisition order.
+        biggest = max(sessions, key=lambda entry: entry.get('n_files', 0))
+        for entry in sessions:
+            label = entry['label']
+            tag = entry.get('tag') or ''
+            base = f"{label} · {tag}" if tag else label
+            for channel_name, channel_data in (entry.get('channels') or {}).items():
+                name = f"{base} · {channel_name}"
+                result['datasets'][name] = channel_data
+                result['browser_folders'][f"dataset:{name}"] = label
+                if entry is biggest and channel_name == 'Mixed':
+                    result['active_dataset'] = name
+            # Scan images ride on this session's Mixed dataset, so the
+            # image-absorb path files them beside their own session.
+            images = entry.get('images') or []
+            if images:
+                carrier = (entry.get('channels') or {}).get('Mixed')
+                if carrier is not None:
+                    carrier.metadata.additional_info['images'] = images
+
+        if result['active_dataset'] is None:
+            result['active_dataset'] = next(iter(result['datasets']), None)
+
+        logger.info("Nanosurf import: %d session(s), %d dataset(s)",
+                    len(sessions), len(result['datasets']))
         return result
 
     def _do_smart_load_matrix(self, filepath: Path, progress_callback=None):
@@ -1636,6 +1706,16 @@ class AppBackend(ToolImplementations, QObject):
                                   session, ls, ls_name, sweep),
                               label)
                     first_ds = first_ds or ds
+                # …and the same line with its repetitions left intact
+                # (P1R1, P1R2, …), so the curves behind each averaged
+                # position can be compared and exported. Added after the
+                # averaged ones so the kymograph stays the active dataset.
+                for sweep in ('Mixed', 'Forward', 'Backward'):
+                    ov_name = f"{base} · overview · {sweep}"
+                    _add(ov_name,
+                         loader.build_line_scan_overview_dataset(
+                             session, ls, ov_name, sweep),
+                         label)
 
             # Isolated points (not part of any line scan) → per-point datasets.
             isolated = [b for b in session['batches']
@@ -1685,19 +1765,25 @@ class AppBackend(ToolImplementations, QObject):
             filepath, progress_callback=progress_callback
         )
 
-        result = {'datasets': {}, 'active_dataset': None}
+        result = {'datasets': {}, 'active_dataset': None, 'browser_folders': {}}
         stem = filepath.stem
-        channels = spectral_data.metadata.additional_info.get('channels', {}) or {}
+        info = spectral_data.metadata.additional_info
+        channels = info.get('channels', {}) or {}
+        # One .wip is one session: its channels, preview images and notes all
+        # belong in a folder named after it.
+        label = info.get('session_label') or stem
         if channels:
             for channel_name, channel_data in channels.items():
                 tag = channel_data.metadata.additional_info.get('channel_tag', '')
                 base = f"{stem} · {channel_name}" if len(channels) > 1 else stem
                 dataset_name = f"{base} · {tag}" if tag else base
                 result['datasets'][dataset_name] = channel_data
+                result['browser_folders'][f"dataset:{dataset_name}"] = label
                 logger.info(f"Smart-loaded WITec channel: {dataset_name}")
             result['active_dataset'] = next(iter(result['datasets']))
         else:
             result['datasets'][stem] = spectral_data
+            result['browser_folders'][f"dataset:{stem}"] = label
             result['active_dataset'] = stem
 
         # Carry the additional_info forward on the active dataset so the
@@ -1994,8 +2080,7 @@ class AppBackend(ToolImplementations, QObject):
         # so the UI surfaces the unsaved-changes indicator and so the autosave
         # timer's next tick has a clear "needs persisting" signal.
         if result.get('datasets'):
-            self.project_manager.mark_modified()
-            self.projectModifiedChanged.emit(True)
+            self._mark_project_modified()
 
         self.status = f"Loaded {len(result['datasets'])} datasets"
         logger.info(
@@ -2086,14 +2171,7 @@ class AppBackend(ToolImplementations, QObject):
                 dirpath,
                 progress_callback=progress_callback
             )
-
-            channels = spectral_data.metadata.additional_info.get('channels', {})
-            for channel_name, channel_data in channels.items():
-                dataset_name = f"{dirpath.name}_{channel_name}"
-                result['datasets'][dataset_name] = channel_data
-                logger.info(f"Loaded dataset: {dataset_name}")
-
-            result['active_dataset'] = f"{dirpath.name}_Mixed"
+            result = self._nanosurf_result_from_spectral(spectral_data, dirpath)
 
         elif txt_files:
             if not self.neaspec_loader:
@@ -2159,7 +2237,7 @@ class AppBackend(ToolImplementations, QObject):
         # pictures — route them through the full import handler so those are
         # absorbed (images, in-memory maps, nested folders) exactly like smart
         # import. Other folder formats keep the lightweight handling below.
-        if 'matrix_maps' in result:
+        if 'matrix_maps' in result or result.get('browser_folders'):
             self._on_file_loaded(result)
             return
 
@@ -2173,6 +2251,9 @@ class AppBackend(ToolImplementations, QObject):
         if result['active_dataset']:
             self._active_dataset = result['active_dataset']
             self.dataLoaded.emit(self._active_dataset)
+
+        if result.get('datasets'):
+            self._mark_project_modified()
 
         self.status = f"Loaded {len(result['datasets'])} datasets"
         logger.info(f"Folder loading complete: {len(result['datasets'])} datasets")
@@ -4757,13 +4838,15 @@ class AppBackend(ToolImplementations, QObject):
         self.projectModifiedChanged.emit(False)
 
     def _get_projects_directory(self) -> str:
-        """Get the default projects directory path."""
-        # Get the application root directory (where run.py is)
-        app_dir = Path(__file__).parent.parent.parent
-        projects_dir = app_dir / "projects"
-        # Create if it doesn't exist
-        projects_dir.mkdir(exist_ok=True)
-        return str(projects_dir)
+        """Where the open/save dialogs start looking for projects.
+
+        ``~/Documents/TRANS_QML_Projects`` — the same place the new-project
+        flow already defaults to, so opening and creating agree. It used to be
+        a ``projects/`` folder beside the source tree, which a frozen build
+        cannot create: that path lands inside the read-only .app bundle.
+        """
+        from src.utils.app_paths import default_projects_dir
+        return str(default_projects_dir())
 
 
     @Slot()
@@ -4883,6 +4966,25 @@ class AppBackend(ToolImplementations, QObject):
 
         logger.info(f"Project saved: {project_path}")
         return str(project_path)
+
+    def _mark_project_modified(self):
+        """Record that the project holds changes that are not on disk yet.
+
+        This is what drives the autosave: ``AutosaveManager`` only writes when
+        it has seen ``projectModifiedChanged(True)`` since its last write, so a
+        change that does not come through here is never persisted and never
+        warns the user.
+
+        Every path that adds, removes or renames project state must call it.
+        Tool results did not, which meant that after the first autosave of a
+        session the flag stayed clear and every later tick skipped silently —
+        a whole session's derived datasets, maps and images could exist only
+        in memory, with a stale .hrt on disk and nothing saying so.
+        """
+        if not self._project_ready:
+            return
+        self.project_manager.mark_modified()
+        self.projectModifiedChanged.emit(True)
 
     def _on_project_saved(self, project_path: Path):
         """Called when project save completes."""
@@ -6385,6 +6487,9 @@ class AppBackend(ToolImplementations, QObject):
         """Generic completion callback for tools."""
         logger.info(f"{tool_name} completed: {output_path}")
         self.status = f"{tool_name} complete"
+        # A tool result is unsaved project state like any other. Without this
+        # the autosave skips it and the .hrt never learns the tool ran.
+        self._mark_project_modified()
         self.toolCompleted.emit(tool_name, output_path)
 
         # Track output file
@@ -6851,6 +6956,9 @@ class AppBackend(ToolImplementations, QObject):
         result = result if isinstance(result, dict) else {}
         summary = result.get('summary') or {}
         if result.get('ok'):
+            # This one registers its table and map itself rather than going
+            # through _on_tool_completed, so it marks the project here.
+            self._mark_project_modified()
             converged = summary.get('converged', 0)
             total = summary.get('total', 0)
             groups = len(result.get('groups') or [])
@@ -7609,12 +7717,18 @@ class AppBackend(ToolImplementations, QObject):
     # (https://github.com/rafinhareis/ststools)
     # ========================================================================
 
-    @Slot(str, float, float, float, float, float, float, bool)
+    @Slot(str, float, float, float, float, float, float, float, bool, float, float)
     def filterBadData(self, dataset_name: str, weight_saturation: float,
                       weight_noise: float, weight_linear: float,
                       weight_periodic: float, weight_partial_noise: float,
-                      threshold: float, correct_periodic: bool):
-        """QML wrapper for filter bad data - runs in background thread."""
+                      weight_featureless: float, threshold: float,
+                      correct_periodic: bool, min_structure_ratio: float,
+                      min_coherence: float):
+        """QML wrapper for filter bad data - runs in background thread.
+
+        Kept for single-dataset callers; the tool panel goes through
+        ``runToolOnDatasets`` so a selection can be filtered in one run.
+        """
         logger.info(f"Submitting filter bad data for {dataset_name} to worker")
         self.status = f"Filtering bad data for {dataset_name}..."
         self.worker_manager.submit(
@@ -7626,8 +7740,11 @@ class AppBackend(ToolImplementations, QObject):
             weight_linear=weight_linear,
             weight_periodic=weight_periodic,
             weight_partial_noise=weight_partial_noise,
+            weight_featureless=weight_featureless,
             threshold=threshold,
             correct_periodic=correct_periodic,
+            min_structure_ratio=min_structure_ratio,
+            min_coherence=min_coherence,
             on_finished=lambda path: self._on_tool_completed("Filter Bad Data", path)
         )
 

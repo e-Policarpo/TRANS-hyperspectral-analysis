@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Optional, Tuple, List, Dict
 import logging
 import re
+from datetime import datetime
 
 from .base_loader import BaseDataLoader
 from ..utils.naming import padded_series
@@ -24,6 +25,13 @@ from ..models.topography_data import TopographyData
 # Original library by Nanosurf AG (nelson@nanosurf.com)
 # See src/data_loaders/nsfopen/LICENSE for full license text
 from .nsfopen import read as nid_read
+
+from .session_organization import (
+    format_session_label,
+    grid_positions_m,
+    session_labels_from_times,
+    spatial_info,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -313,28 +321,62 @@ class NanosurfSTSEnhancedLoader(BaseDataLoader):
         if progress_callback:
             progress_callback(0, 1, "Scanning directory for sibling files...")
 
-        # Find all matching files
-        siblings = self._find_sibling_files(ref_fp, directory)
-        logger.info(f"Found {len(siblings)} matching files in {directory}")
+        # Resolve the whole directory's sessions and take the one holding the
+        # picked file, rather than clustering around it in isolation: the
+        # labels are only unique relative to the other sessions present, so
+        # this is what makes a smart import and a folder import of the same
+        # directory agree on names.
+        sessions = self.discover_sessions(directory)
+        session = next((ss for ss in sessions if filepath in ss['files']), None)
 
-        if not siblings:
-            raise ValueError(
-                f"No matching files found in {directory}. "
-                "Could not assemble a dataset."
-            )
+        if session is None:
+            # The reference file has spectra but landed in no session (it was
+            # filtered out, or the directory changed under us) — fall back to
+            # the pairwise sibling search so the import still works.
+            siblings = self._find_sibling_files(ref_fp, directory)
+            if not siblings:
+                raise ValueError(
+                    f"No matching files found in {directory}. "
+                    "Could not assemble a dataset."
+                )
+            session = {
+                'label': format_session_label(ref_fp.get('timestamp'),
+                                              fallback=directory.name),
+                'files': siblings,
+                'fingerprints': [ref_fp],
+                'started': ref_fp.get('timestamp'),
+                'ended': ref_fp.get('timestamp'),
+                'spec_mode': ref_fp.get('spec_mode') or 'Map',
+                'repetition_mode': ref_fp.get('repetition_mode'),
+                'settings': {'data_points': ref_fp.get('data_points'),
+                             'modulation_time': ref_fp.get('modulation_time'),
+                             'mod_output': ref_fp.get('mod_output'),
+                             'map_dims': ref_fp.get('map_dims')},
+            }
+
+        siblings = session['files']
+        logger.info(
+            "Smart import: %s belongs to session %s (%d file(s) of %d in %s)",
+            filepath.name, session['label'], len(siblings),
+            sum(len(ss['files']) for ss in sessions) or len(siblings), directory)
 
         # Now delegate to the standard loading pipeline
         rep_mode = self._parse_repetition_mode(siblings[0])
-        spec_mode = ref_fp.get('spec_mode', 'Map')
+        spec_mode = session['spec_mode']
         logger.info(f"Repetition mode: {rep_mode}, spec mode: {spec_mode}, "
                     f"loading {len(siblings)} files")
 
         if rep_mode == 'repeat_position_list':
-            return self._load_repeat_position_list(siblings, directory, progress_callback,
-                                                   spec_mode=spec_mode)
+            primary, topo = self._load_repeat_position_list(
+                siblings, directory, progress_callback,
+                spec_mode=spec_mode, session=session)
         else:
-            return self._load_repeat_each_position(siblings, directory, progress_callback,
-                                                   spec_mode=spec_mode)
+            primary, topo = self._load_repeat_each_position(
+                siblings, directory, progress_callback,
+                spec_mode=spec_mode, session=session)
+        # The tag names the dataset; the label names its browser folder.
+        primary.metadata.additional_info['session_tag'] = self.session_tag(session)
+        return primary, topo
 
     def parse_nid_metadata(self, nid_obj) -> Dict:
         """
@@ -466,7 +508,9 @@ class NanosurfSTSEnhancedLoader(BaseDataLoader):
             logger.warning(f"Could not extract topography: {e}")
             return None
 
-    def _extract_image_channels(self, stm_nid, file_label: str) -> List[Tuple[str, "Any"]]:
+    def _extract_image_channels(self, stm_nid, file_label: str,
+                                session_label: Optional[str] = None
+                                ) -> List[Tuple[str, "Any"]]:
         """Surface every Nanosurf Image channel as an :class:`ImageData`.
 
         Each ``.nid`` file may contain forward / backward scans of multiple
@@ -546,6 +590,11 @@ class NanosurfSTSEnhancedLoader(BaseDataLoader):
                         additional_info={
                             "channel_meta": {c: channel_meta[c]
                                              for c in channels},
+                            # Without this the browser files a scan under its
+                            # own file stem, away from the session whose
+                            # datasets it belongs with.
+                            **({"session_label": session_label}
+                               if session_label else {}),
                         },
                     ),
                     active_channel=self._pick_nid_channel(channels),
@@ -619,92 +668,190 @@ class NanosurfSTSEnhancedLoader(BaseDataLoader):
 
     # ── Main Entry Point ────────────────────────────────────────────────
 
+    # ── Session discovery ───────────────────────────────────────────────
+
+    def discover_sessions(self, directory: Path) -> List[Dict]:
+        """Every measurement session in ``directory``, newest information first.
+
+        A session is a set of ``.nid`` files that share acquisition settings
+        (the fingerprint key: spec mode, repetition mode, data points,
+        modulation time and output, grid size) *and* were taken close together
+        in time. Both halves are needed: one afternoon can hold several passes
+        with identical settings, and two different measurements can interleave.
+
+        Returns a list of dicts with ``label``, ``files``, ``fingerprints``,
+        ``key``, ``started``/``ended``, ``spec_mode``, ``repetition_mode`` and
+        ``settings``. Labels are unique within the directory.
+
+        This is what makes a folder import keep everything. The loader used to
+        cluster exactly like this and then hand back only the largest cluster,
+        so importing a directory of 193 spectroscopy files silently produced
+        52 and dropped the other 141.
+        """
+        directory = Path(directory)
+        all_nid = sorted(self.find_files(directory), key=lambda x: x.name)
+
+        param_groups: Dict[tuple, List[Dict]] = {}
+        for f in all_nid:
+            fp = self._parse_file_fingerprint(f)
+            if fp is None:
+                continue                      # topography-only file
+            param_groups.setdefault(self._fingerprint_key(fp), []).append(fp)
+
+        sessions: List[Dict] = []
+        for key, fps in param_groups.items():
+            for cluster in self._cluster_by_time(fps):
+                if not cluster:
+                    continue
+                stamps = sorted(fp['timestamp'] for fp in cluster
+                                if fp.get('timestamp'))
+                sessions.append({
+                    'key': key,
+                    'fingerprints': cluster,
+                    'files': sorted((fp['filepath'] for fp in cluster),
+                                    key=lambda x: x.name),
+                    'started': stamps[0] if stamps else None,
+                    'ended': stamps[-1] if stamps else None,
+                    'spec_mode': cluster[0].get('spec_mode') or 'Map',
+                    'repetition_mode': cluster[0].get('repetition_mode'),
+                    'settings': {
+                        'data_points': cluster[0].get('data_points'),
+                        'modulation_time': cluster[0].get('modulation_time'),
+                        'mod_output': cluster[0].get('mod_output'),
+                        'map_dims': cluster[0].get('map_dims'),
+                    },
+                })
+
+        # Acquisition order, so the browser lists a day's work as it happened.
+        sessions.sort(key=lambda ss: (ss['started'] or datetime.max,
+                                      ss['files'][0].name))
+        labels = session_labels_from_times(
+            [ss['started'] for ss in sessions], fallback=directory.name or 'session')
+        for session, label in zip(sessions, labels):
+            session['label'] = label
+        return sessions
+
+    @staticmethod
+    def session_tag(session: Dict) -> str:
+        """Short description of what a session measured, for a dataset name.
+
+        ``'Map 8x8'`` / ``'Point x52'`` — enough to tell two same-day sessions
+        apart at a glance in the browser, the way the MATRIX loader's
+        ``pt3 (128,64)`` and ``line1 (8pts_256reps)`` names do.
+        """
+        mode = (session.get('spec_mode') or 'Map').strip()
+        dims = (session.get('settings') or {}).get('map_dims')
+        if dims:
+            return f"{mode} {dims.replace(';', 'x')}"
+        return f"{mode} x{len(session.get('files') or [])}"
+
     def load_from_directory(self, directory: Path,
                            progress_callback=None) -> Tuple[SpectralData, Optional[TopographyData]]:
-        """
-        Load STS data from directory of .nid files with zigzag correction.
+        """Load **every** measurement session in a directory of ``.nid`` files.
 
-        Automatically detects the repetition mode from the first file's header
-        and delegates to the appropriate loading strategy.
+        A folder is usually a day's work, not one experiment: several
+        acquisition passes with different settings, minutes or hours apart.
+        Each is loaded separately and carries its own label, settings and
+        per-spectrum provenance, so the backend can file them into one browser
+        folder per session — the same model the Omicron MATRIX loader uses.
 
-        Parameters
-        ----------
-        directory : Path
-            Directory containing .nid files
-        progress_callback : callable, optional
-            Callback function(current, total, message) for progress updates
+        Returns the largest session as the primary :class:`SpectralData` (the
+        historical contract), with every session attached as
+        ``additional_info['sessions']``: a list of
+        ``{label, tag, channels, images, topography, n_files}``.
 
-        Returns
-        -------
-        spectral_data : SpectralData
-            Concatenated spectral data with zigzag correction
-        topography : TopographyData or None
-            Average topography from first file
+        Previously this clustered the files exactly the same way and then used
+        only the biggest cluster, so a folder of 193 spectroscopy files
+        imported as 52 and lost the other 141 without an error.
         """
         directory = Path(directory)
 
         if not self.validate_directory(directory):
             raise ValueError(f"Invalid directory: {directory}")
 
-        # Find all .nid files (sorted alphabetically)
         all_nid = sorted(self.find_files(directory), key=lambda x: x.name)
-
         if not all_nid:
             raise ValueError(f"No .nid files found in {directory}")
 
-        # Parse fingerprints and group by session key + temporal proximity
-        param_groups = {}
-        all_fps = []
-        for f in all_nid:
-            fp = self._parse_file_fingerprint(f)
-            if fp is None:
-                continue  # Skip topo-only files
-            all_fps.append(fp)
-            key = self._fingerprint_key(fp)
-            param_groups.setdefault(key, []).append(fp)
-
-        if not param_groups:
+        sessions = self.discover_sessions(directory)
+        if not sessions:
             raise ValueError(
                 f"No spectroscopy .nid files found in {directory} "
                 f"({len(all_nid)} files scanned, all appear to be topography-only)"
             )
 
-        # For each parameter group, split by temporal clustering
-        all_sessions = []
-        for key, fps in param_groups.items():
-            clusters = self._cluster_by_time(fps)
-            for cluster in clusters:
-                all_sessions.append(cluster)
+        logger.info("Found %d session(s) across %d file(s) in %s",
+                    len(sessions), sum(len(ss['files']) for ss in sessions),
+                    directory)
 
-        # Use the largest temporal cluster
-        best = max(all_sessions, key=len)
-        nid_files = sorted([fp['filepath'] for fp in best], key=lambda x: x.name)
+        loaded: List[Dict] = []
+        topography = None
+        total = sum(len(ss['files']) for ss in sessions) or 1
+        done = 0
 
-        skipped = len(all_nid) - len(nid_files)
-        if skipped > 0:
-            logger.info(
-                f"Found {len(all_sessions)} session(s) across "
-                f"{len(param_groups)} parameter group(s); using largest with "
-                f"{len(nid_files)} files (skipped {skipped} others)"
-            )
+        for session in sessions:
+            files = session['files']
 
-        # Detect repetition mode and spec mode from the session
-        rep_mode = self._parse_repetition_mode(nid_files[0])
-        spec_mode = best[0].get('spec_mode', 'Map')
-        logger.info(f"Detected repetition mode: {rep_mode}, spec mode: {spec_mode} "
-                    f"({len(nid_files)} STS files)")
+            # Scope each session's progress into its share of the whole, so a
+            # folder of many sessions still advances smoothly.
+            def _prog(i, n, msg, _base=done, _total=total, _label=session['label']):
+                if progress_callback:
+                    progress_callback(_base + i, _total, f"{_label}: {msg}")
 
-        if rep_mode == 'repeat_position_list':
-            return self._load_repeat_position_list(nid_files, directory, progress_callback,
-                                                   spec_mode=spec_mode)
-        else:
-            return self._load_repeat_each_position(nid_files, directory, progress_callback,
-                                                   spec_mode=spec_mode)
+            rep_mode = self._parse_repetition_mode(files[0])
+            try:
+                if rep_mode == 'repeat_position_list':
+                    primary, topo = self._load_repeat_position_list(
+                        files, directory, _prog,
+                        spec_mode=session['spec_mode'], session=session)
+                else:
+                    primary, topo = self._load_repeat_each_position(
+                        files, directory, _prog,
+                        spec_mode=session['spec_mode'], session=session)
+            except Exception as exc:
+                # One unreadable session must not cost the user the others.
+                logger.error("Session %s failed to load: %s", session['label'], exc,
+                             exc_info=True)
+                done += len(files)
+                continue
+
+            done += len(files)
+            channels = primary.metadata.additional_info.get('channels') or {
+                'Mixed': primary}
+            loaded.append({
+                'label': session['label'],
+                'tag': self.session_tag(session),
+                'channels': channels,
+                'images': primary.metadata.additional_info.get('images', []),
+                'topography': topo,
+                'n_files': len(files),
+                'spec_mode': session['spec_mode'],
+                'started': (session['started'].isoformat()
+                            if session['started'] else None),
+            })
+            if topography is None and topo is not None:
+                topography = topo
+
+        if not loaded:
+            raise ValueError(f"No session could be loaded from {directory}")
+
+        # The largest session is the primary, so a single-session folder
+        # behaves exactly as it always did.
+        best = max(loaded, key=lambda entry: entry['n_files'])
+        primary = best['channels'].get('Mixed') or next(iter(best['channels'].values()))
+        primary.metadata.additional_info['sessions'] = loaded
+        primary.metadata.additional_info['source_directory'] = str(directory)
+
+        if progress_callback:
+            progress_callback(total, total, "Complete!")
+        self.last_loaded_path = directory
+        return primary, topography
 
     # ── Repeat Each Position ────────────────────────────────────────────
 
     def _load_repeat_each_position(self, nid_files: List[Path], directory: Path,
-                                   progress_callback=None, spec_mode='Map'):
+                                   progress_callback=None, spec_mode='Map',
+                                   session=None):
         """
         Load STS data in "Repeat each position" mode.
 
@@ -716,6 +863,10 @@ class NanosurfSTSEnhancedLoader(BaseDataLoader):
         all_spectra_forward = []
         all_spectra_backward = []
         all_spectra_mixed = []
+        # One file is one spectrum here, so the file each column came from is
+        # recoverable — and worth recording, since it is the only way back to
+        # a single point's raw acquisition.
+        contributing_files: List[Path] = []
         V_common = None
         topography = None
         dimensions = None
@@ -757,6 +908,7 @@ class NanosurfSTSEnhancedLoader(BaseDataLoader):
                     all_spectra_forward.append(I_mean_forward)
                     all_spectra_backward.append(I_mean_backward)
                     all_spectra_mixed.append(I_mean_mixed)
+                    contributing_files.append(filepath)
 
                     # Get voltage array
                     if V_common is None:
@@ -799,17 +951,20 @@ class NanosurfSTSEnhancedLoader(BaseDataLoader):
         if dimensions is None:
             dimensions = self._infer_dimensions(len(all_spectra_mixed), topography)
 
+        column_files = dict(zip(padded_series("Point", len(all_spectra_mixed)),
+                                contributing_files))
         return self._build_result(
             all_spectra_forward, all_spectra_backward, all_spectra_mixed,
             V_common, dimensions, topography, nid_files, directory, progress_callback,
             map_geometry=map_geometry, topo_geometry=topo_geometry,
-            spec_mode=spec_mode
+            spec_mode=spec_mode, session=session, column_files=column_files
         )
 
     # ── Repeat Position List ────────────────────────────────────────────
 
     def _load_repeat_position_list(self, nid_files: List[Path], directory: Path,
-                                   progress_callback=None, spec_mode='Map'):
+                                   progress_callback=None, spec_mode='Map',
+                                   session=None):
         """
         Load STS data in "Repeat position list" mode.
 
@@ -946,7 +1101,7 @@ class NanosurfSTSEnhancedLoader(BaseDataLoader):
             all_spectra_forward, all_spectra_backward, all_spectra_mixed,
             V_common, dimensions, topography, nid_files, directory, progress_callback,
             n_repetitions=n_files_loaded, map_geometry=map_geometry,
-            topo_geometry=topo_geometry, spec_mode=spec_mode
+            topo_geometry=topo_geometry, spec_mode=spec_mode, session=session
         )
 
     # ── Shared Helpers ──────────────────────────────────────────────────
@@ -1026,16 +1181,113 @@ class NanosurfSTSEnhancedLoader(BaseDataLoader):
         self.last_loaded_path = directory
         return sd, topography
 
+    # ── Session metadata ────────────────────────────────────────────────
+
+    @staticmethod
+    def _session_info(session: Dict, nid_files: List[Path]) -> Dict:
+        """Acquisition settings and timing of a session, for the dataset.
+
+        The fingerprint parser already reads all of this to decide which files
+        belong together; it used to be thrown away afterwards, leaving the
+        dataset with no record of the modulation or the sweep it came from.
+        """
+        if not session:
+            return {}
+        info: Dict[str, Any] = {}
+        if session.get('label'):
+            info['session_label'] = session['label']
+        started, ended = session.get('started'), session.get('ended')
+        if started is not None:
+            info['session_started'] = started.isoformat()
+        if ended is not None:
+            info['session_ended'] = ended.isoformat()
+            if started is not None:
+                info['session_duration_s'] = (ended - started).total_seconds()
+        if session.get('repetition_mode'):
+            info['repetition_mode'] = session['repetition_mode']
+        for key, value in (session.get('settings') or {}).items():
+            if value is not None:
+                info[key] = value
+        info['session_files'] = [Path(f).name for f in nid_files]
+        return info
+
+    @staticmethod
+    def _stamp_spectrum_meta(spectral_data: SpectralData,
+                             column_files: Optional[Dict[str, Path]],
+                             times_by_file: Dict[str, str],
+                             map_geometry: Optional[Dict],
+                             spec_mode: str) -> None:
+        """Record where and when each spectrum was taken, column by column.
+
+        Entries are keyed by column *name*, not position, so they survive the
+        meander correction that has just reordered the columns and any later
+        tool that keeps a subset of them.
+
+        ``location_m`` is what lets a map of this dataset come out in
+        nanometres rather than point indices — the grid rectangle is in the
+        ``.nid`` header's ``Map0`` line, which was previously read only to
+        get the grid's shape.
+        """
+        columns = list(spectral_data.spectra.columns)
+        positions = grid_positions_m(map_geometry, len(columns))
+        column_files = column_files or {}
+
+        entries: List[Dict[str, Any]] = []
+        for i, column in enumerate(columns):
+            entry: Dict[str, Any] = {'column': column, 'point_index': i}
+            source = column_files.get(column)
+            if source is not None:
+                entry['file'] = Path(source).name
+                stamp = times_by_file.get(Path(source).name)
+                if stamp:
+                    entry['timestamp'] = stamp
+            if positions is not None:
+                entry['location_m'] = [positions[i][0], positions[i][1]]
+            entries.append(entry)
+
+        # Same vocabulary AppBackend._spatial_layout uses. A "Map" whose grid
+        # is one cell wide really is a line, and calling it one makes the Map
+        # Generator lay it out as a strip instead of a degenerate raster.
+        layout = None
+        if positions is not None and map_geometry:
+            try:
+                nx, ny = int(map_geometry['nx']), int(map_geometry['ny'])
+                layout = 'line' if min(nx, ny) <= 1 else 'area'
+            except (KeyError, TypeError, ValueError):
+                layout = None
+        spectral_data.metadata.additional_info.update(
+            spatial_info(spectrum_meta=entries, layout=layout)
+        )
+
     def _build_result(self, all_fwd, all_bwd, all_mix, V_common,
                       dimensions, topography, nid_files, directory,
                       progress_callback, n_repetitions=None,
                       map_geometry=None, topo_geometry=None,
-                      spec_mode='Map'):
-        """Build SpectralData results for all three channels."""
+                      spec_mode='Map', session=None, column_files=None):
+        """Build SpectralData results for all three channels.
+
+        ``session`` is the entry from :meth:`discover_sessions` this data came
+        from; its label, timing and acquisition settings are stamped onto every
+        channel so the backend can file the datasets together and the user can
+        see what was measured. ``column_files`` maps each data column to the
+        ``.nid`` file it came from, where one file is one spectrum.
+        """
         results = {}
 
         # Only Map mode uses meander scan pattern; Point/Line are sequential
         scan_mode = "meander" if spec_mode == 'Map' else "sequential"
+        session = session or {}
+        column_names = padded_series("Point", len(all_mix))
+
+        # Per-file acquisition times, for the per-spectrum provenance below.
+        # Only "repeat each position" has one file per spectrum; in
+        # "repeat position list" every file covers the whole grid, so the
+        # timestamps belong to the session, not to a column.
+        times_by_file = {}
+        for fp in (session.get('fingerprints') or []):
+            ts = fp.get('timestamp')
+            if ts is not None:
+                times_by_file[Path(fp['filepath']).name] = ts.isoformat()
 
         for channel_name, spectra_list in [
             ('Forward', all_fwd),
@@ -1045,7 +1297,7 @@ class NanosurfSTSEnhancedLoader(BaseDataLoader):
             df = self.concatenate_spectra(
                 spectra_list,
                 V_common,
-                column_names=padded_series("Point", len(spectra_list))
+                column_names=list(column_names)
             )
             df = df.rename(columns={"Variable": "V"})
 
@@ -1061,6 +1313,7 @@ class NanosurfSTSEnhancedLoader(BaseDataLoader):
                 additional['map_geometry'] = map_geometry
             if topo_geometry is not None:
                 additional['topo_geometry'] = topo_geometry
+            additional.update(self._session_info(session, nid_files))
 
             metadata = self.create_metadata(
                 dimensions=dimensions,
@@ -1071,6 +1324,10 @@ class NanosurfSTSEnhancedLoader(BaseDataLoader):
 
             spectral_data = SpectralData(df, metadata, topography.data if topography else None)
             spectral_data.correct_meander()
+            # After the meander correction, and only then: the columns are now
+            # in row-major order, which is the order grid_positions_m returns.
+            self._stamp_spectrum_meta(spectral_data, column_files, times_by_file,
+                                      map_geometry, spec_mode)
             results[channel_name] = spectral_data
 
         if progress_callback:
@@ -1089,13 +1346,15 @@ class NanosurfSTSEnhancedLoader(BaseDataLoader):
         # raw arrays are already cached by NSFopen on first read.
         try:
             session_images = []
+            session_label = session.get('label')
             for filepath in nid_files:
                 try:
                     stm_nid = nid_read(str(filepath))
                 except Exception:
                     continue
                 session_images.extend(
-                    self._extract_image_channels(stm_nid, filepath.stem)
+                    self._extract_image_channels(stm_nid, filepath.stem,
+                                                 session_label)
                 )
             if session_images:
                 primary_data.metadata.additional_info['images'] = session_images

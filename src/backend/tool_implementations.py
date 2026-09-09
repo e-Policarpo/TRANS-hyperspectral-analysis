@@ -5391,10 +5391,38 @@ class ToolImplementations:
                         weight_linear: float = 1.0,
                         weight_periodic: float = 1.0,
                         weight_partial_noise: float = 1.0,
+                        weight_featureless: float = 1.0,
                         threshold: float = 0.5,
-                        correct_periodic: bool = False) -> str:
+                        correct_periodic: bool = False,
+                        min_structure_ratio: float = 3.0,
+                        min_coherence: float = 0.12,
+                        min_finite_fraction: float = 0.5,
+                        filter_offset_outliers: bool = False,
+                        filter_bandgap_outliers: bool = False,
+                        filter_saturation_outliers: bool = False,
+                        max_offset_outliers: int = 5,
+                        max_bandgap_outliers: int = 5,
+                        max_saturation_outliers: int = 5,
+                        outlier_group_by: str = 'point',
+                        outlier_intervals: int = 8,
+                        outlier_z: float = 3.5) -> str:
         """
-        Filter bad spectra based on saturation, noise, linear artifact, and periodic noise heuristics.
+        Filter bad spectra on saturation, noise, linear artifact, periodic
+        noise, partial noise and featurelessness.
+
+        A spectrum with too few finite samples is bad unconditionally, whatever
+        the weights say: every detector returns 0 for a curve it cannot
+        measure, so an all-NaN column used to score 0 across the board and land
+        in *Good Data*. Measured on real STS data, 103 of 167 "good" spectra
+        were entirely empty.
+
+        **Outliers** are judged separately, and only if asked for. Every
+        detector above looks at one curve on its own; an outlier is a curve
+        that may be perfectly sound and still wrong to average in, which is a
+        question about the *population* it sits in. See
+        :mod:`src.processing.curve_outliers`: the comparison runs within each
+        point's repetitions by default, because averaging across points is
+        averaging across different places on the sample.
 
         Creates three new datasets — '{base} - Good Data', '{base} - Bad
         Data' and '{base} - FFT Spectra' — and exports every output of the run
@@ -5406,7 +5434,7 @@ class ToolImplementations:
         from src.backend.sts_algorithms import (
             detect_saturation, detect_noise, detect_linear_artifact,
             detect_periodic_noise, correct_periodic_noise,
-            detect_partial_noise
+            detect_partial_noise, detect_featureless, structure_metrics
         )
         try:
             if dataset_name not in self._datasets:
@@ -5419,8 +5447,15 @@ class ToolImplementations:
             num_spectra = spectra.shape[1]
 
             logger.info(f"Filtering bad data for {dataset_name}: {num_spectra} spectra, "
-                        f"weights=({weight_saturation}, {weight_noise}, {weight_linear}, {weight_periodic}, {weight_partial_noise}), "
-                        f"threshold={threshold}, correct_periodic={correct_periodic}")
+                        f"weights=({weight_saturation}, {weight_noise}, {weight_linear}, "
+                        f"{weight_periodic}, {weight_partial_noise}, {weight_featureless}), "
+                        f"threshold={threshold}, correct_periodic={correct_periodic}, "
+                        f"min_structure_ratio={min_structure_ratio}, min_coherence={min_coherence}")
+
+            # A curve with too little of itself left is not judged, it is
+            # rejected: every detector scores 0 on data it cannot measure.
+            min_finite = max(8, int(math.ceil(min_finite_fraction * len(independent_var))))
+            empty_indices = []
 
             good_indices = []
             bad_indices = []
@@ -5435,11 +5470,16 @@ class ToolImplementations:
                 f"Total spectra: {num_spectra}",
                 f"Combination: max(weighted scores) — each detector independently triggers",
                 f"Weights: saturation={weight_saturation}, noise={weight_noise}, "
-                f"linear={weight_linear}, periodic={weight_periodic}, partial_noise={weight_partial_noise}",
+                f"linear={weight_linear}, periodic={weight_periodic}, "
+                f"partial_noise={weight_partial_noise}, featureless={weight_featureless}",
                 f"Threshold: {threshold}{correction_note}",
+                f"Featureless: structure ratio < {min_structure_ratio} or coherence < {min_coherence}",
+                f"Rejected outright: fewer than {min_finite} finite samples of {len(independent_var)}",
                 "",
-                f"{'Index':>6} {'Sat':>8} {'Noise':>8} {'Linear':>8} {'Periodic':>10} {'Partial':>10} {'Combined':>10} {'Trigger':>12} {'Status':>8}",
-                "-" * 90,
+                f"{'Index':>6} {'Sat':>8} {'Noise':>8} {'Linear':>8} {'Periodic':>10} {'Partial':>10} "
+                f"{'Featless':>10} {'Combined':>10} {'Trigger':>12} {'Status':>8} "
+                f"{'Ratio':>10} {'Cohere':>8} {'Sigma':>11}",
+                "-" * 130,
             ]
 
             for i in range(num_spectra):
@@ -5450,11 +5490,29 @@ class ToolImplementations:
                 spectrum = spectra.iloc[:, i].values
                 col_name = spectra.columns[i]
 
+                # Reject before scoring: a mostly-empty column has nothing for
+                # a detector to measure, and every one of them would return 0.
+                n_finite = int(np.count_nonzero(np.isfinite(spectrum)))
+                if n_finite < min_finite:
+                    empty_indices.append(i)
+                    bad_indices.append(i)
+                    report_lines.append(
+                        f"{i:>6} {'—':>8} {'—':>8} {'—':>8} {'—':>10} {'—':>10} "
+                        f"{'—':>10} {1.0:>10.3f} {'empty':>12} {'BAD':>8} "
+                        f"{'—':>10} {'—':>8} {'—':>11}"
+                        f"   ({n_finite} finite samples)"
+                    )
+                    continue
+
                 sat_score = detect_saturation(spectrum)
                 noise_score = detect_noise(spectrum)
                 lin_score = detect_linear_artifact(independent_var, spectrum)
                 periodic_score, fft_mag, _bg, peak_mask = detect_periodic_noise(spectrum)
                 partial_score = detect_partial_noise(independent_var, spectrum)
+                featureless_score = detect_featureless(
+                    independent_var, spectrum,
+                    min_ratio=min_structure_ratio, min_coherence=min_coherence)
+                metrics = structure_metrics(spectrum)
 
                 # Store FFT magnitude for output dataset
                 fft_magnitudes[col_name] = fft_mag
@@ -5488,6 +5546,9 @@ class ToolImplementations:
                 if weight_partial_noise > 0:
                     weighted_scores.append(weight_partial_noise * partial_score)
                     score_labels.append("partial_noise")
+                if weight_featureless > 0:
+                    weighted_scores.append(weight_featureless * featureless_score)
+                    score_labels.append("featureless")
 
                 if weighted_scores:
                     max_idx = int(np.argmax(weighted_scores))
@@ -5503,14 +5564,88 @@ class ToolImplementations:
                 else:
                     good_indices.append(i)
 
+                ratio = metrics['ratio']
                 report_lines.append(
                     f"{i:>6} {sat_score:>8.3f} {noise_score:>8.3f} {lin_score:>8.3f} "
-                    f"{periodic_score:>10.3f} {partial_score:>10.3f} {combined:>10.3f} {trigger:>12} {status:>8}"
+                    f"{periodic_score:>10.3f} {partial_score:>10.3f} "
+                    f"{featureless_score:>10.3f} {combined:>10.3f} {trigger:>12} {status:>8} "
+                    f"{ratio:>10.1f} {metrics['coherence']:>8.3f} {metrics['sigma']:>11.3e}"
                 )
+
+            # ---------------------------------------------------------------
+            # Outliers: a population question, asked only of the survivors.
+            #
+            # It runs after the per-spectrum pass so the population is not
+            # defined by curves already known to be junk — an all-NaN column
+            # or a railed one would drag the median around and hide the very
+            # curve being looked for.
+            # ---------------------------------------------------------------
+            outlier_enabled = {
+                'offset': bool(filter_offset_outliers),
+                'bandgap': bool(filter_bandgap_outliers),
+                'saturation': bool(filter_saturation_outliers),
+            }
+            outlier_messages: List[str] = []
+            outlier_kind_of: Dict[str, str] = {}
+            if any(outlier_enabled.values()) and len(good_indices) >= 3:
+                from src.processing import curve_outliers as _outliers
+
+                surviving = [spectra.columns[i] for i in good_indices]
+                groups = _outliers.build_groups(
+                    surviving,
+                    spectral_data.metadata.additional_info.get('spectrum_meta'),
+                    mode=str(outlier_group_by or 'point'),
+                )
+                analyses = _outliers.analyze_grouped(
+                    independent_var, spectra[surviving].values, surviving, groups,
+                    n_intervals=int(outlier_intervals),
+                    z_threshold=float(outlier_z),
+                )
+                to_remove, outlier_messages = _outliers.select_grouped(
+                    analyses, outlier_enabled,
+                    {'offset': int(max_offset_outliers),
+                     'bandgap': int(max_bandgap_outliers),
+                     'saturation': int(max_saturation_outliers)},
+                )
+                for analysis in analyses.values():
+                    outlier_kind_of.update(analysis.kind_of)
+
+                if to_remove:
+                    removed = set(to_remove)
+                    by_name = {spectra.columns[i]: i for i in good_indices}
+                    moved = [by_name[name] for name in to_remove if name in by_name]
+                    good_indices = [i for i in good_indices
+                                    if spectra.columns[i] not in removed]
+                    bad_indices.extend(moved)
+                    bad_indices.sort()
+
+                report_lines.append("")
+                report_lines.append(
+                    f"Outliers (compared within {'each point' if groups and 'all curves' not in groups else 'the whole dataset'}, "
+                    f"{len(groups)} group(s), {outlier_intervals} intervals, z>{outlier_z})")
+                for message in outlier_messages or ["Nothing flagged."]:
+                    report_lines.append(f"  {message}")
+                if to_remove:
+                    report_lines.append(
+                        "  These pass every per-spectrum test and are marked GOOD in the "
+                        "table above; they are moved to Bad Data as a decision about the "
+                        "population, not about the curve.")
+                if 'all curves' in groups:
+                    report_lines.append(
+                        "  NOTE: this dataset records no per-spectrum point index, so every "
+                        "curve was compared against every other. That is only meaningful if "
+                        "they really are repetitions of one measurement.")
 
             report_lines.append("")
             report_lines.append(f"Good spectra: {len(good_indices)}")
             report_lines.append(f"Bad spectra: {len(bad_indices)}")
+            if empty_indices:
+                report_lines.append(
+                    f"  of which rejected as empty (too few finite samples): {len(empty_indices)}")
+            if outlier_kind_of:
+                listed = ', '.join(f"{col} ({kind})"
+                                   for col, kind in sorted(outlier_kind_of.items()))
+                report_lines.append(f"  outliers identified: {listed}")
             if correct_periodic:
                 report_lines.append(f"Spectra with periodic correction applied: {len(corrected_spectra)}")
 

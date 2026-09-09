@@ -12,6 +12,8 @@ Date: January 2026
 License: GPL
 """
 
+import math
+
 import numpy as np
 from scipy import ndimage, signal
 from typing import Tuple, Optional
@@ -207,93 +209,358 @@ def validate_ldos(x: np.ndarray, y: np.ndarray) -> Tuple[bool, str]:
     return True, ""
 
 
+# =============================================================================
+# Structure vs. noise
+#
+# Every "is this spectrum usable?" question below reduces to one measurement:
+# how much of the curve's variation is real structure, and how much is its own
+# noise. Two numbers answer it.
+#
+# The noise sigma comes from the second difference: white noise makes it swing
+# with variance 6*sigma^2, while smooth structure barely moves it at all, so a
+# median absolute deviation reads the noise off a spectrum that is mostly
+# signal without needing a signal-free stretch to measure on.
+#
+# The structure amplitude is the peak-to-peak of the *smoothed* curve. The raw
+# peak-to-peak is not usable here: on a featureless spectrum it is set by the
+# noise itself (and by any slow drift), which is exactly why a flat dI/dV
+# sitting above the noise floor used to read as a high-SNR, "good" spectrum.
+# =============================================================================
+
+_SG_POLYORDER = 2
+
+# Peak-to-peak of two independent Gaussian samples, E|z1 - z2| = 2/sqrt(pi).
+# The asymptotic sqrt(2 ln m) law overshoots for tiny m, so this is the floor.
+_MIN_EXPECTED_RANGE = 1.13
+
+
+def _smoothing_window(n: int, fraction: float = 0.05,
+                      minimum: int = 5, maximum: int = 51) -> int:
+    """Odd Savitzky-Golay window for an ``n``-point spectrum, 0 if too short."""
+    if n < minimum + 2:
+        return 0
+    w = int(round(n * fraction))
+    if w % 2 == 0:
+        w += 1
+    w = max(minimum, min(w, maximum))
+    if w >= n:
+        w = n - 1 if (n - 1) % 2 else n - 2
+    return w if w > _SG_POLYORDER else 0
+
+
+def robust_sigma(spectrum: np.ndarray) -> float:
+    """Noise sigma of a spectrum, from the MAD of its own second difference.
+
+    The second difference of white noise has variance ``6*sigma^2``; a median
+    absolute deviation ignores peaks and edges, which are a small minority of
+    the samples. 1.4826 converts MAD to sigma for Gaussian noise.
+
+    Returns 0.0 for a noiseless or too-short spectrum.
+    """
+    y = np.asarray(spectrum, dtype=np.float64)
+    clean = y[np.isfinite(y)]
+    if clean.size < 5:
+        return 0.0
+    d2 = np.diff(clean, n=2)
+    if d2.size == 0:
+        return 0.0
+    mad = float(np.median(np.abs(d2 - np.median(d2))))
+    return float(1.4826 * mad / math.sqrt(6.0))
+
+
+def structure_metrics(spectrum: np.ndarray, detrend: bool = True,
+                      window_fraction: float = 0.05) -> dict:
+    """Separate a spectrum's smooth structure from its noise.
+
+    Parameters
+    ----------
+    spectrum : np.ndarray
+        Spectrum values; NaN/inf are stripped.
+    detrend : bool
+        Remove a straight line from the smoothed curve before measuring its
+        amplitude (default True). A slow monotonic drift is an artifact of the
+        measurement, not a feature of the sample, and without this a drifting
+        flat spectrum reads as though it had structure. A tunnelling band edge
+        survives detrending easily — it is nowhere near a straight line.
+    window_fraction : float
+        Smoothing window as a fraction of the spectrum length (default 0.05).
+
+    Returns
+    -------
+    dict with keys
+
+    ``n``
+        Count of finite samples.
+    ``sigma``, ``sigma_smooth``
+        Noise sigma of the raw curve, and what is left of it after smoothing.
+    ``amplitude``
+        Peak-to-peak of the smoothed, optionally detrended curve.
+    ``span``
+        The same, but measured between the 2nd and 98th percentiles, so a
+        single spike — the derivative of a sweep often has one at each end —
+        cannot stand in for structure.
+    ``expected``
+        Peak-to-peak the smoothed curve would show if it were pure noise.
+    ``ratio``
+        ``amplitude / expected``: ~1 means the curve is a constant plus
+        noise, >> 1 means real structure.
+    ``coherence``
+        ``span`` divided by the smoothed curve's total variation: 1 for a
+        curve that rises once and stops (a band edge), ~2/N for one that
+        wanders up and down N times (noise). This is the measurement that
+        survives correlated 1/f noise, which inflates ``ratio`` without
+        putting any shape into the curve.
+    ``window``, ``level``
+        Smoothing window actually used, and the curve's median value.
+    """
+    y = np.asarray(spectrum, dtype=np.float64)
+    clean = y[np.isfinite(y)]
+    n = int(clean.size)
+    if n < 7:
+        return {'n': n, 'sigma': 0.0, 'sigma_smooth': 0.0, 'amplitude': 0.0,
+                'span': 0.0, 'expected': 0.0, 'ratio': 0.0, 'coherence': 0.0,
+                'window': 0, 'level': float(np.median(clean)) if n else 0.0}
+
+    sigma = robust_sigma(clean)
+    window = _smoothing_window(n, window_fraction)
+    if window:
+        smooth = signal.savgol_filter(clean, window, _SG_POLYORDER, mode='interp')
+        # Noise attenuation of the filter: the smoothed sample is a fixed
+        # linear combination of the window's samples, so its variance is
+        # sigma^2 * sum(c^2).
+        gain = float(np.sqrt(np.sum(signal.savgol_coeffs(window, _SG_POLYORDER) ** 2)))
+        # SG fits one-sided polynomials at the ends, which are much noisier
+        # than the interior; a single wild endpoint must not set the
+        # amplitude on its own.
+        if n > 3 * window:
+            trim = window // 2
+            smooth = smooth[trim:n - trim]
+    else:
+        smooth = clean
+        gain = 1.0
+
+    if detrend and smooth.size >= 3:
+        idx = np.arange(smooth.size, dtype=np.float64)
+        slope, intercept = np.polyfit(idx, smooth, 1)
+        smooth = smooth - (slope * idx + intercept)
+
+    amplitude = float(np.max(smooth) - np.min(smooth))
+    span = float(np.percentile(smooth, 98) - np.percentile(smooth, 2))
+    total_variation = float(np.sum(np.abs(np.diff(smooth)))) if smooth.size > 1 else 0.0
+    coherence = span / total_variation if total_variation > 0 else 0.0
+    sigma_smooth = sigma * gain
+
+    # Smoothing correlates neighbouring samples, so the smoothed curve holds
+    # about n/window independent ones; the peak-to-peak of m independent
+    # Gaussians grows as 2*sqrt(2 ln m).
+    m = max(2.0, smooth.size / float(window or 1))
+    expected_factor = max(2.0 * math.sqrt(2.0 * math.log(m)), _MIN_EXPECTED_RANGE)
+    expected = expected_factor * sigma_smooth
+
+    if float(np.max(clean) - np.min(clean)) <= 0.0:
+        ratio = 0.0                # a perfectly flat line: no structure at all
+    elif expected > 0:
+        ratio = amplitude / expected
+    elif amplitude > 0:
+        ratio = float('inf')       # structure with no noise at all
+    else:
+        ratio = 0.0
+
+    return {'n': n, 'sigma': float(sigma), 'sigma_smooth': float(sigma_smooth),
+            'amplitude': amplitude, 'span': span, 'expected': float(expected),
+            'ratio': float(ratio), 'coherence': float(coherence),
+            'window': int(window), 'level': float(np.median(clean))}
+
+
+def detect_featureless(x: np.ndarray, spectrum: np.ndarray,
+                       min_ratio: float = 3.0,
+                       min_coherence: float = 0.12,
+                       window_fraction: float = 0.05,
+                       detrend: bool = True) -> float:
+    """Flag a spectrum that carries no structure above its own noise floor.
+
+    This is the "flat above the noise floor" case: a dI/dV curve that sits at
+    some level — often well above zero, so no amplitude test catches it — and
+    never departs from it except by wandering. There is no LDOS information in
+    such a spectrum, but every other detector here passes it: it is not
+    clipped, not linear, not periodic, and its raw peak-to-peak (set by the
+    noise and by any slow drift) makes it look like a comfortable
+    signal-to-noise ratio.
+
+    Two independent things mark a spectrum as featureless, and either is
+    enough:
+
+    **Amplitude.** The smoothed curve does not depart from a straight line by
+    more than the noise could manage on its own (``ratio`` near 1).
+
+    **Coherence.** The curve moves, but never in one direction for long: its
+    excursion is a small fraction of the distance it actually travels. A band
+    edge rises once and stays up (coherence near 1); a real state is a single
+    excursion; 1/f noise wanders up and down dozens of times and lands near
+    0.05. The amplitude test alone cannot see this, because correlated noise
+    is much larger than the white-noise sigma predicts — measured on real STS
+    data, dead spectra sit 10-30x above the white-noise expectation while
+    showing no shape whatsoever.
+
+    Parameters
+    ----------
+    x : np.ndarray
+        Independent variable (unused; kept so every detector takes the same
+        arguments).
+    spectrum : np.ndarray
+        Spectrum values.
+    min_ratio : float
+        Structure amplitude, in units of what the noise alone would produce,
+        at or above which the spectrum is definitely real (default 3.0). The
+        score falls linearly from 1.0 at ratio 1 to 0 here.
+    min_coherence : float
+        Coherence at or above which the spectrum is definitely real (default
+        0.12). The score is 1.0 at half this value and falls linearly to 0
+        here — so at the default quality threshold of 0.5 the effective cut is
+        0.09, which is the valley between the dead and the structured
+        populations on real STS data.
+    window_fraction : float
+        Smoothing window as a fraction of the spectrum length.
+    detrend : bool
+        Treat a straight-line drift as an artifact rather than structure.
+
+    Returns
+    -------
+    score : float
+        Featureless score 0-1. Higher = flatter.
+    """
+    metrics = structure_metrics(spectrum, detrend=detrend,
+                                window_fraction=window_fraction)
+    if metrics['n'] < 7:
+        return 0.0
+
+    ratio = metrics['ratio']
+    if np.isfinite(ratio):
+        high = max(float(min_ratio), 1.0 + 1e-6)
+        amplitude_score = float(np.clip((high - ratio) / (high - 1.0), 0.0, 1.0))
+    else:
+        amplitude_score = 0.0      # structure with no noise at all
+
+    coherence = metrics['coherence']
+    high = max(float(min_coherence), 1e-6)
+    low = high / 2.0
+    if coherence <= 0.0:
+        # No total variation at all: a perfectly flat line.
+        coherence_score = 1.0 if metrics['amplitude'] <= 0.0 else 0.0
+    else:
+        coherence_score = float(np.clip((high - coherence) / (high - low), 0.0, 1.0))
+
+    return float(max(amplitude_score, coherence_score))
+
+
 def detect_saturation(spectrum: np.ndarray, threshold: float = 0.95) -> float:
     """
-    Check if spectrum clips at min/max values (saturation artifact).
+    Check if a spectrum clips at its min/max value (saturation artifact).
 
-    Looks for values that are very close to the global min or max,
-    indicating ADC saturation or amplifier clipping.
+    Saturation is a *dead* plateau: once the amplifier or the ADC rails, it
+    stays railed and the noise disappears with it, because the converter is no
+    longer following the signal. Both halves matter.
+
+    Counting samples near an extreme, as an earlier version did, flags every
+    clean spectrum with a band gap — most of a gapped dI/dV curve sits at the
+    bottom of its own range by construction. Requiring only a plateau is not
+    enough either: the floor of a gap is a plateau too. What a gap still has,
+    and a railed converter does not, is its own noise.
 
     Parameters
     ----------
     spectrum : np.ndarray
         Spectrum values.
     threshold : float
-        Fraction of range considered as "saturated" zone (default 0.95).
-        Values in the top/bottom (1 - threshold)/2 of the range are flagged.
+        Fraction of the range that still counts as "at the rail"; the
+        tolerance is ``(1 - threshold) / 2`` of the range (default 0.95, i.e.
+        2.5%).
 
     Returns
     -------
     score : float
         Saturation score 0-1. Higher = more saturated.
     """
-    clean = spectrum[~np.isnan(spectrum)]
+    clean = np.asarray(spectrum, dtype=np.float64)
+    clean = clean[np.isfinite(clean)]
     if len(clean) < 3:
         return 0.0
 
-    vmin, vmax = np.min(clean), np.max(clean)
+    vmin, vmax = float(np.min(clean)), float(np.max(clean))
     vrange = vmax - vmin
     if vrange < 1e-30:
-        return 1.0  # Flat spectrum is saturated or dead
+        return 1.0  # flat spectrum is saturated or dead
 
-    # Fraction of range for saturation zone
-    margin = (1.0 - threshold) / 2.0 * vrange
+    tolerance = (1.0 - threshold) / 2.0 * vrange
+    sigma = robust_sigma(clean)
 
-    # Count points near min or max
-    near_min = np.sum(clean < (vmin + margin))
-    near_max = np.sum(clean > (vmax - margin))
-    saturated_count = near_min + near_max
+    def longest_dead_run(at_rail: np.ndarray) -> int:
+        """Longest stretch pinned at a rail *and* stripped of its noise."""
+        best = 0
+        start = None
+        for i, flag in enumerate(list(at_rail) + [False]):
+            if flag and start is None:
+                start = i
+            elif not flag and start is not None:
+                run = clean[start:i]
+                # A railed converter stops responding: the scatter inside the
+                # plateau collapses well below the spectrum's own noise. The
+                # floor of a real band gap keeps it.
+                if sigma <= 0.0 or float(np.std(run)) < 0.25 * sigma:
+                    best = max(best, i - start)
+                start = None
+        return best
 
-    # Score: fraction of points that are saturated
-    # Normal curves (sine, Gaussian) can have 10-40% near extremes naturally,
-    # so only flag when fraction is high enough to indicate actual clipping.
-    # Score is normalized: 0 if <= 30% at extremes, 1 if >= 60%
-    frac = saturated_count / len(clean)
-    score = np.clip((frac - 0.30) / 0.30, 0.0, 1.0)
+    pinned = max(longest_dead_run(clean <= vmin + tolerance),
+                 longest_dead_run(clean >= vmax - tolerance))
+    fraction = pinned / len(clean)
 
-    return float(score)
+    # A real rail holds for a good stretch of the sweep. Below 2% of the
+    # points it is just the curve's own turning point; by 10% it is clipping.
+    return float(np.clip((fraction - 0.02) / 0.08, 0.0, 1.0))
 
 
 def detect_noise(spectrum: np.ndarray, snr_threshold: float = 3.0) -> float:
     """
-    Estimate noise level via high-frequency content.
+    Score how far a spectrum's signal rises above its own noise.
 
-    Uses the standard deviation of the second derivative as a proxy
-    for high-frequency noise content, compared to the signal amplitude.
+    The signal is the peak-to-peak of the smoothed curve and the noise is the
+    robust sigma of the raw one (see :func:`structure_metrics`). Comparing the
+    *raw* peak-to-peak against the noise, as an earlier version did, measures
+    the noise twice over on a featureless spectrum and lets a slow drift stand
+    in for signal.
 
     Parameters
     ----------
     spectrum : np.ndarray
         Spectrum values.
     snr_threshold : float
-        SNR below this is considered noisy (default 3.0).
+        SNR below this is considered noisy (default 3.0). The score is 1 at
+        ``snr_threshold / 3`` and 0 at ``snr_threshold * 3``.
 
     Returns
     -------
     score : float
         Noise score 0-1. Higher = noisier.
     """
-    clean = spectrum[~np.isnan(spectrum)]
+    clean = np.asarray(spectrum, dtype=np.float64)
+    clean = clean[np.isfinite(clean)]
     if len(clean) < 5:
         return 0.0
 
-    # High-frequency content via second derivative
-    d2 = np.diff(clean, n=2)
-    noise_estimate = np.std(d2)
+    metrics = structure_metrics(clean, detrend=False)
+    amplitude = metrics['amplitude']
+    sigma = metrics['sigma']
 
-    # Signal amplitude
-    signal_range = np.max(clean) - np.min(clean)
-    if signal_range < 1e-30:
-        return 1.0  # Flat signal = all noise
+    if amplitude < 1e-30:
+        return 1.0        # flat signal = all noise (or a dead channel)
+    if sigma <= 0.0:
+        return 0.0        # structure and no noise at all
 
-    # SNR estimate
-    snr = signal_range / (noise_estimate + 1e-30)
-
-    # Map to score: high SNR -> low score, low SNR -> high score
-    # Score = 0 if SNR >= snr_threshold * 3, score = 1 if SNR <= snr_threshold / 3
-    score = np.clip(1.0 - (snr - snr_threshold / 3.0) / (snr_threshold * 3.0 - snr_threshold / 3.0), 0.0, 1.0)
-
-    return float(score)
+    snr = amplitude / sigma
+    low = snr_threshold / 3.0
+    high = snr_threshold * 3.0
+    return float(np.clip(1.0 - (snr - low) / (high - low), 0.0, 1.0))
 
 
 def detect_linear_artifact(x: np.ndarray, spectrum: np.ndarray,
@@ -349,13 +616,20 @@ def detect_linear_artifact(x: np.ndarray, spectrum: np.ndarray,
 
 def detect_partial_noise(x: np.ndarray, spectrum: np.ndarray,
                          window_fraction: float = 0.1,
-                         snr_threshold: float = 3.0) -> float:
+                         snr_threshold: float = 3.0,
+                         noise_ratio: float = 3.0) -> float:
     """
-    Detect regions where noise dominates the signal.
+    Detect stretches of a sweep where the measurement broke down.
 
-    Splits the spectrum into overlapping windows and computes local SNR
-    in each. Score reflects the fraction of the spectrum that is
-    noise-dominated.
+    A window is noise-dominated when it holds no structure of its own *and*
+    its noise is far above the quietest part of the same sweep — a burst of
+    tip instability, a lost contact. Both conditions are needed: a spectrum
+    with a band gap is flat and featureless inside the gap too, and flagging
+    that would condemn every good gapped dI/dV curve (measured: an earlier
+    version scored 0.32-1.0 on clean synthetic gap spectra).
+
+    A spectrum with no signal anywhere is noise-dominated everywhere, and
+    scores 1.0 without any of this.
 
     Parameters
     ----------
@@ -366,54 +640,62 @@ def detect_partial_noise(x: np.ndarray, spectrum: np.ndarray,
     window_fraction : float
         Fraction of spectrum length for each window (default 0.1).
     snr_threshold : float
-        Local SNR below this is considered noisy (default 3.0).
+        A window with a local SNR below this holds no structure (default 3.0).
+    noise_ratio : float
+        How many times the sweep's quietest noise level a window's own noise
+        must reach to count as a breakdown (default 3.0).
 
     Returns
     -------
     score : float
         Partial noise score 0-1. Higher = more noise-dominated regions.
     """
-    clean_mask = ~np.isnan(spectrum)
-    clean = spectrum[clean_mask]
+    clean = np.asarray(spectrum, dtype=np.float64)
+    clean = clean[np.isfinite(clean)]
     n = len(clean)
 
     if n < 20:
         return 0.0
 
-    # Adaptive window size
+    # No signal anywhere: every part of the sweep is noise.
+    overall = structure_metrics(clean, detrend=False)
+    if overall['sigma'] > 0 and overall['amplitude'] / overall['sigma'] < snr_threshold:
+        return 1.0
+
     window = max(10, int(n * window_fraction))
     step = max(1, window // 2)  # 50% overlap
 
-    noisy_count = 0
-    total_windows = 0
-
-    for start in range(0, n - window + 1, step):
-        segment = clean[start:start + window]
-        total_windows += 1
-
-        if len(segment) < 5:
-            continue
-
-        # Local SNR via 2nd derivative
-        d2 = np.diff(segment, n=2)
-        local_noise = np.std(d2)
-        local_range = np.max(segment) - np.min(segment)
-
-        if local_range < 1e-30:
-            noisy_count += 1
-            continue
-
-        local_snr = local_range / (local_noise + 1e-30)
-        if local_snr < snr_threshold:
-            noisy_count += 1
-
-    if total_windows == 0:
+    starts = list(range(0, n - window + 1, step))
+    if not starts:
         return 0.0
 
-    noisy_fraction = noisy_count / total_windows
+    # A short window needs a proportionally larger smoothing kernel than the
+    # whole sweep does, or there is nothing left to smooth with.
+    local = [structure_metrics(clean[s:s + window], detrend=False,
+                               window_fraction=0.35) for s in starts]
+    sigmas = np.array([m['sigma'] for m in local], dtype=np.float64)
+
+    # The quietest stretch of the sweep is the instrument's own noise floor.
+    positive = sigmas[sigmas > 0]
+    floor = float(np.percentile(positive, 10)) if positive.size else 0.0
+
+    noisy_count = 0
+    for metrics, local_sigma in zip(local, sigmas):
+        amplitude = metrics['amplitude']
+        if amplitude < 1e-30:
+            noisy_count += 1              # dead stretch
+            continue
+        if local_sigma <= 0.0:
+            continue                      # structure and no noise at all
+        if amplitude / local_sigma >= snr_threshold:
+            continue                      # this window holds structure
+        if floor > 0 and local_sigma <= noise_ratio * floor:
+            continue                      # quiet, not broken — a gap looks like this
+        noisy_count += 1
+
+    noisy_fraction = noisy_count / len(starts)
     # Scale: 50% noisy windows -> score 1.0
-    score = np.clip(noisy_fraction * 2.0, 0.0, 1.0)
-    return float(score)
+    return float(np.clip(noisy_fraction * 2.0, 0.0, 1.0))
 
 
 def auto_detect_dirac_ranges(dx: np.ndarray, dy: np.ndarray,
@@ -549,13 +831,26 @@ def fit_dirac_point(dx: np.ndarray, dy: np.ndarray,
 
 def detect_periodic_noise(spectrum: np.ndarray,
                           peak_threshold: float = 3.0,
-                          min_freq_fraction: float = 0.05
+                          min_freq_fraction: float = 0.15,
+                          min_concentration: float = 5.0,
+                          full_concentration: float = 20.0
                           ) -> Tuple[float, np.ndarray, np.ndarray, np.ndarray]:
     """
     Detect periodic noise in a spectrum via FFT peak analysis.
 
-    Looks for sharp peaks in the FFT magnitude spectrum that rise
-    significantly above the local background, indicating periodic artifacts.
+    A periodic artifact — mains pickup, a piezo resonance — is a *line*: it
+    puts a large share of the band's power into one or two frequency bins.
+    The score is therefore the power **concentration**, the share of the
+    analysed band's power carried by the detected peaks divided by the share
+    that many bins would carry if the power were spread evenly. Concentration
+    is 1 when the peaks are no more than their fair share and tens when a
+    genuine line is present.
+
+    Scoring the raw power share instead, as an earlier version did, cannot
+    work: on a smooth spectrum nearly all the power sits at low frequency, so
+    any bin flagged there saturates the score. Measured on real STS data that
+    marked 91% of the spectra as periodic; the same data scores 0% here,
+    while a sine artifact at 1% of the signal amplitude still scores 1.0.
 
     Parameters
     ----------
@@ -564,7 +859,13 @@ def detect_periodic_noise(spectrum: np.ndarray,
     peak_threshold : float
         Number of MADs above the background to consider a peak (default 3.0).
     min_freq_fraction : float
-        Fraction of total frequency bins to skip at the low end (DC + slow trends).
+        Fraction of frequency bins to skip at the low end (DC and the signal's
+        own slow structure), default 0.15.
+    min_concentration : float
+        Concentration at or below which nothing is flagged (default 5.0 —
+        real STS spectra measured between 4.5 and 8.5).
+    full_concentration : float
+        Concentration at or above which the score is 1.0 (default 20.0).
 
     Returns
     -------
@@ -577,7 +878,8 @@ def detect_periodic_noise(spectrum: np.ndarray,
     peak_mask : np.ndarray
         Boolean mask of detected peaks (same length as fft_magnitude).
     """
-    clean = spectrum[~np.isnan(spectrum)]
+    clean = np.asarray(spectrum, dtype=np.float64)
+    clean = clean[np.isfinite(clean)]
     n = len(clean)
     if n < 8:
         empty = np.zeros(1)
@@ -610,19 +912,23 @@ def detect_periodic_noise(spectrum: np.ndarray,
     peak_mask = np.zeros(len(fft_magnitude), dtype=bool)
     peak_mask[peaks] = True
 
-    if len(peaks) == 0:
+    n_band = len(fft_magnitude) - min_bin
+    if len(peaks) == 0 or n_band <= 0:
         return 0.0, fft_magnitude, np.expm1(background), peak_mask
 
-    # Score: power in peaks vs total power (skip DC)
-    power = fft_magnitude[1:] ** 2
-    total_power = np.sum(power)
-    if total_power < 1e-30:
+    band_power = float(np.sum(fft_magnitude[min_bin:] ** 2))
+    if band_power < 1e-300:
         return 0.0, fft_magnitude, np.expm1(background), peak_mask
 
-    peak_power = np.sum(fft_magnitude[peaks] ** 2)
-    score = np.clip(peak_power / total_power * 10.0, 0.0, 1.0)
+    share = float(np.sum(fft_magnitude[peaks] ** 2)) / band_power
+    fair_share = len(peaks) / float(n_band)
+    concentration = share / fair_share if fair_share > 0 else 0.0
 
-    return float(score), fft_magnitude, np.expm1(background), peak_mask
+    low = float(min_concentration)
+    high = max(float(full_concentration), low + 1e-6)
+    score = float(np.clip((concentration - low) / (high - low), 0.0, 1.0))
+
+    return score, fft_magnitude, np.expm1(background), peak_mask
 
 
 def correct_periodic_noise(spectrum: np.ndarray,

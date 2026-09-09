@@ -338,3 +338,211 @@ class TestNanosurfDataProcessing:
         assert isinstance(df, pd.DataFrame)
         assert len(df.columns) == 3  # Variable + 2 spectra
         assert len(df) == 5
+
+
+# =============================================================================
+# Session organisation
+#
+# A .nid folder is a day's work, not one experiment. The loader used to
+# cluster it into sessions and then hand back only the largest one, so a
+# folder of 193 spectroscopy files imported as 52 and lost the other 141
+# without an error. These cover the discovery, the labels the sessions get,
+# and the per-spectrum provenance now carried on each dataset.
+# =============================================================================
+
+from datetime import datetime, timedelta      # noqa: E402
+from pathlib import Path                      # noqa: E402
+from unittest.mock import patch               # noqa: E402
+
+from src.data_loaders.nanosurf_sts_enhanced import (   # noqa: E402
+    NanosurfSTSEnhancedLoader,
+)
+
+
+def _fingerprint(name, when, *, spec_mode='Map', data_points=512,
+                 map_dims='8;8', rep='Repeat each position'):
+    """A fingerprint dict shaped like _parse_file_fingerprint's output."""
+    return {
+        'filepath': Path(f"/fake/{name}.nid"),
+        'repetition_mode': rep,
+        'data_points': data_points,
+        'modulation_time': '200ms',
+        'mod_output': 'Tip voltage',
+        'spec_mode': spec_mode,
+        'map_dims': map_dims,
+        'map0': None,
+        'timestamp': when,
+    }
+
+
+class TestDiscoverSessions:
+    """Session discovery over a directory of .nid files."""
+
+    @pytest.fixture
+    def loader(self):
+        return NanosurfSTSEnhancedLoader()
+
+    def _run(self, loader, fingerprints):
+        with patch.object(loader, 'find_files',
+                          return_value=[fp['filepath'] for fp in fingerprints]), \
+             patch.object(loader, '_parse_file_fingerprint',
+                          side_effect=lambda p: next(
+                              (fp for fp in fingerprints if fp['filepath'] == p), None)):
+            return loader.discover_sessions(Path("/fake"))
+
+    def test_splits_on_a_long_gap(self, loader):
+        base = datetime(2026, 5, 2, 19, 0)
+        fps = [_fingerprint("a", base),
+               _fingerprint("b", base + timedelta(minutes=1)),
+               _fingerprint("c", base + timedelta(hours=2))]
+        sessions = self._run(loader, fps)
+        assert [len(s['files']) for s in sessions] == [2, 1]
+
+    def test_splits_on_different_settings(self, loader):
+        base = datetime(2026, 5, 2, 19, 0)
+        fps = [_fingerprint("a", base),
+               _fingerprint("b", base + timedelta(seconds=30), data_points=128)]
+        sessions = self._run(loader, fps)
+        assert len(sessions) == 2
+
+    def test_every_file_is_kept(self, loader):
+        """The defect: sessions beyond the largest used to be dropped."""
+        base = datetime(2026, 5, 2, 19, 0)
+        fps = ([_fingerprint(f"big{i}", base + timedelta(seconds=i))
+                for i in range(10)]
+               + [_fingerprint("lone", base + timedelta(hours=3))])
+        sessions = self._run(loader, fps)
+        assert sum(len(s['files']) for s in sessions) == 11
+
+    def test_sessions_are_in_acquisition_order(self, loader):
+        base = datetime(2026, 5, 2, 19, 0)
+        fps = [_fingerprint("late", base + timedelta(hours=3)),
+               _fingerprint("early", base)]
+        sessions = self._run(loader, fps)
+        assert sessions[0]['files'][0].name == "early.nid"
+
+    def test_labels_are_unique(self, loader):
+        base = datetime(2026, 5, 2, 19, 0)
+        fps = [_fingerprint("a", base),
+               _fingerprint("b", base + timedelta(hours=2)),
+               _fingerprint("c", base + timedelta(hours=4))]
+        labels = [s['label'] for s in self._run(loader, fps)]
+        assert len(set(labels)) == 3
+
+    def test_same_day_sessions_keep_their_times(self, loader):
+        base = datetime(2026, 5, 2, 19, 0)
+        fps = [_fingerprint("a", base), _fingerprint("b", base + timedelta(hours=2))]
+        labels = [s['label'] for s in self._run(loader, fps)]
+        assert all(label.startswith("2026May02-") for label in labels)
+
+    def test_topography_only_files_are_ignored(self, loader):
+        base = datetime(2026, 5, 2, 19, 0)
+        fps = [_fingerprint("a", base)]
+        with patch.object(loader, 'find_files',
+                          return_value=[Path("/fake/a.nid"), Path("/fake/topo.nid")]), \
+             patch.object(loader, '_parse_file_fingerprint',
+                          side_effect=lambda p: fps[0] if p.name == "a.nid" else None):
+            sessions = loader.discover_sessions(Path("/fake"))
+        assert sum(len(s['files']) for s in sessions) == 1
+
+    def test_session_carries_its_settings(self, loader):
+        session = self._run(loader, [_fingerprint("a", datetime(2026, 5, 2, 19, 0))])[0]
+        assert session['repetition_mode'] == 'Repeat each position'
+        assert session['settings']['data_points'] == 512
+        assert session['settings']['modulation_time'] == '200ms'
+        assert session['spec_mode'] == 'Map'
+
+
+class TestSessionTag:
+    """The short description that names a session's datasets."""
+
+    def test_map_reports_its_grid(self):
+        tag = NanosurfSTSEnhancedLoader.session_tag(
+            {'spec_mode': 'Map', 'settings': {'map_dims': '8;8'}, 'files': [1] * 30})
+        assert tag == "Map 8x8"
+
+    def test_point_reports_its_count(self):
+        tag = NanosurfSTSEnhancedLoader.session_tag(
+            {'spec_mode': 'Point', 'settings': {}, 'files': [1] * 52})
+        assert tag == "Point x52"
+
+
+class TestSpectrumProvenance:
+    """Per-spectrum metadata stamped onto a loaded session."""
+
+    @pytest.fixture
+    def spectral(self):
+        from src.models.spectral_data import SpectralData, SpectralMetadata
+        df = pd.DataFrame({
+            "V": np.linspace(-1, 1, 5),
+            **{f"Point_{i + 1:02d}": np.arange(5, dtype=float) for i in range(4)},
+        })
+        meta = SpectralMetadata(source_type='nanosurf_sts', dimensions=(2, 2),
+                                scan_mode='sequential',
+                                units={'independent': 'V', 'dependent': 'A'},
+                                additional_info={})
+        return SpectralData(df, meta)
+
+    @pytest.fixture
+    def geometry(self):
+        return {'x_start': 0.0, 'y_start': 0.0,
+                'x_end': 1e-9, 'y_end': 1e-9, 'nx': 2, 'ny': 2}
+
+    def test_entries_are_keyed_by_column(self, spectral, geometry):
+        NanosurfSTSEnhancedLoader._stamp_spectrum_meta(
+            spectral, None, {}, geometry, 'Map')
+        meta = spectral.metadata.additional_info['spectrum_meta']
+        assert [e['column'] for e in meta] == list(spectral.spectra.columns)
+
+    def test_positions_are_in_metres(self, spectral, geometry):
+        NanosurfSTSEnhancedLoader._stamp_spectrum_meta(
+            spectral, None, {}, geometry, 'Map')
+        meta = spectral.metadata.additional_info['spectrum_meta']
+        assert meta[0]['location_m'] == [0.0, 0.0]
+        assert meta[-1]['location_m'] == pytest.approx([1e-9, 1e-9])
+
+    def test_file_and_timestamp_are_recorded(self, spectral, geometry):
+        column_files = {'Point_01': Path('/fake/first.nid')}
+        NanosurfSTSEnhancedLoader._stamp_spectrum_meta(
+            spectral, column_files, {'first.nid': '2026-05-02T19:00:00'},
+            geometry, 'Map')
+        entry = spectral.metadata.additional_info['spectrum_meta'][0]
+        assert entry['file'] == 'first.nid'
+        assert entry['timestamp'] == '2026-05-02T19:00:00'
+
+    def test_no_geometry_means_no_invented_positions(self, spectral):
+        NanosurfSTSEnhancedLoader._stamp_spectrum_meta(
+            spectral, None, {}, None, 'Point')
+        meta = spectral.metadata.additional_info['spectrum_meta']
+        assert all('location_m' not in e for e in meta)
+        assert 'spatial_layout' not in spectral.metadata.additional_info
+
+    def test_one_cell_wide_map_is_a_line(self, spectral):
+        NanosurfSTSEnhancedLoader._stamp_spectrum_meta(
+            spectral, None, {},
+            {'x_start': 0.0, 'y_start': 0.0, 'x_end': 0.0, 'y_end': 3e-9,
+             'nx': 1, 'ny': 4}, 'Map')
+        assert spectral.metadata.additional_info['spatial_layout'] == 'line'
+
+
+class TestSessionInfo:
+    """Acquisition settings carried onto the dataset."""
+
+    def test_records_timing_and_settings(self):
+        session = {
+            'label': '2026May02-190000',
+            'started': datetime(2026, 5, 2, 19, 0),
+            'ended': datetime(2026, 5, 2, 19, 10),
+            'repetition_mode': 'Repeat each position',
+            'settings': {'data_points': 512, 'modulation_time': '200ms',
+                         'mod_output': 'Tip voltage', 'map_dims': '8;8'},
+        }
+        info = NanosurfSTSEnhancedLoader._session_info(session, [Path('/f/a.nid')])
+        assert info['session_label'] == '2026May02-190000'
+        assert info['session_duration_s'] == 600.0
+        assert info['data_points'] == 512
+        assert info['mod_output'] == 'Tip voltage'
+        assert info['session_files'] == ['a.nid']
+
+    def test_empty_session_adds_nothing(self):
+        assert NanosurfSTSEnhancedLoader._session_info({}, []) == {}

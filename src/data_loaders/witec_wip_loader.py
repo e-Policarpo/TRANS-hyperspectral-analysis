@@ -17,6 +17,7 @@ License: GPL
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -25,8 +26,10 @@ import numpy as np
 import pandas as pd
 
 from ..models.image_data import ImageData, ImageMetadata, ImageMode
-from ..utils.units import pixel_size_to_nm
+from ..utils.units import pixel_size_to_nm, to_nm
+from ..utils.naming import strip_acquisition_time
 from ..models.spectral_data import SpectralData, SpectralMetadata
+from .session_organization import spatial_info
 from ..models.topography_data import TopographyData
 from .base_loader import BaseDataLoader, ProgressCallback
 from .witec_wip.wip_parser import (
@@ -216,6 +219,52 @@ def _parse_objective_name(raw: str) -> Optional[str]:
     if m:
         return f"{m.group(1)} {m.group(2)}x/{m.group(3)}"
     return raw
+
+
+_WEEKDAYS = frozenset((
+    'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday',
+    'sunday',
+    # WITec writes the weekday in the machine's own locale.
+    'segunda-feira', 'terça-feira', 'terca-feira', 'quarta-feira',
+    'quinta-feira', 'sexta-feira', 'sábado', 'sabado', 'domingo',
+    'montag', 'dienstag', 'mittwoch', 'donnerstag', 'freitag', 'samstag',
+    'sonntag',
+))
+
+
+def _iso_timestamp(date_text: Optional[str],
+                   time_text: Optional[str]) -> Optional[str]:
+    """ISO 8601 timestamp from WITec's human-readable date and clock time.
+
+    WITec writes the date the way a person would — ``"Thursday, May 7, 2026"``
+    — so it has to be parsed before it can be joined to ``"16:26"``. Returns
+    None when either part is missing or the date does not parse, rather than
+    emitting a string that only looks like a timestamp.
+    """
+    if not date_text or not time_text:
+        return None
+    cleaned = str(date_text).strip()
+    # Drop a leading weekday name; it carries no information. Split on the
+    # first comma only when what precedes it really is a weekday — "May 7,
+    # 2026" has a comma too, and cutting at it would leave just the year.
+    head, sep, rest = cleaned.partition(',')
+    if sep and head.strip().lower() in _WEEKDAYS:
+        cleaned = rest.strip()
+    cleaned = cleaned.replace(',', ' ').strip()
+    for fmt in ("%B %d %Y", "%b %d %Y", "%d %B %Y", "%d %b %Y",
+                "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"):
+        try:
+            day = datetime.strptime(" ".join(cleaned.split()), fmt).date()
+        except ValueError:
+            continue
+        for tfmt in ("%H:%M:%S", "%H:%M"):
+            try:
+                clock = datetime.strptime(str(time_text).strip(), tfmt).time()
+            except ValueError:
+                continue
+            return datetime.combine(day, clock).isoformat()
+        return day.isoformat()
+    return None
 
 
 def _build_info_index(project: WipProject) -> Dict[int, Dict[str, Any]]:
@@ -432,6 +481,21 @@ class WitecWipLoader(BaseDataLoader):
         primary.metadata.additional_info["wip_version"] = project.version
         primary.metadata.additional_info["source_file"] = str(filepath)
 
+        # A .wip *is* the session, so every entity it produced belongs in one
+        # browser folder named after it. Stamped on each channel individually,
+        # not just the primary: AppBackend._group_label reads the metadata of
+        # the dataset it is filing, and the other channels carry no
+        # ``source_file`` of their own to fall back on.
+        session_label = strip_acquisition_time(filepath.stem)
+        session_span = self._session_time_span(channels)
+        for channel in channels.values():
+            info = channel.metadata.additional_info
+            info["session_label"] = session_label
+            info.setdefault("source_file", str(filepath))
+            info.update(session_span)
+        primary.metadata.additional_info["session_label"] = session_label
+        primary.metadata.additional_info.update(session_span)
+
         # Acquisition info, excitation wavelength, and spectral cursors —
         # all attached to the primary dataset's additional_info so the
         # backend / UI can find them via a single lookup.
@@ -545,6 +609,10 @@ class WitecWipLoader(BaseDataLoader):
             df = self._build_dataframe(
                 axis, unit, group, normalization_factors=norm_factors,
             )
+            # The DataFrame's own column labels, in group order — cleaned and
+            # de-duplicated by _build_dataframe, so this is the only place they
+            # can be read back from.
+            column_labels = list(df.columns)[1:]
             zint = project.get_interpretation(group[0][0].z_interpretation_id)
             y_unit_raw = (
                 (zint.standard_unit if zint else "") or "counts"
@@ -598,6 +666,7 @@ class WitecWipLoader(BaseDataLoader):
             ]
             additional_info: Dict[str, Any] = {
                 "captions": [g.entry.caption for g, _, _ in group],
+                "column_names": column_labels,
                 "wip_data_ids": [g.entry.id for g, _, _ in group],
                 "integration_times_s": integration_times,
                 "accumulation_counts": accumulation_counts,
@@ -638,6 +707,21 @@ class WitecWipLoader(BaseDataLoader):
                     additional_info["excitation_wavelength_nm_per_spectrum"] = excitations
                     # Also expose a single representative value when most agree.
                     additional_info["excitation_wavelength_nm"] = non_null[0]
+
+            # Per-spectrum provenance in the shape the rest of TRANS reads:
+            # one entry per data column, keyed by column name so it survives a
+            # tool that keeps a subset. WITec already knew every one of these
+            # facts; they were spread across parallel lists that only this
+            # loader could line up, which meant a derivative of a WITec
+            # dataset lost where its spectra were taken.
+            additional_info.update(spatial_info(
+                spectrum_meta=self._build_spectrum_meta(
+                    column_labels, group, acquisition_positions,
+                    per_spectrum_info, integration_times,
+                    accumulation_counts, excitations,
+                ),
+                layout='line' if len(group) > 1 else 'point',
+            ))
             metadata = SpectralMetadata(
                 source_type=self.loader_type,
                 dimensions=(len(group), 1),
@@ -651,6 +735,97 @@ class WitecWipLoader(BaseDataLoader):
             )
             channels[channel_name] = SpectralData(df, metadata)
         return channels
+
+    @staticmethod
+    def _session_time_span(channels: Dict[str, SpectralData]) -> Dict[str, Any]:
+        """When the session started and ended, across all of its channels.
+
+        Read from the per-spectrum timestamps rather than the file's mtime, so
+        it describes the measurement rather than the last time someone saved
+        the project.
+        """
+        stamps = sorted(
+            entry['timestamp']
+            for channel in channels.values()
+            for entry in (channel.metadata.additional_info.get('spectrum_meta') or [])
+            if entry.get('timestamp')
+        )
+        if not stamps:
+            return {}
+        span: Dict[str, Any] = {'session_started': stamps[0],
+                                'session_ended': stamps[-1]}
+        try:
+            span['session_duration_s'] = (
+                datetime.fromisoformat(stamps[-1])
+                - datetime.fromisoformat(stamps[0])
+            ).total_seconds()
+        except ValueError:                     # pragma: no cover - defensive
+            pass
+        return span
+
+    @staticmethod
+    def _build_spectrum_meta(
+        column_labels: List[str],
+        group: List[Tuple[WipGraph, np.ndarray, str]],
+        acquisition_positions: List[Optional[Dict[str, Any]]],
+        per_spectrum_info: List[Optional[Dict[str, Any]]],
+        integration_times: List[Optional[float]],
+        accumulation_counts: List[Optional[int]],
+        excitations: List[Optional[float]],
+    ) -> List[Dict[str, Any]]:
+        """One provenance record per data column.
+
+        ``location_m`` is the stage coordinate converted to **metres**: WITec
+        works in µm, but every spatial consumer in TRANS expects metres, and a
+        unit mismatch here would put a map out by six orders of magnitude
+        rather than fail visibly.
+
+        ``timestamp`` is ISO ``YYYY-MM-DDTHH:MM`` when the acquisition info
+        carries both a date and a time, and the bare time when it only has
+        one — never a guessed date.
+        """
+        entries: List[Dict[str, Any]] = []
+        for i, column in enumerate(column_labels):
+            graph = group[i][0] if i < len(group) else None
+            info = per_spectrum_info[i] if i < len(per_spectrum_info) else None
+            info = info or {}
+
+            entry: Dict[str, Any] = {'column': column, 'point_index': i}
+            if graph is not None:
+                entry['caption'] = (graph.entry.caption or '').strip()
+                entry['wip_data_id'] = int(graph.entry.id)
+
+            position = (acquisition_positions[i]
+                        if i < len(acquisition_positions) else None)
+            if position:
+                x_nm = to_nm(position['x_world'], position.get('unit') or 'µm')
+                y_nm = to_nm(position['y_world'], position.get('unit') or 'µm')
+                if x_nm is not None and y_nm is not None:
+                    entry['location_m'] = [x_nm * 1e-9, y_nm * 1e-9]
+                entry['location_world'] = [position['x_world'],
+                                           position['y_world']]
+                entry['location_unit'] = position.get('unit') or 'µm'
+
+            date, time = info.get('start_date'), info.get('start_time')
+            stamp = _iso_timestamp(date, time)
+            if stamp:
+                entry['timestamp'] = stamp
+            if date:
+                entry['start_date'] = date
+            if time:
+                entry['start_time'] = time
+            for key in ('objective', 'magnification'):
+                if info.get(key) is not None:
+                    entry[key] = info[key]
+
+            if i < len(integration_times) and integration_times[i] is not None:
+                entry['integration_time_s'] = integration_times[i]
+            if i < len(accumulation_counts) and accumulation_counts[i] is not None:
+                entry['accumulation_count'] = accumulation_counts[i]
+            if i < len(excitations) and excitations[i] is not None:
+                entry['excitation_wavelength_nm'] = excitations[i]
+            entries.append(entry)
+        return entries
 
     @staticmethod
     def _axis_signature(axis: np.ndarray, unit: str) -> Tuple:

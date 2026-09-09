@@ -330,6 +330,7 @@ class TestFilterBadData(TestFilterBadDataSetup):
             weight_linear=0.0,
             weight_periodic=0.0,
             weight_partial_noise=0.0,
+            weight_featureless=0.0,
             threshold=0.5
         )
 
@@ -581,3 +582,246 @@ class TestFilterBadDataExports(TestFilterBadDataSetup):
         names = sorted(p.name for p in folder.iterdir())
         assert 'BadData_Bad_Data.csv' in names
         assert 'BadData_Good_Data.csv' not in names
+
+
+class TestEmptyAndFeaturelessSpectra(TestFilterBadDataSetup):
+    """The reported defect, at tool level.
+
+    Two ways a useless dI/dV curve used to reach 'Good Data': an all-NaN
+    column, which every detector scores 0 because it cannot be measured, and a
+    curve that is flat above the noise floor, which no detector asked about.
+    On the real calibration dataset 103 of 167 "good" spectra were entirely
+    empty.
+    """
+
+    @staticmethod
+    def _pink_noise(n, rng):
+        """1/f noise — the correlated noise a dead STS channel actually shows.
+
+        White noise would be caught by ``detect_noise`` on its own; what makes
+        the featureless test necessary is that real dead spectra wander far
+        above the white-noise sigma while holding no shape.
+        """
+        freqs = np.fft.rfftfreq(n)
+        freqs[0] = freqs[1]
+        spectrum = (rng.normal(size=freqs.size)
+                    + 1j * rng.normal(size=freqs.size)) / np.sqrt(freqs)
+        spectrum[0] = 0
+        noise = np.fft.irfft(spectrum, n=n)
+        return noise / noise.std()
+
+    @pytest.fixture
+    def mixed_dataset(self):
+        """Real band edges, flat 1/f noise, and empty columns in one dataset."""
+        rng = np.random.default_rng(27)
+        v = np.linspace(-1.5, 1.5, 256)
+        edges = (np.exp((v - 0.8) / 0.08) / (1 + np.exp((v - 0.8) / 0.08))
+                 + np.exp(-(v + 0.7) / 0.08) / (1 + np.exp(-(v + 0.7) / 0.08)))
+        columns, spectra = [], []
+        # Flat above the noise floor, with the correlated noise real dead
+        # spectra carry: the plain-noise detectors do not see these, which is
+        # exactly why the featureless test had to be added.
+        for i in range(4):
+            columns.append(f'flat_{i}')
+            spectra.append(0.5 + 0.01 * self._pink_noise(len(v), rng)
+                           + rng.normal(0, 0.002, len(v)))
+        for i in range(4):                       # real spectra
+            columns.append(f'real_{i}')
+            spectra.append(edges + rng.normal(0, 0.01, len(v)))
+        for i in range(2):                       # empty
+            columns.append(f'empty_{i}')
+            spectra.append(np.full(len(v), np.nan))
+        df = pd.DataFrame(np.column_stack([v] + spectra), columns=['V'] + columns)
+        metadata = SpectralMetadata(
+            source_type='test', dimensions=(10, 1), scan_mode='forward',
+            units={'independent': 'V', 'dependent': 'A/V'})
+        return SpectralData(data=df, metadata=metadata)
+
+    def test_empty_spectra_are_rejected(self, tool_impl, mixed_dataset):
+        tool_impl._datasets['Mixed'] = mixed_dataset
+        tool_impl.filter_bad_data(MockTask(), 'Mixed')
+
+        good = tool_impl._datasets['Mixed - Good Data']
+        assert not any(c.startswith('empty') for c in good.spectra.columns)
+        bad = tool_impl._datasets['Mixed - Bad Data']
+        assert all(f'empty_{i}' in bad.spectra.columns for i in range(2))
+
+    def test_no_all_nan_column_survives(self, tool_impl, mixed_dataset):
+        tool_impl._datasets['Mixed'] = mixed_dataset
+        tool_impl.filter_bad_data(MockTask(), 'Mixed')
+
+        values = tool_impl._datasets['Mixed - Good Data'].spectra.values
+        assert np.isfinite(values).sum(axis=0).min() > 0
+
+    def test_flat_spectra_are_rejected(self, tool_impl, mixed_dataset):
+        """The reported defect: flat above the noise floor is not good data."""
+        tool_impl._datasets['Mixed'] = mixed_dataset
+        tool_impl.filter_bad_data(MockTask(), 'Mixed')
+
+        good = tool_impl._datasets['Mixed - Good Data']
+        assert not any(c.startswith('flat') for c in good.spectra.columns)
+
+    def test_real_spectra_survive(self, tool_impl, mixed_dataset):
+        tool_impl._datasets['Mixed'] = mixed_dataset
+        tool_impl.filter_bad_data(MockTask(), 'Mixed')
+
+        good = tool_impl._datasets['Mixed - Good Data']
+        assert sorted(good.spectra.columns) == [f'real_{i}' for i in range(4)]
+
+    def test_featureless_weight_zero_disables_the_check(self, tool_impl, mixed_dataset):
+        """Turning the detector off brings the flat spectra back — but never
+        the empty ones, which are rejected before any weight is consulted."""
+        tool_impl._datasets['Mixed'] = mixed_dataset
+        tool_impl.filter_bad_data(MockTask(), 'Mixed', weight_featureless=0.0)
+
+        good = tool_impl._datasets['Mixed - Good Data'].spectra.columns
+        assert any(c.startswith('flat') for c in good)
+        assert not any(c.startswith('empty') for c in good)
+
+    def test_report_records_the_new_columns(self, tool_impl, mixed_dataset):
+        tool_impl._datasets['Mixed'] = mixed_dataset
+        report = Path(tool_impl.filter_bad_data(MockTask(), 'Mixed')).read_text()
+
+        assert 'Featless' in report
+        assert 'Cohere' in report
+        assert 'rejected as empty' in report
+        assert 'featureless' in report
+
+    def test_min_coherence_is_tunable(self, tool_impl, mixed_dataset):
+        """Demanding more coherence than a real spectrum has flags everything."""
+        tool_impl._datasets['Mixed'] = mixed_dataset
+        tool_impl.filter_bad_data(MockTask(), 'Mixed', min_coherence=0.95)
+
+        assert 'Mixed - Good Data' not in tool_impl._datasets
+
+    def test_batch_spec_is_registered(self):
+        """The tool is available to a multi-dataset selection."""
+        from src.backend.batch_tools import get_spec
+
+        spec = get_spec('filter_bad_data')
+        assert spec is not None
+        assert spec.method == 'filter_bad_data'
+        assert spec.takes_task
+        assert 'weight_featureless' in spec.defaults
+        coerced = spec.coerce({'weight_featureless': '0.0', 'correct_periodic': 'true'})
+        assert coerced['weight_featureless'] == 0.0
+        assert coerced['correct_periodic'] is True
+
+
+class TestOutlierRemoval(TestFilterBadDataSetup):
+    """Outliers at tool level.
+
+    Every other detector judges a curve on its own. An outlier may be a sound
+    measurement and still be wrong to average in, so it is opt-in, decided
+    per kind, and capped — past the cap what has been found is a distribution
+    rather than a few odd curves, and nothing is removed.
+    """
+
+    @staticmethod
+    def _edge(v, gap_hi=0.8):
+        return (np.exp((v - gap_hi) / 0.06) / (1 + np.exp((v - gap_hi) / 0.06))
+                + np.exp(-(v + 0.7) / 0.06) / (1 + np.exp(-(v + 0.7) / 0.06)))
+
+    def _overview(self, n_offset=1, points=(1, 2), reps=20, with_meta=True):
+        """An overview dataset: two points, `reps` repetitions each."""
+        rng = np.random.default_rng(21)
+        v = np.linspace(-1.5, 1.5, 128)
+        columns, meta, data = [], [], {}
+        for point in points:
+            for rep in range(1, reps + 1):
+                name = f"P{point:02d}R{rep:02d}"
+                columns.append(name)
+                meta.append({'column': name, 'point_index': point, 'rep': rep})
+                curve = self._edge(v, 0.8 if point == 1 else 0.5)
+                curve = curve + rng.normal(0, 0.01, v.size)
+                if point == 2 and rep <= n_offset:
+                    curve = curve * 400
+                data[name] = curve
+        df = pd.DataFrame({'V': v, **data})
+        metadata = SpectralMetadata(
+            source_type='test', dimensions=(len(columns), 1), scan_mode='point',
+            units={'independent': 'V', 'dependent': 'A/V'},
+            additional_info={'spectrum_meta': meta} if with_meta else {})
+        return SpectralData(df, metadata)
+
+    def test_off_by_default(self, tool_impl):
+        """Removing sound curves must never be something that just happens."""
+        tool_impl._datasets['OV'] = self._overview()
+        tool_impl.filter_bad_data(MockTask(), 'OV')
+        good = tool_impl._datasets['OV - Good Data'].spectra.columns
+        assert 'P02R01' in good
+
+    def test_offset_outlier_is_removed_when_asked(self, tool_impl):
+        tool_impl._datasets['OV'] = self._overview()
+        tool_impl.filter_bad_data(MockTask(), 'OV', filter_offset_outliers=True)
+        good = tool_impl._datasets['OV - Good Data'].spectra.columns
+        assert 'P02R01' not in good
+        assert 'P02R02' in good
+
+    def test_removed_outliers_land_in_bad_data(self, tool_impl):
+        tool_impl._datasets['OV'] = self._overview()
+        tool_impl.filter_bad_data(MockTask(), 'OV', filter_offset_outliers=True)
+        assert 'P02R01' in tool_impl._datasets['OV - Bad Data'].spectra.columns
+
+    def test_beyond_the_limit_nothing_goes(self, tool_impl):
+        tool_impl._datasets['OV'] = self._overview(n_offset=8)
+        report = Path(tool_impl.filter_bad_data(
+            MockTask(), 'OV', filter_offset_outliers=True,
+            max_offset_outliers=5)).read_text()
+
+        good = tool_impl._datasets['OV - Good Data'].spectra.columns
+        assert all(f'P02R{i:02d}' in good for i in range(1, 9))
+        assert 'distribution' in report
+        assert 'check them by eye' in report
+
+    def test_points_are_compared_separately(self, tool_impl):
+        """Two points with different gaps must not be outliers of each other."""
+        tool_impl._datasets['OV'] = self._overview(n_offset=0)
+        tool_impl.filter_bad_data(
+            MockTask(), 'OV', filter_offset_outliers=True,
+            filter_bandgap_outliers=True)
+        good = tool_impl._datasets['OV - Good Data'].spectra.columns
+        assert any(c.startswith('P01') for c in good)
+        assert any(c.startswith('P02') for c in good)
+
+    def test_whole_dataset_grouping_is_available(self, tool_impl):
+        tool_impl._datasets['OV'] = self._overview()
+        report = Path(tool_impl.filter_bad_data(
+            MockTask(), 'OV', filter_offset_outliers=True,
+            outlier_group_by='dataset')).read_text()
+        assert 'the whole dataset' in report
+
+    def test_a_dataset_without_metadata_is_warned_about(self, tool_impl):
+        """It still runs — the user may know what they are doing — but the
+        report says every curve was compared against every other."""
+        tool_impl._datasets['OV'] = self._overview(with_meta=False)
+        report = Path(tool_impl.filter_bad_data(
+            MockTask(), 'OV', filter_offset_outliers=True)).read_text()
+        assert 'records no per-spectrum point index' in report
+
+    def test_report_names_the_kind_and_the_curve(self, tool_impl):
+        tool_impl._datasets['OV'] = self._overview()
+        report = Path(tool_impl.filter_bad_data(
+            MockTask(), 'OV', filter_offset_outliers=True)).read_text()
+        assert 'Removed 1 offset outlier(s): P02R01.' in report
+        assert 'P02R01 (offset)' in report
+
+    def test_kinds_are_independent(self, tool_impl):
+        """Asking for saturation must not remove an offset outlier."""
+        tool_impl._datasets['OV'] = self._overview()
+        tool_impl.filter_bad_data(
+            MockTask(), 'OV', filter_saturation_outliers=True,
+            filter_offset_outliers=False)
+        assert 'P02R01' in tool_impl._datasets['OV - Good Data'].spectra.columns
+
+    def test_batch_spec_exposes_the_new_knobs(self):
+        from src.backend.batch_tools import get_spec
+
+        coerced = get_spec('filter_bad_data').coerce({
+            'filter_offset_outliers': 'true', 'max_offset_outliers': '3',
+            'outlier_group_by': 'dataset', 'outlier_intervals': '12'})
+        assert coerced['filter_offset_outliers'] is True
+        assert coerced['max_offset_outliers'] == 3
+        assert coerced['outlier_group_by'] == 'dataset'
+        assert coerced['outlier_intervals'] == 12
+        assert coerced['filter_bandgap_outliers'] is False
