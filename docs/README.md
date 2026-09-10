@@ -1,3 +1,15 @@
+> ## Start here: [`TRANS_REFERENCE.md`](TRANS_REFERENCE.md)
+>
+> The current reference, in three levels — **Surface** (tools, inputs and
+> outputs), **Under the hood** (libraries, heuristics, formats, quirks) and
+> **Inside the engine** (classes and how they interact).
+>
+> **The other files in this directory are out of date.** `API_REFERENCE.md`,
+> `PROJECT_STRUCTURE.md` and the `*_PLAN.md` documents were written before the
+> Confinement, Map Generator, Filter Bad Data and Modeling work and describe a
+> program that no longer exists. They are kept for their history, not as
+> guidance.
+
 # TRANS-QML: Hyperspectral Data Analysis Platform
 
 A modular, QML-based desktop application for analyzing hyperspectral data from scanning probe microscopy experiments (STS, SNOM).
