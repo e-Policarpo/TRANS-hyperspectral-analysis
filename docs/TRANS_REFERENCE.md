@@ -69,6 +69,11 @@ Plus plain `.csv` for anything TRANS itself wrote.
 
 ## The tools
 
+> **Per-tool pages** — inputs, every parameter with its default, outputs and
+> the method behind each — are in [`tools/`](tools/README.md). The tables
+> below are the overview.
+
+
 ### Tools — one operation, one dataset (or several, in sequence)
 
 | tool | does |
