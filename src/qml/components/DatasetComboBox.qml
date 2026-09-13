@@ -58,6 +58,12 @@ ComboBox {
 
     displayText: currentIndex >= 0 ? currentText : placeholderText
 
+    // The rolling text reads a long name out slowly; hovering says it at once.
+    ToolTip.text: root.displayText
+    ToolTip.delay: 400
+    ToolTip.visible: hoverArea.containsMouse && displayTextItem.shouldRoll
+                     && !root.popup.visible
+
     background: Rectangle {
         color: bgColor
         border.color: root.activeFocus ? borderColorFocus : borderColorNormal

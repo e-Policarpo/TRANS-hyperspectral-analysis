@@ -17,6 +17,12 @@ Item {
     id: root
     property var closeWindow: null
 
+    // The task name the backend hands back when this panel submits a run.
+    // Closing the window cancels that run BY NAME: there is one worker thread,
+    // so the task in flight when a panel closes is very often somebody else's,
+    // and a blind cancelCurrentOperation() would kill it.
+    property string runningTaskName: ""
+
     // Set by WindowManager while a browser drag hovers this tool, so the
     // drop target is visible before the mouse is released.
     property bool datasetDropActive: false
@@ -97,7 +103,7 @@ Item {
                         elide: Text.ElideRight
                     }
 
-                    Button {
+                    ToolButton {
                         text: "Refresh list"
                         flat: true
                         font.pixelSize: 10
@@ -112,6 +118,15 @@ Item {
         Connections {
             target: backend
             function onDataLoaded(name) { root.refreshDatasets() }
+            // This panel shows no progress of its own, so there is nothing to
+            // put right on screen — but the remembered task name has to go,
+            // or closing the window later would try to cancel a finished run.
+            function onToolCompleted(toolName, outputPath) {
+                if (root.runningTaskName.indexOf(toolName) === 0) root.runningTaskName = ""
+            }
+            function onOperationCancelled(name) {
+                if (name === root.runningTaskName) root.runningTaskName = ""
+            }
         }
 
         GroupBox {
@@ -164,23 +179,23 @@ Item {
         RowLayout {
             Layout.fillWidth: true
 
-            Button {
+            ToolButton {
                 text: datasetList.selectedDatasets.length > 1
                       ? "Calculate Derivatives (" + datasetList.selectedDatasets.length + ")"
                       : "Calculate Derivative"
                 enabled: datasetList.selectedDatasets.length > 0
-                highlighted: true
+                primary: true
                 onClicked: performDerivative()
             }
 
-            Button {
+            ToolButton {
                 text: "Cancel Operation"
                 onClicked: backend.cancelCurrentOperation()
             }
 
             Item { Layout.fillWidth: true }
 
-            Button {
+            ToolButton {
                 text: "Close"
                 onClicked: {
                     if (root.closeWindow) { root.closeWindow() } else { var win = Window.window; if (win) win.close() }
@@ -204,10 +219,17 @@ Item {
 
         // One batch task: the datasets are processed in the order they were
         // picked, each yielding its own output named after its input.
-        backend.runToolOnDatasets("derivative", datasets, {
+        root.runningTaskName = backend.runToolOnDatasets("derivative", datasets, {
             "order": order,
             "smooth_before": smoothBeforeCheck.checked,
             "smooth_after": smoothAfterCheck.checked
         })
+    }
+
+    Component.onDestruction: {
+        // A panel that is gone cannot show a result, so its run is abandoned
+        // work — stop it. cancelOperation only fires when the named task is
+        // the one running, so a stale name here is a no-op.
+        if (root.runningTaskName) backend.cancelOperation(root.runningTaskName)
     }
 }

@@ -4,7 +4,7 @@ Decides whether the states in a spectrum are confined in 0, 1 or 2
 dimensions — from the **ratios between levels**, not from their absolute
 positions. Accepts a **multi-dataset selection**.
 
-**Menu** Tools → Composite tools → Confinement Dimensionality · **Panel**
+**Menu** Tools → Confinement → Confinement Dimensionality · **Panel**
 `ConfinementDimensionalityTool.qml` · **Method**
 `analyze_confinement_dimensionality()` · **Batch key**
 `confinement_dimensionality`

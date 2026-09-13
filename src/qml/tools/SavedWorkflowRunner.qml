@@ -184,20 +184,20 @@ Item {
         RowLayout {
             Layout.fillWidth: true
 
-            Button {
+            ToolButton {
                 text: running ? "Running…" : "Run"
                 enabled: !running && datasetList.selectedDatasets.length > 0
                          && root.workflowPath !== ""
-                highlighted: true
+                primary: true
                 onClicked: root.run()
             }
-            Button {
+            ToolButton {
                 text: "Cancel"
                 enabled: running
                 onClicked: backend.workflowManager.cancelExecution()
             }
             Item { Layout.fillWidth: true }
-            Button {
+            ToolButton {
                 text: "Close"
                 onClicked: {
                     if (root.closeWindow) { root.closeWindow() }

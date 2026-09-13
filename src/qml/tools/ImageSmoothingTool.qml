@@ -81,7 +81,7 @@ Item {
                     readOnly: true
                 }
 
-                Button {
+                ToolButton {
                     text: "Browse..."
                     onClicked: imageFileDialog.open()
                 }
@@ -119,16 +119,16 @@ Item {
         RowLayout {
             Layout.fillWidth: true
 
-            Button {
+            ToolButton {
                 text: "Apply Filter"
                 enabled: imagePathField.text.length > 0
-                highlighted: true
+                primary: true
                 onClicked: performSmoothing()
             }
 
             Item { Layout.fillWidth: true }
 
-            Button {
+            ToolButton {
                 text: "Close"
                 onClicked: {
                     if (root.closeWindow) { root.closeWindow() } else { var win = Window.window; if (win) win.close() }

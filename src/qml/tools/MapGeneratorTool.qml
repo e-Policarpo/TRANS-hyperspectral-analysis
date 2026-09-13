@@ -20,6 +20,12 @@ Item {
     id: root
     property var closeWindow: null
 
+    // The task name the backend hands back when this panel submits a run.
+    // Closing the window cancels that run BY NAME: there is one worker thread,
+    // so the task in flight when a panel closes is very often somebody else's,
+    // and a blind cancelCurrentOperation() would kill it.
+    property string runningTaskName: ""
+
     property var parentWindow: Window.window
     // Each colour is resolved explicitly, and the property is named as a
     // literal rather than looked up by string.
@@ -120,6 +126,8 @@ Item {
         p["scan_type"] = scanTypeKey()
         p["interval_source"] = intervalSource()
         p["noise_floor"] = noiseFloorSpin.realValue
+        p["bin_x"] = binXSpin.value
+        p["bin_y"] = binYSpin.value
         p["intervals"] = currentIntervals()
         if (intervalSource() === "dataset")
             p["intervals_from"] = intervalDatasetCombo.currentText
@@ -223,7 +231,8 @@ Item {
         statusLabel.color = accentBlue
         // One batch task: the datasets are processed in the order they were
         // picked, each writing into its own folder.
-        backend.runToolOnDatasets("map_generator", datasets, collectParams())
+        root.runningTaskName = backend.runToolOnDatasets("map_generator", datasets,
+                                                         collectParams())
     }
 
     Component.onCompleted: refreshDatasets()
@@ -238,6 +247,7 @@ Item {
 
         function onMapIntervalsReady(intervals) {
             running = false
+            root.runningTaskName = ""
             if (intervals && intervals.length > 0) {
                 setIntervals(intervals)
                 statusLabel.text = intervals.length + " interval(s) ready — " +
@@ -248,6 +258,23 @@ Item {
                                    "or change the background."
                 statusLabel.color = accentPink
             }
+        }
+
+        // Neither the interval detection nor the map run reports a cancel of
+        // its own, so this is the only way out of `running` once Cancel is
+        // pressed. Two operations share that flag and only one of them hands a
+        // task name back, so when there is no name to match on, "is this panel
+        // waiting for something?" is the only test left.
+        function onOperationCancelled(name) {
+            if (root.runningTaskName !== "") {
+                if (name !== root.runningTaskName) return
+            } else if (!root.running) {
+                return
+            }
+            root.runningTaskName = ""
+            running = false
+            statusLabel.text = "Cancelled"
+            statusLabel.color = textMuted
         }
     }
 
@@ -353,6 +380,44 @@ Item {
             }
 
             ToolSection {
+                title: "Spatial averaging"
+
+                GridLayout {
+                    anchors.fill: parent
+                    columns: 4
+                    columnSpacing: 8
+
+                    Label { text: "Block width:"; color: textLight }
+                    ToolSpinBox {
+                        id: binXSpin
+                        from: 1; to: 256; value: 1
+                    }
+                    Label { text: "Block height:"; color: textLight }
+                    ToolSpinBox {
+                        id: binYSpin
+                        from: 1; to: 256; value: 1
+                    }
+
+                    Label {
+                        Layout.columnSpan: 4
+                        Layout.fillWidth: true
+                        text: (binXSpin.value > 1 || binYSpin.value > 1)
+                              ? "Neighbouring positions are averaged in blocks of " + binXSpin.value +
+                                " × " + binYSpin.value + " before the background and integration — " +
+                                "laid out along the scan path above, so a meander is not scrambled. " +
+                                "Averaging n spectra gains √n in signal-to-noise at n× the area. " +
+                                "The averaged spectra are also registered as '- Spatially Averaged'."
+                              : "1 × 1 keeps every position. Raise either to trade spatial " +
+                                "resolution for signal — a 2 × 2 block halves the noise. On a " +
+                                "line scan only the width applies."
+                        font.pixelSize: 10
+                        color: textMuted
+                        wrapMode: Text.Wrap
+                    }
+                }
+            }
+
+            ToolSection {
                 title: "Background"
 
                 GridLayout {
@@ -438,7 +503,7 @@ Item {
                             Layout.fillWidth: true
                             placeholderText: "Analysis result..."
                         }
-                        Button {
+                        ToolButton {
                             text: "Load"
                             onClicked: loadIntervalsFromAnalysis()
                         }
@@ -506,7 +571,7 @@ Item {
                             decimals: 4
                         }
 
-                        Button {
+                        ToolButton {
                             Layout.columnSpan: 2
                             Layout.fillWidth: true
                             text: running ? "Working..." : "Detect intervals"
@@ -622,7 +687,7 @@ Item {
                                         if (!isNaN(v)) intervalModel.setProperty(index, "upper", v)
                                     }
                                 }
-                                Button {
+                                ToolButton {
                                     text: "×"
                                     flat: true
                                     implicitWidth: 26
@@ -643,11 +708,11 @@ Item {
                     RowLayout {
                         Layout.fillWidth: true
 
-                        Button {
+                        ToolButton {
                             text: "Add interval"
                             onClicked: intervalModel.append({"lower": 0.0, "upper": 0.1})
                         }
-                        Button {
+                        ToolButton {
                             text: "Clear"
                             enabled: intervalModel.count > 0
                             onClicked: intervalModel.clear()
@@ -709,8 +774,9 @@ Item {
                     Label {
                         text: "Filed under outputs/maps/<dataset>/, split by format " +
                               "(gsf/, tiff/, csv/): one calibrated map per interval, " +
-                              "plus the integrals as a flat dataset you can inspect " +
-                              "or re-map."
+                              "plus the integrals as a '- Map Values' flat dataset and " +
+                              "as <name>_Integrated.csv under outputs/integrated/ — the " +
+                              "same table the Integration Utility writes."
                         font.pixelSize: 11
                         color: textMuted
                         wrapMode: Text.Wrap
@@ -727,7 +793,7 @@ Item {
                         Layout.fillWidth: true
                     }
 
-                    Button {
+                    ToolButton {
                         text: "Open interval map in Hyperspectral"
                         enabled: root.intervalMapName !== ""
                         visible: root.intervalMapName !== ""
@@ -749,24 +815,24 @@ Item {
             RowLayout {
                 Layout.fillWidth: true
 
-                Button {
+                ToolButton {
                     text: running ? "Working..."
                                   : (datasetList.selectedDatasets.length > 1
                                      ? "Generate maps (" + datasetList.selectedDatasets.length + " datasets)"
                                      : "Generate maps")
                     enabled: !running && datasetList.selectedDatasets.length > 0
-                    highlighted: true
+                    primary: true
                     onClicked: generateMaps()
                 }
 
-                Button {
+                ToolButton {
                     text: "Cancel"
                     onClicked: backend.cancelCurrentOperation()
                 }
 
                 Item { Layout.fillWidth: true }
 
-                Button {
+                ToolButton {
                     text: "Close"
                     onClicked: {
                         if (root.closeWindow) { root.closeWindow() }
@@ -775,5 +841,12 @@ Item {
                 }
             }
         }
+    }
+
+    Component.onDestruction: {
+        // A panel that is gone cannot show a result, so its run is abandoned
+        // work — stop it. cancelOperation only fires when the named task is
+        // the one running, so a stale name here is a no-op.
+        if (root.runningTaskName) backend.cancelOperation(root.runningTaskName)
     }
 }

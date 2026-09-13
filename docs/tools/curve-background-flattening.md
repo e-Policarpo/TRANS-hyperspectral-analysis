@@ -1,21 +1,24 @@
-# Curve Fitting
+# Curve Background Flattening
 
-Fits a polynomial to every spectrum and subtracts it. The standard way to
-remove a background before looking for states.
+Fits a smooth background to every spectrum and subtracts it, leaving the
+features on a flat baseline. The standard way to remove a background before
+looking for states. (Until the tool rework this was called *Curve Fitting*;
+the panel file keeps that name.)
 
-**Menu** Tools → Curve Fitting · **Panel** `CurveFittingTool.qml` ·
-**Method** `fit_curves()`
+**Menu** Tools → Transform → Curve Background Flattening · **Panel** `CurveFittingTool.qml` ·
+**Method** `fit_curves()` · **Batch key** `curve_background_flattening`
 
 ## Input
 
-Any spectral dataset.
+Any spectral dataset — or several: the panel takes a multi-dataset selection
+and flattens them one after another, each producing its own outputs.
 
 ## Parameters
 
 | parameter | default | meaning |
 |---|---|---|
-| `fit_type` | polynomial | the model |
-| `degree` | 3 | polynomial degree |
+| `fit_type` | polynomial | `polynomial`, `linear` or `exponential` |
+| `degree` | 2 | polynomial degree |
 | `basis` | `power` | `power`, `legendre` or `chebyshev` |
 
 ## Output

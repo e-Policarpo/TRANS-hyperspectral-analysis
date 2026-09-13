@@ -2,10 +2,13 @@
 
 Collapses a dataset to a single mean curve.
 
-**Menu** Tools → Average Curves · **Panel** `AverageCurvesTool.qml` ·
-**Method** `average_curves()`
+**Menu** Tools → Prepare → Average Curves · **Panel** `AverageCurvesTool.qml` ·
+**Method** `average_curves()` · **Batch key** `average_curves`
 
 ## Input
+
+A multi-dataset selection: each dataset is averaged on its own, one after
+another, and produces its own output.
 
 Any spectral dataset. Only meaningful when the curves are repetitions of the
 same measurement — averaging across positions averages across the sample.

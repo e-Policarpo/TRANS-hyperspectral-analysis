@@ -28,7 +28,7 @@ A modular, QML-based desktop application for analyzing hyperspectral data from s
 - Peak Finding with prominence detection
 - 1D/2D FFT Analysis
 - Gradient Filters
-- Curve Fitting
+- Curve Background Flattening
 - Map Generation
 - Spatial Averaging/Discretization
 - Data Manipulation (equation-based operations)
@@ -68,6 +68,7 @@ A modular, QML-based desktop application for analyzing hyperspectral data from s
 | [Quick Reference](docs/QUICK_REFERENCE.md) | Developer quick reference card |
 | [Testing Guide](TESTING_GUIDE.md) | How to test the application |
 | [Quickstart](QUICKSTART.md) | Getting started guide |
+| [Workflow inventory](WORKFLOW_INVENTORY.md) | Which tools have a workflow node, which lag, and the ranked change list |
 
 ## Installation
 

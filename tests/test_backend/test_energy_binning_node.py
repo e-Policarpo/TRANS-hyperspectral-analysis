@@ -124,7 +124,7 @@ class TestEnergyBinningNodeDefinition:
 
     def test_node_is_registered_in_the_analysis_category(self):
         node_def = TOOL_DEFINITIONS["EnergyBinning"]
-        assert node_def["category"] == "Analysis"
+        assert node_def["category"] == "Fit and features"
         assert node_def["display_name"] == "Energy Binning"
 
     def test_the_peaks_input_is_required_and_the_spectra_are_not(self):
@@ -158,7 +158,7 @@ class TestEnergyBinningNodeDefinition:
     def test_it_sits_after_peak_finder_in_the_palette(self):
         """The two are read as a pair: find the peaks, then bin them."""
         analysis = next(c["tools"] for c in get_tool_categories()
-                        if c["category"] == "Analysis")
+                        if c["category"] == "Fit and features")
         assert (analysis.index("EnergyBinning")
                 - analysis.index("PeakFinder")) == 1
 

@@ -19,6 +19,12 @@ Item {
     id: root
     property var closeWindow: null
 
+    // The task name the backend hands back when this panel submits a run.
+    // Closing the window cancels that run BY NAME: there is one worker thread,
+    // so the task in flight when a panel closes is very often somebody else's,
+    // and a blind cancelCurrentOperation() would kill it.
+    property string runningTaskName: ""
+
     // Set by WindowManager while a browser drag hovers this tool, so the
     // drop target is visible before the mouse is released.
     property bool datasetDropActive: false
@@ -111,7 +117,7 @@ Item {
                         elide: Text.ElideRight
                     }
 
-                    Button {
+                    ToolButton {
                         text: "Refresh"
                         flat: true
                         font.pixelSize: 10
@@ -129,13 +135,19 @@ Item {
 
         // Scrollable so the parameter blocks stay reachable in a short window.
         ScrollView {
+            id: parameterScroll
             Layout.fillWidth: true
+            // Width comes from the window, never from what is inside: a long
+            // line of text must wrap, not widen the tool.
+            Layout.preferredWidth: 0
+            Layout.minimumWidth: 0
             Layout.preferredHeight: Math.min(contentHeight, 340)
             clip: true
+            contentWidth: availableWidth
             ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
             ColumnLayout {
-                width: parent.width
+                width: parameterScroll.availableWidth
                 spacing: 8
 
                 ToolSection {
@@ -372,9 +384,11 @@ Item {
                             color: textMuted
                         }
 
+                        // Two columns, not four: a spin box is ~130 px wide,
+                        // and four of these across do not fit the tool.
                         GridLayout {
                             Layout.fillWidth: true
-                            columns: 4
+                            columns: 2
                             columnSpacing: 8
                             visible: offsetOutlierCheck.checked || bandgapOutlierCheck.checked
                                      || saturationOutlierCheck.checked
@@ -425,20 +439,28 @@ Item {
                     title: "Information"
                     Layout.fillWidth: true
 
-                    Label {
+                    ColumnLayout {
                         anchors.fill: parent
-                        text: "Each input dataset produces 'Good Data', 'Bad Data' and 'FFT Spectra', " +
-                              "plus a report listing every spectrum's scores, its structure ratio, " +
-                              "coherence and noise σ.\n\n" +
-                              "A spectrum with too few finite points is rejected outright, whatever " +
-                              "the weights say — there is nothing in it to measure.\n\n" +
-                              "With outlier filtering on, an 'Outliers Removed' dataset is written too: " +
-                              "one curve per point, each the average of the repetitions that survived. " +
-                              "That is the average the outlier pass exists to protect.\n\n" +
-                              "Select several datasets to filter them one after another."
-                        wrapMode: Text.Wrap
-                        font.pixelSize: 10
-                        color: textMuted
+
+                        Label {
+                            Layout.fillWidth: true
+                            Layout.preferredWidth: 0
+                            Layout.minimumWidth: 0
+                            text: "Each input dataset produces 'Good Data', 'Bad Data', 'FFT Spectra' " +
+                                  "and 'Point Averages', plus a report listing every spectrum's " +
+                                  "scores, its structure ratio, coherence and noise σ.\n\n" +
+                                  "A spectrum with too few finite points is rejected outright, " +
+                                  "whatever the weights say — there is nothing in it to measure.\n\n" +
+                                  "'Point Averages' is one curve per point, each the average of the " +
+                                  "repetitions that survived — with outlier filtering on, of the " +
+                                  "ones that survived that too. It is skipped only when the dataset " +
+                                  "records no point index, since there is then no way to tell " +
+                                  "repetitions of one point from different points.\n\n" +
+                                  "Select several datasets to filter them one after another."
+                            wrapMode: Text.Wrap
+                            font.pixelSize: 10
+                            color: textMuted
+                        }
                     }
                 }
             }
@@ -458,23 +480,23 @@ Item {
         RowLayout {
             Layout.fillWidth: true
 
-            Button {
+            ToolButton {
                 text: datasetList.selectedDatasets.length > 1
                       ? "Filter (" + datasetList.selectedDatasets.length + ")"
                       : "Filter"
                 enabled: datasetList.selectedDatasets.length > 0
-                highlighted: true
+                primary: true
                 onClicked: performFilter()
             }
 
-            Button {
+            ToolButton {
                 text: "Cancel"
                 onClicked: backend.cancelCurrentOperation()
             }
 
             Item { Layout.fillWidth: true }
 
-            Button {
+            ToolButton {
                 text: "Close"
                 onClicked: {
                     if (root.closeWindow) { root.closeWindow() } else { var win = Window.window; if (win) win.close() }
@@ -488,13 +510,22 @@ Item {
         enabled: backend !== null
         function onToolCompleted(toolName, outputPath) {
             if (toolName === "Filter Bad Data") {
+                root.runningTaskName = ""
                 statusLabel.text = "Filter complete. Check the project browser for output datasets. See report for details."
             }
         }
         function onErrorOccurred(title, message) {
             if (title.indexOf("Filter") >= 0) {
+                root.runningTaskName = ""
                 statusLabel.text = "Error: " + message
             }
+        }
+        // A cancelled task reaches neither of the two handlers above, so
+        // without this the panel goes on saying "Filtering...".
+        function onOperationCancelled(name) {
+            if (name !== root.runningTaskName) return
+            root.runningTaskName = ""
+            statusLabel.text = "Cancelled"
         }
     }
 
@@ -513,7 +544,7 @@ Item {
 
         // One batch task: the datasets are processed in the order they were
         // picked, each yielding its own Good/Bad/FFT outputs and report.
-        backend.runToolOnDatasets("filter_bad_data", datasets, {
+        root.runningTaskName = backend.runToolOnDatasets("filter_bad_data", datasets, {
             "weight_saturation": satSlider.value,
             "weight_noise": noiseSlider.value,
             "weight_linear": linearSlider.value,
@@ -534,5 +565,12 @@ Item {
             "outlier_intervals": outlierIntervalsSpin.value,
             "outlier_z": outlierZSpin.realValue
         })
+    }
+
+    Component.onDestruction: {
+        // A panel that is gone cannot show a result, so its run is abandoned
+        // work — stop it. cancelOperation only fires when the named task is
+        // the one running, so a stale name here is a no-op.
+        if (root.runningTaskName) backend.cancelOperation(root.runningTaskName)
     }
 }

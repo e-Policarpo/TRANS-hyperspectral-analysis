@@ -1,16 +1,21 @@
-# Background Subtraction
+# Subtract Detector Background
 
-Subtracts one dataset from one or more others — a measured background rather
-than a fitted one.
+Subtracts one measured dataset — a dark frame, a bare-substrate or empty-cell
+spectrum, a reference taken off the feature — from one or more others. A
+measured background rather than a fitted one. (Until the tool rework this
+was called *Background Subtraction*; the panel file keeps that name.)
 
-**Menu** Tools → Background Subtraction · **Panel**
+**Menu** Tools → Prepare → Subtract Detector Background · **Panel**
 `BackgroundSubtractionTool.qml` · **Method**
 `subtract_background_datasets()`, `src/processing/background_subtraction.py`
 
 ## Input
 
-Two selections: the **signal** datasets, and the single **background**
-dataset. They must share a compatible independent axis.
+Two selections: the **signal** datasets (a multi-dataset list — Ctrl/Cmd-click,
+Shift-click, or a drag from the project browser adds to it), and the single
+**background** dataset. They must share a compatible independent axis. If the
+background is also picked as a signal it is skipped: it would come out as
+zero everywhere.
 
 ## Parameters
 
@@ -40,8 +45,8 @@ mismatch does not pass for a result.
 
 - This is the right tool for a **measured** background: a spectrum taken off
   the feature, a dark reference, a substrate curve. For a background that has
-  to be *inferred* from the curve itself, use [Curve
-  Fitting](curve-fitting.md) or the arPLS baseline in [Confinement
+  to be *inferred* from the curve itself, use [Curve Background
+  Flattening](curve-background-flattening.md) or the arPLS baseline in [Confinement
   Analysis](confinement-analysis.md).
 - The result can go negative; that is expected for a signed quantity and the
   positivity rule does not apply to the subtraction itself.

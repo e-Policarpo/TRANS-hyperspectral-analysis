@@ -23,6 +23,12 @@ Item {
     id: root
     property var closeWindow: null
 
+    // The task name the backend hands back when this panel submits a run.
+    // Closing the window cancels that run BY NAME: there is one worker thread,
+    // so the task in flight when a panel closes is very often somebody else's,
+    // and a blind cancelCurrentOperation() would kill it.
+    property string runningTaskName: ""
+
     // Dropping datasets from the project browser onto the window adds them
     // to the selection; declaring these two makes it a drop target.
     property bool datasetDropActive: false
@@ -132,14 +138,16 @@ Item {
         var picked = datasetList.selectedDatasets
         if (!picked || picked.length === 0) return
         root.running = true
+        progressBar.reset()
         root.tableName = ""
         stripCanvas.showMessage("Searching every position…")
         statusLabel.text = "Searching " + root.spectrumCount + " position(s) — "
                          + estimateText()
         if (picked.length > 1) {
-            backend.runToolOnDatasets("line_scan_designer", picked, searchParams())
+            root.runningTaskName = backend.runToolOnDatasets("line_scan_designer",
+                                                             picked, searchParams())
         } else {
-            backend.runLineScanDesigner(picked[0], searchParams())
+            root.runningTaskName = backend.runLineScanDesigner(picked[0], searchParams())
         }
     }
 
@@ -149,6 +157,7 @@ Item {
 
         function onLineScanDesignCompleted(result) {
             root.running = false
+            root.runningTaskName = ""
             if (!result || !result.ok) {
                 stripCanvas.showMessage(result && result.error
                                         ? result.error : "Nothing found")
@@ -173,6 +182,17 @@ Item {
                 + (result.groups ? result.groups.length : 0) + " size group(s)"
                 + (parts.length > 0 ? " — " + parts.join(", ") : "")
         }
+
+        // A cancelled search never reaches lineScanDesignCompleted, so this is
+        // the only place the panel can come out of its running state.
+        function onOperationCancelled(name) {
+            if (name !== root.runningTaskName) return
+            root.runningTaskName = ""
+            root.running = false
+            stripCanvas.showMessage("Cancelled")
+            statusLabel.text = "Cancelled — the positions already searched were "
+                             + "not written to a table."
+        }
     }
 
     Component.onCompleted: {
@@ -182,7 +202,13 @@ Item {
         refreshDatasets()
     }
 
-    Component.onDestruction: { if (stripCanvas) stripCanvas.cleanup() }
+    Component.onDestruction: {
+        if (stripCanvas) stripCanvas.cleanup()
+        // A search whose panel has closed has nowhere to put its line, and a
+        // long line is minutes of worker time. cancelOperation only fires when
+        // the named task is the one running, so a stale name is a no-op.
+        if (root.runningTaskName) backend.cancelOperation(root.runningTaskName)
+    }
 
     RowLayout {
         anchors.fill: parent
@@ -207,9 +233,17 @@ Item {
 
                 Label {
                     Layout.fillWidth: true
-                    text: "Searches every position for the well that produces its " +
-                          "ladder of levels. Positions with no confinement come back " +
-                          "empty with the reason — they are not given a size."
+                    text: "The Confinement Designer run at every position of a line " +
+                          "scan. Where the Designer asks 'which well gives THIS " +
+                          "spectrum its ladder of levels?' — one spectrum, many " +
+                          "candidate geometries to inspect — this tool asks that at " +
+                          "every point along the line and reports how the answer " +
+                          "changes with position: one best size per point, positions " +
+                          "grouped by the size they share, and a strip map of size " +
+                          "along the line. Positions with no confinement come back " +
+                          "empty with the reason — they are not given a size. Use the " +
+                          "Designer to tune the search on one spectrum first, then " +
+                          "run it here along the whole line."
                     wrapMode: Text.Wrap
                     color: accentPurple
                 }
@@ -520,22 +554,22 @@ Item {
                 RowLayout {
                     Layout.fillWidth: true
 
-                    Button {
+                    ToolButton {
                         text: running ? "Searching…"
                                       : (datasetList.selectedDatasets.length > 1
                                          ? "Map " + datasetList.selectedDatasets.length + " lines"
                                          : "Map the line")
                         enabled: !running && datasetList.selectedDatasets.length > 0
-                        highlighted: true
+                        primary: true
                         onClicked: runSearch()
                     }
-                    Button {
+                    ToolButton {
                         text: "Cancel"
                         enabled: running
                         onClicked: backend.cancelCurrentOperation()
                     }
                     Item { Layout.fillWidth: true }
-                    Button {
+                    ToolButton {
                         text: "Close"
                         onClicked: {
                             if (root.closeWindow) { root.closeWindow() }
@@ -546,36 +580,52 @@ Item {
             }
         }
 
-        DesignerCanvas {
-            id: stripCanvas
+        ColumnLayout {
             Layout.fillWidth: true
             Layout.fillHeight: true
-            backgroundColor: root.bgDark
-            foregroundColor: root.textMuted
-            // gridColor draws the spines and the gridlines. borderColor —
-            // which is what a rule IS in this scheme — and NOT bgLight.
-            // bgLight was chosen to dodge the advisory borderColor pairing,
-            // but measured on all 22 schemes bgLight-on-bgDark runs
-            // 1.12:1 to 1.54:1, so the frame was fainter than either
-            // candidate and the painted gridline came out at 1.02–1.08:1:
-            // no visible box at all, on every scheme. borderColor is the
-            // higher-contrast choice in 21 of the 22.
-            gridColor: root.borderColor
-            // The semantic scale. These four were added to FigureCanvasItem and
-            // bound at no site at all, so every canvas painted the class defaults
-            // (#5BCEFA / #2ECC71 / #FF9800 / #FF6B6B) whatever the scheme said —
-            // dark-tuned marks at 1.6:1 to 2.6:1 on a light scheme's near-white
-            // ground, and #5BCEFA is byte-identical to a series colour it is
-            // meant to be read against.
-            //
-            // They bind to the Theme singleton directly rather than through the
-            // host: these are meanings, not decoration, and no window overrides
-            // them. The canvas guards them — if a scheme's three scale colours
-            // are too close to tell apart it keeps the fixed triple instead.
-            accentColor: Theme.accentPink
-            successColor: Theme.successColor
-            warningColor: Theme.warningColor
-            errorColor: Theme.errorColor
+            spacing: 6
+
+            // The run's own progress and time estimate (backend.toolProgress),
+            // above the strip map where it is seen without scrolling the
+            // parameter column.
+            ToolProgressBar {
+                id: progressBar
+                toolName: "Line Scan Designer"
+                active: root.running
+                Layout.fillWidth: true
+            }
+
+            DesignerCanvas {
+                id: stripCanvas
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                backgroundColor: root.bgDark
+                foregroundColor: root.textMuted
+                // gridColor draws the spines and the gridlines. borderColor —
+                // which is what a rule IS in this scheme — and NOT bgLight.
+                // bgLight was chosen to dodge the advisory borderColor pairing,
+                // but measured on all 22 schemes bgLight-on-bgDark runs
+                // 1.12:1 to 1.54:1, so the frame was fainter than either
+                // candidate and the painted gridline came out at 1.02–1.08:1:
+                // no visible box at all, on every scheme. borderColor is the
+                // higher-contrast choice in 21 of the 22.
+                gridColor: root.borderColor
+                // The semantic scale. These four were added to FigureCanvasItem and
+                // bound at no site at all, so every canvas painted the class defaults
+                // (#5BCEFA / #2ECC71 / #FF9800 / #FF6B6B) whatever the scheme said —
+                // dark-tuned marks at 1.6:1 to 2.6:1 on a light scheme's near-white
+                // ground, and #5BCEFA is byte-identical to a series colour it is
+                // meant to be read against.
+                //
+                // They bind to the Theme singleton directly rather than through the
+                // host: these are meanings, not decoration, and no window overrides
+                // them. The canvas guards them — if a scheme's three scale colours
+                // are too close to tell apart it keeps the fixed triple instead.
+                accentColor: Theme.accentPink
+                successColor: Theme.successColor
+                warningColor: Theme.warningColor
+                errorColor: Theme.errorColor
+            }
         }
     }
 }

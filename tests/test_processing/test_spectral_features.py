@@ -34,6 +34,7 @@ from src.processing.spectral_features import (
     gap_features,
     metallicity_features,
     normalize_spectrum,
+    sign_state_features,
     spectrum_features,
     suppress_narrow_peaks,
 )
@@ -379,3 +380,87 @@ def test_custom_confinement_params_are_used():
     strict = FeatureConfig(state_noise_sigmas=1e6)   # nothing can clear this
     assert spectrum_features(x, y, lenient)["n_states"] == 5
     assert spectrum_features(x, y, strict)["n_states"] == 0
+
+
+# ---------------------------------------------------------------------------
+# States by the sign of the bias
+# ---------------------------------------------------------------------------
+
+def _outside_state(x, y, centre=0.35, amplitude=1.0):
+    """Plant one state on the band edge, well outside the gap."""
+    return y + amplitude * 2.5e-8 * np.exp(-0.5 * ((x - centre) / 0.006) ** 2)
+
+
+def test_the_sign_split_adds_up_to_the_in_gap_count():
+    x, y = make_sts(n_states=3)
+    row = spectrum_features(x, y)
+
+    assert (row["nstates_negative_in_gap"]
+            + row["nstates_positive_in_gap"]) == row["n_states"]
+
+
+def test_states_are_split_by_the_sign_of_the_bias():
+    """Three states across a gap centred on zero: one below, two at or above
+    — the one planted exactly at 0 V counts as positive."""
+    x, y = make_sts(n_states=3)
+    row = spectrum_features(x, y)
+
+    assert row["nstates_negative_in_gap"] == 1
+    assert row["nstates_positive_in_gap"] == 2
+
+
+def test_a_state_outside_the_gap_is_counted_but_not_as_in_gap():
+    x, y = make_sts(n_states=1)
+    row = spectrum_features(x, _outside_state(x, y))
+
+    assert row["n_states"] == 1
+    assert row["nstates_positive"] > row["nstates_positive_in_gap"]
+
+
+def test_the_totals_never_undercount_the_gap():
+    x, y = make_sts(n_states=3)
+    row = spectrum_features(x, _outside_state(x, y, centre=-0.35))
+
+    assert row["nstates_negative"] >= row["nstates_negative_in_gap"]
+    assert row["nstates_positive"] >= row["nstates_positive_in_gap"]
+
+
+def test_a_spectrum_with_no_gap_still_reports_the_sides():
+    """No gap means no in-gap states — but the states are still somewhere."""
+    x, y = make_sts(gap_half=0.0, n_states=0)
+    row = sign_state_features(x, y, {"gap_left": float("nan"),
+                                     "gap_right": float("nan")})
+
+    assert row["nstates_negative_in_gap"] == 0
+    assert row["nstates_positive_in_gap"] == 0
+    assert row["nstates_negative"] >= 0
+    assert row["nstates_positive"] >= 0
+
+
+def test_the_new_columns_are_declared():
+    for name in ("nstates_negative", "nstates_positive",
+                 "nstates_negative_in_gap", "nstates_positive_in_gap"):
+        assert name in feature_columns()
+    x, y = make_sts(n_states=2)
+    row = feature_table(x, y)[0]
+    for name in ("nstates_negative", "nstates_positive"):
+        assert name in row
+
+
+def test_a_clean_gap_invents_no_states():
+    """The band edge's knee survives arPLS as a bump as tall as a real state.
+    Counting it would add one invented state per side to every spectrum."""
+    x, y = make_sts(n_states=0)
+    row = spectrum_features(x, y)
+
+    assert row["nstates_negative"] == 0
+    assert row["nstates_positive"] == 0
+
+
+def test_a_state_out_on_the_band_edge_is_counted_on_its_own_side():
+    x, y = make_sts(n_states=0)
+    positive = spectrum_features(x, _outside_state(x, y, centre=0.35))
+    negative = spectrum_features(x, _outside_state(x, y, centre=-0.35))
+
+    assert (positive["nstates_positive"], positive["nstates_negative"]) == (1, 0)
+    assert (negative["nstates_positive"], negative["nstates_negative"]) == (0, 1)

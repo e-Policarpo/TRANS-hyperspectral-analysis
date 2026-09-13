@@ -143,8 +143,16 @@ rest. There is deliberately no FWHM-merging fallback: it fused everything into
 two or three bands tens of mV wide (2 intervals where 216 states were
 detected), which is what "the map generator finds almost no peaks" was. A scan-type combo picks the layout:
 `map_meander` reverses alternate rows, `map_raster` doesn't, `line` produces a
-single row, `auto` reads the dataset's metadata. Outputs are unchanged: one
-calibrated `.tiff` (+ `.gsf`/`.csv`) per interval.
+single row, `auto` reads the dataset's metadata. Outputs: one calibrated
+`.tiff` (+ `.gsf`/`.csv`) per interval, plus the integrals as
+`<base> - Map Values` (columns `Interval_<lo>_<hi>`, the Integration
+Utility's names) and as `integrated/<name>_Integrated.csv` — the Map
+Generator subsumes the Integration Utility's outputs. **Spatial averaging**
+(`bin_x`/`bin_y`, the old Spatial Average tool) is a step of this tool:
+`_bin_spectra_spatially` lays the spectra on the scan path first so a
+meander is not scrambled, averages blocks, and the run continues on the
+reduced grid as `map_raster`; the averaged spectra are registered as
+`<base> - Spatially Averaged (AxB)`.
 
 ## Peak detection defaults
 
@@ -200,7 +208,14 @@ input and can be named after it.
   declaring that function (plus `property bool datasetDropActive` for the
   hover highlight) is all a tool needs to become a drop target. Delivery is
   a global-coordinate hit test in `WindowManager.deliverDatasetDrop`; there
-  are deliberately no `DropArea`s (see the browser-tree notes).
+  are deliberately no `DropArea`s (see the browser-tree notes). The payload
+  carries dataset names plus `map:<id>` / `image:<id>` refs: a field tool
+  (Gradient Filter, via `getFieldSourceList`) lists exactly those refs, and
+  `DatasetMultiSelect.addToSelection` ignores anything not in its model, so
+  the refs never reach a spectral tool.
+- **A batch output need not be a path**: a spec's `completion` receives
+  whatever the method returned (the Unit Converter returns a dataset name;
+  `_on_unit_converter_completed` must not file it as an output file).
 - **No auto-open with several inputs**: `AppBackend._suppress_auto_open` is
   set while a multi-input run is in flight (a tool batch, a multi-dataset
   workflow run). Results are still registered in the browser, but
@@ -211,3 +226,80 @@ input and can be named after it.
   and `dataset_name` (first pick, kept for older workflows and validation).
   `WorkflowExecutor` runs the whole graph once per dataset; output names come
   from `_format_output_name`, which uses that pass's source dataset.
+
+## Tools never overwrite an input — except the Unit Converter's relabel
+
+Every tool produces a new dataset named after its input. The one exception is
+`relabelDatasets` (Unit Converter → *Relabel*): it edits units and captions
+in place because it never touches a number, and a wrong unit is a fact about
+the dataset rather than a derived result. *Set values* (a formula for x
+and/or y, `src/processing/formula.py`) creates `<name> · x=…, y=…` unless the
+user ticks *Replace the originals*. The formula engine is an AST whitelist —
+arithmetic, the listed functions and names, numeric literals — evaluated
+with NumPy; do not widen it to `eval`. Both formulas see the ORIGINAL x and
+y, so a change of axis unit cannot silently change what `y / x` means.
+
+## Sunset tools
+
+Removed from the Tools menu and palette, engines kept for their workflow
+nodes: Image Smoothing, Peak Indexing (Peak Finder node), Spatial Average
+(now a Map Generator step), Detect Bandgap & Doping and Dirac Point Estimator
+(both feature groups of Spectral Features; `dirac_features` reuses the gap
+edges the table already found rather than detecting its own). Their
+`docs/tools/` pages say where each went. Renamed, panel files unchanged:
+Curve Fitting → Curve Background Flattening (`CurveFittingTool.qml`), Curve
+Analysis → Curve Plotting (`CurveAnalysisTool.qml`, and it now plots),
+Background Subtraction → Subtract Detector Background
+(`BackgroundSubtractionTool.qml`), Spectral Axis Converter → Unit Converter
+(`UnitConverterTool.qml`, new file).
+
+## Tool catalog
+
+`src/qml/components/ToolCatalog.js` is the one list of tools: sections
+grouped by type and ordered by complexity (Prepare, Transform, View, Fit and
+features, Maps, Confinement), each tool with the tabs it is listed on. The
+Tools menu (an `Instantiator` over `ToolCatalog.menuRows()`) and the tool
+palette (`ToolPalettePanel.sections`) are both built from it — adding a tool
+is one entry there plus its file in `Main.qml`'s `toolMap`. Do not add
+hand-written `MenuItem`s for tools.
+
+## Tool windows fit their panel
+
+`EmbeddedWindow` hosts a tool panel in a `Flickable` whose loader is never
+shorter than the panel's natural height (its root Column/Grid/RowLayout's
+implicitHeight), and grows the window once on open to show it (capped to
+the viewport). A panel whose root layout holds its own `ScrollView` is left
+at its configured size — it scrolls itself. So a panel taller than 550 px
+no longer has its GroupBoxes squeezed over each other; write panels as
+`Item { ColumnLayout { anchors.fill } }` and they get this for free. Width
+is never fitted: a wrapped Label reports its unwrapped text as
+implicitWidth.
+
+## Workflow nodes
+
+Parity with the tools is tracked in `docs/WORKFLOW_INVENTORY.md`. Node
+`category` values are the Tools menu's sections (Prepare, Transform, Fit
+and features, Maps, Confinement) after Input/Output/Annotations; a node with
+`"deprecated": "<why>"` is hidden from the palette but still loads and runs.
+A node over a `BATCH_TOOLS` tool needs no parameter plumbing of its own:
+`WorkflowExecutor._stage_dataset` registers the incoming port value,
+`_run_batch_tool(key, name, params)` runs the spec's method with the spec's
+casts and defaults, `_derived(name, suffix)` fetches the ``<base> - <suffix>``
+dataset the tool registered. A `dataset` port carries a `SpectralData`,
+never a path — FFT's `fft_result` used to carry a CSV path; the `MapGenerator`
+node runs the tool's spectra engine (`generate_maps_from_spectra`) when a
+dataset is connected and the old flat-data path otherwise.
+
+## Designer outputs never overwrite
+
+`Confinement Designer` and `Line Scan Designer` tables are named with the
+search settings — `<base> - Designer Candidates (2D, cartesian, tetragonal,
+e+h, ΔE)`, `<base> - Confinement (1D, cartesian, e, ΔE)` — via
+`_search_signature`, and `_unique_dataset_name` / `_unique_path` append
+` (2)`, ` (3)` when a name or file is taken. A sweep over the symmetries used
+to write the same name each time and keep only the last run. Use the same
+two helpers for any tool whose settings change what the result *means*.
+A result table may carry text columns (`reason`, `carrier`): the project
+serializer splits them out as JSON (`text_columns`) beside the numeric
+block, so they save — they used to make the whole dataset vanish from the
+autosave with "Object arrays cannot be saved".

@@ -40,17 +40,16 @@ DraggableWindow {
         var toolMap = {
             "1D FFT": "FFT1DTool.qml",
             "Curve Smoothing": "CurveSmoothingTool.qml",
-            "Image Smoothing": "ImageSmoothingTool.qml",
             "Derivative Calculator": "DerivativeTool.qml",
             "Gradient Filter": "GradientTool.qml",
-            "Curve Fitting": "CurveFittingTool.qml",
+            "Curve Background Flattening": "CurveFittingTool.qml",
             "Integration Utility": "IntegrationTool.qml",
             "Map Generator": "MapGeneratorTool.qml",
-            "Spatial Average": "SpatialAverageTool.qml",
             "Map Discretizer": "MapDiscretizerTool.qml",
             "Map Processing": "MapProcessingTool.qml",
-            "Curve Analysis": "CurveAnalysisTool.qml",
-            "Truncate Data": "TruncateTool.qml"
+            "Curve Plotting": "CurveAnalysisTool.qml",
+            "Truncate Data": "TruncateTool.qml",
+            "Unit Converter": "UnitConverterTool.qml"
         }
 
         return toolMap[name] || null

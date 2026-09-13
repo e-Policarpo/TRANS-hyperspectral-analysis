@@ -631,3 +631,149 @@ class TestShutdownDoesNotKillWorkInFlight:
         release.set()
         manager.io_worker.wait(3000)
         manager.shutdown()
+
+
+class TestCancellingOneWorkerOrTheOther:
+    """Cancel means "stop the computation", never "abandon the write".
+
+    Everything on the compute worker is reproducible -- cancel a derivative
+    and you run it again -- while the I/O worker may be halfway through a
+    .hrt, and a save that stops in the middle leaves the user with a
+    truncated project instead of the one they had. So the plain
+    ``cancel_current()`` deliberately walks past a running save, and a caller
+    that knows the write is safe to abandon has to say so.
+    """
+
+    def _park(self):
+        """An operation that stops at a known point and waits to be let go.
+
+        ``cancelled`` is what the task's own flag said at the moment it was
+        released -- the operation's view of the cancel, which is what a
+        long-running tool body actually polls.
+        """
+        state = {'entered': threading.Event(), 'release': threading.Event(),
+                 'done': threading.Event(), 'cancelled': None}
+
+        def operation(task):
+            state['entered'].set()
+            state['release'].wait(5)
+            state['cancelled'] = bool(task.cancelled)
+            state['done'].set()
+
+        state['operation'] = operation
+        return state
+
+    @staticmethod
+    def _let_go(*parked):
+        """Release the parked operations and wait for them to return.
+
+        Not ``QThread.wait()``: a persistent worker never terminates between
+        tasks, so waiting on the thread only burns the timeout.
+        """
+        for state in parked:
+            state['release'].set()
+        for state in parked:
+            assert state['done'].wait(5), "the parked operation never returned"
+
+    def test_nothing_running_is_nothing_to_cancel(self):
+        manager = WorkerManager()
+        try:
+            assert manager.cancel_current() is False
+            assert manager.cancel_current_io() is False
+        finally:
+            manager.shutdown()
+
+    def test_cancel_current_names_the_task_it_stopped(self):
+        manager = WorkerManager()
+        names = []
+        manager.worker_cancelled.connect(names.append)
+        parked = self._park()
+        try:
+            manager.submit("Derivative: ds1", parked['operation'])
+            assert parked['entered'].wait(5)
+
+            assert manager.cancel_current() is True
+            assert names == ["Derivative: ds1"]
+        finally:
+            parked['release'].set()
+            manager.shutdown()
+
+    def test_a_cancelled_name_stops_counting_as_pending(self):
+        """Otherwise the duplicate-submission guard swallows every later run.
+
+        A cancelled task emits neither completion nor failure, so the entry
+        that ``submit`` reads as "already in flight" has to be dropped here
+        or nothing will ever drop it.
+        """
+        manager = WorkerManager()
+        parked = self._park()
+        try:
+            manager.submit("Derivative: ds1", parked['operation'])
+            assert parked['entered'].wait(5)
+            assert "Derivative: ds1" in manager._task_callbacks
+
+            manager.cancel_current()
+
+            assert "Derivative: ds1" not in manager._task_callbacks
+            assert manager.submit("Derivative: ds1", lambda task: None) is True
+        finally:
+            parked['release'].set()
+            manager.shutdown()
+
+    def test_cancel_current_walks_past_a_running_save(self):
+        manager = WorkerManager()
+        compute, save = self._park(), self._park()
+        try:
+            manager.submit("Derivative: ds1", compute['operation'])
+            manager.submit_io("Save Project", save['operation'])
+            assert compute['entered'].wait(5)
+            assert save['entered'].wait(5)
+
+            assert manager.cancel_current() is True
+
+            self._let_go(compute, save)
+            assert compute['cancelled'] is True
+            assert save['cancelled'] is False
+        finally:
+            compute['release'].set()
+            save['release'].set()
+            manager.shutdown()
+
+    def test_include_io_abandons_the_save_as_well(self):
+        """For the caller that knows the process is going away regardless."""
+        manager = WorkerManager()
+        names = []
+        manager.worker_cancelled.connect(names.append)
+        compute, save = self._park(), self._park()
+        try:
+            manager.submit("Derivative: ds1", compute['operation'])
+            manager.submit_io("Save Project", save['operation'])
+            assert compute['entered'].wait(5)
+            assert save['entered'].wait(5)
+
+            assert manager.cancel_current(include_io=True) is True
+
+            assert sorted(names) == ["Derivative: ds1", "Save Project"]
+        finally:
+            compute['release'].set()
+            save['release'].set()
+            manager.shutdown()
+
+    def test_cancel_current_io_stops_only_the_save(self):
+        manager = WorkerManager()
+        compute, save = self._park(), self._park()
+        try:
+            manager.submit("Derivative: ds1", compute['operation'])
+            manager.submit_io("Save Project", save['operation'])
+            assert compute['entered'].wait(5)
+            assert save['entered'].wait(5)
+
+            assert manager.cancel_current_io() is True
+
+            self._let_go(compute, save)
+            assert save['cancelled'] is True
+            assert compute['cancelled'] is False
+        finally:
+            compute['release'].set()
+            save['release'].set()
+            manager.shutdown()

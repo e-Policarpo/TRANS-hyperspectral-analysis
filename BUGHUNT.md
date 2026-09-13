@@ -518,3 +518,48 @@ estiver no `Unified-UI` (e cole o hash do commit ao lado).
   *Fix: `importFromFolder` — se a pasta escolhida não tem dados próprios
   mas as subpastas têm, cada subpasta com dados vira um import na fila
   (`_folder_has_data`). Escolher "STM UHV" enfileira as 10 pastas de dia.*
+
+## Confinement Designer / modelos de dot — reportado 2026-09-13
+
+- [x] **"0D lens/disc" e "3D cylindrical" são a MESMA fórmula com bases
+  diferentes.** `dot_energies(DOT_DISC)` e `cylinder_energies` calculam
+  E = (ħ²/2m)[x_mn²/R² + (πn_z)²/L_z²]; só diferiam em quantos estados
+  geravam antes de ordenar e cortar em `n_levels`. O disco cortava o eixo z em
+  `ceil(n_levels/8)` = **3 estados** (o designer pede 20), o cilindro em 10
+  fixos. Numa estrutura alta (L_z ≳ R) o espectro baixo É a escada axial, e
+  o disco não conseguia produzi-la — o fit explicava esses picos com estados
+  no plano, empurrando R para outra faixa. Explica (em parte) os dois lobos
+  desconectados nos gráficos d1×d2 do lens e o cilindro "preenchendo o meio":
+  não era física, era o tamanho da base. Verificado: em R=3, L_z=20 os 20
+  níveis mais baixos precisam de n_z até 10; em R=2, L_z=27, até 14.
+  *Fix: `_disc_levels` em `quantum_dot.py` e `cylinder_energies` em
+  `analytical.py` crescem a base até provar que contêm os `n_levels` mais
+  baixos (energia é monotônica em cada número quântico, então o estado mais
+  barato logo além de cada corte limita tudo além dele). Testes em
+  `test_quantum_dot.py::TestTheDiscBasisFollowsTheShape` comparam com força
+  bruta e exigem disco ≡ cilindro. Não commitado ainda.*
+- [x] **Cancel deixava o painel morto.** Tarefa cancelada não emitia nem
+  `task_completed` nem `task_failed`, então nenhum `on*Completed` disparava e
+  `running` ficava `true` para sempre; fechar a janela não parava o worker.
+  *Fix: sinal `operationCancelled(str)` + slot `cancelOperation(name)`; os
+  slots de run devolvem o nome da task; 15/17 painéis limpam estado no
+  cancel e cancelam a própria run no `Component.onDestruction`.
+  `IntegrationTool` e `MapProcessingTool` são síncronos e ficaram de fora.
+  Cancel agora é checado antes de cada passe de `differential_evolution`.
+  Não commitado ainda.*
+- [x] **Extração `.gwy` no import falhava em silêncio.** Todos os `return
+  None` de `_save_image_to_gwy` eram mudos: uma run que escreveu 15 arquivos
+  e uma que escreveu zero logavam as mesmas duas linhas. Confirmado: zero
+  `.gwy` em todos os projetos apesar de "Write images #N" completar.
+  *Fix: cada recusa loga o motivo; sucesso loga caminho e nº de canais; o job
+  de import também escreve um TIFF calibrado por canal
+  (`_save_image_channels_to_tiff`). Docstrings que diziam ".gsf é o export
+  primário" corrigidas — o import escreve .gwy. Não commitado ainda.*
+- [ ] **Drag-and-drop no canvas hiperespectral chama `mapBackend.loadMap`,
+  que não existe** (`MapEditorWorkstation.qml:777`). Só há `loadMapById` e
+  `loadMapFromFile`. Soltar um mapa não faz nada, sem erro visível.
+- [ ] **`MapViewerPanel.qml` (822 linhas) é código morto** — nunca
+  instanciado. Tem o header com nome do mapa que o workstation não tinha.
+- [ ] **`MapGeneratorTool.generateMaps()` seta `running = true` e nada limpa
+  no sucesso** (sem `onToolCompleted`). Reportado pelo agente de cancel,
+  não corrigido.

@@ -10,29 +10,27 @@ For the wider picture — data model, formats, heuristics, architecture — see
 
 ## Tools
 
-Single operations. Several accept a multi-dataset selection and process the
-datasets one after another; those are marked **batch**.
+Single operations. Every one takes a multi-dataset selection (Ctrl/Cmd-click,
+Shift-click, or a drag from the project browser) and processes the datasets
+one after another.
 
 | tool | does | page |
 |---|---|---|
-| 1D FFT | frequency content of each spectrum | [fft-1d](fft-1d.md) |
-| Average Curves | one mean curve from a dataset | [average-curves](average-curves.md) |
-| Background Subtraction | subtract one dataset from others | [background-subtraction](background-subtraction.md) |
+| 1D FFT | magnitude and phase of every spectrum | [fft-1d](fft-1d.md) |
+| Average Curves | one mean curve per dataset | [average-curves](average-curves.md) |
 | Cosmic Ray Filter | remove single-sample spikes | [cosmic-ray-filter](cosmic-ray-filter.md) |
-| Curve Analysis | inspect curves; a viewer, writes nothing | [curve-analysis](curve-analysis.md) |
-| Curve Fitting | polynomial fit + coefficients | [curve-fitting](curve-fitting.md) |
+| Curve Background Flattening | fit a background and subtract it | [curve-background-flattening](curve-background-flattening.md) |
+| Curve Plotting | overlay curves from several datasets; a viewer, writes nothing | [curve-plotting](curve-plotting.md) |
 | Curve Smoothing | Savitzky–Golay, Gaussian, moving average | [curve-smoothing](curve-smoothing.md) |
-| Derivative Calculator | dI/dV and d²I/dV² — **batch** | [derivative-calculator](derivative-calculator.md) |
-| Filter Bad Data | separate usable spectra from junk — **batch** | [filter-bad-data](filter-bad-data.md) |
-| Gradient Filter | edge filters on an image | [gradient-filter](gradient-filter.md) |
-| Image Smoothing | smooth an image channel | [image-smoothing](image-smoothing.md) |
+| Derivative Calculator | dI/dV and d²I/dV² | [derivative-calculator](derivative-calculator.md) |
+| Filter Bad Data | separate usable spectra from junk | [filter-bad-data](filter-bad-data.md) |
+| Gradient Filter | gradient magnitude of a browser map or image, calibrated | [gradient-filter](gradient-filter.md) |
 | Integration Utility | area under curves over bias intervals | [integration-utility](integration-utility.md) |
 | Map Discretizer | reduce a map's spatial resolution | [map-discretizer](map-discretizer.md) |
 | Map Processing | operations on map channels | [map-processing](map-processing.md) |
-| Peak Indexing | find and index peaks | [peak-indexing](peak-indexing.md) |
-| Spatial Average | average neighbouring positions | [spatial-average](spatial-average.md) |
-| Spectral Axis Converter | nm ↔ eV ↔ cm⁻¹ | [spectral-axis-converter](spectral-axis-converter.md) |
+| Subtract Detector Background | subtract a measured reference from others | [subtract-detector-background](subtract-detector-background.md) |
 | Truncate Data | cut the sweep to a bias window | [truncate-data](truncate-data.md) |
+| Unit Converter | relabel in place, nm ↔ eV ↔ cm⁻¹, set x / y by formula with a preview | [unit-converter](unit-converter.md) |
 
 ## Composite tools
 
@@ -41,16 +39,28 @@ A whole analysis in one run.
 | tool | does | page |
 |---|---|---|
 | Confinement Analysis | peaks + background in one pass; occupancy table | [confinement-analysis](confinement-analysis.md) |
-| Confinement Designer | find the geometry matching measured levels | [confinement-designer](confinement-designer.md) |
-| Confinement Dimensionality | 0D/1D/2D from level ratios — **batch** | [confinement-dimensionality](confinement-dimensionality.md) |
-| Detect Bandgap & Doping | gap size and N/P/neutral per spectrum | [detect-bandgap-doping](detect-bandgap-doping.md) |
-| Dirac Point Estimator | Dirac point from slope intersections | [dirac-point-estimator](dirac-point-estimator.md) |
-| Line Scan Designer | one confinement search per position — **batch** | [line-scan-designer](line-scan-designer.md) |
-| Map Generator | background + intervals + maps in one pass — **batch** | [map-generator](map-generator.md) |
-| Multi-Peak Fitting | Gaussian / Lorentzian / pseudo-Voigt | [multi-peak-fitting](multi-peak-fitting.md) |
+| Confinement Designer | find the geometry matching one spectrum's levels | [confinement-designer](confinement-designer.md) |
+| Confinement Dimensionality | 0D/1D/2D from level ratios | [confinement-dimensionality](confinement-dimensionality.md) |
+| Line Scan Designer | the Designer at every position of a line | [line-scan-designer](line-scan-designer.md) |
+| Map Generator | spatial averaging + background + intervals + maps in one pass; integrals as dataset and CSV | [map-generator](map-generator.md) |
+| Multi-Peak Fitting | Gaussian / Lorentzian / pseudo-Voigt on every spectrum; peak table + fitted curves | [multi-peak-fitting](multi-peak-fitting.md) |
 | Quantum Dot Solver | solve a 0D dot | [quantum-dot-solver](quantum-dot-solver.md) |
 | Quantum Well Solver | solve a 1D well | [quantum-well-solver](quantum-well-solver.md) |
-| Spectral Features | per-spectrum feature table | [spectral-features](spectral-features.md) |
+| Spectral Features | per-spectrum table: gap, doping, metallicity, states, Dirac point | [spectral-features](spectral-features.md) |
+
+## Sunset
+
+Removed from the Tools menu in the tool rework; each page says where the
+function went. The engines live on as workflow nodes.
+
+| tool | went to | page |
+|---|---|---|
+| Detect Bandgap & Doping | Spectral Features (gap and doping groups) | [detect-bandgap-doping](detect-bandgap-doping.md) |
+| Dirac Point Estimator | Spectral Features (Dirac point group) | [dirac-point-estimator](dirac-point-estimator.md) |
+| Image Smoothing | Map Processing; workflow node | [image-smoothing](image-smoothing.md) |
+| Peak Indexing | Spectral Features, Multi-Peak Fitting, Confinement Analysis; Peak Finder node | [peak-indexing](peak-indexing.md) |
+| Spatial Average | Map Generator (spatial averaging step) | [spatial-average](spatial-average.md) |
+| Spectral Axis Converter | Unit Converter (convert axis) | [unit-converter](unit-converter.md) |
 
 ## Reading a page
 

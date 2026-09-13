@@ -954,12 +954,31 @@ class TestConfinementAnalysis(TestToolImplementationsSetup):
     def test_flat_outputs_are_mappable(self, tool_impl, sts_dataset):
         result = self._run(tool_impl, sts_dataset)
 
+        from src.backend.tool_implementations import ToolImplementations
+
         counts = result['peak_count']
         assert counts.metadata.data_type == 'flat'
-        assert list(counts.data.columns) == ['Spectrum_Index', 'Peak_Count']
+        assert tuple(counts.data.columns) == ToolImplementations.PEAK_COUNT_COLUMNS
         assert counts.data['Peak_Count'].tolist() == [
             int(result['peaks'].data['spectrum_index'].eq(i).sum()) for i in range(3)
         ]
+
+    def test_the_states_are_counted_on_each_side_of_zero_bias(
+            self, tool_impl, sts_dataset):
+        """The two sides account for every peak, and the in-gap columns are a
+        subset of them — the same quantities Spectral Features reports."""
+        result = self._run(tool_impl, sts_dataset)
+        counts = result['peak_count'].data
+        peaks = result['peaks'].data
+
+        assert (counts['nstates_negative']
+                + counts['nstates_positive']).tolist() == counts['Peak_Count'].tolist()
+        assert (counts['nstates_negative_in_gap'] <= counts['nstates_negative']).all()
+        assert (counts['nstates_positive_in_gap'] <= counts['nstates_positive']).all()
+        for i in range(3):
+            mine = peaks[peaks['spectrum_index'] == i]
+            assert int(counts['nstates_negative'].iloc[i]) == int(
+                (mine['position_value'] < 0).sum())
 
         coeffs = result['coefficients']
         assert coeffs.metadata.data_type == 'flat'

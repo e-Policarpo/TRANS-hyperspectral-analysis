@@ -2,7 +2,7 @@
 
 Reduces a map's spatial resolution by averaging blocks of pixels.
 
-**Menu** Tools → Map Discretizer · **Panel** `MapDiscretizerTool.qml` ·
+**Menu** Tools → Maps → Map Discretizer · **Panel** `MapDiscretizerTool.qml` ·
 **Method** `discretize_map()`
 
 ## Input

@@ -2,7 +2,7 @@
 
 Removes single-sample spikes — cosmic rays on a CCD, or an electrical glitch.
 
-**Menu** Tools → Cosmic Ray Filter · **Panel** `CosmicRayFilterTool.qml` ·
+**Menu** Tools → Prepare → Cosmic Ray Filter · **Panel** `CosmicRayFilterTool.qml` ·
 **Method** `remove_cosmic_rays()`, `src/processing/cosmic_ray.py`
 
 ## Input

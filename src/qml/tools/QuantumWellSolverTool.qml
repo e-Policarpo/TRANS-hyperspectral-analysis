@@ -332,13 +332,13 @@ Item {
                 RowLayout {
                     Layout.fillWidth: true
 
-                    Button {
+                    ToolButton {
                         text: "Solve"
-                        highlighted: true
+                        primary: true
                         onClicked: root.solve()
                     }
                     Item { Layout.fillWidth: true }
-                    Button {
+                    ToolButton {
                         text: "Close"
                         onClicked: {
                             if (root.closeWindow) { root.closeWindow() }

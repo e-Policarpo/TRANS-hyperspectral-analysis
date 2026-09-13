@@ -3,10 +3,13 @@
 Smooths every spectrum in a dataset. Mostly used before differentiation,
 which amplifies noise badly enough that a raw dI/dV is often unusable.
 
-**Menu** Tools → Curve Smoothing · **Panel** `CurveSmoothingTool.qml` ·
-**Method** `smooth_curves()` in `tool_implementations.py`
+**Menu** Tools → Prepare → Curve Smoothing · **Panel** `CurveSmoothingTool.qml` ·
+**Method** `smooth_curves()` in `tool_implementations.py` · **Batch key** `smooth_curves`
 
 ## Input
+
+A multi-dataset selection: the same settings are applied to each dataset in
+turn, each producing its own output.
 
 Any spectral dataset. Every column is smoothed independently against the
 shared axis.

@@ -12,20 +12,34 @@ import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
 import "../components"
 
-// Voltage/Range Truncation Tool
+// Truncate Data Tool
 Item {
-    id: truncateTool
+    id: root
     property var closeWindow: null
 
-    // Theme colors - reactive bindings to parent DraggableWindow
+    // The task name the backend hands back when this panel submits a run.
+    // Closing the window cancels that run BY NAME: there is one worker thread,
+    // so the task in flight when a panel closes is very often somebody else's,
+    // and a blind cancelCurrentOperation() would kill it.
+    property string runningTaskName: ""
+
+    property bool datasetDropActive: false
+
+    function acceptDatasetDrop(names) {
+        root.refreshDatasets()
+        datasetList.addToSelection(names)
+        datasetDropActive = false
+    }
+
+    // Theme colors - reactive bindings to the hosting window
     property var parentWindow: Window.window
     property color bgDark: (parentWindow && parentWindow.bgDark !== undefined) ? parentWindow.bgDark : Theme.bgDark
     property color bgMedium: (parentWindow && parentWindow.bgMedium !== undefined) ? parentWindow.bgMedium : Theme.bgMedium
     property color bgLight: (parentWindow && parentWindow.bgLight !== undefined) ? parentWindow.bgLight : Theme.bgLight
     property color accentPink: (parentWindow && parentWindow.accentPink !== undefined) ? parentWindow.accentPink : Theme.accentPink
     property color accentBlue: (parentWindow && parentWindow.accentBlue !== undefined) ? parentWindow.accentBlue : Theme.accentBlue
-    property color accentMagenta: (parentWindow && parentWindow.accentMagenta !== undefined) ? parentWindow.accentMagenta : Theme.accentMagenta
     property color accentPurple: (parentWindow && parentWindow.accentPurple !== undefined) ? parentWindow.accentPurple : Theme.accentPurple
+    property color accentMagenta: (parentWindow && parentWindow.accentMagenta !== undefined) ? parentWindow.accentMagenta : Theme.accentMagenta
     property color textLight: (parentWindow && parentWindow.textLight !== undefined) ? parentWindow.textLight : Theme.textLight
     property color textMuted: (parentWindow && parentWindow.textMuted !== undefined) ? parentWindow.textMuted : Theme.textMuted
     property color successColor: (parentWindow && parentWindow.successColor !== undefined) ? parentWindow.successColor : Theme.successColor
@@ -42,7 +56,8 @@ Item {
         }
 
         Label {
-            text: "Truncate spectral data to a specific range of the independent variable (e.g., voltage, wavenumber)."
+            text: "Keep only the part of each spectrum inside a range of the independent " +
+                  "variable (bias, wavelength, wavenumber…)."
             wrapMode: Text.Wrap
             Layout.fillWidth: true
             color: accentPurple
@@ -51,26 +66,88 @@ Item {
         GroupBox {
             title: "Dataset Selection"
             Layout.fillWidth: true
+            Layout.fillHeight: true
 
             ColumnLayout {
                 anchors.fill: parent
-                spacing: 8
+                spacing: 4
 
-                DatasetComboBox {
-                    id: datasetCombo
+                DatasetMultiSelect {
+                    id: datasetList
                     Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    Layout.minimumHeight: 130
                     model: backend.getDatasetList()
-                    onCurrentIndexChanged: updateDatasetInfo()
+
+                    bgColor: bgLight
+                    borderColorNormal: root.datasetDropActive ? accentBlue : accentPurple
+                    borderColorFocus: accentPink
+                    textColor: textLight
+                    textMutedColor: textMuted
+                    selectionColor: accentPink
+                    onSelectionChanged: {
+                        statusLabel.text = ""
+                        rangeLabel.text = root.currentRangeText()
+                    }
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+
+                    Label {
+                        Layout.fillWidth: true
+                        Layout.preferredWidth: 0
+                        text: root.datasetDropActive
+                              ? "Drop to add to the selection"
+                              : "…or drag datasets here from the project browser"
+                        font.pixelSize: 10
+                        color: root.datasetDropActive ? accentBlue : textMuted
+                        elide: Text.ElideRight
+                    }
+
+                    ToolButton {
+                        text: "Refresh list"
+                        flat: true
+                        font.pixelSize: 10
+                        onClicked: root.refreshDatasets()
+                    }
                 }
 
                 Label {
-                    id: datasetInfo
-                    text: getDatasetInfoText()
+                    id: rangeLabel
+                    Layout.fillWidth: true
+                    text: root.currentRangeText()
                     font.pixelSize: 10
                     color: textMuted
                     wrapMode: Text.Wrap
-                    Layout.fillWidth: true
                 }
+            }
+        }
+
+        Connections {
+            target: backend
+            function onDataLoaded(name) { root.refreshDatasets() }
+            function onToolCompleted(toolName, outputPath) {
+                if (toolName === "Truncate Data") {
+                    root.runningTaskName = ""
+                    statusLabel.text = "✓ Truncated: " + outputPath
+                    statusLabel.color = successColor
+                }
+            }
+            function onErrorOccurred(title, message) {
+                if (title.indexOf("Truncat") >= 0) {
+                    root.runningTaskName = ""
+                    statusLabel.text = "✗ Error: " + message
+                    statusLabel.color = accentMagenta
+                }
+            }
+            // A cancelled task reaches neither of the two handlers above, so
+            // without this the panel goes on saying "Truncating data...".
+            function onOperationCancelled(name) {
+                if (name !== root.runningTaskName) return
+                root.runningTaskName = ""
+                statusLabel.text = "Cancelled"
+                statusLabel.color = textMuted
             }
         }
 
@@ -88,109 +165,93 @@ Item {
                     text: "Minimum Value:"
                     Layout.alignment: Qt.AlignRight
                 }
-
                 TextField {
                     // A bare TextField takes the style's own palette, which under the
                     // Basic style is a light one — white ground, black text — regardless
                     // of what the window around it is painted. Say it explicitly.
-                    color: truncateTool.textLight
-                    placeholderTextColor: truncateTool.textMuted
+                    id: minValueField
+                    Layout.fillWidth: true
+                    color: root.textLight
+                    placeholderTextColor: root.textMuted
                     background: Rectangle {
-                        color: truncateTool.bgDark
-                        border.color: truncateTool.bgLight
+                        color: root.bgDark
+                        border.color: root.bgLight
                         border.width: 1
                         radius: 4
                     }
-                    id: minValueField
-                    Layout.fillWidth: true
                     placeholderText: "e.g., -2.0"
-                    validator: DoubleValidator {
-                        notation: DoubleValidator.StandardNotation
-                    }
-                    onTextChanged: validateRange()
+                    validator: DoubleValidator { notation: DoubleValidator.StandardNotation }
                 }
 
                 Label {
                     text: "Maximum Value:"
                     Layout.alignment: Qt.AlignRight
                 }
-
                 TextField {
                     id: maxValueField
                     Layout.fillWidth: true
-                    placeholderText: "e.g., 2.0"
-                    validator: DoubleValidator {
-                        notation: DoubleValidator.StandardNotation
+                    color: root.textLight
+                    placeholderTextColor: root.textMuted
+                    background: Rectangle {
+                        color: root.bgDark
+                        border.color: root.bgLight
+                        border.width: 1
+                        radius: 4
                     }
-                    onTextChanged: validateRange()
+                    placeholderText: "e.g., 2.0"
+                    validator: DoubleValidator { notation: DoubleValidator.StandardNotation }
                 }
 
                 Label {
-                    id: rangeValidationLabel
                     Layout.columnSpan: 2
                     font.pixelSize: 10
-                    color: isRangeValid() ? successColor : accentMagenta
-                    text: getRangeValidationText()
+                    color: root.isRangeValid() ? successColor : accentMagenta
+                    text: root.rangeValidationText()
                     visible: minValueField.text !== "" && maxValueField.text !== ""
                 }
-            }
-        }
-
-        GroupBox {
-            title: "Current Data Range"
-            Layout.fillWidth: true
-            visible: datasetCombo.currentIndex >= 0
-
-            ColumnLayout {
-                anchors.fill: parent
-                spacing: 5
 
                 Label {
-                    id: currentRangeLabel
-                    text: getCurrentRangeText()
-                    font.pixelSize: 11
-                    color: textMuted
-                }
-
-                Label {
-                    text: "Preview: This will select data points within the specified range"
+                    Layout.columnSpan: 2
+                    Layout.fillWidth: true
+                    text: "The same range is applied to every selected dataset, each " +
+                          "producing its own '- Truncated' output."
                     font.pixelSize: 10
                     font.italic: true
                     color: textMuted
+                    wrapMode: Text.Wrap
                 }
             }
         }
 
-        Item { Layout.fillHeight: true }
-
-        // Action buttons
         RowLayout {
             Layout.fillWidth: true
             spacing: 10
 
-            Button {
-                text: "Truncate"
-                enabled: datasetCombo.currentIndex >= 0 && isRangeValid() && !backend.isBusy
-                highlighted: true
+            ToolButton {
+                text: datasetList.selectedDatasets.length > 1
+                      ? "Truncate (" + datasetList.selectedDatasets.length + ")"
+                      : "Truncate"
+                enabled: datasetList.selectedDatasets.length > 0 && root.isRangeValid() && !backend.isBusy
+                primary: true
                 onClicked: performTruncation()
             }
 
-            Button {
+            ToolButton {
                 text: "Cancel Operation"
                 onClicked: backend.cancelCurrentOperation()
             }
 
-            Button {
+            ToolButton {
                 text: "Reset"
                 onClicked: resetFields()
             }
 
             Item { Layout.fillWidth: true }
 
-            Button {
+            ToolButton {
                 text: "Close"
                 onClicked: {
-                    if (truncateTool.closeWindow) { truncateTool.closeWindow() } else { var window = truncateTool.Window.window; if (window) window.close() }
+                    if (root.closeWindow) { root.closeWindow() } else { var win = Window.window; if (win) win.close() }
                 }
             }
         }
@@ -206,81 +267,42 @@ Item {
         }
     }
 
-    // Backend connections
-    Connections {
-        target: backend
-
-        function onToolCompleted(toolName, outputPath) {
-            if (toolName === "Truncate Data") {
-                statusLabel.text = "✓ Data truncated successfully: " + outputPath
-                statusLabel.color = successColor
-            }
-        }
-
-        function onErrorOccurred(title, message) {
-            if (title.includes("Truncate")) {
-                statusLabel.text = "✗ Error: " + message
-                statusLabel.color = accentMagenta
-            }
-        }
+    function refreshDatasets() {
+        datasetList.model = backend.getDatasetList()
+        datasetList.pruneSelection()
+        rangeLabel.text = currentRangeText()
     }
 
-    // Helper functions
-    function getDatasetInfoText() {
-        if (datasetCombo.currentIndex < 0 || !datasetCombo.currentText) {
-            return "No dataset selected"
+    // The extent of the selection: one dataset's range, or the envelope of
+    // several so the user sees what a single range will cut from each.
+    function currentRangeText() {
+        var picks = datasetList.selectedDatasets
+        if (picks.length === 0) return "Select a dataset to see its range"
+        var lo = Infinity, hi = -Infinity, unit = "", variable = ""
+        for (var i = 0; i < picks.length; i++) {
+            var info = backend.getDatasetInfo(picks[i])
+            if (!info || info.x_min === undefined) continue
+            lo = Math.min(lo, info.x_min)
+            hi = Math.max(hi, info.x_max)
+            unit = info.x_unit || unit
+            variable = info.independent_var || variable
         }
-
-        var info = backend.getDatasetInfo(datasetCombo.currentText)
-        if (!info || !info.type) {
-            return "No dataset selected"
-        }
-        return "Type: " + info.type + " | Spectra: " + info.num_spectra +
-               " | Points: " + info.num_points + " | Variable: " + info.independent_var
-    }
-
-    function getCurrentRangeText() {
-        if (datasetCombo.currentIndex < 0) {
-            return "Select a dataset to see its range"
-        }
-
-        // Note: This would ideally query the actual data range from backend
-        // For now, show placeholder
-        return "Current range will be displayed here (requires backend method)"
+        if (!isFinite(lo)) return "No axis range available"
+        var span = variable + ": " + lo.toPrecision(5) + " … " + hi.toPrecision(5) + (unit ? " " + unit : "")
+        return picks.length > 1 ? picks.length + " datasets — combined range " + span : "Current range — " + span
     }
 
     function isRangeValid() {
-        if (minValueField.text === "" || maxValueField.text === "") {
-            return false
-        }
-
+        if (minValueField.text === "" || maxValueField.text === "") return false
         var minVal = parseFloat(minValueField.text)
         var maxVal = parseFloat(maxValueField.text)
-
         return !isNaN(minVal) && !isNaN(maxVal) && minVal < maxVal
     }
 
-    function getRangeValidationText() {
-        if (!isRangeValid()) {
-            return "⚠ Invalid range: maximum must be greater than minimum"
-        }
-
-        var minVal = parseFloat(minValueField.text)
-        var maxVal = parseFloat(maxValueField.text)
-        var range = maxVal - minVal
-
+    function rangeValidationText() {
+        if (!isRangeValid()) return "⚠ Invalid range: maximum must be greater than minimum"
+        var range = parseFloat(maxValueField.text) - parseFloat(minValueField.text)
         return "✓ Valid range: " + range.toFixed(3) + " units"
-    }
-
-    function validateRange() {
-        // Trigger validation label update
-        rangeValidationLabel.text = getRangeValidationText()
-    }
-
-    function updateDatasetInfo() {
-        datasetInfo.text = getDatasetInfoText()
-        currentRangeLabel.text = getCurrentRangeText()
-        statusLabel.text = ""
     }
 
     function resetFields() {
@@ -290,21 +312,24 @@ Item {
     }
 
     function performTruncation() {
-        if (!isRangeValid()) {
-            console.error("Invalid range for truncation")
-            return
-        }
-
-        var datasetName = datasetCombo.currentText
+        if (!isRangeValid()) return
+        var datasets = datasetList.selectedDatasets
+        if (datasets.length === 0) return
         var minVal = parseFloat(minValueField.text)
         var maxVal = parseFloat(maxValueField.text)
-
-        console.log("Truncating dataset:", datasetName, "to range [", minVal, ",", maxVal, "]")
-
+        console.log("Truncating:", datasets.join(", "), "to [", minVal, ",", maxVal, "]")
         statusLabel.text = "Truncating data..."
         statusLabel.color = accentBlue
+        root.runningTaskName = backend.runToolOnDatasets("truncate", datasets, {
+            "min_val": minVal,
+            "max_val": maxVal
+        })
+    }
 
-        // Call backend truncation method
-        backend.truncateData(datasetName, minVal, maxVal)
+    Component.onDestruction: {
+        // A panel that is gone cannot show a result, so its run is abandoned
+        // work — stop it. cancelOperation only fires when the named task is
+        // the one running, so a stale name here is a no-op.
+        if (root.runningTaskName) backend.cancelOperation(root.runningTaskName)
     }
 }

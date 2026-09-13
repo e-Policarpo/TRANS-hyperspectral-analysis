@@ -130,6 +130,91 @@ BATCH_TOOLS: Dict[str, BatchToolSpec] = {
                   'outlier_group_by': 'point',
                   'outlier_intervals': 8, 'outlier_z': 3.5},
     ),
+    'average_curves': BatchToolSpec(
+        label="Average Curves",
+        method="average_curves",
+        takes_task=True,
+    ),
+    'smooth_curves': BatchToolSpec(
+        label="Curve Smoothing",
+        method="smooth_curves",
+        takes_task=True,
+        params={'window_size': _as_int, 'poly_order': _as_int,
+                'smoothing_type': str},
+        defaults={'window_size': 11, 'poly_order': 3,
+                  'smoothing_type': 'savgol'},
+    ),
+    'fft_1d': BatchToolSpec(
+        label="1D FFT",
+        method="_do_fft1D",
+        takes_task=True,
+        params={'window': str, 'detrend': _as_bool, 'one_sided': _as_bool,
+                'power_spectrum': _as_bool},
+        defaults={'window': 'none', 'detrend': True, 'one_sided': True,
+                  'power_spectrum': False},
+    ),
+    'truncate': BatchToolSpec(
+        label="Truncate Data",
+        method="_do_truncate_data",
+        takes_task=True,
+        params={'min_val': float, 'max_val': float},
+    ),
+    'curve_background_flattening': BatchToolSpec(
+        # Was "Curve Fitting": the tool fits a baseline and subtracts it, so
+        # the name now says what comes out rather than how it is done.
+        label="Curve Background Flattening",
+        method="fit_curves",
+        takes_task=True,
+        params={'fit_type': str, 'degree': _as_int, 'basis': str},
+        defaults={'fit_type': 'polynomial', 'degree': 2, 'basis': 'power'},
+    ),
+    'gradient_filter': BatchToolSpec(
+        # The "dataset" here is a browser ref — ``map:<id>``, ``image:<id>``
+        # or a bare file path — resolved by the tool itself.
+        label="Gradient Filter",
+        method="apply_gradient_filter",
+        takes_task=True,
+        params={'method': str},
+        defaults={'method': 'sobel'},
+        completion="_on_gradient_completed",
+    ),
+    'multi_peak_fit': BatchToolSpec(
+        label="Multi-Peak Fitting",
+        method="fit_multipeak_dataset",
+        takes_task=True,
+        params={'peak_shape': str, 'n_peaks_auto': _as_int,
+                'baseline_degree': _as_int, 'positive_only': _as_bool},
+        defaults={'peak_shape': 'gaussian', 'n_peaks_auto': 0,
+                  'baseline_degree': 1, 'positive_only': True},
+    ),
+    'axis_convert': BatchToolSpec(
+        label="Unit Converter",
+        method="convert_axis_dataset",
+        takes_task=True,
+        params={'target_unit': str, 'excitation_nm': float},
+        defaults={'target_unit': 'eV', 'excitation_nm': 0.0},
+        completion="_on_unit_converter_completed",
+    ),
+    'unit_formula': BatchToolSpec(
+        label="Unit Converter",
+        method="apply_formula_dataset",
+        takes_task=True,
+        params={'x_formula': str, 'y_formula': str, 'x_unit': str, 'y_unit': str,
+                'x_name': str, 'y_name': str, 'replace': _as_bool},
+        defaults={'x_formula': '', 'y_formula': '', 'x_unit': '', 'y_unit': '',
+                  'x_name': '', 'y_name': '', 'replace': False},
+        completion="_on_unit_converter_completed",
+    ),
+    'confinement_designer': BatchToolSpec(
+        label="Confinement Designer",
+        method="design_confinement",
+        takes_task=True,
+        # The designer's knobs are a map — geometry, symmetry, masses, edges,
+        # matching — coerced against DESIGNER_DEFAULTS by the tool itself.
+        params_as_dict=True,
+        # Returns the candidates (for the panel's list), not a path.
+        completion="_on_designer_completed",
+    ),
     'derivative': BatchToolSpec(
         label="Derivative Calculator",
         method="calculate_derivative",
@@ -188,6 +273,9 @@ def run_dataset_batch(backend, task, tool_key: str, dataset_names: List[str],
             break
 
         task.progress = i / len(names)
+        # Where this dataset sits in the batch, for a tool that reports its
+        # own progress and wants its estimate to cover the whole batch.
+        task.batch = (i, len(names), name)
         entry: Dict[str, Any] = {'dataset': name, 'output': '', 'error': ''}
         try:
             if spec.params_as_dict:

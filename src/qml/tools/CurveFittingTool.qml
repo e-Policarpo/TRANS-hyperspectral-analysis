@@ -12,12 +12,28 @@ import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
 import "../components"
 
-// Curve Fitting Tool
+// Curve Background Flattening (formerly "Curve Fitting"): fit a baseline
+// to every spectrum and subtract it. The file keeps its old name so the
+// tool map and docs history still point here.
 Item {
     id: root
     property var closeWindow: null
 
-    // Theme colors - reactive bindings to parent DraggableWindow
+    // The task name the backend hands back when this panel submits a run.
+    // Closing the window cancels that run BY NAME: there is one worker thread,
+    // so the task in flight when a panel closes is very often somebody else's,
+    // and a blind cancelCurrentOperation() would kill it.
+    property string runningTaskName: ""
+
+    property bool datasetDropActive: false
+
+    function acceptDatasetDrop(names) {
+        root.refreshDatasets()
+        datasetList.addToSelection(names)
+        datasetDropActive = false
+    }
+
+    // Theme colors - reactive bindings to the hosting window
     property var parentWindow: Window.window
     property color bgDark: (parentWindow && parentWindow.bgDark !== undefined) ? parentWindow.bgDark : Theme.bgDark
     property color bgMedium: (parentWindow && parentWindow.bgMedium !== undefined) ? parentWindow.bgMedium : Theme.bgMedium
@@ -33,14 +49,15 @@ Item {
         spacing: 10
 
         Label {
-            text: "Curve Fitting Utility"
+            text: "Curve Background Flattening"
             font.pixelSize: 18
             font.bold: true
             color: textLight
         }
 
         Label {
-            text: "Fit baseline to spectral curves and subtract it to obtain corrected data."
+            text: "Fit a smooth background to each spectrum and subtract it, leaving the " +
+                  "features on a flat baseline."
             wrapMode: Text.Wrap
             Layout.fillWidth: true
             color: accentPurple
@@ -49,32 +66,81 @@ Item {
         GroupBox {
             title: "Dataset Selection"
             Layout.fillWidth: true
+            Layout.fillHeight: true
 
-            DatasetComboBox {
-                id: datasetCombo
-                Layout.fillWidth: true
-                model: backend.getDatasetList()
+            ColumnLayout {
+                anchors.fill: parent
+                spacing: 4
+
+                DatasetMultiSelect {
+                    id: datasetList
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    Layout.minimumHeight: 130
+                    model: backend.getDatasetList()
+
+                    bgColor: bgLight
+                    borderColorNormal: root.datasetDropActive ? accentBlue : accentPurple
+                    borderColorFocus: accentPink
+                    textColor: textLight
+                    textMutedColor: textMuted
+                    selectionColor: accentPink
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+
+                    Label {
+                        Layout.fillWidth: true
+                        Layout.preferredWidth: 0
+                        text: root.datasetDropActive
+                              ? "Drop to add to the selection"
+                              : "…or drag datasets here from the project browser"
+                        font.pixelSize: 10
+                        color: root.datasetDropActive ? accentBlue : textMuted
+                        elide: Text.ElideRight
+                    }
+
+                    ToolButton {
+                        text: "Refresh list"
+                        flat: true
+                        font.pixelSize: 10
+                        onClicked: root.refreshDatasets()
+                    }
+                }
+            }
+        }
+
+        Connections {
+            target: backend
+            function onDataLoaded(name) { root.refreshDatasets() }
+            // This panel shows no progress of its own, so there is nothing to
+            // put right on screen — but the remembered task name has to go,
+            // or closing the window later would try to cancel a finished run.
+            function onToolCompleted(toolName, outputPath) {
+                if (root.runningTaskName.indexOf(toolName) === 0) root.runningTaskName = ""
+            }
+            function onOperationCancelled(name) {
+                if (name === root.runningTaskName) root.runningTaskName = ""
             }
         }
 
         GroupBox {
-            title: "Fitting Parameters"
+            title: "Background Model"
             Layout.fillWidth: true
 
             GridLayout {
                 anchors.fill: parent
                 columns: 2
 
-                Label { text: "Fit Type:" }
+                Label { text: "Background Type:" }
                 ComboBox {
                     id: fitTypeCombo
                     Layout.fillWidth: true
                     model: ["Polynomial", "Linear", "Exponential"]
-                    onCurrentIndexChanged: updateDegreeVisibility()
                 }
 
                 Label {
-                    id: degreeLabel
                     text: "Polynomial Degree:"
                     visible: fitTypeCombo.currentIndex === 0
                 }
@@ -87,7 +153,6 @@ Item {
                 }
 
                 Label {
-                    id: basisLabel
                     text: "Coefficient Basis:"
                     visible: fitTypeCombo.currentIndex === 0
                 }
@@ -107,31 +172,39 @@ Item {
             Layout.fillWidth: true
 
             Label {
-                text: "Two files will be generated:\n" +
-                      "1. Fit parameters (CSV)\n" +
-                      "2. Baseline-corrected spectra (NoBaseline_...csv)\n\n" +
-                      "Corrected data will be added as new dataset."
+                text: "Per input dataset:\n" +
+                      "1. Background parameters (CSV)\n" +
+                      "2. Flattened spectra (NoBaseline_…csv), added as a new dataset\n\n" +
+                      "This is the baseline tool: the fit sits through the data, so negative " +
+                      "values are kept — see Spectral Features or the Map Generator for " +
+                      "the arPLS background used before peak analysis.\n\n" +
+                      "Select several datasets to flatten them one after another."
                 wrapMode: Text.Wrap
                 font.pixelSize: 10
                 color: textMuted
             }
         }
 
-        Item { Layout.fillHeight: true }
-
         RowLayout {
             Layout.fillWidth: true
 
-            Button {
-                text: "Fit and Subtract Baseline"
-                enabled: datasetCombo.currentIndex >= 0
-                highlighted: true
+            ToolButton {
+                text: datasetList.selectedDatasets.length > 1
+                      ? "Flatten (" + datasetList.selectedDatasets.length + ")"
+                      : "Flatten Background"
+                enabled: datasetList.selectedDatasets.length > 0
+                primary: true
                 onClicked: performFitting()
+            }
+
+            ToolButton {
+                text: "Cancel Operation"
+                onClicked: backend.cancelCurrentOperation()
             }
 
             Item { Layout.fillWidth: true }
 
-            Button {
+            ToolButton {
                 text: "Close"
                 onClicked: {
                     if (root.closeWindow) { root.closeWindow() } else { var win = Window.window; if (win) win.close() }
@@ -140,27 +213,28 @@ Item {
         }
     }
 
-    function updateDegreeVisibility() {
-        degreeLabel.visible = fitTypeCombo.currentIndex === 0
-        degreeSpin.visible = fitTypeCombo.currentIndex === 0
-        basisLabel.visible = fitTypeCombo.currentIndex === 0
-        basisCombo.visible = fitTypeCombo.currentIndex === 0
+    function refreshDatasets() {
+        datasetList.model = backend.getDatasetList()
+        datasetList.pruneSelection()
     }
 
     function performFitting() {
+        var datasets = datasetList.selectedDatasets
+        if (datasets.length === 0) return
         var fitType = ["polynomial", "linear", "exponential"][fitTypeCombo.currentIndex]
-        console.log("Fitting curves:",
+        console.log("Flattening background:", datasets.join(", "),
                    "Type:", fitType, "Degree:", degreeSpin.value)
+        root.runningTaskName = backend.runToolOnDatasets("curve_background_flattening", datasets, {
+            "fit_type": fitType,
+            "degree": degreeSpin.value,
+            "basis": basisCombo.currentText
+        })
+    }
 
-        var result = backend.fitCurves(
-            datasetCombo.currentText,
-            fitType,
-            degreeSpin.value,
-            basisCombo.currentText
-        )
-
-        if (result) {
-            console.log("Curve fitting complete, saved to:", result)
-        }
+    Component.onDestruction: {
+        // A panel that is gone cannot show a result, so its run is abandoned
+        // work — stop it. cancelOperation only fires when the named task is
+        // the one running, so a stale name here is a no-op.
+        if (root.runningTaskName) backend.cancelOperation(root.runningTaskName)
     }
 }

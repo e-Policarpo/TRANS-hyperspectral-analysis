@@ -1,52 +1,18 @@
-# Dirac Point Estimator
+# Dirac Point Estimator — sunset
 
-Finds the Dirac point of a graphene-like spectrum by intersecting the two
-linear branches either side of it.
+Folded into [Spectral Features](spectral-features.md) in the tool rework
+as the **Dirac point** feature group: `dirac_point`, `dirac_conductance`,
+`dirac_slope_left`, `dirac_slope_right`, `dirac_r2_left`, `dirac_r2_right`,
+`dirac_slope_asymmetry`, one row per spectrum, previewed on the panel's plot
+as the two fitted branches and their crossing.
 
-**Menu** Tools → Composite tools → Dirac Point Estimator · **Panel**
-`DiracPointEstimatorTool.qml` · **Method** `estimate_dirac_point()`,
-`fit_dirac_point()` / `auto_detect_dirac_ranges()` in
-`src/backend/sts_algorithms.py`
+The branch windows are `auto` (from each end of the sweep to the gap edge
+the table has already found, trimmed at the outer end — the same recipe as
+`auto_detect_dirac_ranges`, but reusing the gap so the branches and the gap
+always agree), `manual` (four bias limits) or `off`.
 
-## Input
+The engine (`fit_dirac_point()` in `src/backend/sts_algorithms.py`,
+`estimate_dirac_point()` in the backend) is unchanged and still drives the
+**Dirac Point Estimator workflow node**.
 
-dI/dV spectra with a V-shaped conductance minimum.
-
-## Parameters
-
-| parameter | default | meaning |
-|---|---|---|
-| `auto_detect` | false | choose the two fit ranges automatically |
-| `left_min` / `left_max` | — | bias window for the left branch |
-| `right_min` / `right_max` | — | bias window for the right branch |
-| `smoothing` | — | smoothing strength |
-| `smoothing_method` | `Savgol` | `Savgol`, `Moving Avg`, `None` |
-
-## Output
-
-| output | contents |
-|---|---|
-| `<dataset> - Dirac Point` | per spectrum: the Dirac voltage and conductance, both slopes, both R², both intercepts |
-| files | `<project>_outputs/curves/` |
-
-## Method
-
-Fit a straight line to each branch and intersect them. The intersection is
-the Dirac point; the slopes come out as a by-product and are what tell you
-whether the fit meant anything.
-
-With `auto_detect`, `auto_detect_dirac_ranges` picks the windows from the
-curve itself, using `bandgap_delta` to stay clear of the flat minimum where a
-linear fit is meaningless.
-
-**Parallel branches have no intersection.** That case is detected and returns
-`NaN` rather than a number produced by dividing by a near-zero slope
-difference.
-
-## Notes
-
-- **Read the two R² values.** They are in the output because the Dirac point
-  is only as trustworthy as the linearity of the branches, and a confident
-  number from two badly fitted lines is the failure mode here.
-- The fit windows matter more than the smoothing. Include the curved region
-  near the minimum and the intersection is pulled off systematically.
+Use: Tools → Fit and features → Spectral Features → *Dirac point*.

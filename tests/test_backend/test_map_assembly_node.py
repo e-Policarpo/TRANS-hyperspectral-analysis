@@ -148,7 +148,7 @@ class TestMapAssemblyNodeDefinition:
 
     def test_node_is_registered_in_the_visualization_category(self):
         node_def = TOOL_DEFINITIONS["MapAssembly"]
-        assert node_def["category"] == "Visualization"
+        assert node_def["category"] == "Maps"
         assert node_def["display_name"] == "Map Assembly"
 
     def test_only_the_values_are_required(self):
@@ -186,7 +186,7 @@ class TestMapAssemblyNodeDefinition:
     def test_it_sits_next_to_the_map_generator_in_the_palette(self):
         """They lay the same values out; one finds them first."""
         visualization = next(c["tools"] for c in get_tool_categories()
-                             if c["category"] == "Visualization")
+                             if c["category"] == "Maps")
         assert (visualization.index("MapAssembly")
                 - visualization.index("MapGenerator")) == 1
 

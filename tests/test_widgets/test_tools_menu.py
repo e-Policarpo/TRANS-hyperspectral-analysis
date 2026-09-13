@@ -1,10 +1,10 @@
 """
-The Tools menu's three groups, checked against the code they point at.
+The Tools menu's sections, checked against the code they point at.
 
-The menu is hand-written QML: a tool can be listed with no file behind it, or
-have a file and never appear, and neither shows up until someone clicks. This
-reads Main.qml and holds the list to the tool map, the palette, and the
-taxonomy the grouping is claiming.
+The menu and the tool palette are generated from components/ToolCatalog.js:
+a tool can be listed there with no file behind it, or have a file and never
+appear, and neither shows up until someone clicks. This reads the catalog and
+Main.qml and holds them to each other and to the taxonomy the sections claim.
 
 Also loads the saved-workflow runner, which the menu's third group opens.
 
@@ -39,25 +39,31 @@ def tools_menu(main_qml):
     return main_qml[start:end]
 
 
-def _menu_entries(text):
-    """Every clickable tool entry, in menu order.
+CATALOG_JS = QML_ROOT / "components" / "ToolCatalog.js"
 
-    Comment lines between the text and the visibility are allowed: several
-    entries carry a line saying why they appear on a second tab, and a
-    parser that ignored them would quietly report the entry as missing.
+LEVEL_RANK = {"basic": 0, "intermediate": 1, "advanced": 2}
+
+
+def _catalog():
+    """The sections of ToolCatalog.js: [(title, level, [(tool, tabs)])].
+
+    The menu and the palette are both generated from this file, so it is
+    the thing to hold to the code — a hand-written entry no longer exists.
     """
-    return re.findall(r'text: "([^"]+)"\n(?:\s*//[^\n]*\n)*'
-                      r'\s*visible: [^\n]+\n\s*height: '
-                      r'visible \? implicitHeight : 0\n\s*onTriggered: '
-                      r'openToolWindow\(text\)', text)
+    text = CATALOG_JS.read_text(encoding="utf-8")
+    text = text[text.index("var SECTIONS = ["):text.index("// Sections with only the tools")]
+    sections = []
+    for block in re.split(r"\n    \{\n", text)[1:]:
+        title = re.search(r'title: "([^"]+)"', block).group(1)
+        level = re.search(r'level: "([^"]+)"', block).group(1)
+        tools = [(name, [int(t) for t in tabs.split(",")])
+                 for name, tabs in re.findall(r'\{ name: "([^"]+)",\s*tabs: \[([0-9, ]+)\] \}', block)]
+        sections.append((title, level, tools))
+    return sections
 
 
-def _group(text, title):
-    """The entries between one group header and the next separator."""
-    start = text.index(f'text: "— {title} —"')
-    rest = text[start:]
-    end = rest.find("MenuSeparator")
-    return _menu_entries(rest if end < 0 else rest[:end])
+def _catalog_tools():
+    return [name for _, _, tools in _catalog() for name, _ in tools]
 
 
 def _tool_map(text):
@@ -66,96 +72,84 @@ def _tool_map(text):
     return dict(re.findall(r'"([^"]+)": "([^"]+)"', block))
 
 
-def _current_tools(text):
-    block = text[text.index("property var currentTools:"):]
-    block = block[:block.index("return []")]
-    return set(re.findall(r'"([^"]+)"', block))
-
-
-class TestTheThreeGroups:
-    def test_the_menu_is_split_into_three_labelled_groups(self, tools_menu):
-        for title in ("Tools", "Composite tools", "Saved workflows"):
-            assert f'text: "— {title} —"' in tools_menu, title
+class TestTheSections:
+    def test_the_menu_and_the_palette_are_built_from_the_catalog(self, main_qml, tools_menu):
+        """One list, two views: a tool in the menu and not the palette (or
+        the reverse) is reachable from only half the app."""
+        assert "ToolCatalog.menuRows()" in tools_menu
+        assert "ToolCatalog.toolsForTab(currentTabIndex)" in main_qml
+        assert "ToolCatalog.sectionsForTab(currentTabIndex)" in main_qml
+        assert 'sections: currentToolSections' in main_qml
 
     def test_the_headers_are_disabled_entries_not_submenus(self, tools_menu):
         """Keeping one flat list is what preserves the per-tab visibility on
         every entry; submenus would have to re-implement it."""
-        header = tools_menu[tools_menu.index('text: "Composite tools"'):]
-        assert "enabled: false" in header[:200]
+        assert "enabled: !isHeader" in tools_menu
+        assert "visible: modelData.tabs.indexOf(currentTabIndex) >= 0" in tools_menu
 
-    def test_the_composite_group_is_the_composite_tools(self, tools_menu):
-        assert set(_group(tools_menu, "Composite tools")) == {
-            "Map Generator", "Confinement Analysis",
-            "Confinement Dimensionality", "Spectral Features",
-            "Confinement Designer", "Line Scan Designer",
-            "Quantum Well Solver", "Quantum Dot Solver", "Multi-Peak Fitting",
-            "Detect Bandgap & Doping", "Dirac Point Estimator"}
+    def test_the_sections_are_ordered_by_complexity(self):
+        levels = [LEVEL_RANK[level] for _, level, _ in _catalog()]
+        assert levels == sorted(levels)
+        assert levels[0] == 0 and levels[-1] == 2
 
-    def test_the_dimensionality_tool_is_composite(self, tools_menu):
-        """Background, peak search, a segmented band-edge fit and a model
-        selection over five geometries, in one pass — several operations with
-        decisions between them, which is what puts a tool in this group."""
-        assert "Confinement Dimensionality" in _group(tools_menu, "Composite tools")
+    def test_the_sections_group_by_type(self):
+        titles = [title for title, _, _ in _catalog()]
+        assert titles == ["Prepare", "Transform", "View", "Fit and features",
+                          "Maps", "Confinement"]
 
-    def test_the_solvers_are_composite_too(self, tools_menu):
-        """Each does several things in one pass — build the potential, solve
-        it, group the levels into shells, compare with the measurement."""
-        composite = set(_group(tools_menu, "Composite tools"))
+    def test_no_tool_is_in_two_sections(self):
+        tools = _catalog_tools()
+        assert len(tools) == len(set(tools))
 
-        assert {"Quantum Well Solver", "Quantum Dot Solver"} <= composite
+    def test_a_simple_tool_is_in_a_basic_section(self):
+        by_tool = {name: level for _, level, tools in _catalog() for name, _ in tools}
+        for name in ("Curve Smoothing", "Derivative Calculator", "Integration Utility",
+                     "Truncate Data", "Unit Converter"):
+            assert by_tool[name] == "basic", name
 
-    def test_a_simple_tool_is_in_the_first_group(self, tools_menu):
-        simple = set(_group(tools_menu, "Tools"))
-
-        assert {"Curve Smoothing", "Derivative Calculator", "Integration Utility",
-                "Truncate Data"} <= simple
-        assert "Map Generator" not in simple
-
-    def test_the_designer_tools_are_composite(self, tools_menu):
-        """They find peaks, split branches, search and pair in one pass —
+    def test_the_composite_analyses_are_advanced(self):
+        """Background, peak search, a fit and a model selection in one pass —
         several operations with decisions between them."""
-        composite = set(_group(tools_menu, "Composite tools"))
+        by_tool = {name: level for _, level, tools in _catalog() for name, _ in tools}
+        for name in ("Confinement Analysis", "Confinement Dimensionality",
+                     "Confinement Designer", "Line Scan Designer",
+                     "Quantum Well Solver", "Quantum Dot Solver"):
+            assert by_tool[name] == "advanced", name
 
-        assert {"Confinement Designer", "Line Scan Designer"} <= composite
+    def test_the_sunset_tools_are_gone(self):
+        tools = set(_catalog_tools())
+        for name in ("Image Smoothing", "Peak Indexing", "Spatial Average",
+                     "Detect Bandgap & Doping", "Dirac Point Estimator",
+                     "Spectral Axis Converter", "Curve Fitting", "Curve Analysis",
+                     "Background Subtraction"):
+            assert name not in tools, name
 
-    def test_the_groups_are_the_whole_menu(self, tools_menu):
-        entries = _menu_entries(tools_menu)
-        grouped = (_group(tools_menu, "Tools")
-                   + _group(tools_menu, "Composite tools"))
-
-        assert sorted(entries) == sorted(grouped)
-
-    def test_no_tool_is_in_both_groups(self, tools_menu):
-        simple = _group(tools_menu, "Tools")
-        composite = _group(tools_menu, "Composite tools")
-
-        assert set(simple).isdisjoint(composite)
+    def test_every_tool_is_listed_on_a_tab(self):
+        for _, _, tools in _catalog():
+            for name, tabs in tools:
+                assert tabs and set(tabs) <= {0, 1}, name
 
 
 class TestTheMenuMatchesTheCode:
-    def test_every_entry_has_a_tool_behind_it(self, main_qml, tools_menu):
+    def test_every_entry_has_a_tool_behind_it(self, main_qml):
         """A menu entry with no file opens the generic placeholder, which
         looks like a broken tool rather than a missing one."""
         tool_map = _tool_map(main_qml)
-        missing = [name for name in _menu_entries(tools_menu)
-                   if name not in tool_map]
+        missing = [name for name in _catalog_tools() if name not in tool_map]
 
         assert missing == []
 
-    def test_every_tool_file_the_menu_names_exists(self, main_qml, tools_menu):
+    def test_every_tool_file_the_catalog_names_exists(self, main_qml):
         tool_map = _tool_map(main_qml)
-        for name in _menu_entries(tools_menu):
+        for name in _catalog_tools():
             path = (MAIN_QML.parent / tool_map[name]).resolve()
             assert path.exists(), f"{name} -> {tool_map[name]}"
 
-    def test_every_tool_in_the_palette_list_is_in_the_menu(self, main_qml,
-                                                           tools_menu):
-        """`currentTools` feeds the tool palette panel; a tool in one and not
-        the other is reachable from only half the app."""
-        listed = _current_tools(main_qml)
-        entries = set(_menu_entries(tools_menu))
-
-        assert listed - entries == set()
+    def test_every_tool_file_is_in_the_catalog(self, main_qml):
+        """The reverse: a file the map knows but the catalog does not list is
+        unreachable from the UI."""
+        tool_map = _tool_map(main_qml)
+        assert set(tool_map) - set(_catalog_tools()) == set()
 
     def test_the_composite_tools_that_are_also_nodes_are_flagged(self):
         """The menu grouping and the palette badge have to agree about which
@@ -166,9 +160,7 @@ class TestTheMenuMatchesTheCode:
         pairs = {"Map Generator": "MapGenerator",
                  "Confinement Analysis": "ConfinementAnalysis",
                  "Spectral Features": "SpectralFeatures",
-                 "Line Scan Designer": "ConfinementDesign",
-                 "Detect Bandgap & Doping": "DetectBandgapDoping",
-                 "Dirac Point Estimator": "DiracPointEstimator"}
+                 "Line Scan Designer": "ConfinementDesign"}
         for menu_name, node_name in pairs.items():
             assert TOOL_DEFINITIONS[node_name].get('composite'), menu_name
 

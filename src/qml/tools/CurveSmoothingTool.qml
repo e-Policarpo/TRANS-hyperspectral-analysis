@@ -17,7 +17,21 @@ Item {
     id: root
     property var closeWindow: null
 
-    // Theme colors - reactive bindings to parent DraggableWindow
+    // The task name the backend hands back when this panel submits a run.
+    // Closing the window cancels that run BY NAME: there is one worker thread,
+    // so the task in flight when a panel closes is very often somebody else's,
+    // and a blind cancelCurrentOperation() would kill it.
+    property string runningTaskName: ""
+
+    property bool datasetDropActive: false
+
+    function acceptDatasetDrop(names) {
+        root.refreshDatasets()
+        datasetList.addToSelection(names)
+        datasetDropActive = false
+    }
+
+    // Theme colors - reactive bindings to the hosting window
     property var parentWindow: Window.window
     property color bgDark: (parentWindow && parentWindow.bgDark !== undefined) ? parentWindow.bgDark : Theme.bgDark
     property color bgMedium: (parentWindow && parentWindow.bgMedium !== undefined) ? parentWindow.bgMedium : Theme.bgMedium
@@ -49,15 +63,62 @@ Item {
         GroupBox {
             title: "Dataset Selection"
             Layout.fillWidth: true
+            Layout.fillHeight: true
 
             ColumnLayout {
                 anchors.fill: parent
+                spacing: 4
 
-                DatasetComboBox {
-                    id: datasetCombo
+                DatasetMultiSelect {
+                    id: datasetList
                     Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    Layout.minimumHeight: 130
                     model: backend.getDatasetList()
+
+                    bgColor: bgLight
+                    borderColorNormal: root.datasetDropActive ? accentBlue : accentPurple
+                    borderColorFocus: accentPink
+                    textColor: textLight
+                    textMutedColor: textMuted
+                    selectionColor: accentPink
                 }
+
+                RowLayout {
+                    Layout.fillWidth: true
+
+                    Label {
+                        Layout.fillWidth: true
+                        Layout.preferredWidth: 0
+                        text: root.datasetDropActive
+                              ? "Drop to add to the selection"
+                              : "…or drag datasets here from the project browser"
+                        font.pixelSize: 10
+                        color: root.datasetDropActive ? accentBlue : textMuted
+                        elide: Text.ElideRight
+                    }
+
+                    ToolButton {
+                        text: "Refresh list"
+                        flat: true
+                        font.pixelSize: 10
+                        onClicked: root.refreshDatasets()
+                    }
+                }
+            }
+        }
+
+        Connections {
+            target: backend
+            function onDataLoaded(name) { root.refreshDatasets() }
+            // This panel shows no progress of its own, so there is nothing to
+            // put right on screen — but the remembered task name has to go,
+            // or closing the window later would try to cancel a finished run.
+            function onToolCompleted(toolName, outputPath) {
+                if (root.runningTaskName.indexOf(toolName) === 0) root.runningTaskName = ""
+            }
+            function onOperationCancelled(name) {
+                if (name === root.runningTaskName) root.runningTaskName = ""
             }
         }
 
@@ -110,26 +171,35 @@ Item {
             Label {
                 text: "Smoothing method: " + getSmoothingMethod() +
                       "\nWindow size: " + windowSizeSpin.value +
-                      (smoothingTypeCombo.currentIndex === 0 ? "\nPolynomial order: " + polyOrderSpin.value : "")
+                      (smoothingTypeCombo.currentIndex === 0 ? "\nPolynomial order: " + polyOrderSpin.value : "") +
+                      "\n\nSelect several datasets to smooth them one after another —" +
+                      "\neach produces its own output, named after its input."
                 wrapMode: Text.Wrap
+                font.pixelSize: 10
+                color: textMuted
             }
         }
-
-        Item { Layout.fillHeight: true }
 
         RowLayout {
             Layout.fillWidth: true
 
-            Button {
-                text: "Apply Smoothing"
-                enabled: datasetCombo.currentIndex >= 0
-                highlighted: true
+            ToolButton {
+                text: datasetList.selectedDatasets.length > 1
+                      ? "Apply Smoothing (" + datasetList.selectedDatasets.length + ")"
+                      : "Apply Smoothing"
+                enabled: datasetList.selectedDatasets.length > 0
+                primary: true
                 onClicked: performSmoothing()
+            }
+
+            ToolButton {
+                text: "Cancel Operation"
+                onClicked: backend.cancelCurrentOperation()
             }
 
             Item { Layout.fillWidth: true }
 
-            Button {
+            ToolButton {
                 text: "Close"
                 onClicked: {
                     if (root.closeWindow) { root.closeWindow() } else { var win = Window.window; if (win) win.close() }
@@ -138,25 +208,33 @@ Item {
         }
     }
 
+    function refreshDatasets() {
+        datasetList.model = backend.getDatasetList()
+        datasetList.pruneSelection()
+    }
+
     function getSmoothingMethod() {
         var types = ["savgol", "moving_average", "gaussian"]
         return types[smoothingTypeCombo.currentIndex]
     }
 
     function performSmoothing() {
-        console.log("Smoothing:", datasetCombo.currentText,
+        var datasets = datasetList.selectedDatasets
+        if (datasets.length === 0) return
+        console.log("Smoothing:", datasets.join(", "),
                    "Method:", getSmoothingMethod(),
                    "Window:", windowSizeSpin.value)
+        root.runningTaskName = backend.runToolOnDatasets("smooth_curves", datasets, {
+            "window_size": windowSizeSpin.value,
+            "poly_order": polyOrderSpin.value,
+            "smoothing_type": getSmoothingMethod()
+        })
+    }
 
-        var result = backend.smoothCurves(
-            datasetCombo.currentText,
-            windowSizeSpin.value,
-            polyOrderSpin.value,
-            getSmoothingMethod()
-        )
-
-        if (result) {
-            console.log("Smoothing complete, saved to:", result)
-        }
+    Component.onDestruction: {
+        // A panel that is gone cannot show a result, so its run is abandoned
+        // work — stop it. cancelOperation only fires when the named task is
+        // the one running, so a stale name here is a no-op.
+        if (root.runningTaskName) backend.cancelOperation(root.runningTaskName)
     }
 }

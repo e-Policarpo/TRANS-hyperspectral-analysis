@@ -323,7 +323,7 @@ class TestWorkflowManagerSlots:
         assert isinstance(categories, list)
         cat_names = [c["category"] for c in categories]
         assert "Input" in cat_names
-        assert "Processing" in cat_names
+        assert "Prepare" in cat_names
 
     def test_get_tool_info(self, manager):
         """Test getToolInfo slot."""

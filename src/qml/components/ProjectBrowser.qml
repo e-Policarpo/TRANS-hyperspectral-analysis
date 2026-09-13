@@ -64,12 +64,18 @@ Rectangle {
 
     // Dataset names among the current selection, in selection order. Used as
     // the drag payload, so a tool receives them in the order they were picked.
+    // Maps and images travel as their refs ("map:<id>", "image:<id>"): a
+    // field tool (Gradient Filter) lists exactly those, while a dataset
+    // tool's DatasetMultiSelect.addToSelection ignores anything not in its
+    // model, so the extra entries never reach a spectral tool.
     function selectedDatasetNames() {
         var names = []
         for (var i = 0; i < browserRoot.selectedRefs.length; i++) {
             var ref = browserRoot.selectedRefs[i]
             if (ref.indexOf("dataset:") === 0)
                 names.push(ref.substring("dataset:".length))
+            else if (ref.indexOf("map:") === 0 || ref.indexOf("image:") === 0)
+                names.push(ref)
         }
         return names
     }

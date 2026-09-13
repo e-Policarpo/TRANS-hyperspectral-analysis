@@ -55,6 +55,7 @@ from src.backend.peak_fitting import estimate_noise_sigma
 from src.processing.peak_detection import Params, analyze, params_from_dict
 from src.processing.positivity import positive_integral
 from src.processing.spectral_features import (
+    dirac_windows,
     feature_columns,
     gap_features,
     normalize_spectrum,
@@ -155,6 +156,16 @@ class _ObservableDict(dict):
             super().clear()
 
 
+# Window functions offered by the 1D FFT tool. ``none`` is a rectangular
+# window, i.e. the raw transform.
+_FFT_WINDOWS = {
+    'none': None,
+    'hann': np.hanning,
+    'hamming': np.hamming,
+    'blackman': np.blackman,
+}
+
+
 class AppBackend(ToolImplementations, QObject):
     """
     Main application backend that bridges QML UI to Python logic.
@@ -164,6 +175,10 @@ class AppBackend(ToolImplementations, QObject):
     # Signals
     statusChanged = Signal(str)
     progressChanged = Signal(int, int, str)
+    # A long tool's own progress: tool name, done, total, and a message that
+    # carries the time estimate. Separate from progressChanged, which opens
+    # the modal import dialog — a designer run is watched from its panel.
+    toolProgress = Signal(str, int, int, str)
     dataLoaded = Signal(str)
     errorOccurred = Signal(str, str)
     toolOpened = Signal(str)
@@ -192,6 +207,11 @@ class AppBackend(ToolImplementations, QObject):
     windowClosed = Signal(str, str)  # window_type, window_id
     outputCreated = Signal(str, str, str)  # output_id, tool_name, file_path
     isBusyChanged = Signal(bool)  # worker is processing tasks
+    # A task the user cancelled, by task name. A cancelled task emits
+    # neither completion nor failure, so without this a tool panel has no
+    # way to learn its run ended and its 'running' flag stays true for the
+    # life of the window. Panels listen for this and clear their busy state.
+    operationCancelled = Signal(str)  # task name
     applicationClosing = Signal()  # emitted when main window is closing - all windows should close
     largeDatasetConfirmation = Signal(str, int, int)  # dataset_name, num_spectra, num_points - prompt user before opening large dataset
     datasetDeleted = Signal(str)  # dataset_name - emitted when a dataset is deleted
@@ -2295,9 +2315,15 @@ class AppBackend(ToolImplementations, QObject):
         logger.info(f"Duplicate submission dropped: {operation_name}")
 
     def _on_worker_cancelled(self, operation_name: str):
-        """Called when a worker is cancelled."""
+        """Called when a worker is cancelled.
+
+        The cancelled task never reaches on_finished or on_error, so this is
+        the only place the UI hears about it — hence operationCancelled, which
+        is what lets a panel drop out of its running state.
+        """
         self.status = f"Cancelled: {operation_name}"
         logger.info(f"Worker cancelled: {operation_name}")
+        self.operationCancelled.emit(operation_name)
         self.isBusyChanged.emit(self.worker_manager.is_busy())
 
     @Slot()
@@ -2307,6 +2333,25 @@ class AppBackend(ToolImplementations, QObject):
             logger.info("Current operation cancelled by user")
         else:
             logger.info("No operation to cancel")
+
+    @Slot(str)
+    def cancelOperation(self, name: str):
+        """Cancel the running task only if it is the one named.
+
+        A tool window closing wants to stop ITS run, not whatever happens to
+        be in flight — with a single worker thread the task running when the
+        window closes is very often somebody else's. QML remembers the name
+        the run*() slot handed back and passes it here, so a stale Cancel is a
+        no-op instead of killing an unrelated import.
+        """
+        name = str(name or "")
+        current = self.worker_manager.get_current_operation()
+        if name and name == current:
+            self.worker_manager.cancel_current()
+            logger.info(f"Cancelled operation by name: {name}")
+        else:
+            logger.info(f"cancelOperation({name!r}) ignored — current operation "
+                        f"is {current!r}")
 
     @Slot()
     def cancelAllOperations(self):
@@ -2654,10 +2699,10 @@ class AppBackend(ToolImplementations, QObject):
     def _save_image_to_gsf(self, image: "ImageData") -> List[str]:
         """Write ``image`` as Gwyddion Simple Field(s). Returns the paths.
 
-        **This is the primary export**, written as soon as data is imported:
-        Gwyddion is the analysis tool for this SPM data and ``.gsf`` is the only
-        format it reads real dimensions from. TIFF is secondary and written
-        lazily, on demand, by :meth:`_save_image_to_tiff`.
+        Not written automatically: the import path writes ``.gwy`` (every
+        channel in one document) and one TIFF per channel — see
+        :meth:`_absorb_dataset_images`. GSF is the on-demand single-field
+        export for the cases that want exactly that.
 
         A multi-channel scan yields **one file per channel** (GSF holds a single
         field), so every trace direction is separately openable. Colour images
@@ -2768,13 +2813,24 @@ class AppBackend(ToolImplementations, QObject):
         """
         from src.utils.gwy_io import gwy_available, write_gwy
 
-        if not image.mode.is_single_channel or not gwy_available():
+        # Every way out of here used to be silent, so a run that wrote fifteen
+        # files and one that wrote none logged the same two lines ("Write
+        # images #N" queued, completed). Each refusal now says why.
+        if not gwy_available():
+            logger.warning("Image %r not written as .gwy: the gwyfile package "
+                           "is not importable in this environment.", image.name)
+            return None
+        if not image.mode.is_single_channel:
+            logger.info("Image %r not written as .gwy: colour image, and .gwy "
+                        "holds scalar fields.", image.name)
             return None
         channels = ({name: image.get_channel(name)
                      for name in image.channel_names}
                     if image.channel_names else {image.name: image.array})
         channels = {k: v for k, v in channels.items() if v is not None}
         if not channels:
+            logger.warning("Image %r not written as .gwy: it has no channel "
+                           "data.", image.name)
             return None
 
         x_real, y_real, xy_units = self._image_scan_extent(image)
@@ -2793,7 +2849,51 @@ class AppBackend(ToolImplementations, QObject):
             logger.error("Could not write GWY %s: %s", target, e)
             return None
         image.metadata.additional_info['gwy_path'] = path
+        logger.info("Wrote %s (%d channel%s)", path, len(channels),
+                    "" if len(channels) == 1 else "s")
         return path
+
+    def _save_image_channels_to_tiff(self, image: "ImageData") -> List[str]:
+        """One calibrated TIFF per channel of ``image``. Returns the paths.
+
+        The import-time companion to :meth:`_save_image_to_gwy`: the ``.gwy``
+        carries every channel in one document, and a TIFF holds one field,
+        so a scan with forward and backward traces becomes two files, each
+        named after its channel. A single-array image goes through
+        :meth:`_save_image_to_tiff`, which also records the path the viewer
+        reuses; the per-channel files deliberately do not claim
+        ``image.file_path``, since that is whichever channel is on screen.
+        """
+        if not image.mode.is_single_channel:
+            logger.info("Image %r not written as TIFF per channel: colour "
+                        "image.", image.name)
+            return []
+        names = list(image.channel_names or [])
+        if len(names) <= 1:
+            path = self._save_image_to_tiff(image)
+            return [path] if path else []
+        try:
+            import tifffile
+        except ImportError:
+            logger.error("tifffile is required to write channel TIFFs")
+            return []
+        written = []
+        for name in names:
+            data = image.get_channel(name)
+            if data is None:
+                continue
+            safe = self._sanitize_filename(name) or "channel"
+            target = self._image_export_basename(image, f" - {safe}.tiff")
+            try:
+                tifffile.imwrite(str(target), data,
+                                 **self._pixel_scale_tiff_kwargs(image, data))
+            except Exception as e:
+                logger.error("Could not write %s: %s", target, e)
+                continue
+            written.append(str(target))
+        logger.info("Wrote %d channel TIFF%s for image %r", len(written),
+                    "" if len(written) == 1 else "s", image.name)
+        return written
 
     @Slot(str, str, result=str)
     def exportImageAsGwy(self, image_id: str, file_path: str = "") -> str:
@@ -2858,12 +2958,12 @@ class AppBackend(ToolImplementations, QObject):
     def _absorb_dataset_images(self, result: dict):
         """Pull images out of any loaded dataset's metadata into the registry.
 
-        Each absorbed scan is written straight out as **Gwyddion Simple Field**
-        (``.gsf``, one file per channel) under ``<project_outputs>/images/``,
-        so imported data is immediately analysable in Gwyddion with correct
-        physical dimensions. TIFF is secondary: ``openImage`` /
-        ``openImageInOS`` write one lazily when the user actually wants an
-        OS-viewable raster.
+        Each absorbed scan is written out under ``<project_outputs>/images/``
+        as a multi-channel **Gwyddion ``.gwy``** — so imported data is
+        immediately analysable in Gwyddion with correct physical dimensions —
+        and as **one calibrated TIFF per channel**, so it is just as
+        immediately openable anywhere else. Both ride the same queued write
+        and the same "extract images" option on the import dialog.
 
         The write is queued on the I/O worker rather than done here: a Matrix
         session carries dozens of scan images, and writing them all inline
@@ -2916,10 +3016,17 @@ class AppBackend(ToolImplementations, QObject):
                 return
 
             def _write_images(task, images=pending):
+                gwy = tiff = 0
                 for img in images:
                     if task.cancelled:
+                        logger.info("Image write cancelled after %d/%d",
+                                    gwy, len(images))
                         return
-                    self._save_image_to_gwy(img)
+                    if self._save_image_to_gwy(img):
+                        gwy += 1
+                    tiff += len(self._save_image_channels_to_tiff(img))
+                logger.info("Image write done: %d/%d .gwy, %d channel TIFF(s)",
+                            gwy, len(images), tiff)
 
             self.worker_manager.submit_io(
                 name=f"Write images #{self._image_write_seq}",
@@ -4084,6 +4191,192 @@ class AppBackend(ToolImplementations, QObject):
         )
         return out_name
 
+    def convert_axis_dataset(self, task, dataset_name: str, target_unit: str = 'eV',
+                             excitation_nm: float = 0.0) -> str:
+        """Batch form of :meth:`convertDatasetAxis` (key ``axis_convert``).
+
+        Returns the new dataset's name, which the batch runner registers as
+        the "output"; the datasets themselves are already published.
+        """
+        return self.convertDatasetAxis(dataset_name, target_unit,
+                                       float(excitation_nm or 0.0), "")
+
+    # ------------------------------------------------------------------
+    # Unit Converter: relabel in place, or set values by formula
+    # ------------------------------------------------------------------
+
+    @Slot('QVariantList', 'QVariantMap', result=int)
+    def relabelDatasets(self, dataset_names, spec) -> int:
+        """Change what the numbers MEAN without touching the numbers.
+
+        ``spec`` may carry ``x_unit``, ``y_unit``, ``x_name`` (the axis
+        column's caption) and ``y_name`` (what the spectra measure). Every
+        key given is applied to every dataset in place — a loader that
+        recorded the wrong unit, or none, is corrected here rather than by
+        copying the data. Returns how many datasets were changed.
+        """
+        spec = dict(spec or {})
+        x_unit = str(spec.get('x_unit') or '').strip()
+        y_unit = str(spec.get('y_unit') or '').strip()
+        x_name = str(spec.get('x_name') or '').strip()
+        y_name = str(spec.get('y_name') or '').strip()
+        if not any((x_unit, y_unit, x_name, y_name)):
+            return 0
+        changed = 0
+        for name in [str(n) for n in (dataset_names or [])]:
+            sd = self._datasets.get(name)
+            if sd is None:
+                continue
+            try:
+                units = dict(sd.metadata.units or {})
+                info = dict(sd.metadata.additional_info or {})
+                if x_unit:
+                    units['independent'] = x_unit
+                    units['x'] = x_unit
+                    info['axis_unit'] = x_unit
+                if y_unit:
+                    units['dependent'] = y_unit
+                    units['y'] = y_unit
+                if y_name:
+                    info['quantity'] = y_name
+                sd.metadata.units = units
+                sd.metadata.additional_info = info
+                if x_name and x_name != sd.independent_var_name:
+                    sd.data.rename(columns={sd.independent_var_name: x_name}, inplace=True)
+                changed += 1
+                self.dataLoaded.emit(name)
+            except Exception as exc:                        # noqa: BLE001
+                logger.error("Relabel failed on %r: %s", name, exc, exc_info=True)
+                self.errorOccurred.emit("Unit Converter", f"{name}: {exc}")
+        if changed:
+            self._mark_project_modified()
+            self.status = f"Relabelled {changed} dataset(s)"
+            logger.info("Unit Converter: relabelled %d dataset(s): x_unit=%r y_unit=%r "
+                        "x_name=%r y_name=%r", changed, x_unit, y_unit, x_name, y_name)
+        return changed
+
+    @Slot(str, str, str, int, result='QVariantMap')
+    def previewFormula(self, dataset_name: str, x_formula: str, y_formula: str,
+                       rows: int = 12):
+        """What the formulas would do to ONE dataset, before anything changes.
+
+        Returns the first ``rows`` samples of the axis and the first
+        spectrum, old and new side by side, plus the new ranges — the
+        spreadsheet preview qtiplot shows before Set Column Values commits.
+        """
+        from src.processing.formula import apply_formulas, FormulaError
+
+        out = {'ok': False, 'error': '', 'rows': [], 'x_name': '', 'spectrum': '',
+               'x_range': [], 'y_range': [], 'new_x_range': [], 'new_y_range': [],
+               'n_samples': 0, 'n_spectra': 0}
+        sd = self._datasets.get(dataset_name)
+        if sd is None:
+            out['error'] = "Dataset not found"
+            return out
+        try:
+            x = np.asarray(sd.independent_var, dtype=np.float64)
+            y = np.asarray(sd.spectra.values, dtype=np.float64)
+            new_x, new_y = apply_formulas(x, y, x_formula or '', y_formula or '')
+        except FormulaError as exc:
+            out['error'] = str(exc)
+            return out
+        except Exception as exc:                            # noqa: BLE001
+            out['error'] = f"could not evaluate: {exc}"
+            return out
+
+        def _rng(a):
+            a = np.asarray(a, dtype=float)
+            fin = a[np.isfinite(a)]
+            return [float(fin.min()), float(fin.max())] if fin.size else []
+
+        n = max(1, min(int(rows), x.size))
+        # Evenly spaced sample rows so the ends of the sweep are in the
+        # preview, not just its first dozen points.
+        idx = np.unique(np.linspace(0, x.size - 1, n).astype(int))
+        first = 0
+        out.update({
+            'ok': True,
+            'x_name': sd.independent_var_name,
+            'spectrum': str(sd.spectra.columns[first]) if y.shape[1] else '',
+            'rows': [[int(i), float(x[i]), float(new_x[i]),
+                      float(y[i, first]) if y.shape[1] else float('nan'),
+                      float(new_y[i, first]) if new_y.shape[1] else float('nan')]
+                     for i in idx],
+            'x_range': _rng(x), 'y_range': _rng(y),
+            'new_x_range': _rng(new_x), 'new_y_range': _rng(new_y),
+            'n_samples': int(x.size), 'n_spectra': int(y.shape[1]),
+            'non_finite': int(np.count_nonzero(~np.isfinite(new_y)) +
+                              np.count_nonzero(~np.isfinite(new_x))),
+        })
+        return out
+
+    def apply_formula_dataset(self, task, dataset_name: str, x_formula: str = '',
+                              y_formula: str = '', x_unit: str = '', y_unit: str = '',
+                              x_name: str = '', y_name: str = '',
+                              replace: bool = False) -> str:
+        """Set the axis and/or every spectrum by formula (key ``unit_formula``).
+
+        Produces ``<name> · f(x,y)`` with the new units stamped on it, or —
+        with ``replace`` — overwrites the dataset in place. Both formulas see
+        the original x and y. Returns the resulting dataset's name.
+        """
+        from src.processing.formula import apply_formulas
+
+        sd = self._datasets.get(dataset_name)
+        if sd is None:
+            raise ValueError(f"Dataset {dataset_name!r} not found")
+        x = np.asarray(sd.independent_var, dtype=np.float64)
+        y = np.asarray(sd.spectra.values, dtype=np.float64)
+        new_x, new_y = apply_formulas(x, y, x_formula or '', y_formula or '')
+
+        cols = list(sd.spectra.columns)
+        frame = pd.DataFrame(new_y, columns=cols)
+        frame.insert(0, (x_name or sd.independent_var_name), new_x)
+
+        units = dict(sd.metadata.units or {})
+        if x_unit:
+            units['independent'] = units['x'] = x_unit
+        if y_unit:
+            units['dependent'] = units['y'] = y_unit
+        info = {
+            **dict(sd.metadata.additional_info or {}),
+            'original': dataset_name,
+            'created_from': 'unit_converter',
+            'x_formula': x_formula or '',
+            'y_formula': y_formula or '',
+        }
+        if x_unit:
+            info['axis_unit'] = x_unit
+        if y_name:
+            info['quantity'] = y_name
+        meta = SpectralMetadata(
+            source_type=sd.metadata.source_type,
+            dimensions=sd.metadata.dimensions,
+            scan_mode=sd.metadata.scan_mode,
+            units=units,
+            acquisition_date=sd.metadata.acquisition_date,
+            additional_info=info,
+        )
+        result = SpectralData(frame, meta, getattr(sd, 'topography', None))
+
+        if replace:
+            # In place: the name stays, the graph windows keyed on it pick
+            # up the new curve on the next redraw.
+            info.pop('original', None)
+            self._datasets[dataset_name] = result
+            out_name = dataset_name
+        else:
+            parts = [p for p in ((f"x={x_formula.strip()}" if (x_formula or '').strip() else ''),
+                                 (f"y={y_formula.strip()}" if (y_formula or '').strip() else ''))
+                     if p]
+            out_name = f"{dataset_name} · " + (", ".join(parts) if parts else "relabelled")
+            self._datasets[out_name] = result
+        if not self._workflow_mode:
+            self.dataLoaded.emit(out_name)
+        logger.info("Unit Converter: %s → %s (x=%r, y=%r, replace=%s)",
+                    dataset_name, out_name, x_formula, y_formula, replace)
+        return out_name
+
     # ------------------------------------------------------------------
     # Multi-peak Gaussian / Lorentzian / pseudo-Voigt fitting
     # ------------------------------------------------------------------
@@ -4095,6 +4388,10 @@ class AppBackend(ToolImplementations, QObject):
         spectrum_index: int = 0,
     ):
         """Fit a sum of peaks + polynomial baseline to one column of a dataset.
+
+        The tool panel's live preview: returns the curves and parameters for
+        the plot and registers nothing. The full run over every spectrum is
+        ``fit_multipeak_dataset`` (batch key ``multi_peak_fit``).
 
         Parameters
         ----------
@@ -4150,35 +4447,9 @@ class AppBackend(ToolImplementations, QObject):
             self.errorOccurred.emit("Fit Failed", str(e))
             return {"success": False, "message": str(e)}
 
-        # Optionally surface the fit as a new dataset so the user can plot
-        # the fitted curve / residuals alongside the source data. We store
-        # everything on a fresh DataFrame (axis + each component + sum).
-        try:
-            cols = {sd.independent_var_name: x, "Data": y, "Fit": res.fitted_curve,
-                    "Baseline": res.baseline_curve, "Residuals": res.residuals}
-            for i, comp in enumerate(res.components):
-                cols[f"Peak {i+1}"] = comp
-            df = pd.DataFrame(cols)
-            new_meta = SpectralMetadata(
-                source_type=sd.metadata.source_type,
-                dimensions=sd.metadata.dimensions,
-                scan_mode=sd.metadata.scan_mode,
-                units=dict(sd.metadata.units or {}),
-                additional_info={
-                    **dict(sd.metadata.additional_info or {}),
-                    "fit_source": dataset_name,
-                    "fit_shape": shape.value,
-                    "fit_baseline_degree": baseline_degree,
-                    "fit_peak_count": len(res.peaks),
-                    "fit_rsq": res.rsq,
-                },
-            )
-            out_name = f"{dataset_name} · fit ({shape.value}, {len(res.peaks)} peaks)"
-            self._datasets[out_name] = SpectralData(df, new_meta)
-            self.dataLoaded.emit(out_name)
-        except Exception as e:
-            logger.warning("Could not create fit-result dataset: %s", e)
-
+        # This is the PREVIEW path: one spectrum, nothing registered. The
+        # datasets (per-spectrum table, fitted curves, long CSV) come from
+        # ``fit_multipeak_dataset`` through ``runToolOnDatasets``.
         return {
             "success": bool(res.success),
             "message": res.message,
@@ -4442,6 +4713,19 @@ class AppBackend(ToolImplementations, QObject):
             'num_points': data.num_points,
             'independent_var': data.independent_var_name
         }
+        # Axis extent and units: what the Truncate and Unit Converter panels
+        # show before the user types a range or picks a unit.
+        try:
+            x = np.asarray(data.independent_var, dtype=float)
+            finite = x[np.isfinite(x)]
+            if finite.size:
+                info['x_min'] = float(finite.min())
+                info['x_max'] = float(finite.max())
+        except Exception:
+            pass
+        units = dict(getattr(data.metadata, 'units', None) or {})
+        info['x_unit'] = units.get('independent') or units.get('x') or ''
+        info['y_unit'] = units.get('dependent') or units.get('y') or ''
         logger.debug(f"getDatasetInfo({dataset_name}): {info}")
         return info
 
@@ -5890,7 +6174,12 @@ class AppBackend(ToolImplementations, QObject):
 
     @Slot(str)
     def fft1D(self, dataset_name: str):
-        """QML wrapper for 1D FFT - runs in background thread."""
+        """QML wrapper for 1D FFT - runs in background thread.
+
+        Kept for older call sites; the tool panel goes through
+        ``runToolOnDatasets('fft_1d', ...)`` so several datasets can be
+        transformed one after another.
+        """
         logger.info(f"Submitting 1D FFT for {dataset_name} to worker")
         self.status = f"Computing 1D FFT for {dataset_name}..."
         self.worker_manager.submit(
@@ -5900,9 +6189,11 @@ class AppBackend(ToolImplementations, QObject):
             on_finished=lambda path: self._on_tool_completed("1D FFT", path)
         )
 
-    def _do_fft1D(self, task, dataset_name: str):
+    def _do_fft1D(self, task, dataset_name: str, window: str = 'none',
+                  detrend: bool = True, one_sided: bool = True,
+                  power_spectrum: bool = False):
         """
-        Perform 1D FFT on spectral data.
+        Perform 1D FFT on every spectrum of a dataset.
 
         Parameters:
         -----------
@@ -5910,11 +6201,24 @@ class AppBackend(ToolImplementations, QObject):
             Task object for cancellation checking
         dataset_name : str
             Dataset to transform
+        window : str
+            ``none`` / ``hann`` / ``hamming`` / ``blackman`` — tapers the
+            curve before the transform so the ends do not leak into every
+            frequency.
+        detrend : bool
+            Remove each spectrum's mean first. Without it the DC term dwarfs
+            everything else on a curve that never crosses zero.
+        one_sided : bool
+            Keep only the non-negative frequencies (the data are real, so
+            the negative half is the mirror image).
+        power_spectrum : bool
+            Emit |F|² instead of |F|.
 
         Returns:
         --------
         output_path : str
-            Path to FFT results
+            Path to the magnitude CSV. Two datasets are registered:
+            ``<base> - FFT Magnitude`` and ``<base> - FFT Phase``.
         """
         try:
             # Check if cancelled
@@ -5927,28 +6231,64 @@ class AppBackend(ToolImplementations, QObject):
                 return ""
 
             spectral_data = self._datasets[dataset_name]
-            logger.info(f"Performing 1D FFT on {dataset_name}")
+            logger.info(f"Performing 1D FFT on {dataset_name} (window={window}, "
+                        f"detrend={detrend}, one_sided={one_sided}, power={power_spectrum})")
 
             # Get spectral data
-            spectra = spectral_data.spectra.values  # (n_points, n_spectra)
-            independent_var = spectral_data.independent_var
+            spectra = np.asarray(spectral_data.spectra.values, dtype=float)  # (n_points, n_spectra)
+            independent_var = np.asarray(spectral_data.independent_var, dtype=float)
+            n_points = len(independent_var)
+            if n_points < 4:
+                self.errorOccurred.emit("FFT Error",
+                                        f"{dataset_name} has only {n_points} points")
+                return ""
+
+            work = spectra.copy()
+            work = np.where(np.isfinite(work), work, 0.0)
+            if detrend:
+                work = work - np.nanmean(work, axis=0, keepdims=True)
+            taper = _FFT_WINDOWS.get((window or 'none').lower())
+            if taper is not None:
+                w = taper(n_points)
+                # Normalise so a windowed amplitude compares with an
+                # unwindowed one.
+                w = w / max(float(np.mean(w)), 1e-12)
+                work = work * w[:, None]
 
             # Perform FFT on each spectrum
-            fft_results = np.fft.fft(spectra, axis=0)
+            fft_results = np.fft.fft(work, axis=0)
             fft_magnitude = np.abs(fft_results)
+            if power_spectrum:
+                fft_magnitude = fft_magnitude ** 2
             fft_phase = np.angle(fft_results)
 
             # Create frequency axis
-            n_points = len(independent_var)
-            d = np.mean(np.diff(independent_var))  # Average spacing
+            d = float(np.mean(np.diff(independent_var)))  # Average spacing
             frequencies = np.fft.fftfreq(n_points, d)
+            if one_sided:
+                keep = frequencies >= 0
+                frequencies = frequencies[keep]
+                fft_magnitude = fft_magnitude[keep]
+                fft_phase = fft_phase[keep]
+            else:
+                order = np.argsort(frequencies)
+                frequencies = frequencies[order]
+                fft_magnitude = fft_magnitude[order]
+                fft_phase = fft_phase[order]
+
+            # The frequency axis is the reciprocal of the independent axis:
+            # 1/V for a bias sweep, 1/nm for a wavelength axis, and so on.
+            x_unit = (spectral_data.metadata.units or {}).get('independent') or \
+                (spectral_data.metadata.units or {}).get('x') or ''
+            freq_unit = f"1/{x_unit}" if x_unit else 'Hz'
+            freq_col = f"Frequency ({freq_unit})" if x_unit else 'Frequency'
 
             # Create DataFrames for magnitude and phase
             mag_df = pd.DataFrame(fft_magnitude, columns=spectral_data.spectra.columns)
-            mag_df.insert(0, 'Frequency', frequencies)
+            mag_df.insert(0, freq_col, frequencies)
 
             phase_df = pd.DataFrame(fft_phase, columns=spectral_data.spectra.columns)
-            phase_df.insert(0, 'Frequency', frequencies)
+            phase_df.insert(0, freq_col, frequencies)
 
             # Create user-friendly names using naming convention
             base_name = self._extract_clean_base_name(dataset_name)
@@ -5956,24 +6296,43 @@ class AppBackend(ToolImplementations, QObject):
             file_safe_name = self._sanitize_filename(base_name)
 
             # Save results using _ensure_output_dir for proper project structure
-            mag_path = self._ensure_output_dir('fft') / f"{convention_name}_Magnitude.csv"
+            kind = "Power" if power_spectrum else "Magnitude"
+            mag_path = self._ensure_output_dir('fft') / f"{convention_name}_{kind}.csv"
             phase_path = self._ensure_output_dir('fft') / f"{file_safe_name}_FFT_Phase.csv"
 
             mag_df.to_csv(mag_path, index=False)
             phase_df.to_csv(phase_path, index=False)
 
-            # Create new datasets with clean base name (convention only for file path)
-            friendly_name = f"{base_name} - FFT Magnitude"
+            common_info = {
+                **self._carry_spatial_info(spectral_data.metadata),
+                'original': dataset_name,
+                'fft_window': window or 'none',
+                'fft_detrend': bool(detrend),
+                'fft_one_sided': bool(one_sided),
+                'fft_sample_spacing': d,
+                'fft_source_unit': x_unit,
+            }
             mag_metadata = SpectralMetadata(
                 source_type=spectral_data.metadata.source_type,
                 dimensions=spectral_data.metadata.dimensions,
                 scan_mode=spectral_data.metadata.scan_mode,
-                units={'independent': 'Hz', 'dependent': 'a.u.'},
-                additional_info={'transform': 'FFT_magnitude', 'original': dataset_name}
+                units={'independent': freq_unit,
+                       'dependent': 'a.u.²' if power_spectrum else 'a.u.'},
+                additional_info={**common_info,
+                                 'transform': 'FFT_power' if power_spectrum else 'FFT_magnitude'}
             )
-            mag_spectral_data = SpectralData(mag_df, mag_metadata)
-            # Store only with friendly name (no duplicates)
-            self._datasets[friendly_name] = mag_spectral_data
+            phase_metadata = SpectralMetadata(
+                source_type=spectral_data.metadata.source_type,
+                dimensions=spectral_data.metadata.dimensions,
+                scan_mode=spectral_data.metadata.scan_mode,
+                units={'independent': freq_unit, 'dependent': 'rad'},
+                additional_info={**common_info, 'transform': 'FFT_phase'}
+            )
+            mag_name = f"{base_name} - FFT {kind}"
+            phase_name = f"{base_name} - FFT Phase"
+            self._datasets[mag_name] = SpectralData(mag_df, mag_metadata)
+            self._datasets[phase_name] = SpectralData(phase_df, phase_metadata)
+            self.dataLoaded.emit(phase_name)
 
             # Status update will be handled by callback in main thread
             logger.info(f"FFT results saved to {mag_path} and {phase_path}")
@@ -6037,7 +6396,7 @@ class AppBackend(ToolImplementations, QObject):
             operation=self.subtract_background_datasets,
             signal_names=names,
             background_name=background_name,
-            on_finished=lambda path: self._on_tool_completed("Background Subtraction", path),
+            on_finished=lambda path: self._on_tool_completed("Subtract Detector Background", path),
         )
 
     @Slot(str, float, int, int)
@@ -6350,7 +6709,7 @@ class AppBackend(ToolImplementations, QObject):
 
         return self.calculate_derivative(dataset_name, order, smooth_before, smooth_after)
 
-    @Slot(str, 'QVariantList', 'QVariantMap')
+    @Slot(str, 'QVariantList', 'QVariantMap', result=str)
     def runToolOnDatasets(self, tool_key: str, dataset_names, params):
         """Run a registered tool over several datasets, one after another.
 
@@ -6361,6 +6720,10 @@ class AppBackend(ToolImplementations, QObject):
 
         The whole batch is a single worker task, so the datasets are
         processed strictly in sequence and one Cancel stops the run.
+
+        Returns the submitted task's name (empty when nothing was submitted)
+        so the caller can hand it to :meth:`cancelOperation` later and cancel
+        exactly this run rather than whatever is in flight at the time.
         """
         from src.backend import batch_tools
 
@@ -6369,20 +6732,22 @@ class AppBackend(ToolImplementations, QObject):
         if spec is None:
             logger.error(f"runToolOnDatasets: unknown tool {tool_key!r}")
             self.errorOccurred.emit("Tool Error", f"Unknown tool: {tool_key}")
-            return
+            return ""
         if not names:
             self.errorOccurred.emit(spec.label, "No dataset selected")
-            return
+            return ""
 
         logger.info(f"Submitting {spec.label} batch over {len(names)} dataset(s)")
         self.status = (f"{spec.label}: {names[0]}..." if len(names) == 1
                        else f"{spec.label}: {len(names)} datasets...")
 
+        # The task name lists the datasets so two different selections
+        # aren't taken for the same task by the duplicate-submission
+        # guard — only a genuine repeat click is dropped.
+        task_name = (f"{spec.label}: " + ", ".join(names[:3])
+                     + ("…" if len(names) > 3 else ""))
         self.worker_manager.submit(
-            # The task name lists the datasets so two different selections
-            # aren't taken for the same task by the duplicate-submission
-            # guard — only a genuine repeat click is dropped.
-            name=f"{spec.label}: " + ", ".join(names[:3]) + ("…" if len(names) > 3 else ""),
+            name=task_name,
             operation=self._do_run_tool_on_datasets,
             tool_key=tool_key,
             dataset_names=names,
@@ -6390,6 +6755,7 @@ class AppBackend(ToolImplementations, QObject):
             on_finished=lambda results: self._on_batch_completed(
                 tool_key, spec.label, results),
         )
+        return task_name
 
     def _do_run_tool_on_datasets(self, task, tool_key: str, dataset_names, params):
         """Background worker body for :meth:`runToolOnDatasets`."""
@@ -6441,6 +6807,15 @@ class AppBackend(ToolImplementations, QObject):
             self.status = (f"{label} complete" if len(results) <= 1
                            else f"{label} complete — {done} datasets "
                                 f"(results are in the project browser)")
+
+    def _on_unit_converter_completed(self, output):
+        """One Unit Converter result: ``output`` is a dataset NAME, not a
+        file, so it must not go through the output-file registration."""
+        if not output:
+            return
+        self._mark_project_modified()
+        self.toolCompleted.emit("Unit Converter", str(output))
+        self._route_derived_datasets()
 
     def _on_dimensionality_completed(self, output):
         """Register one Confinement Dimensionality run.
@@ -6603,13 +6978,16 @@ class AppBackend(ToolImplementations, QObject):
             redo_fn=redo_tool
         ))
 
-    def _on_maps_completed(self, output_paths: list, open_paths=None):
+    def _on_maps_completed(self, output_paths: list, open_paths=None,
+                           tool_name: str = "Map Generator"):
         """Called when multiple map generation completes.
 
         Every map is registered in the project browser; ``open_paths`` limits
         which of them get a window. A run over many intervals produces dozens
         of maps and opening one window each locks the UI up, so the caller
-        passes just the summary map.
+        passes just the summary map. ``tool_name`` is what the completion
+        signal names — another map-producing tool (Gradient Filter) reuses
+        the registration without announcing itself as the Map Generator.
         """
         num_maps = len(output_paths)
         logger.info(f"Map generation completed: {num_maps} maps created")
@@ -6646,20 +7024,54 @@ class AppBackend(ToolImplementations, QObject):
 
         if filed:
             self.browserTreeChanged.emit()
-        self.toolCompleted.emit("Map Generator", f"{num_maps} maps")
+        self.toolCompleted.emit(tool_name, f"{num_maps} maps")
 
     @Slot(str, str)
     def applyGradientFilter(self, image_path: str, method: str):
-        """QML wrapper for gradient filter - runs in background thread."""
+        """QML wrapper for gradient filter - runs in background thread.
+
+        ``image_path`` may be a browser ref (``map:<id>`` / ``image:<id>``)
+        or a file path. The tool panel goes through
+        ``runToolOnDatasets('gradient_filter', ...)`` instead so several
+        maps can be filtered one after another.
+        """
         logger.info(f"Submitting gradient filter to worker")
         self.status = "Applying gradient filter..."
         self.worker_manager.submit(
-            name="Gradient Filter",
+            name=f"Gradient Filter {image_path}",
             operation=self.apply_gradient_filter,
             image_path=image_path,
             method=method,
-            on_finished=lambda path: self._on_tool_completed("Gradient Filter", path)
+            on_finished=self._on_gradient_completed,
         )
+
+    def _on_gradient_completed(self, output_path):
+        """Register a gradient map in the browser and open it.
+
+        The gradient is a map like any other output map, so it goes through
+        ``_on_maps_completed`` (registration, filing, one window) rather
+        than the generic tool completion, which would only list the file.
+        """
+        if not output_path:
+            return
+        self._on_maps_completed([str(output_path)], tool_name="Gradient Filter")
+        self._mark_project_modified()
+
+    @Slot(result='QVariantList')
+    def getFieldSourceList(self):
+        """Maps and images a field tool (Gradient Filter) can take as input.
+
+        Each entry is ``{'ref', 'label'}``; ``ref`` is the browser ref the
+        tool hands back (``map:<id>`` / ``image:<id>``), ``label`` what the
+        list shows. Refs are what a browser drag carries, so a dropped map
+        lands on the tool the same way a picked one does.
+        """
+        out = []
+        for m in self.maps:
+            out.append({'ref': f"map:{m['id']}", 'label': m.get('title') or m['id']})
+        for image_id, img in getattr(self, '_images', {}).items():
+            out.append({'ref': f"image:{image_id}", 'label': img.name})
+        return out
 
     @Slot(str, str, int)
     @Slot(str, str, int, str)
@@ -6679,7 +7091,7 @@ class AppBackend(ToolImplementations, QObject):
             fit_type=fit_type,
             degree=degree,
             basis=basis,
-            on_finished=lambda path: self._on_tool_completed("Curve Fitting", path)
+            on_finished=lambda path: self._on_tool_completed("Curve Background Flattening", path)
         )
 
     @Slot(str, result='QVariantList')
@@ -6808,8 +7220,13 @@ class AppBackend(ToolImplementations, QObject):
 
         self._on_maps_completed(paths, open_paths=open_paths)
         if result.get('output_folder'):
+            extra = ""
+            if result.get('integrated_path'):
+                extra += f", integrals in integrated/{Path(result['integrated_path']).name}"
+            if result.get('binned_dataset'):
+                extra += f", averaged spectra as '{result['binned_dataset']}'"
             self.status = (f"{len(paths)} map(s) written to "
-                           f"{Path(result['output_folder']).name}/")
+                           f"{Path(result['output_folder']).name}/{extra}")
 
     @Slot(str, int, str)
     def generateMapFromFlatData(self, flat_dataset_name: str, value_index: int,
@@ -6835,7 +7252,7 @@ class AppBackend(ToolImplementations, QObject):
         """QML wrapper for peak finding - runs in background thread.
 
         Pass ``prominence <= 0`` to use a noise-aware adaptive threshold
-        computed per spectrum. The QML PeakIndexingTool "Adaptive" checkbox
+        computed per spectrum. The Peak Finder workflow node's "Adaptive" option
         wires this sentinel through.
         """
         logger.info(f"Submitting peak finding for {dataset_name} to worker")
@@ -6879,31 +7296,46 @@ class AppBackend(ToolImplementations, QObject):
                 if isinstance(result, dict) else (result or ''))
         )
 
-    @Slot(str, "QVariantMap")
+    @Slot(str, "QVariantMap", result=str)
     def runConfinementDesigner(self, dataset_name: str, params: dict):
         """QML wrapper for the Confinement Designer - runs on the worker.
 
         A search is seconds, not milliseconds, so it never runs on the GUI
         thread. The result is a map rather than a path: no file is written,
         and the panel needs the candidates themselves.
+
+        Returns the submitted task's name so the panel can cancel this run by
+        name (see :meth:`cancelOperation`) instead of cancelling whatever the
+        worker happens to be running when it closes.
         """
         logger.info(f"Submitting confinement designer for {dataset_name} to worker")
         self.status = f"Designing confinement for {dataset_name}..."
+        task_name = f"Confinement Designer {dataset_name}"
         self.worker_manager.submit(
-            name=f"Confinement Designer {dataset_name}",
+            name=task_name,
             operation=self.design_confinement,
             dataset_name=dataset_name,
             params=dict(params or {}),
             on_finished=self._on_designer_completed,
         )
+        return task_name
 
     def _on_designer_completed(self, result):
         """Hand the run's candidates to the panel, and say what happened."""
         result = result if isinstance(result, dict) else {}
-        count = len(result.get('candidates') or [])
+        total = int(result.get('candidates_total')
+                    or len(result.get('candidates') or []))
         message = result.get('error') or ""
-        if count:
-            self.status = (f"Confinement Designer: {count} candidate(s)"
+        if result.get('tables'):
+            # The tables are datasets in the project now, so the project has
+            # changed even though no dataset was transformed.
+            self._mark_project_modified()
+        if total:
+            searched = int(result.get('spectra_searched') or 1)
+            found_in = int(result.get('spectra_with_candidates') or 0)
+            where = (f" over {found_in}/{searched} spectra"
+                     if result.get('all_spectra') else "")
+            self.status = (f"Confinement Designer: {total} candidate(s){where}"
                            + (f", {result['pairs']} pair(s)" if result.get('pairs')
                               else ""))
         else:
@@ -6934,22 +7366,27 @@ class AppBackend(ToolImplementations, QObject):
         """
         return self.describe_candidate(dict(candidate or {}))
 
-    @Slot(str, "QVariantMap")
+    @Slot(str, "QVariantMap", result=str)
     def runLineScanDesigner(self, dataset_name: str, params: dict):
         """QML wrapper for the Line Scan Designer - runs on the worker.
 
         A search per position, so a long line is minutes rather than seconds:
         never on the GUI thread, and cancellable between positions.
+
+        Returns the submitted task's name so the panel can cancel this run by
+        name (see :meth:`cancelOperation`).
         """
         logger.info(f"Submitting line scan design for {dataset_name} to worker")
         self.status = f"Mapping confinement along {dataset_name}..."
+        task_name = f"Line Scan Designer {dataset_name}"
         self.worker_manager.submit(
-            name=f"Line Scan Designer {dataset_name}",
+            name=task_name,
             operation=self.design_line_scan,
             dataset_name=dataset_name,
             params=dict(params or {}),
             on_finished=self._on_line_scan_design_completed,
         )
+        return task_name
 
     def _on_line_scan_design_completed(self, result):
         """Publish the table and the size map, and say what the line held."""
@@ -7104,7 +7541,9 @@ class AppBackend(ToolImplementations, QObject):
         """
         blank = {'ok': False, 'x': [], 'y': [], 'gapLeft': 0.0, 'gapRight': 0.0,
                  'stateX': [], 'stateY': [], 'names': [], 'values': [],
-                 'name': '', 'valid': False, 'error': ''}
+                 'name': '', 'valid': False, 'error': '',
+                 'diracX': float('nan'), 'diracY': float('nan'),
+                 'diracLineX': [], 'diracLineY': []}
         try:
             if dataset_name not in self._datasets:
                 blank['error'] = "Dataset not found"
@@ -7139,6 +7578,22 @@ class AppBackend(ToolImplementations, QObject):
             except Exception:
                 logger.debug("Preview in-gap search failed", exc_info=True)
 
+            # The Dirac branches, drawn as the fitted lines over their
+            # windows, so a branch that was not linear is visible as a line
+            # that does not follow the curve. Flat lists (left pair, then
+            # right pair) — preview payloads hold scalars only.
+            dirac_line_x, dirac_line_y = [], []
+            windows = dirac_windows(x, gap, config)
+            px, py = row.get('dirac_point', np.nan), row.get('dirac_conductance', np.nan)
+            if windows is not None and np.isfinite(px) and np.isfinite(py):
+                for (lo, hi), slope in ((windows[0], row['dirac_slope_left']),
+                                        (windows[1], row['dirac_slope_right'])):
+                    if not np.isfinite(slope):
+                        continue
+                    # Each line passes through the crossing with its slope.
+                    dirac_line_x += [float(lo), float(hi)]
+                    dirac_line_y += [float(py + slope * (lo - px)), float(py + slope * (hi - px))]
+
             ordered = [c for c in feature_columns(config)
                        if c not in ('Spectrum_Index',) and c in row]
             return {
@@ -7149,6 +7604,10 @@ class AppBackend(ToolImplementations, QObject):
                 'gapRight': float(gap['gap_right']),
                 'stateX': state_x,
                 'stateY': state_y,
+                'diracX': float(px),
+                'diracY': float(py),
+                'diracLineX': dirac_line_x,
+                'diracLineY': dirac_line_y,
                 'names': ordered,
                 'values': [_format_feature(row[c]) for c in ordered],
                 'name': str(spectra.columns[index]),
@@ -7422,6 +7881,84 @@ class AppBackend(ToolImplementations, QObject):
             self.openTableEmbedded.emit(f"Table: {dataset_name}", model)
         except Exception as e:
             logger.error(f"Error building table data: {e}")
+
+    @Slot('QVariantList', 'QVariantMap')
+    def plotDatasetCurves(self, dataset_names, options):
+        """Open ONE graph window with curves from several datasets overlaid.
+
+        The Curve Plotting tool's entry point. ``options`` picks the curves
+        of each dataset:
+
+        - ``mode``: ``all`` / ``first`` / ``every`` / ``range``
+        - ``count``: how many, for ``first``
+        - ``step``: the stride, for ``every``
+        - ``start`` / ``stop``: 1-based inclusive indices, for ``range``
+        - ``normalize``: divide each curve by its own maximum
+        - ``offset``: vertical spacing between successive curves (waterfall)
+
+        A curve is labelled ``<dataset> - <column>`` so the legend still
+        says where it came from once datasets are mixed. Unlike opening a
+        dataset from the browser, no table window is opened — this is a
+        viewer, and it writes nothing.
+        """
+        names = [str(n) for n in (dataset_names or []) if n in self._datasets]
+        if not names:
+            self.errorOccurred.emit("Curve Plotting", "No dataset selected")
+            return
+        opts = dict(options or {})
+        mode = str(opts.get('mode', 'all'))
+        count = max(1, int(float(opts.get('count', 10) or 10)))
+        step = max(1, int(float(opts.get('step', 10) or 10)))
+        start = max(1, int(float(opts.get('start', 1) or 1)))
+        stop = int(float(opts.get('stop', 0) or 0))
+        normalize = bool(opts.get('normalize', False))
+        offset = float(opts.get('offset', 0.0) or 0.0)
+
+        curves = []
+        x_label, y_label = 'x', 'Intensity'
+        for name in names:
+            ds = self._datasets[name]
+            n = int(getattr(ds, 'num_spectra', 0) or 0)
+            if n == 0:
+                continue
+            if mode == 'first':
+                idx = list(range(min(count, n)))
+            elif mode == 'every':
+                idx = list(range(0, n, step))
+            elif mode == 'range':
+                hi = n if stop <= 0 else min(stop, n)
+                idx = list(range(start - 1, hi))
+            else:
+                idx = list(range(n))
+            try:
+                x = np.asarray(ds.independent_var, dtype=float).tolist()
+                cols = list(ds.spectra.columns)
+                x_label = getattr(ds, 'independent_var_name', x_label) or x_label
+                for i in idx:
+                    y = np.asarray(ds.spectra.iloc[:, i].values, dtype=float)
+                    if normalize:
+                        peak = np.nanmax(np.abs(y)) if np.isfinite(y).any() else 0.0
+                        if peak > 0:
+                            y = y / peak
+                    if offset:
+                        y = y + offset * len(curves)
+                    curves.append({
+                        'x': x,
+                        'y': y.tolist(),
+                        'label': f"{name} - {cols[i]}" if len(names) > 1 or len(idx) > 1
+                                 else name,
+                    })
+            except Exception as e:
+                logger.error(f"Curve Plotting: could not read {name}: {e}")
+
+        if not curves:
+            self.errorOccurred.emit("Curve Plotting", "Nothing to plot in the selection")
+            return
+        if normalize:
+            y_label = 'Normalised intensity'
+        title = names[0] if len(names) == 1 else f"Plot: {names[0]} (+{len(names) - 1})"
+        self.openDatasetEmbedded.emit(title, curves, x_label, y_label)
+        self.status = f"Plotted {len(curves)} curve(s) from {len(names)} dataset(s)"
 
     @Slot(str, 'QVariantList')
     def openDatasetWithCurves(self, dataset_name: str, curve_indices: List):

@@ -4,7 +4,7 @@ Turns spectra into spatial maps: removes the background, integrates over bias
 intervals and assembles the maps, in one pass. Accepts a **multi-dataset
 selection**.
 
-**Menu** Tools → Composite tools → Map Generator · **Panel**
+**Menu** Tools → Maps → Map Generator · **Panel**
 `MapGeneratorTool.qml` · **Method** `generate_maps_from_spectra()` ·
 **Batch key** `map_generator`
 
@@ -49,6 +49,24 @@ Not from a JSON file — that path was removed.
 |---|---|---|
 | `scan_type` | `auto` | `map_meander` reverses alternate rows, `map_raster` does not, `line` gives a single row, `auto` reads the dataset's metadata |
 
+### Spatial averaging
+
+| parameter | default | meaning |
+|---|---|---|
+| `bin_x` | 1 | block width, in grid positions |
+| `bin_y` | 1 | block height; ignored on a line |
+
+Folded in from the old Spatial Average tool. With either above 1, blocks of
+`bin_x × bin_y` neighbouring positions are averaged into one spectrum each
+**before** the background and the integration — laid out along the scan
+path `scan_type` names, so a meander is not scrambled — and the grid the
+maps are assembled on shrinks accordingly (`_bin_spectra_spatially`).
+Averaging *n* curves gains √n in signal-to-noise at *n*× the area. A ragged
+edge keeps its partial blocks. The averaged spectra are registered as
+`<dataset> - Spatially Averaged (AxB)` so what was mapped stays inspectable;
+on a line their positions are the block means, on a map the per-spectrum
+spatial keys are dropped and the reduced `dimensions` place the blocks.
+
 ## Output
 
 Filed as `maps/<dataset>/<format>/` — `gsf`, `tiff`, `csv`:
@@ -57,7 +75,12 @@ Filed as `maps/<dataset>/<format>/` — `gsf`, `tiff`, `csv`:
 - a **joined interval map** when the run covers several intervals: position
   across, interval up, indexed by midpoint. Registered as a line-scan dataset
   (`<base> - Interval Map`) so the Hyperspectral tab opens it as a kymograph.
-- `<dataset> - Map Values`
+- `<dataset> - Map Values` — the integrals as a flat dataset, one column
+  per interval (`Interval_<lo>_<hi>`, the Integration Utility's names), with
+  the `intervals` key so it reads as integrated values everywhere
+- `<name>_Integrated.csv` under `<project>_outputs/integrated/` — the same
+  table the Integration Utility writes, from the same numbers
+- `<dataset> - Spatially Averaged (AxB)` when spatial averaging was on
 
 **Only the joined map is opened** on completion. The per-interval maps are
 registered in the browser but not shown — dozens of windows lock the

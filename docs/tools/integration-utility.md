@@ -3,7 +3,7 @@
 Integrates each spectrum over one or more bias intervals — the area under
 dI/dV, which is the spectral weight in that energy window.
 
-**Menu** Tools → Integration Utility · **Panel** `IntegrationTool.qml` ·
+**Menu** Tools → Transform → Integration Utility · **Panel** `IntegrationTool.qml` ·
 **Method** `integrate()`, `src/processing/integration.py`
 
 ## Input

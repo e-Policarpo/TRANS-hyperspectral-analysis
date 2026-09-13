@@ -1,28 +1,48 @@
 # 1D FFT
 
-Frequency content of each spectrum.
+Frequency content of every spectrum of a dataset — a beating in a bias
+sweep, a fringe period in a wavelength scan, mains pickup.
 
-**Menu** Tools → 1D FFT · **Panel** `FFT1DTool.qml` ·
-**Method** `fft1D()` → `_do_fft1D()`
+**Menu** Tools → Transform → 1D FFT · **Panel** `FFT1DTool.qml` ·
+**Method** `_do_fft1D()` · **Batch key** `fft_1d`
 
 ## Input
 
-Any spectral dataset.
+Any spectral datasets — a multi-dataset selection, transformed one after
+another.
 
 ## Parameters
 
-None.
+| parameter | default | meaning |
+|---|---|---|
+| `window` | `hann` | taper before the transform: `none` (rectangular), `hann`, `hamming`, `blackman` |
+| `detrend` | true | remove each spectrum's mean first |
+| `one_sided` | true | keep the non-negative frequencies only |
+| `power_spectrum` | false | emit \|F\|² instead of \|F\| |
 
 ## Output
 
-A dataset whose axis is frequency (`1/<axis unit>`) and whose columns are the
-magnitude of each spectrum's real FFT.
+| output | where |
+|---|---|
+| `<dataset> - FFT Magnitude` (or `- FFT Power`) | axis `Frequency (1/<unit>)`, one column per spectrum |
+| `<dataset> - FFT Phase` | same axis, phase in radians |
+| `<name>_FFT_Magnitude.csv`, `<name>_FFT_Phase.csv` | `<project>_outputs/fft/` |
+
+Both datasets carry the source's spatial keys, so the FFT of a line scan is
+still that line scan's positions and maps as such.
 
 ## Method
 
-`np.fft.rfft` per column, magnitude taken. The frequency axis is
-`np.fft.rfftfreq(n, d)` where `d` is the mean axis step, so the units are the
-reciprocal of the input axis.
+`np.fft.fft` per column after the window and the detrend, frequencies from
+`np.fft.fftfreq(n, d)` with `d` the mean axis step, so the frequency unit is
+the reciprocal of the axis unit — `1/V` for a bias sweep. A windowed
+transform is rescaled by the window's mean so its amplitudes compare with an
+unwindowed one. Non-finite samples are zeroed before the transform.
+
+**Detrend** matters: a curve that never crosses zero has a DC term that
+dwarfs every other frequency, and the plot shows nothing else. The **window**
+matters for the same reason at the ends of the sweep: a rectangular window
+leaks the step at each end into every frequency.
 
 ## Notes
 
@@ -32,5 +52,3 @@ reciprocal of the input axis.
 - [Filter Bad Data](filter-bad-data.md) does this automatically, writes the
   FFT of every spectrum as a dataset, and can interpolate the offending lines
   out of the curves it keeps.
-- A spectrum with NaNs (railed samples) is transformed on its finite part, so
-  its frequency axis may be shorter than the others'.

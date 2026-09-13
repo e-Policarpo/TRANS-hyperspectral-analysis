@@ -155,6 +155,40 @@ Item {
         stateChanged(windowState)
     }
 
+    // Open tall (and wide) enough to show the whole panel, within the
+    // viewport. Runs once, just after the content has laid itself out; a
+    // later user resize is left alone, and the content scrolls instead.
+    property bool fittedToContent: false
+    Timer {
+        id: fitTimer
+        interval: 0
+        repeat: false
+        onTriggered: embeddedWindow.fitWindowToContent()
+    }
+
+    function fitWindowToContent() {
+        if (fittedToContent || windowState !== EmbeddedWindow.WindowState.Windowed) return
+        // Height only. Width is left as configured: a wrapped Label reports
+        // its UNWRAPPED text as implicitWidth, so a layout's implicitWidth
+        // says nothing about how wide the panel needs to be, and the natural
+        // height already accounts for wrapping at the current width.
+        var natH = contentLoader.contentNaturalHeight
+        if (!(natH > 0)) return
+        fittedToContent = true
+        var chromeH = height - contentFlick.height
+        var margin = 24
+        var wantH = Math.ceil(natH + chromeH + 2)
+        var maxH = Math.max(minHeight, (viewportHeight > 0 ? viewportHeight : wantH) - margin)
+        var newH = Math.min(Math.max(previousHeight, wantH), maxH)
+        if (newH !== previousHeight) {
+            previousHeight = newH
+            // Keep the window inside the viewport after growing.
+            if (viewportHeight > 0 && previousY + newH > viewportY + viewportHeight)
+                previousY = Math.max(viewportY, viewportY + viewportHeight - newH - margin / 2)
+            windowResized()
+        }
+    }
+
     // Window functions
     function minimize() {
         if (windowState === EmbeddedWindow.WindowState.Windowed) {
@@ -461,15 +495,89 @@ Item {
                 color: bgDark
                 visible: windowState !== EmbeddedWindow.WindowState.Minimized
 
-                Item {
+                // The content scrolls rather than squeezes. A tool panel is
+                // a ColumnLayout of GroupBoxes whose insides are anchored to
+                // fill; when the window is shorter than the panel's natural
+                // height, the layout compresses the boxes below their
+                // implicit size and their contents overflow onto each other
+                // (the dataset list drawn through the parameters box). Here
+                // the loader is never shorter than the panel wants to be, and
+                // the window opens tall enough to show it — see
+                // fitWindowToContent.
+                Flickable {
+                    id: contentFlick
                     anchors.fill: parent
                     anchors.margins: 1
                     clip: true
+                    contentWidth: width
+                    contentHeight: contentLoader.height
+                    boundsBehavior: Flickable.StopAtBounds
+                    interactive: contentHeight > height
+                    ScrollBar.vertical: ScrollBar {
+                        policy: contentFlick.contentHeight > contentFlick.height
+                                ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
+                    }
 
                     Loader {
                         id: contentLoader
-                        anchors.fill: parent
+                        width: contentFlick.width
+                        height: Math.max(contentFlick.height, contentNaturalHeight)
                         sourceComponent: contentComponent
+
+                        // The panel's natural height: its own implicitHeight
+                        // when it declares one, else that of its top-level
+                        // layout (most panels are `Item { ColumnLayout {
+                        // anchors.fill } }`, whose root reports 0). Bound
+                        // after load, so it follows the panel as it changes.
+                        property real contentNaturalHeight: 0
+
+                        // Only a Column/Grid/RowLayout counts. A SplitView or
+                        // ScrollView at the root means the panel scrolls
+                        // itself, and a ScrollView's implicitHeight is its
+                        // whole content's — measuring that would balloon a
+                        // self-scrolling panel to the viewport.
+                        function scrollsItself(lay) {
+                            // A ScrollView/Flickable directly inside the root
+                            // layout is the panel's own scrolling column; its
+                            // implicitHeight is the whole column's, which is
+                            // not a height the window needs to reach.
+                            for (var i = 0; i < lay.children.length; i++) {
+                                var c = lay.children[i]
+                                if (/^(QQuick)?(ScrollView|Flickable)/.test(String(c)))
+                                    return true
+                            }
+                            return false
+                        }
+
+                        function primaryLayout(it) {
+                            var best = null
+                            for (var i = 0; i < it.children.length; i++) {
+                                var c = it.children[i]
+                                if (!c || c.implicitHeight === undefined || !(c.implicitHeight > 0))
+                                    continue
+                                if (!/^QQuick(Column|Grid|Row)?Layout/.test(String(c)))
+                                    continue
+                                if (scrollsItself(c))
+                                    return null
+                                if (!best || c.implicitHeight > best.implicitHeight)
+                                    best = c
+                            }
+                            return best
+                        }
+
+                        function bindNaturalSize() {
+                            var it = contentLoader.item
+                            if (!it) return
+                            if (it.implicitHeight > 0) {
+                                contentNaturalHeight = Qt.binding(function() { return it.implicitHeight })
+                                return
+                            }
+                            var lay = primaryLayout(it)
+                            if (!lay) return
+                            // Margins the layout keeps from the panel's edges.
+                            var extra = (lay.anchors && lay.anchors.margins) ? 2 * lay.anchors.margins : 0
+                            contentNaturalHeight = Qt.binding(function() { return lay.implicitHeight + extra })
+                        }
 
                         // Pass backend and theme to loaded content
                         onLoaded: {
@@ -482,6 +590,10 @@ Item {
                                 if (item.hasOwnProperty("closeWindow")) {
                                     item.closeWindow = function() { embeddedWindow.close() }
                                 }
+                                bindNaturalSize()
+                                // Layouts settle a frame after creation, so
+                                // the fit runs once they have.
+                                fitTimer.restart()
                                 // Theme colours are NOT pushed here, and must
                                 // not be. An imperative assignment in QML
                                 // destroys whatever binding the property held,
@@ -507,7 +619,15 @@ Item {
             }
         }
 
-        // Resize handles (only in windowed mode)
+        // Resize handles (only in windowed mode).
+        //
+        // The mouse is measured in the window container's frame, as the
+        // title-bar drag does — NOT in the handle's own coordinates. Each
+        // handle is anchored to the edge it moves, so after every step it has
+        // moved under the cursor and a delta taken in its own frame is
+        // measured from the new position: the edge chased the cursor at about
+        // half speed. In the container's frame the cursor position is
+        // absolute, and the edge lands where the cursor is.
         // Right edge
         MouseArea {
             width: 6
@@ -523,14 +643,15 @@ Item {
             property real startWidth
 
             onPressed: function(mouse) {
-                startX = mouse.x
+                startX = mapToItem(embeddedWindow.parent, mouse.x, mouse.y).x
                 startWidth = embeddedWindow.previousWidth
                 embeddedWindow.bringToFront()
             }
 
             onPositionChanged: function(mouse) {
                 if (pressed) {
-                    var newWidth = Math.max(minWidth, Math.min(maxWidth, startWidth + mouse.x - startX))
+                    var x = mapToItem(embeddedWindow.parent, mouse.x, mouse.y).x
+                    var newWidth = Math.max(minWidth, Math.min(maxWidth, startWidth + x - startX))
                     embeddedWindow.previousWidth = newWidth
                 }
             }
@@ -553,14 +674,15 @@ Item {
             property real startHeight
 
             onPressed: function(mouse) {
-                startY = mouse.y
+                startY = mapToItem(embeddedWindow.parent, mouse.x, mouse.y).y
                 startHeight = embeddedWindow.previousHeight
                 embeddedWindow.bringToFront()
             }
 
             onPositionChanged: function(mouse) {
                 if (pressed) {
-                    var newHeight = Math.max(minHeight, Math.min(maxHeight, startHeight + mouse.y - startY))
+                    var y = mapToItem(embeddedWindow.parent, mouse.x, mouse.y).y
+                    var newHeight = Math.max(minHeight, Math.min(maxHeight, startHeight + y - startY))
                     embeddedWindow.previousHeight = newHeight
                 }
             }
@@ -582,7 +704,7 @@ Item {
             property real startHeight
 
             onPressed: function(mouse) {
-                startPos = Qt.point(mouse.x, mouse.y)
+                startPos = mapToItem(embeddedWindow.parent, mouse.x, mouse.y)
                 startWidth = embeddedWindow.previousWidth
                 startHeight = embeddedWindow.previousHeight
                 embeddedWindow.bringToFront()
@@ -590,8 +712,9 @@ Item {
 
             onPositionChanged: function(mouse) {
                 if (pressed) {
-                    var newWidth = Math.max(minWidth, Math.min(maxWidth, startWidth + mouse.x - startPos.x))
-                    var newHeight = Math.max(minHeight, Math.min(maxHeight, startHeight + mouse.y - startPos.y))
+                    var pos = mapToItem(embeddedWindow.parent, mouse.x, mouse.y)
+                    var newWidth = Math.max(minWidth, Math.min(maxWidth, startWidth + pos.x - startPos.x))
+                    var newHeight = Math.max(minHeight, Math.min(maxHeight, startHeight + pos.y - startPos.y))
                     embeddedWindow.previousWidth = newWidth
                     embeddedWindow.previousHeight = newHeight
                 }

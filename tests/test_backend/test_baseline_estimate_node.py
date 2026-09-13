@@ -103,7 +103,7 @@ class TestBaselineEstimateNodeDefinition:
 
     def test_node_is_registered_in_the_processing_category(self):
         node_def = TOOL_DEFINITIONS["BaselineEstimate"]
-        assert node_def["category"] == "Processing"
+        assert node_def["category"] == "Transform"
         assert node_def["display_name"] == "Baseline Estimate"
 
     def test_takes_a_single_dataset_input(self):
@@ -150,7 +150,7 @@ class TestBaselineEstimateNodeDefinition:
 
     def test_sits_next_to_curve_fitting_in_the_palette(self):
         processing = next(c["tools"] for c in get_tool_categories()
-                          if c["category"] == "Processing")
+                          if c["category"] == "Transform")
         assert abs(processing.index("BaselineEstimate")
                    - processing.index("CurveFitting")) == 1
 

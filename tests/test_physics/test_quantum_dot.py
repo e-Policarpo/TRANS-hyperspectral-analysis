@@ -193,3 +193,59 @@ def test_orbital_labels_run_s_p_d_f():
 def test_a_negative_radius_is_refused():
     with pytest.raises(ValueError):
         spherical_dot(-1.0)
+
+
+class TestTheDiscBasisFollowsTheShape:
+    """The disc's level list must be the true lowest ``n_levels``, for a flat
+    lens AND a tall one.
+
+    The axial basis used to be cut at ``ceil(n_levels / 8)`` states — three
+    for the twenty the designer requests. Fine for a flat lens; for a tall
+    one the low-lying spectrum is the axial ladder itself, and the cut left
+    states out of the first twenty. The "cylindrical" model is the same
+    formula with a deeper basis, so the same measurement fitted as two
+    different geometries depending only on which name was picked.
+    """
+
+    @staticmethod
+    def _brute(R_nm, Lz_nm, meff, n):
+        from src.physics.quantum_dot import _jn_zeros_cached
+        m = meff * m_e
+        pref = hbar ** 2 / (2 * m) / e
+        R, Lz = R_nm * 1e-9, Lz_nm * 1e-9
+        out = []
+        for mq in range(30):
+            for i, a in enumerate(_jn_zeros_cached(mq, 30), 1):
+                for nz in range(1, 80):
+                    out.append((pref * (a ** 2 / R ** 2 + (np.pi * nz) ** 2 / Lz ** 2),
+                                (i, mq, nz)))
+        out.sort(key=lambda t: t[0])
+        return out[:n]
+
+    @pytest.mark.parametrize("R, Lz", [(5, 1.5), (5, 5), (3, 20), (2, 27), (8, 3)])
+    def test_it_is_exactly_the_lowest_twenty(self, R, Lz):
+        from src.physics.quantum_dot import dot_energies, DOT_DISC
+        got = dot_energies(DOT_DISC, (R, Lz), 0.322, 20)
+        ref = self._brute(R, Lz, 0.322, 20)
+        assert len(got) == 20
+        assert [q for _, q in got] == [q for _, q in ref]
+        assert np.allclose([E for E, _ in got], [E for E, _ in ref])
+
+    def test_a_tall_disc_reaches_past_the_old_axial_cut(self):
+        from src.physics.quantum_dot import dot_energies, DOT_DISC
+        levels = dot_energies(DOT_DISC, (3, 20), 0.322, 20)
+        assert max(nz for _, (_, _, nz) in levels) > 3
+
+    def test_a_flat_lens_stays_in_the_first_axial_state(self):
+        from src.physics.quantum_dot import dot_energies, DOT_DISC
+        levels = dot_energies(DOT_DISC, (5, 1.5), 0.322, 20)
+        assert {nz for _, (_, _, nz) in levels} == {1}
+
+    def test_disc_and_cylinder_now_agree(self):
+        """Same formula, and now the same answer."""
+        from src.physics.quantum_dot import dot_energies, DOT_DISC
+        from src.physics.analytical import cylinder_energies
+        for R, Lz in [(5, 1.5), (3, 20), (2, 27)]:
+            disc = [E for E, _ in dot_energies(DOT_DISC, (R, Lz), 0.322, 20)]
+            cyl = [E for E, _ in cylinder_energies(R, Lz, 0.322, 20)]
+            assert np.allclose(disc, cyl)

@@ -294,19 +294,50 @@ class WorkerManager(QObject):
                     break
         logger.info("All pending tasks cancelled")
 
-    def cancel_current(self):
-        """Cancel the currently running operation."""
-        if self.worker._current_task:
-            self.worker._current_task.cancelled = True
-            task_name = self.worker._current_task.name
-            # A cancelled task emits neither completed nor failed, so drop its
-            # callback entry here — otherwise the name would stay "pending"
-            # and dedup would silently swallow every future submission of it.
-            self._task_callbacks.pop(task_name, None)
-            logger.info(f"Cancelling current task: {task_name}")
-            self.worker_cancelled.emit(task_name)
-            return True
-        return False
+    def _cancel_running(self, worker: PersistentWorker) -> bool:
+        """Flag the task running on one worker as cancelled."""
+        task = worker._current_task
+        if not task:
+            return False
+        task.cancelled = True
+        task_name = task.name
+        # A cancelled task emits neither completed nor failed, so drop its
+        # callback entry here — otherwise the name would stay "pending"
+        # and dedup would silently swallow every future submission of it.
+        self._task_callbacks.pop(task_name, None)
+        logger.info(f"Cancelling current task on {worker.objectName()}: {task_name}")
+        self.worker_cancelled.emit(task_name)
+        return True
+
+    def cancel_current(self, include_io: bool = False):
+        """Cancel the currently running operation.
+
+        The I/O worker is deliberately left alone unless ``include_io`` is
+        asked for. Everything on the compute worker is reproducible — cancel
+        a derivative and you re-run it — but the I/O worker is the one that
+        might be halfway through writing a .hrt, and a save that stops in the
+        middle leaves the user with a truncated project file rather than the
+        one they had. So Cancel means "stop the computation"; only a caller
+        that knows the write is safe to abandon (or that the process is going
+        away regardless) passes include_io=True. See also
+        :meth:`cancel_current_io`, which is the same choice made explicit.
+        """
+        cancelled = self._cancel_running(self.worker)
+        if include_io:
+            cancelled = self._cancel_running(self.io_worker) or cancelled
+        elif self.io_worker._current_task is not None:
+            logger.info("Leaving I/O task '%s' running; cancel_current() does not "
+                        "abort disk writes", self.io_worker._current_task_name)
+        return cancelled
+
+    def cancel_current_io(self):
+        """Cancel the running I/O (save/export) task.
+
+        Separate from :meth:`cancel_current` so aborting a disk write is
+        always a deliberate act at the call site and never a side effect of a
+        user pressing Cancel on a tool panel.
+        """
+        return self._cancel_running(self.io_worker)
 
     def get_current_operation(self) -> str:
         """Get the name of the currently running operation."""

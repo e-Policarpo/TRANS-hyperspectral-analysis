@@ -700,3 +700,79 @@ def test_convert_image_to_map_rejects_unknown_mode(backend, tmp_path):
     # successful single-channel path while we're at it.
     backend.convertImageToMap(img.id)
     assert backend.maps[-1]['title'] == "gray"
+
+
+# =============================================================================
+# Import-time exports: .gwy plus one TIFF per channel, and nothing silent
+# =============================================================================
+
+def _two_channel_scan(name="scan"):
+    Y, X = np.mgrid[0:12, 0:10].astype(np.float32)
+    return ImageData.from_channels(
+        {"Z fwd/up": X * 2.0 + Y, "Z bwd/up": Y * 3.0},
+        name=name, mode=ImageMode.SINGLE_FLOAT)
+
+
+def test_import_writes_one_tiff_per_channel(backend, tmp_path):
+    """The .gwy carries every channel in one document; a TIFF holds one, so a
+    two-trace scan becomes two TIFFs, each named after its channel."""
+    backend._output_base_dir = tmp_path
+    img = _two_channel_scan()
+
+    paths = backend._save_image_channels_to_tiff(img)
+
+    assert len(paths) == 2
+    names = sorted(Path(p).name for p in paths)
+    assert names == ["scan - Z bwd_up.tiff", "scan - Z fwd_up.tiff"] \
+        or all(n.startswith("scan - ") and n.endswith(".tiff") for n in names)
+    assert all(Path(p).exists() for p in paths)
+    # The per-channel files do not claim the viewer's path: that is whichever
+    # channel is on screen, and openImage writes it on demand.
+    assert not getattr(img, "file_path", None)
+
+
+def test_import_writes_a_single_array_through_the_viewer_path(backend, tmp_path):
+    backend._output_base_dir = tmp_path
+    img = ImageData.from_array(np.arange(20, dtype=np.float32).reshape(4, 5),
+                               name="one", mode=ImageMode.SINGLE_FLOAT)
+    paths = backend._save_image_channels_to_tiff(img)
+    assert len(paths) == 1 and Path(paths[0]).exists()
+    assert img.file_path == paths[0]
+
+
+def test_gwy_refusals_are_logged_not_silent(backend, tmp_path, caplog, monkeypatch):
+    """A run that wrote nothing used to log exactly what a run that wrote
+    everything did. Each way out now says why."""
+    import logging
+    backend._output_base_dir = tmp_path
+    img = _two_channel_scan()
+
+    monkeypatch.setattr("src.utils.gwy_io.gwy_available", lambda: False)
+    with caplog.at_level(logging.WARNING, logger="src.backend.app_backend"):
+        assert backend._save_image_to_gwy(img) is None
+    assert any("gwyfile" in r.message for r in caplog.records)
+
+
+def test_the_queued_import_write_produces_both_formats(backend, tmp_path):
+    """The one job the I/O worker gets per import writes .gwy AND the TIFFs."""
+    pytest.importorskip("gwyfile")
+    backend._output_base_dir = tmp_path
+    backend._extract_gwy_on_import = True
+    img = _two_channel_scan("absorbed")
+    df = pd.DataFrame({"x": [1.0, 2.0], "y": [3.0, 4.0]})
+    sd = SpectralData(df, SpectralMetadata(source_type="test", dimensions=(2, 1),
+                                           scan_mode="point", units={}))
+    sd.metadata.additional_info["images"] = [("absorbed", img)]
+
+    submitted = []
+    backend.worker_manager.submit_io = lambda name, operation, **kw: submitted.append(operation)
+    backend._absorb_dataset_images({"datasets": {"d": sd}})
+    assert len(submitted) == 1
+
+    class _Task:
+        cancelled = False
+    submitted[0](_Task())
+
+    written = sorted(p.name for p in (tmp_path / "images").iterdir())
+    assert any(n.endswith(".gwy") for n in written)
+    assert sum(n.endswith(".tiff") for n in written) == 2

@@ -574,7 +574,7 @@ TOOL_DEFINITIONS = {
     # ===========================================================================
     "ColumnSelector": {
         "display_name": "Column Selector",
-        "category": "Processing",
+        "category": "Prepare",
         "description": "Filter dataset columns - keeps X values and selected data columns",
         "inputs": [
             {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
@@ -589,7 +589,7 @@ TOOL_DEFINITIONS = {
 
     "TruncateData": {
         "display_name": "Truncate",
-        "category": "Processing",
+        "category": "Prepare",
         "description": "Limit data to X range",
         "inputs": [
             {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
@@ -605,7 +605,7 @@ TOOL_DEFINITIONS = {
 
     "Derivative": {
         "display_name": "Derivative",
-        "category": "Processing",
+        "category": "Transform",
         "description": "Calculate derivative (dI/dV)",
         "inputs": [
             {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
@@ -622,7 +622,7 @@ TOOL_DEFINITIONS = {
 
     "CurveSmoothing": {
         "display_name": "Smoothing",
-        "category": "Processing",
+        "category": "Prepare",
         "description": "Smooth spectral curves",
         "inputs": [
             {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
@@ -639,7 +639,7 @@ TOOL_DEFINITIONS = {
 
     "CosmicRayFilter": {
         "display_name": "Cosmic Ray Filter",
-        "category": "Processing",
+        "category": "Prepare",
         "description": "Remove narrow CCD spikes (cosmic rays / hot pixels) from spectra",
         "inputs": [
             {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
@@ -655,8 +655,8 @@ TOOL_DEFINITIONS = {
     },
 
     "BackgroundSubtraction": {
-        "display_name": "Background Subtraction",
-        "category": "Processing",
+        "display_name": "Subtract Detector Background",
+        "category": "Prepare",
         "description": "Subtract a reference background dataset from a signal; truncates to axis overlap if needed",
         "inputs": [
             {"id": "signal", "name": "Signal", "port_type": "dataset", "required": True},
@@ -670,7 +670,7 @@ TOOL_DEFINITIONS = {
 
     "BaselineEstimate": {
         "display_name": "Baseline Estimate",
-        "category": "Processing",
+        "category": "Transform",
         "description": "Estimate the spectral background with any of the arPLS / ALS / SNIP / rubberband / endpoint / polynomial methods, returning both the background and the corrected spectra",
         "inputs": [
             {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
@@ -703,8 +703,8 @@ TOOL_DEFINITIONS = {
     },
 
     "CurveFitting": {
-        "display_name": "Baseline",
-        "category": "Processing",
+        "display_name": "Background Flattening",
+        "category": "Transform",
         "description": "Subtract baseline from curves",
         "inputs": [
             {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
@@ -729,7 +729,7 @@ TOOL_DEFINITIONS = {
 
     "Integration": {
         "display_name": "Integration",
-        "category": "Processing",
+        "category": "Transform",
         "description": "Integrate over intervals",
         "inputs": [
             {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True},
@@ -748,7 +748,7 @@ TOOL_DEFINITIONS = {
 
     "SpatialAverage": {
         "display_name": "Spatial Average",
-        "category": "Processing",
+        "category": "Prepare",
         "description": "Average over spatial blocks",
         "inputs": [
             {"id": "datasets", "name": "Datasets", "port_type": "dataset", "required": False, "multi_input": True, "description": "One or more datasets to process"},
@@ -767,7 +767,7 @@ TOOL_DEFINITIONS = {
 
     "DataManipulation": {
         "display_name": "Math Operation",
-        "category": "Processing",
+        "category": "Prepare",
         "description": "Apply equations with multiple inputs (A+B+C, sqrt, etc.)",
         "inputs": [
             {"id": "inputs", "name": "Inputs", "port_type": "any", "required": True, "multi_input": True, "description": "Connect multiple datasets or flat data (referenced as A, B, C, ... in equation)"}
@@ -785,16 +785,22 @@ TOOL_DEFINITIONS = {
 
     "FFT1D": {
         "display_name": "FFT",
-        "category": "Processing",
-        "description": "1D Fourier transform",
+        "category": "Transform",
+        "description": "1D Fourier transform of every spectrum: magnitude (or power) and phase on a 1/<axis unit> frequency axis",
         "inputs": [
             {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
         ],
         "outputs": [
-            {"id": "fft_result", "name": "FFT Result", "port_type": "dataset", "description": "FFT transformed data"}
+            {"id": "fft_result", "name": "Magnitude", "port_type": "dataset", "description": "|F| (or |F|²) per spectrum — the port keeps its old id so saved workflows still connect"},
+            {"id": "phase", "name": "Phase", "port_type": "dataset", "description": "Phase per spectrum, radians"}
         ],
         "parameters": {
-            "output_type": {"type": "select", "label": "Output", "options": ["magnitude", "phase", "complex"], "default": "magnitude"}
+            "window": {"type": "select", "label": "Window", "options": ["hann", "none", "hamming", "blackman"], "default": "hann",
+                       "description": "Taper before the transform, so the ends of the sweep do not leak into every frequency"},
+            "detrend": {"type": "bool", "label": "Remove the mean first", "default": True,
+                        "description": "Without it the DC term dwarfs everything on a curve that never crosses zero"},
+            "one_sided": {"type": "bool", "label": "One-sided (non-negative frequencies)", "default": True},
+            "power_spectrum": {"type": "bool", "label": "Power spectrum |F|²", "default": False}
         }
     },
 
@@ -803,7 +809,7 @@ TOOL_DEFINITIONS = {
     # ===========================================================================
     "PeakFinder": {
         "display_name": "Peak Finder",
-        "category": "Analysis",
+        "category": "Fit and features",
         "description": "Detect peaks and intervals",
         "inputs": [
             {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
@@ -822,7 +828,7 @@ TOOL_DEFINITIONS = {
     "ConfinementAnalysis": {
         "composite": True,
         "display_name": "Confinement Analysis",
-        "category": "Analysis",
+        "category": "Confinement",
         "description": "Subtract a background and detect peaks in one pass, with an occupancy table",
         "inputs": [
             {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
@@ -886,7 +892,7 @@ TOOL_DEFINITIONS = {
     "SpectralFeatures": {
         "composite": True,
         "display_name": "Spectral Features",
-        "category": "Analysis",
+        "category": "Fit and features",
         "description": "Reduce each spectrum to physical features (gap, doping, metallicity, confined states) for classification",
         "inputs": [
             {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
@@ -910,14 +916,23 @@ TOOL_DEFINITIONS = {
             "state_width_samples": {"type": "int", "label": "State width (samples)", "default": 11, "min": 3, "max": 101,
                                     "description": "Narrower features are suppressed before gap detection, so a confined state is not mistaken for a band edge"},
             "positive_only": {"type": "bool", "label": "Fit the positive part only", "default": True,
-                              "description": "The band-edge polynomial ignores samples below zero: the LDOS cannot be negative, and those samples drag the fit down at the foot of the edge, which is where the steepness is read"}
+                              "description": "The band-edge polynomial ignores samples below zero: the LDOS cannot be negative, and those samples drag the fit down at the foot of the edge, which is where the steepness is read"},
+            # Dirac point (folded in from the sunset Dirac Point Estimator)
+            "dirac_mode": {"type": "select", "label": "Dirac branch windows", "options": ["auto", "manual", "off"], "default": "auto",
+                           "description": "auto: from each end of the sweep to the gap edge found above; manual: the four limits below; off: NaN columns"},
+            "dirac_edge_trim": {"type": "float", "label": "Dirac outer trim", "default": 0.10, "min": 0.0, "max": 0.49,
+                                "description": "Fraction of each branch's outer span left out (auto only), clear of the sweep's turnaround"},
+            "dirac_left_min": {"type": "float", "label": "Dirac left branch from (V)", "default": -1.0},
+            "dirac_left_max": {"type": "float", "label": "Dirac left branch to (V)", "default": -0.2},
+            "dirac_right_min": {"type": "float", "label": "Dirac right branch from (V)", "default": 0.2},
+            "dirac_right_max": {"type": "float", "label": "Dirac right branch to (V)", "default": 1.0}
         }
     },
 
     "ConfinementDesign": {
         "composite": True,
-        "display_name": "Confinement Design",
-        "category": "Analysis",
+        "display_name": "Line Scan Designer",
+        "category": "Confinement",
         "description": "Search every position of a line scan for the well that produces its ladder of levels — one confinement size per spectrum, or the reason there is none",
         "inputs": [
             {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
@@ -964,7 +979,7 @@ TOOL_DEFINITIONS = {
 
     "EnergyBinning": {
         "display_name": "Energy Binning",
-        "category": "Analysis",
+        "category": "Fit and features",
         "description": "Bin peaks that have already been found onto a k_B*T/2 energy grid and return the occupied bins as integration intervals — the same grid Confinement Analysis and the Map Generator report on, and deliberately NOT the FWHM intervals Peak Finder emits",
         "inputs": [
             {"id": "peaks", "name": "Peaks", "port_type": "dataset", "required": True, "description": "Peak table from Peak Finder or Confinement Analysis (needs spectrum_index and position_value columns)"},
@@ -989,7 +1004,7 @@ TOOL_DEFINITIONS = {
 
     "OccupancyMatrix": {
         "display_name": "Occupancy Matrix",
-        "category": "Analysis",
+        "category": "Fit and features",
         "description": "Turn a peak list into the occupancy table — 1 where a spectrum has a peak, blank elsewhere; one column per spectrum, one row per measured energy, or per bin when bins are connected",
         "inputs": [
             {"id": "peaks", "name": "Peaks", "port_type": "dataset", "required": True, "description": "Peak table from Peak Finder or Confinement Analysis"},
@@ -1010,26 +1025,48 @@ TOOL_DEFINITIONS = {
     "MapGenerator": {
         "composite": True,
         "display_name": "Map Generator",
-        "category": "Visualization",
-        "description": "Create spatial maps from flat data",
+        "category": "Maps",
+        "description": "Spectra to maps in one pass: optional spatial averaging, background removal, interval detection, integration above a noise floor, one calibrated map per interval plus the joined interval map — the same engine as the Map Generator tool. Connect a flat dataset instead to map already-integrated values (the old path).",
         "inputs": [
-            {"id": "flat_data", "name": "Flat Dataset", "port_type": "flat_data", "required": True}
+            {"id": "dataset", "name": "Spectra", "port_type": "dataset", "required": False,
+             "description": "Spectra — the full pipeline runs"},
+            {"id": "intervals", "name": "Intervals", "port_type": "intervals", "required": False,
+             "description": "Bias intervals to integrate; overrides detection when connected"},
+            {"id": "flat_data", "name": "Flat Dataset", "port_type": "flat_data", "required": False,
+             "description": "Already-integrated values: one map per column, nothing else"}
         ],
         "outputs": [
-            {"id": "maps", "name": "Maps", "port_type": "map", "description": "List of generated TIFF map paths"}
+            {"id": "maps", "name": "Maps", "port_type": "map", "description": "One calibrated TIFF per interval"},
+            {"id": "interval_map", "name": "Interval Map", "port_type": "map", "description": "The joined map: position across, interval up"},
+            {"id": "values", "name": "Map Values", "port_type": "flat_data", "description": "The integrals, one column per interval (the Integration Utility's table)"},
+            {"id": "intervals_used", "name": "Intervals", "port_type": "intervals", "description": "The intervals that were integrated"},
+            {"id": "binned", "name": "Averaged Spectra", "port_type": "dataset", "description": "The spatially averaged spectra, when a block size above 1 was set"}
         ],
         "parameters": {
-            "intervals": {"type": "interval_checklist", "label": "Intervals to Generate", "description": "Select which intervals to generate maps for (auto-populated from input)"},
-            "generate_all": {"type": "bool", "label": "Generate All", "default": True, "description": "Generate maps for all available intervals"},
             "scan_type": {"type": "select", "label": "Scan type", "default": "auto",
                           "options": ["auto", "map_meander", "map_raster", "line"],
-                          "description": "How the points were acquired: a meandering map needs every other row reversed, a line scan becomes a single row. 'auto' reads the dataset's own metadata."}
+                          "description": "How the points were acquired: a meandering map needs every other row reversed, a line scan becomes a single row. 'auto' reads the dataset's own metadata."},
+            "bin_x": {"type": "int", "label": "Spatial block width", "default": 1, "min": 1, "max": 256,
+                      "description": "Average blocks of neighbouring positions first (1 = every position)"},
+            "bin_y": {"type": "int", "label": "Spatial block height", "default": 1, "min": 1, "max": 256},
+            "interval_source": {"type": "select", "label": "Intervals from", "options": ["detect", "manual"], "default": "detect",
+                                "description": "detect: a peak search on the corrected spectra, binned at k_B*T/2; manual: the list below (or the Intervals port)"},
+            "intervals": {"type": "interval_list", "label": "Manual intervals", "required": False},
+            "baseline": {"type": "select", "label": "Background",
+                         "options": ["arpls", "poly-iter", "poly", "snip", "als", "rubberband", "endpoints", "none"], "default": "arpls"},
+            "baseline_degree": {"type": "int", "label": "Degree", "default": 5, "min": 0, "max": 15},
+            "height": {"type": "float", "label": "Peak threshold (sigma)", "default": 3.0, "min": 0.1, "max": 50.0},
+            "noise_floor": {"type": "float", "label": "Noise floor (sigma)", "default": 1.0, "min": 0.0, "max": 10.0,
+                            "description": "Only the part standing above this many sigmas of each spectrum's noise is integrated"},
+            "min_spectra_per_bin": {"type": "int", "label": "Min spectra per bin", "default": 1, "min": 1, "max": 1000},
+            "temperature_k": {"type": "float", "label": "Temperature (K)", "default": 4.5, "min": 0.01, "max": 1000.0},
+            "generate_all": {"type": "bool", "label": "Generate all (flat-data path)", "default": True}
         }
     },
 
     "MapAssembly": {
         "display_name": "Map Assembly",
-        "category": "Visualization",
+        "category": "Maps",
         "description": "Lay one value per spectrum out on the sample — a calibrated map per value column in real physical units, plus the joined interval map when several columns share one energy grid",
         "inputs": [
             {"id": "flat_data", "name": "Flat Dataset", "port_type": "flat_data", "required": True, "description": "One row per spectrum, one column per value"},
@@ -1057,7 +1094,7 @@ TOOL_DEFINITIONS = {
     # ===========================================================================
     "ImageSmoothing": {
         "display_name": "Image Smoothing",
-        "category": "Image Processing",
+        "category": "Maps",
         "description": "Smooth image/map",
         "inputs": [
             {"id": "image", "name": "Image", "port_type": "image", "required": True}
@@ -1073,7 +1110,7 @@ TOOL_DEFINITIONS = {
 
     "GradientFilter": {
         "display_name": "Gradient",
-        "category": "Image Processing",
+        "category": "Maps",
         "description": "Edge detection filter",
         "inputs": [
             {"id": "image", "name": "Image", "port_type": "image", "required": True}
@@ -1088,7 +1125,7 @@ TOOL_DEFINITIONS = {
 
     "ImageDiscretizer": {
         "display_name": "Image Discretizer",
-        "category": "Image Processing",
+        "category": "Maps",
         "description": "Discretize image values into bins for visualization or analysis",
         "inputs": [
             {"id": "image", "name": "Image", "port_type": "image", "required": True, "description": "Input image to discretize"}
@@ -1130,7 +1167,7 @@ TOOL_DEFINITIONS = {
 
     "MapGaussianFilter": {
         "display_name": "Map Gaussian Filter",
-        "category": "Image Processing",
+        "category": "Maps",
         "description": "Apply Gaussian smoothing filter to a map image",
         "inputs": [
             {"id": "map", "name": "Map", "port_type": "map", "required": True, "description": "Input map image"}
@@ -1145,7 +1182,7 @@ TOOL_DEFINITIONS = {
 
     "MapMedianFilter": {
         "display_name": "Map Median Filter",
-        "category": "Image Processing",
+        "category": "Maps",
         "description": "Apply median filter to a map image (removes salt-and-pepper noise)",
         "inputs": [
             {"id": "map", "name": "Map", "port_type": "map", "required": True, "description": "Input map image"}
@@ -1160,7 +1197,7 @@ TOOL_DEFINITIONS = {
 
     "MapPlaneLevel": {
         "display_name": "Map Plane Level",
-        "category": "Image Processing",
+        "category": "Maps",
         "description": "Subtract a fitted plane from the map to remove tilt",
         "inputs": [
             {"id": "map", "name": "Map", "port_type": "map", "required": True, "description": "Input map image"}
@@ -1173,7 +1210,7 @@ TOOL_DEFINITIONS = {
 
     "MapRowAlign": {
         "display_name": "Map Row Align",
-        "category": "Image Processing",
+        "category": "Maps",
         "description": "Align rows by subtracting the median of each row",
         "inputs": [
             {"id": "map", "name": "Map", "port_type": "map", "required": True, "description": "Input map image"}
@@ -1186,7 +1223,7 @@ TOOL_DEFINITIONS = {
 
     "MapNormalize": {
         "display_name": "Map Normalize",
-        "category": "Image Processing",
+        "category": "Maps",
         "description": "Normalize map values to [0, 1] range",
         "inputs": [
             {"id": "map", "name": "Map", "port_type": "map", "required": True, "description": "Input map image"}
@@ -1199,7 +1236,7 @@ TOOL_DEFINITIONS = {
 
     "MapPolynomialBGRemoval": {
         "display_name": "Map Polynomial BG Removal",
-        "category": "Image Processing",
+        "category": "Maps",
         "description": "Remove polynomial background from map",
         "inputs": [
             {"id": "map", "name": "Map", "port_type": "map", "required": True, "description": "Input map image"}
@@ -1220,7 +1257,7 @@ TOOL_DEFINITIONS = {
 
     "FilterBadData": {
         "display_name": "Filter Bad Data",
-        "category": "Processing",
+        "category": "Prepare",
         "description": "Classify and separate bad spectra (saturation, noise, linear artifacts, periodic noise, featureless curves)",
         "inputs": [
             {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
@@ -1229,6 +1266,7 @@ TOOL_DEFINITIONS = {
             {"id": "good_data", "name": "Good Data", "port_type": "dataset"},
             {"id": "bad_data", "name": "Bad Data", "port_type": "dataset"},
             {"id": "fft_spectra", "name": "FFT Spectra", "port_type": "dataset"},
+            {"id": "point_averages", "name": "Point Averages", "port_type": "dataset"},
             {"id": "report", "name": "Report", "port_type": "string"}
         ],
         "parameters": {
@@ -1256,8 +1294,10 @@ TOOL_DEFINITIONS = {
 
     "DetectBandgapDoping": {
         "composite": True,
+        # Hidden from the palette; still executable so saved workflows run.
+        "deprecated": "Replaced by the gap and doping groups of Spectral Features",
         "display_name": "Detect Bandgap & Doping",
-        "category": "Analysis",
+        "category": "Fit and features",
         "description": "Bandgap size and doping type (N/P/Neutral) per spectrum",
         "inputs": [
             {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
@@ -1276,8 +1316,10 @@ TOOL_DEFINITIONS = {
 
     "DiracPointEstimator": {
         "composite": True,
+        # Hidden from the palette; still executable so saved workflows run.
+        "deprecated": "Replaced by the Dirac point group of Spectral Features",
         "display_name": "Dirac Point Estimator",
-        "category": "Analysis",
+        "category": "Fit and features",
         "description": "Estimate Dirac point from linear slope intersections",
         "inputs": [
             {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
@@ -1299,6 +1341,156 @@ TOOL_DEFINITIONS = {
     # ===========================================================================
     # TEXT OUTPUT NODE
     # ===========================================================================
+    "AverageCurves": {
+        "display_name": "Average Curves",
+        "category": "Prepare",
+        "description": "The arithmetic mean of every spectrum in the dataset, as one curve",
+        "inputs": [
+            {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
+        ],
+        "outputs": [
+            {"id": "average", "name": "Average", "port_type": "dataset", "description": "One mean spectrum"}
+        ],
+        "parameters": {}
+    },
+
+    "SetUnits": {
+        "display_name": "Set Units",
+        "category": "Prepare",
+        "description": "Say what the numbers are — axis and spectra units and names — without changing them. The Unit Converter's Relabel, applied to a copy flowing through the graph.",
+        "inputs": [
+            {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
+        ],
+        "outputs": [
+            {"id": "dataset", "name": "Dataset", "port_type": "dataset"}
+        ],
+        "parameters": {
+            "x_unit": {"type": "string", "label": "x unit", "default": "", "description": "e.g. V, mV, nm, eV, cm-1 (blank keeps)"},
+            "x_name": {"type": "string", "label": "x name", "default": ""},
+            "y_unit": {"type": "string", "label": "y unit", "default": "", "description": "e.g. A, nA, S, a.u."},
+            "y_name": {"type": "string", "label": "y quantity", "default": "", "description": "e.g. dI/dV, Current, Intensity"}
+        }
+    },
+
+    "AxisConvert": {
+        "display_name": "Convert Axis",
+        "category": "Prepare",
+        "description": "nm ↔ eV ↔ cm⁻¹ ↔ Raman shift. The source unit is read from the dataset (Set Units first if it has none).",
+        "inputs": [
+            {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
+        ],
+        "outputs": [
+            {"id": "converted", "name": "Converted", "port_type": "dataset"}
+        ],
+        "parameters": {
+            "target_unit": {"type": "select", "label": "Target unit", "options": ["eV", "nm", "cm-1", "raman_cm-1"], "default": "eV"},
+            "excitation_nm": {"type": "float", "label": "Excitation (nm, Raman only)", "default": 532.0, "min": 0.0}
+        }
+    },
+
+    "SetValues": {
+        "display_name": "Set Values",
+        "category": "Prepare",
+        "description": "Set the axis and/or every spectrum by formula — x * 1e3, y / 1e-9, y - min(y) — with new units stamped on the result. Both formulas see the original x and y.",
+        "inputs": [
+            {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
+        ],
+        "outputs": [
+            {"id": "result", "name": "Result", "port_type": "dataset"}
+        ],
+        "parameters": {
+            "x_formula": {"type": "string", "label": "x =", "default": "", "description": "Blank keeps the axis. Functions: sqrt log log10 exp abs clip where min max mean …; constants pi e h hbar c kB q hc_eVnm"},
+            "y_formula": {"type": "string", "label": "y =", "default": "", "description": "Every spectrum at once; x broadcasts; i is the sample index"},
+            "x_unit": {"type": "string", "label": "new x unit", "default": ""},
+            "x_name": {"type": "string", "label": "new x name", "default": ""},
+            "y_unit": {"type": "string", "label": "new y unit", "default": ""},
+            "y_name": {"type": "string", "label": "new y quantity", "default": ""}
+        }
+    },
+
+    "MultiPeakFit": {
+        "composite": True,
+        "display_name": "Multi-Peak Fitting",
+        "category": "Fit and features",
+        "description": "A sum of Gaussian / Lorentzian / pseudo-Voigt peaks plus a polynomial baseline, fitted to every spectrum: a per-spectrum peak table (centres, amplitudes, FWHMs) and the fitted curves",
+        "inputs": [
+            {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
+        ],
+        "outputs": [
+            {"id": "peak_table", "name": "Peak Table", "port_type": "flat_data", "description": "One row per spectrum: n_peaks, rsq, peak<k>_center/_amplitude/_fwhm"},
+            {"id": "fitted", "name": "Fitted Curves", "port_type": "dataset", "description": "The fitted model on the source axis, one column per spectrum"}
+        ],
+        "parameters": {
+            "peak_shape": {"type": "select", "label": "Peak shape", "options": ["gaussian", "lorentzian", "pseudo_voigt"], "default": "gaussian"},
+            "n_peaks_auto": {"type": "int", "label": "Max peaks (0 = auto)", "default": 0, "min": 0, "max": 50},
+            "baseline_degree": {"type": "int", "label": "Baseline degree (-1 = none)", "default": 1, "min": -1, "max": 6},
+            "positive_only": {"type": "bool", "label": "Fit the positive part only", "default": True,
+                              "description": "The LDOS cannot be negative; clear for a signed quantity"}
+        }
+    },
+
+    "ConfinementDimensionality": {
+        "composite": True,
+        "display_name": "Confinement Dimensionality",
+        "category": "Confinement",
+        "description": "0D / 1D / 2D from the ratios between the levels at the band edge, per spectrum, with a whole-set verdict",
+        "inputs": [
+            {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
+        ],
+        "outputs": [
+            {"id": "table", "name": "Dimensionality", "port_type": "flat_data", "description": "One row per spectrum: verdict code, geometry ranking, fit statistics"}
+        ],
+        "parameters": {
+            "temperature_k": {"type": "float", "label": "Temperature (K)", "default": 4.5, "min": 0.01, "max": 1000.0},
+            "baseline": {"type": "select", "label": "Background",
+                         "options": ["arpls", "poly-iter", "poly", "snip", "als", "rubberband", "endpoints", "none"], "default": "arpls"},
+            "height": {"type": "float", "label": "Peak threshold (sigma)", "default": 2.0, "min": 0.1, "max": 50.0}
+        }
+    },
+
+    "ConfinementDesigner": {
+        "composite": True,
+        "display_name": "Confinement Designer",
+        "category": "Confinement",
+        "description": "One spectrum: which well would produce its ladder of levels? Every candidate geometry ranked — the Confinement Designer tool; for every position of a line scan use Line Scan Designer",
+        "inputs": [
+            {"id": "dataset", "name": "Dataset", "port_type": "dataset", "required": True}
+        ],
+        "outputs": [
+            {"id": "candidates", "name": "Candidates", "port_type": "flat_data", "description": "Ranked candidate geometries with size, error and levels"}
+        ],
+        "parameters": {
+            "spectrum_index": {"type": "int", "label": "Spectrum", "default": 0, "min": 0, "max": 100000},
+            "carrier": {"type": "select", "label": "Carriers", "options": ["electrons", "holes", "both"], "default": "electrons"},
+            "meff_e": {"type": "string", "label": "m* electron", "default": "0.067"},
+            "meff_h": {"type": "string", "label": "m* hole", "default": "0.45"},
+            "ndim": {"type": "select", "label": "Dimensions", "options": ["1D", "2D", "3D"], "default": "1D"},
+            "coords": {"type": "select", "label": "Shape", "options": ["cartesian", "polar", "cylindrical", "spherical"], "default": "cartesian"},
+            "sym": {"type": "select", "label": "Symmetry", "options": ["orthorhombic", "tetragonal", "cubic"], "default": "orthorhombic"},
+            "Lmin": {"type": "float", "label": "Smallest (nm)", "default": 1.0, "min": 0.01},
+            "Lmax": {"type": "float", "label": "Largest (nm)", "default": 20.0, "min": 0.02},
+            "match": {"type": "select", "label": "Match by", "options": ["delta_e", "absolute"], "default": "delta_e"},
+            "maxsol": {"type": "int", "label": "Candidates", "default": 5, "min": 1, "max": 50},
+            "height": {"type": "float", "label": "Peak threshold (sigma)", "default": 3.0, "min": 0.1, "max": 50.0}
+        }
+    },
+
+    "MapDiscretizer": {
+        "display_name": "Map Discretizer",
+        "category": "Maps",
+        "description": "Reduce a map's SPATIAL resolution to a target grid (the Map Discretizer tool). Image Discretizer, by contrast, bins the values.",
+        "inputs": [
+            {"id": "map", "name": "Map", "port_type": "map", "required": True}
+        ],
+        "outputs": [
+            {"id": "discretized", "name": "Discretized", "port_type": "map"}
+        ],
+        "parameters": {
+            "target_x": {"type": "int", "label": "Target width", "default": 10, "min": 1, "max": 4096},
+            "target_y": {"type": "int", "label": "Target height", "default": 10, "min": 1, "max": 4096}
+        }
+    },
+
     "TextOutput": {
         "display_name": "Text Report",
         "category": "Output",
@@ -1373,11 +1565,15 @@ def get_tool_categories() -> List[Dict]:
     Returns a list of {"category": str, "tools": List[str]} dicts to preserve
     category order (PySide6 QVariantMap sorts keys alphabetically).
 
-    Category order: Input -> Output -> Annotations -> Processing -> Analysis -> Visualization -> Image Processing
-    Within each category, tools are sorted for optimal UX flow.
+    Category order: Input -> Output -> Annotations -> Prepare -> Transform ->
+    Fit and features -> Maps -> Confinement — the Tools menu's sections.
+    Within each category, tools are sorted for optimal UX flow. Deprecated
+    nodes are left out.
     """
-    # Define category order for optimal UX - Image Processing last
-    category_order = ["Input", "Output", "Annotations", "Processing", "Analysis", "Visualization", "Image Processing"]
+    # The same sections as the Tools menu and tool palette (ToolCatalog.js),
+    # ordered by complexity, after the graph plumbing.
+    category_order = ["Input", "Output", "Annotations", "Prepare", "Transform",
+                      "Fit and features", "Maps", "Confinement"]
 
     categories: Dict[str, List[str]] = {}
     #: Tools that do several operations in one pass with decisions between
@@ -1386,6 +1582,10 @@ def get_tool_categories() -> List[Dict]:
     #: what makes that a real option rather than a slogan.
     composite: Dict[str, List[str]] = {}
     for tool_name, tool_def in TOOL_DEFINITIONS.items():
+        # A deprecated node stays executable (saved workflows) but is not
+        # offered: the tool that replaced it is.
+        if tool_def.get('deprecated'):
+            continue
         category = tool_def.get('category', 'Other')
         if category not in categories:
             categories[category] = []
@@ -1397,56 +1597,30 @@ def get_tool_categories() -> List[Dict]:
     # Sort tools within each category for logical flow
     tool_order = {
         # Input tools
-        "DatasetInput": 0,
-        "MapInput": 1,
-        "ImageInput": 2,
-        "FlatDataInput": 3,
-        "IntervalInput": 4,
+        "DatasetInput": 0, "MapInput": 1, "ImageInput": 2, "FlatDataInput": 3, "IntervalInput": 4,
         # Output tools
-        "DatasetOutput": 0,
-        "MapOutput": 1,
-        "ImageOutput": 2,
-        "FlatDataOutput": 3,
-        "TextOutput": 4,
-        "IntervalOutput": 5,
+        "DatasetOutput": 0, "MapOutput": 1, "ImageOutput": 2, "FlatDataOutput": 3,
+        "TextOutput": 4, "IntervalOutput": 5,
         # Annotations
         "CommentNode": 0,
-        # Processing tools - ordered by typical workflow
-        "ColumnSelector": 0,
-        "TruncateData": 1,
-        "Derivative": 2,
-        "CurveSmoothing": 2,
-        "BaselineEstimate": 3,
-        "CurveFitting": 4,
-        "Integration": 5,
-        "SpatialAverage": 6,
-        "DataManipulation": 7,
-        "FFT1D": 8,
-        "FilterBadData": 9,
-        "CosmicRayFilter": 10,
-        "BackgroundSubtraction": 11,
-        # Analysis tools
-        "ConfinementAnalysis": 0,
-        "SpectralFeatures": 1,
-        "PeakFinder": 2,
-        "EnergyBinning": 3,
-        "OccupancyMatrix": 4,
-        "ConfinementDesign": 5,
-        "DetectBandgapDoping": 6,
-        "DiracPointEstimator": 7,
-        # Visualization
-        "MapGenerator": 0,
-        "MapAssembly": 1,
-        # Image Processing - image tools first, then map processing
-        "ImageSmoothing": 0,
-        "GradientFilter": 1,
-        "ImageDiscretizer": 2,
-        "MapGaussianFilter": 3,
-        "MapMedianFilter": 4,
-        "MapPlaneLevel": 5,
-        "MapRowAlign": 6,
-        "MapNormalize": 7,
-        "MapPolynomialBGRemoval": 8,
+        # Prepare — in the order a dataset is usually cleaned
+        "ColumnSelector": 0, "SetUnits": 1, "AxisConvert": 2, "SetValues": 3,
+        "TruncateData": 4, "CurveSmoothing": 5, "CosmicRayFilter": 6,
+        "BackgroundSubtraction": 7, "FilterBadData": 8, "AverageCurves": 9,
+        "SpatialAverage": 10, "DataManipulation": 11,
+        # Transform
+        "Derivative": 0, "CurveFitting": 1, "BaselineEstimate": 2, "Integration": 3, "FFT1D": 4,
+        # Fit and features
+        "SpectralFeatures": 0, "MultiPeakFit": 1, "PeakFinder": 2, "EnergyBinning": 3,
+        "OccupancyMatrix": 4, "DetectBandgapDoping": 5, "DiracPointEstimator": 6,
+        # Maps — spectra → maps first, then operations on maps and images
+        "MapGenerator": 0, "MapAssembly": 1, "MapDiscretizer": 2,
+        "MapGaussianFilter": 3, "MapMedianFilter": 4, "MapPlaneLevel": 5,
+        "MapRowAlign": 6, "MapNormalize": 7, "MapPolynomialBGRemoval": 8,
+        "GradientFilter": 9, "ImageSmoothing": 10, "ImageDiscretizer": 11,
+        # Confinement
+        "ConfinementAnalysis": 0, "ConfinementDimensionality": 1,
+        "ConfinementDesigner": 2, "ConfinementDesign": 3,
     }
 
     for category in categories:

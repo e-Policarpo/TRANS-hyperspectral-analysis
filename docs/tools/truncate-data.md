@@ -2,10 +2,14 @@
 
 Cuts every spectrum down to a bias window.
 
-**Menu** Tools → Truncate Data · **Panel** `TruncateTool.qml` ·
-**Method** `truncateData()` → `_do_truncate_data()`
+**Menu** Tools → Prepare → Truncate Data · **Panel** `TruncateTool.qml` ·
+**Method** `_do_truncate_data()` · **Batch key** `truncate`
 
 ## Input
+
+A multi-dataset selection: the same range is applied to each dataset in
+turn. The panel shows the selection's axis range (the envelope, for several)
+before a range is typed.
 
 Any spectral dataset.
 

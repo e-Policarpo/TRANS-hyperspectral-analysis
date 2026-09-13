@@ -109,8 +109,9 @@ class TestTheCompositeFlag:
 
     def test_the_composite_tools_are_marked(self):
         expected = {"MapGenerator", "ConfinementAnalysis", "SpectralFeatures",
-                    "ConfinementDesign", "DetectBandgapDoping",
-                    "DiracPointEstimator"}
+                    "ConfinementDesign", "ConfinementDesigner",
+                    "ConfinementDimensionality", "MultiPeakFit",
+                    "DetectBandgapDoping", "DiracPointEstimator"}
         marked = {name for name, node in TOOL_DEFINITIONS.items()
                   if node.get('composite')}
 
@@ -125,9 +126,9 @@ class TestTheCompositeFlag:
     def test_the_categories_carry_it_to_the_palette(self):
         categories = {c['category']: c for c in get_tool_categories()}
 
-        assert "ConfinementAnalysis" in categories['Analysis']['composite']
-        assert "MapGenerator" in categories['Visualization']['composite']
-        assert categories['Processing']['composite'] == []
+        assert "ConfinementAnalysis" in categories['Confinement']['composite']
+        assert "MapGenerator" in categories['Maps']['composite']
+        assert categories['Prepare']['composite'] == []
 
     def test_every_category_answers_the_question(self):
         """The palette reads the key unconditionally; a missing one would be

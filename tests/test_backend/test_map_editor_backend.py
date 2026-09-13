@@ -1388,3 +1388,47 @@ class TestStsMarkerLabels:
         from src.backend.map_editor_backend import MapEditorBackend
 
         assert MapEditorBackend._sts_marker_label({}) == ''
+
+
+class TestMapNameIsAlwaysSet:
+    """The Hyperspectral tab names what it is showing.
+
+    The map-tabs strip is filled in by only two of the load paths, so opening
+    a dataset from the browser used to leave the tab showing an unnamed map.
+    ``mapName`` is the backend's own record and every load path sets it.
+    """
+
+    def test_nothing_loaded_is_an_empty_name(self, backend):
+        assert backend.mapName == ""
+
+    def test_an_array_is_named_by_its_channel(self, backend):
+        backend.setMapDataFromArray(np.zeros((4, 4)), "1st Derivative Map")
+        assert backend.mapName == "1st Derivative Map"
+
+    def test_a_second_load_replaces_the_first(self, backend):
+        backend.setMapDataFromArray(np.zeros((4, 4)), "First")
+        backend.setMapDataFromArray(np.ones((4, 4)), "Second")
+        assert backend.mapName == "Second"
+
+    def test_the_change_is_signalled_once_per_real_change(self, backend):
+        seen = []
+        backend.mapNameChanged.connect(lambda: seen.append(backend.mapName))
+        backend.setMapDataFromArray(np.zeros((4, 4)), "Map A")
+        backend.setMapDataFromArray(np.zeros((4, 4)), "Map A")   # same name
+        backend.setMapDataFromArray(np.zeros((4, 4)), "Map B")
+        assert seen == ["Map A", "Map B"]
+
+    def test_a_line_scan_is_named_by_its_dataset(self, backend, sample_spectral_data):
+        app = Mock()
+        app._datasets = {"line3 64pts": sample_spectral_data}
+        backend.set_app_backend(app)
+        backend.loadDatasetAsLineScan("line3 64pts")
+        assert backend.mapName == "line3 64pts"
+
+    def test_a_dataset_that_is_not_there_leaves_the_name_alone(self, backend):
+        backend.setMapDataFromArray(np.zeros((4, 4)), "Still showing this")
+        app = Mock()
+        app._datasets = {}
+        backend.set_app_backend(app)
+        backend.loadDatasetAsLineScan("missing")
+        assert backend.mapName == "Still showing this"

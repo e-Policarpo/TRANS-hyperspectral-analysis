@@ -4,7 +4,7 @@ Numerical derivative of each spectrum — dI/dV from an I(V) sweep, or
 d²I/dV². Accepts a **multi-dataset selection** and processes them one after
 another.
 
-**Menu** Tools → Derivative Calculator · **Panel** `DerivativeTool.qml` ·
+**Menu** Tools → Transform → Derivative Calculator · **Panel** `DerivativeTool.qml` ·
 **Method** `calculate_derivative()` · **Batch key** `derivative`
 
 ## Input

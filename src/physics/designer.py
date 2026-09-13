@@ -499,12 +499,29 @@ class Designer:
                 return True
         return False
 
-    def find_solutions(self, p):
+    def find_solutions(self, p,
+                       progress: Optional[Callable[[str], None]] = None,
+                       should_cancel: Optional[Callable[[], bool]] = None
+                       ) -> list:
         """Candidates for one carrier at one effective mass, best error first.
 
         Two passes: an analytical estimate per target refined locally, then a
         global optimisation for what that misses. Anything above ``tol`` is
         discarded rather than reported as a poor fit.
+
+        ``should_cancel`` is asked before each analytical estimate and before
+        each global pass. One differential_evolution run at maxiter=200 is
+        the longest stretch this method is stuck inside with no way out, so
+        between the passes is the finest granularity the search has to offer
+        — and it is enough to turn a Cancel that used to be ignored for the
+        whole of a carrier into one that lands within a pass. When it answers
+        True the search stops where it is and RETURNS the candidates found so
+        far instead of raising: a partial list is still a list of real
+        solutions, and whether a partial answer is worth showing is the
+        caller's decision, not this method's.
+
+        ``progress``, when given, is told which pass is running — the global
+        passes are the slow ones and a silent minute looks like a hang.
         """
         bounds = self.bounds(p)
         nfree = len(bounds)
@@ -516,7 +533,17 @@ class Designer:
 
         # Analytical estimates
         m = p['meff'] * m_e
-        for Er in p['Et']:
+        nest = len(p['Et'])
+        for i, Er in enumerate(p['Et']):
+            if should_cancel is not None and should_cancel():
+                # Returns rather than breaks: with the estimates abandoned
+                # there is no reason to go on to the far slower global pass.
+                logger.info("find_solutions cancelled during the analytical "
+                            "estimates: %d candidate(s) kept", len(sols))
+                sols.sort(key=lambda x: x['RRMSE'])
+                return sols[:p['maxsol']]
+            if progress is not None:
+                progress(f"analytical estimate {i + 1}/{nest}")
             E_J = Er * e
             pf = hbar ** 2 * np.pi ** 2 / (2.0 * m)
             # A hard sphere's ground state is hbar^2*pi^2/(2 m R^2), the same
@@ -535,9 +562,17 @@ class Designer:
                     pass
 
         # Global optimisation
-        for _ in range(p['maxsol'] * 2):
+        npass = p['maxsol'] * 2
+        for i in range(npass):
             if len(sols) >= p['maxsol']:
                 break
+            if should_cancel is not None and should_cancel():
+                logger.info("find_solutions cancelled after %d/%d global "
+                            "pass(es): %d candidate(s) kept",
+                            i, npass, len(sols))
+                break
+            if progress is not None:
+                progress(f"global search pass {i + 1}/{npass}")
             try:
                 res = differential_evolution(
                     self.objective, bounds, args=(p,),
@@ -553,21 +588,45 @@ class Designer:
         return sols[:p['maxsol']]
 
     def search_carrier(self, p: dict, carrier: dict,
-                       progress: Optional[Callable[[str], None]] = None) -> list:
+                       progress: Optional[Callable[[str], None]] = None,
+                       should_cancel: Optional[Callable[[], bool]] = None
+                       ) -> list:
         """Search one carrier's candidates, once per effective mass.
 
         Different masses are different searches — the same energy with a
         larger mass asks for a larger well — and each candidate comes out
         stamped with its own, so the final list can mix them without losing
         track of which mass produced which geometry.
+
+        ``should_cancel`` is asked before each mass and handed down to
+        ``find_solutions``, which polls it between its own optimisation
+        passes. A list of masses was the longest uninterruptible block in the
+        designer: three masses is three full searches, and a Cancel ignored
+        for that long reads as a freeze. A cancelled search returns what it
+        has already found, deduplicated exactly like a complete one, instead
+        of raising — the caller decides whether a partial list is worth
+        keeping.
+
+        ``progress`` is told which mass is starting and is then passed on to
+        ``find_solutions`` prefixed with that mass, so the wait inside one
+        mass's search is visible too and not just the gaps between them.
         """
         found = []
         for meff in carrier['meffs']:
+            if should_cancel is not None and should_cancel():
+                logger.info("search %s cancelled before m*=%g: %d candidate(s)"
+                            " kept", carrier['label'], meff, len(found))
+                break
             pm = {**p, 'Et': carrier['Et'], 'meff': meff,
                   'carrier': carrier['carrier']}
+            label = f"{carrier['label']}s with m* = {meff:g}"
             if progress is not None:
-                progress(f"Searching {carrier['label']}s with m* = {meff:g}…")
-            sols = self.find_solutions(pm)
+                progress(f"Searching {label}…")
+            sols = self.find_solutions(
+                pm,
+                progress=(None if progress is None else
+                          lambda msg, _label=label: progress(f"{_label}: {msg}")),
+                should_cancel=should_cancel)
             logger.info("search %s m*=%g: %d candidate(s)",
                         carrier['label'], meff, len(sols))
             found.extend(sols)

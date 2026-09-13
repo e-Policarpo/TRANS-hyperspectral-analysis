@@ -44,9 +44,11 @@ from typing import Callable, Dict, List, Optional
 import numpy as np
 
 from src.backend.peak_fitting import estimate_noise_sigma
-from src.backend.sts_algorithms import detect_bandgap, classify_doping, validate_ldos
+from src.backend.sts_algorithms import (detect_bandgap, classify_doping, validate_ldos,
+                                        fit_dirac_point)
 from src.processing.positivity import positive_mask
 from src.processing.peak_detection import (
+    CONFINEMENT_DEFAULTS,
     Params,
     analyze,
     coefficient_names,
@@ -59,6 +61,7 @@ logger = logging.getLogger(__name__)
 
 
 NORMALIZATIONS = ("none", "max", "band-edge", "area")
+DIRAC_MODES = ("auto", "manual", "off")
 
 
 @dataclass
@@ -83,6 +86,10 @@ class FeatureConfig:
     doping_smooth_points: int = 5
     #: Peak search used for the confined states. Restricted to the gap.
     confinement: Optional[Params] = None
+    #: Peak search used to count states on each side of zero bias. Unlike
+    #: :attr:`confinement` it runs over the whole sweep, so it needs a
+    #: baseline that can follow a band edge — see :meth:`sign_params`.
+    state_sign: Optional[Params] = None
     #: In-gap states must clear this many noise sigmas to count.
     state_noise_sigmas: float = 4.0
     #: Features narrower than this many samples are suppressed before gap
@@ -93,8 +100,30 @@ class FeatureConfig:
     #: noise or an over-subtracted background. Clear it only if the input is
     #: a signed quantity rather than an LDOS.
     positive_only: bool = True
+    #: Dirac point — where the two linear branches of a V-shaped spectrum
+    #: (graphene, a Dirac semimetal) meet. ``dirac_mode`` is ``"auto"``
+    #: (branches run from each end of the sweep to the gap edge found
+    #: above, trimmed by ``dirac_edge_trim`` at the outer end) or
+    #: ``"manual"`` (the four bias limits below). ``"off"`` skips the group
+    #: and its columns are NaN.
+    dirac_mode: str = "auto"
+    dirac_edge_trim: float = 0.10
+    dirac_left_min: float = -1.0
+    dirac_left_max: float = -0.2
+    dirac_right_min: float = 0.2
+    dirac_right_max: float = 1.0
 
     def validate(self) -> None:
+        if self.dirac_mode not in DIRAC_MODES:
+            raise ValueError(
+                f"dirac_mode must be one of {DIRAC_MODES}, got {self.dirac_mode!r}")
+        if not 0 <= self.dirac_edge_trim < 0.5:
+            raise ValueError(
+                f"dirac_edge_trim must lie in [0, 0.5), got {self.dirac_edge_trim}")
+        if self.dirac_mode == "manual" and not (
+                self.dirac_left_min < self.dirac_left_max
+                and self.dirac_right_min < self.dirac_right_max):
+            raise ValueError("manual Dirac windows must satisfy min < max on both sides")
         if self.normalize not in NORMALIZATIONS:
             raise ValueError(
                 f"normalize must be one of {NORMALIZATIONS}, got {self.normalize!r}")
@@ -117,6 +146,18 @@ class FeatureConfig:
         # polynomial fitted across it would eat the very states being counted.
         return Params(baseline="none", height=5.0, smooth_points=2)
 
+    def sign_params(self) -> Params:
+        """Peak-search settings for the whole sweep.
+
+        The band edge dominates everything outside the gap, so this search
+        needs the arPLS background that :data:`CONFINEMENT_DEFAULTS` was
+        calibrated with — a flat-region setting would report the edge itself
+        as a state.
+        """
+        if self.state_sign is not None:
+            return self.state_sign
+        return Params(**CONFINEMENT_DEFAULTS)
+
 
 def feature_columns(config: Optional[FeatureConfig] = None) -> List[str]:
     """Column order of the emitted table. Stable, so PCA inputs line up."""
@@ -129,7 +170,18 @@ def feature_columns(config: Optional[FeatureConfig] = None) -> List[str]:
         + ["ldos_left", "ldos_right", "asymmetry", "zero_bias_conductance",
            "in_gap_weight"]
         + ["n_states", "state_spacing_mean", "lowest_state", "state_weight"]
+        # Appended, never inserted: the order is what lines a PCA input up
+        # with the one from last month.
+        + ["nstates_negative", "nstates_positive",
+           "nstates_negative_in_gap", "nstates_positive_in_gap"]
+        + DIRAC_COLUMNS
     )
+
+
+#: The Dirac group, appended after everything else for the same reason.
+DIRAC_COLUMNS = ["dirac_point", "dirac_conductance", "dirac_slope_left",
+                 "dirac_slope_right", "dirac_r2_left", "dirac_r2_right",
+                 "dirac_slope_asymmetry"]
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +363,89 @@ def metallicity_features(x: np.ndarray, y: np.ndarray, gap: Dict[str, float],
     return features
 
 
+def gated_peaks(x: np.ndarray, y: np.ndarray, params: Optional[Params],
+                noise_sigmas: float, xmin: Optional[float] = None,
+                xmax: Optional[float] = None) -> list:
+    """Peaks in a window, keeping only those clear of that window's noise.
+
+    The gate is the whole reason a count means anything: a percentage-of-span
+    threshold measures the span, and on a flat stretch that is noise. Every
+    state count in this module goes through here, so "a state" means the same
+    thing inside the gap and outside it.
+    """
+    search = Params(**{**vars(params or Params()), "xmin": xmin, "xmax": xmax})
+    try:
+        result = analyze(x, y, search)
+    except Exception:
+        logger.debug("Peak search failed over [%s, %s]", xmin, xmax, exc_info=True)
+        return []
+
+    floor = noise_sigmas * estimate_noise_sigma(result.y_corrected)
+    if floor <= 0:
+        return list(result.peaks)
+    return [pk for pk in result.peaks if pk.prominence > floor]
+
+
+def sign_state_features(x: np.ndarray, y: np.ndarray, gap: Dict[str, float],
+                        in_gap_params: Optional[Params] = None,
+                        sign_params: Optional[Params] = None,
+                        noise_sigmas: float = 4.0,
+                        state_width_samples: int = 11) -> Dict[str, float]:
+    """How many states sit at negative bias, and how many at positive.
+
+    ``n_states`` counts the gap interior only, which leaves the question a
+    doped or asymmetric sample actually raises: are the states on the empty
+    side or the filled one? These columns count **every** state, in the gap
+    and outside it, split by the sign of the bias — and report the in-gap
+    part separately, so the out-of-gap count is
+    ``nstates_negative - nstates_negative_in_gap``.
+
+    Two searches, because the two regions need different backgrounds: the gap
+    interior is flat and takes none (the same pass that produces
+    ``n_states``, so the parts add up), while outside it the band edge
+    dominates and needs the arPLS background. Peaks inside the gap are
+    dropped from the second pass so nothing is counted twice.
+
+    A peak exactly at zero bias counts as positive; nothing sits there in
+    practice, and silently dropping it would make the parts stop adding up.
+
+    Outside the gap a state must also be a **local maximum of the curve
+    itself**, not only of the background-corrected one. The band edge's knee
+    survives arPLS as a residual bump as tall as a real state — measured at
+    prominence 0.09 against 0.07-0.20 for planted states — so a height gate
+    cannot tell them apart, and without this every gapped spectrum would
+    report one invented state per side. The cost is a state sitting exactly
+    on the knee, which is not counted; it cannot be separated from the knee
+    by any test on this curve.
+    """
+    left, right = gap["gap_left"], gap["gap_right"]
+    has_gap = (math.isfinite(left) and math.isfinite(right) and right > left)
+
+    inside = (gated_peaks(x, y, in_gap_params, noise_sigmas, xmin=left, xmax=right)
+              if has_gap else [])
+    window = max(1, int(state_width_samples) // 2)
+    curve = smooth(np.asarray(y, dtype=np.float64), "average", 2)
+
+    def _is_local_max(index: int) -> bool:
+        low = max(0, index - window)
+        high = min(curve.size - 1, index + window)
+        return curve[index] >= curve[low] and curve[index] >= curve[high]
+
+    outside = [pk for pk in gated_peaks(x, y, sign_params, noise_sigmas)
+               if not (has_gap and left <= pk.x <= right)
+               and _is_local_max(pk.index)]
+
+    def _count(peaks, negative: bool) -> float:
+        return float(sum(1 for pk in peaks if (pk.x < 0) is negative))
+
+    return {
+        "nstates_negative": _count(inside, True) + _count(outside, True),
+        "nstates_positive": _count(inside, False) + _count(outside, False),
+        "nstates_negative_in_gap": _count(inside, True),
+        "nstates_positive_in_gap": _count(inside, False),
+    }
+
+
 def confinement_features(x: np.ndarray, y: np.ndarray, gap: Dict[str, float],
                          params: Optional[Params] = None,
                          noise_sigmas: float = 4.0) -> Dict[str, float]:
@@ -333,16 +468,7 @@ def confinement_features(x: np.ndarray, y: np.ndarray, gap: Dict[str, float],
     if not (math.isfinite(left) and math.isfinite(right) and right > left):
         return blank
 
-    search = Params(**{**vars(params or Params()), "xmin": left, "xmax": right})
-    try:
-        result = analyze(x, y, search)
-    except Exception:
-        logger.debug("In-gap peak search failed", exc_info=True)
-        return blank
-
-    sigma = estimate_noise_sigma(result.y_corrected)
-    floor = noise_sigmas * sigma
-    peaks = [pk for pk in result.peaks if pk.prominence > floor] if floor > 0 else result.peaks
+    peaks = gated_peaks(x, y, params, noise_sigmas, xmin=left, xmax=right)
     if not peaks:
         return blank
 
@@ -363,6 +489,65 @@ def confinement_features(x: np.ndarray, y: np.ndarray, gap: Dict[str, float],
 # Per-spectrum and batch entry points
 # ---------------------------------------------------------------------------
 
+def dirac_windows(x: np.ndarray, gap: Dict[str, float],
+                  config: FeatureConfig) -> Optional[tuple]:
+    """The two bias windows the Dirac branches are fitted in, or ``None``.
+
+    ``auto`` mirrors ``auto_detect_dirac_ranges`` but reuses the gap edges
+    this table has already found, so the branches and the gap always agree
+    with each other: left branch from the sweep start to ``gap_left``, right
+    branch from ``gap_right`` to the sweep end, each trimmed at its outer
+    end by ``dirac_edge_trim`` of its span to stay clear of the turnaround
+    artefacts a sweep has at its limits.
+    """
+    if config.dirac_mode == "off":
+        return None
+    if config.dirac_mode == "manual":
+        return ((config.dirac_left_min, config.dirac_left_max),
+                (config.dirac_right_min, config.dirac_right_max))
+    lo, hi = float(np.nanmin(x)), float(np.nanmax(x))
+    gl, gr = gap.get("gap_left", np.nan), gap.get("gap_right", np.nan)
+    if not (np.isfinite(gl) and np.isfinite(gr)) or gl <= lo or gr >= hi:
+        return None
+    trim = config.dirac_edge_trim
+    return ((lo + (gl - lo) * trim, gl), (gr, hi - (hi - gr) * trim))
+
+
+def dirac_features(x: np.ndarray, y: np.ndarray, gap: Dict[str, float],
+                   config: FeatureConfig) -> Dict[str, float]:
+    """Dirac point of a V-shaped spectrum: the crossing of its two branches.
+
+    Each branch is fitted with a straight line inside its window and the
+    two lines are intersected. The R² of each fit says whether the branch
+    was linear at all — on a gapped spectrum with flat band edges it is
+    low, and the "Dirac point" is then the meaningless crossing of two
+    nearly parallel lines, so it is the first thing to check. The slope
+    asymmetry |right| / |left| is the electron–hole asymmetry.
+    """
+    out = {k: float("nan") for k in DIRAC_COLUMNS}
+    windows = dirac_windows(x, gap, config)
+    if windows is None:
+        return out
+    try:
+        (dx_, dy_, s_l, s_r, r2_l, r2_r, _, _) = fit_dirac_point(
+            np.asarray(x, dtype=np.float64), np.asarray(y, dtype=np.float64),
+            windows[0], windows[1])
+    except Exception:
+        logger.debug("Dirac fit failed", exc_info=True)
+        return out
+    out.update({
+        "dirac_point": float(dx_),
+        "dirac_conductance": float(dy_),
+        "dirac_slope_left": float(s_l),
+        "dirac_slope_right": float(s_r),
+        "dirac_r2_left": float(r2_l),
+        "dirac_r2_right": float(r2_r),
+        "dirac_slope_asymmetry": (float(abs(s_r) / abs(s_l))
+                                  if np.isfinite(s_l) and abs(s_l) > 1e-30 else float("nan")),
+    })
+    return out
+
+
 def spectrum_features(x: np.ndarray, y: np.ndarray,
                       config: Optional[FeatureConfig] = None) -> Dict[str, float]:
     """Every feature for one spectrum, keyed by column name."""
@@ -382,6 +567,10 @@ def spectrum_features(x: np.ndarray, y: np.ndarray,
                                     cfg.positive_only))
     row.update(confinement_features(x, normalized, gap, cfg.confinement_params(),
                                     cfg.state_noise_sigmas))
+    row.update(sign_state_features(x, normalized, gap, cfg.confinement_params(),
+                                   cfg.sign_params(), cfg.state_noise_sigmas,
+                                   cfg.state_width_samples))
+    row.update(dirac_features(x, normalized, gap, cfg))
     if not is_valid:
         row["invalid_reason"] = reason
     return row

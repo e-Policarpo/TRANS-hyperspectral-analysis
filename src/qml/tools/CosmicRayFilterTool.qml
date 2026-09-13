@@ -18,6 +18,14 @@ Item {
     id: root
     property var closeWindow: null
 
+    // cosmicRayFilter() hands no task name back, so this panel can only know
+    // that it is waiting for a run, not which one it is waiting for.
+    property bool running: false
+
+    // Empty by design here: see the comment on `running`. Kept so the
+    // destruction handler reads the same as in every other tool.
+    property string runningTaskName: ""
+
     // `Window.window`, not `ApplicationWindow.window`: a tool is hosted
     // either by the embedded window (whose root IS the ApplicationWindow) or
     // by ToolWindow, whose root is a plain Window. The ApplicationWindow
@@ -136,21 +144,21 @@ Item {
         RowLayout {
             Layout.fillWidth: true
 
-            Button {
+            ToolButton {
                 text: "Filter"
                 enabled: datasetCombo.currentIndex >= 0
-                highlighted: true
+                primary: true
                 onClicked: performFilter()
             }
 
-            Button {
+            ToolButton {
                 text: "Cancel"
                 onClicked: backend.cancelCurrentOperation()
             }
 
             Item { Layout.fillWidth: true }
 
-            Button {
+            ToolButton {
                 text: "Close"
                 onClicked: {
                     if (root.closeWindow) { root.closeWindow() } else { var win = Window.window; if (win) win.close() }
@@ -164,17 +172,28 @@ Item {
         enabled: backend !== null
         function onToolCompleted(toolName, outputPath) {
             if (toolName === "Cosmic Ray Filter") {
+                root.running = false
                 statusLabel.text = "Done. A '- CR Cleaned' dataset has been added to the browser."
             }
         }
         function onErrorOccurred(title, message) {
             if (title.indexOf("Cosmic") >= 0) {
+                root.running = false
                 statusLabel.text = "Error: " + message
             }
+        }
+        // Cancel reaches neither handler above, so the status line would keep
+        // saying "Filtering cosmic rays..." for the life of the window.
+        function onOperationCancelled(name) {
+            if (!root.running || name.indexOf("Cosmic Ray Filter") !== 0) return
+            root.running = false
+            statusLabel.text = "Cancelled"
+            statusLabel.color = textMuted
         }
     }
 
     function performFilter() {
+        root.running = true
         statusLabel.text = "Filtering cosmic rays..."
         backend.cosmicRayFilter(
             datasetCombo.currentText,
@@ -182,5 +201,12 @@ Item {
             windowSpin.value,
             maxWidthSpin.value
         )
+    }
+
+    Component.onDestruction: {
+        // No task name to cancel by (see `runningTaskName`), so the run can
+        // only be stopped as "the current one", and only while this panel is
+        // really waiting for one.
+        if (root.running) backend.cancelCurrentOperation()
     }
 }

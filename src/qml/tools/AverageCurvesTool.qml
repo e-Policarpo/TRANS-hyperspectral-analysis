@@ -1,8 +1,8 @@
 /*
  * T.R.A.N.S. - Tools for Research and Analysis for Nano Spectroscopy
- * Made by Eduarda Policarpo, with love
+ * Made by Eduarda Policarpo, with love 🩵🩷🤍🩷🩵
  * Contact: eduardapolicarpo.fisica@gmail.com
- * Date: January 2026
+ * Date: December 2025
  * License: GPL
  */
 
@@ -12,42 +12,44 @@ import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
 import "../components"
 
-// Average Curves Tool
-// Computes the arithmetic mean of all spectra in a dataset,
-// producing a single averaged spectrum as output.
+// Average Curves: one mean spectrum per selected dataset.
 Item {
-    id: averageCurvesTool
+    id: root
     property var closeWindow: null
 
-    // Theme colors - reactive bindings to parent window
-    // `Window.window`, not `ApplicationWindow.window`: a tool is hosted
-    // either by the embedded window (whose root IS the ApplicationWindow) or
-    // by ToolWindow, whose root is a plain Window. The ApplicationWindow
-    // attached property resolves to null in the second case, and every colour
-    // below then falls through to the singleton instead of following the
-    // host. Window.window resolves in both.
+    // The task name the backend hands back when this panel submits a run.
+    // Closing the window cancels that run BY NAME: there is one worker thread,
+    // so the task in flight when a panel closes is very often somebody else's,
+    // and a blind cancelCurrentOperation() would kill it.
+    property string runningTaskName: ""
+
+    // Set by WindowManager while a browser drag hovers this tool.
+    property bool datasetDropActive: false
+
+    // Datasets dropped from the project browser join the selection — see
+    // WindowManager.deliverDatasetDrop.
+    function acceptDatasetDrop(names) {
+        root.refreshDatasets()
+        datasetList.addToSelection(names)
+        datasetDropActive = false
+    }
+
+    // Theme colors - reactive bindings to the hosting window (Window.window
+    // resolves both for the embedded host and for a ToolWindow).
     property var parentWindow: Window.window
     property color bgDark: (parentWindow && parentWindow.bgDark !== undefined) ? parentWindow.bgDark : Theme.bgDark
     property color bgMedium: (parentWindow && parentWindow.bgMedium !== undefined) ? parentWindow.bgMedium : Theme.bgMedium
     property color bgLight: (parentWindow && parentWindow.bgLight !== undefined) ? parentWindow.bgLight : Theme.bgLight
     property color accentPink: (parentWindow && parentWindow.accentPink !== undefined) ? parentWindow.accentPink : Theme.accentPink
     property color accentBlue: (parentWindow && parentWindow.accentBlue !== undefined) ? parentWindow.accentBlue : Theme.accentBlue
-    property color accentMagenta: (parentWindow && parentWindow.accentMagenta !== undefined) ? parentWindow.accentMagenta : Theme.accentMagenta
     property color accentPurple: (parentWindow && parentWindow.accentPurple !== undefined) ? parentWindow.accentPurple : Theme.accentPurple
+    property color accentMagenta: (parentWindow && parentWindow.accentMagenta !== undefined) ? parentWindow.accentMagenta : Theme.accentMagenta
     property color textLight: (parentWindow && parentWindow.textLight !== undefined) ? parentWindow.textLight : Theme.textLight
     property color textMuted: (parentWindow && parentWindow.textMuted !== undefined) ? parentWindow.textMuted : Theme.textMuted
     property color successColor: (parentWindow && parentWindow.successColor !== undefined) ? parentWindow.successColor : Theme.successColor
 
-    // Define implicit size for proper scrolling
-    implicitWidth: mainLayout.implicitWidth + 20
-    implicitHeight: mainLayout.implicitHeight + 20
-
     ColumnLayout {
-        id: mainLayout
-        anchors.left: parent.left
-        anchors.right: parent.right
-        anchors.top: parent.top
-        anchors.margins: 10
+        anchors.fill: parent
         spacing: 10
 
         Label {
@@ -58,7 +60,8 @@ Item {
         }
 
         Label {
-            text: "Compute the arithmetic mean of all spectra in the selected dataset, producing a single averaged spectrum."
+            text: "Compute the arithmetic mean of all spectra in each selected dataset, " +
+                  "producing one averaged spectrum per dataset."
             wrapMode: Text.Wrap
             Layout.fillWidth: true
             color: accentPurple
@@ -67,82 +70,126 @@ Item {
         GroupBox {
             title: "Dataset Selection"
             Layout.fillWidth: true
+            Layout.fillHeight: true
 
             ColumnLayout {
                 anchors.fill: parent
-                spacing: 8
+                spacing: 4
 
-                DatasetComboBox {
-                    id: datasetCombo
+                DatasetMultiSelect {
+                    id: datasetList
                     Layout.fillWidth: true
-                    model: backend ? backend.getDatasetList() : []
-                    onCurrentIndexChanged: updateDatasetInfo()
+                    Layout.fillHeight: true
+                    Layout.minimumHeight: 130
+                    model: backend.getDatasetList()
+
+                    bgColor: bgLight
+                    borderColorNormal: root.datasetDropActive ? accentBlue : accentPurple
+                    borderColorFocus: accentPink
+                    textColor: textLight
+                    textMutedColor: textMuted
+                    selectionColor: accentPink
+                    onSelectionChanged: statusLabel.text = ""
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+
+                    Label {
+                        Layout.fillWidth: true
+                        Layout.preferredWidth: 0
+                        text: root.datasetDropActive
+                              ? "Drop to add to the selection"
+                              : "…or drag datasets here from the project browser"
+                        font.pixelSize: 10
+                        color: root.datasetDropActive ? accentBlue : textMuted
+                        elide: Text.ElideRight
+                    }
+
+                    ToolButton {
+                        text: "Refresh list"
+                        flat: true
+                        font.pixelSize: 10
+                        onClicked: root.refreshDatasets()
+                    }
                 }
 
                 Label {
-                    id: datasetInfo
-                    text: getDatasetInfoText()
+                    Layout.fillWidth: true
+                    text: root.selectionSummary()
                     font.pixelSize: 10
                     color: textMuted
                     wrapMode: Text.Wrap
-                    Layout.fillWidth: true
                 }
+            }
+        }
+
+        Connections {
+            target: backend
+            function onDataLoaded(name) { root.refreshDatasets() }
+            function onToolCompleted(toolName, outputPath) {
+                if (toolName === "Average Curves") {
+                    root.runningTaskName = ""
+                    statusLabel.text = "Averaged: " + outputPath
+                    statusLabel.color = successColor
+                }
+            }
+            function onErrorOccurred(title, message) {
+                if (title.indexOf("Average") >= 0) {
+                    root.runningTaskName = ""
+                    statusLabel.text = "Error: " + message
+                    statusLabel.color = accentMagenta
+                }
+            }
+            // A cancelled task reaches neither of the two handlers above, so
+            // without this the panel goes on claiming it is averaging.
+            function onOperationCancelled(name) {
+                if (name !== root.runningTaskName) return
+                root.runningTaskName = ""
+                statusLabel.text = "Cancelled"
+                statusLabel.color = textMuted
             }
         }
 
         GroupBox {
-            title: "Operation"
+            title: "Information"
             Layout.fillWidth: true
-            visible: datasetCombo.currentIndex >= 0
 
-            ColumnLayout {
-                anchors.fill: parent
-                spacing: 5
-
-                Label {
-                    text: "This tool computes the simple arithmetic mean across all spectra (columns) in the dataset."
-                    font.pixelSize: 11
-                    color: textMuted
-                    wrapMode: Text.Wrap
-                    Layout.fillWidth: true
-                }
-
-                Label {
-                    text: "Tip: Use Column Selector first to average only specific spectra."
-                    font.pixelSize: 10
-                    font.italic: true
-                    color: accentBlue
-                    wrapMode: Text.Wrap
-                    Layout.fillWidth: true
-                }
+            Label {
+                text: "The mean is taken across all spectra (columns) of a dataset.\n" +
+                      "Use Filter Bad Data first to drop curves that should not count.\n\n" +
+                      "Select several datasets to average them one after another —\n" +
+                      "each produces its own '- Average' output, named after its input."
+                wrapMode: Text.Wrap
+                font.pixelSize: 10
+                color: textMuted
             }
         }
 
-        Item { Layout.fillHeight: true }
-
-        // Action buttons
         RowLayout {
             Layout.fillWidth: true
             spacing: 10
 
-            Button {
-                text: "Average"
-                enabled: datasetCombo.currentIndex >= 0 && !backend.isBusy
-                highlighted: true
+            ToolButton {
+                text: datasetList.selectedDatasets.length > 1
+                      ? "Average (" + datasetList.selectedDatasets.length + ")"
+                      : "Average"
+                enabled: datasetList.selectedDatasets.length > 0 && !backend.isBusy
+                primary: true
                 onClicked: performAverage()
             }
 
-            Button {
+            ToolButton {
                 text: "Cancel Operation"
                 onClicked: backend.cancelCurrentOperation()
             }
 
             Item { Layout.fillWidth: true }
 
-            Button {
+            ToolButton {
                 text: "Close"
                 onClicked: {
-                    if (averageCurvesTool.closeWindow) { averageCurvesTool.closeWindow() } else { var window = averageCurvesTool.Window.window; if (window) window.close() }
+                    if (root.closeWindow) { root.closeWindow() } else { var win = Window.window; if (win) win.close() }
                 }
             }
         }
@@ -158,51 +205,33 @@ Item {
         }
     }
 
-    // Backend connections
-    Connections {
-        target: backend
-
-        function onToolCompleted(toolName, outputPath) {
-            if (toolName === "Average Curves") {
-                statusLabel.text = "Data averaged successfully: " + outputPath
-                statusLabel.color = successColor
-            }
-        }
-
-        function onErrorOccurred(title, message) {
-            if (title.includes("Average")) {
-                statusLabel.text = "Error: " + message
-                statusLabel.color = accentMagenta
-            }
-        }
+    function refreshDatasets() {
+        datasetList.model = backend.getDatasetList()
+        datasetList.pruneSelection()
     }
 
-    // Helper functions
-    function getDatasetInfoText() {
-        if (!backend || datasetCombo.currentIndex < 0 || !datasetCombo.currentText) {
-            return "No dataset selected"
-        }
-
-        var info = backend.getDatasetInfo(datasetCombo.currentText)
-        if (!info || !info.type) {
-            return "No dataset selected"
-        }
+    function selectionSummary() {
+        var picks = datasetList.selectedDatasets
+        if (picks.length === 0) return "No dataset selected"
+        if (picks.length > 1) return picks.length + " datasets — averaged one after another"
+        var info = backend.getDatasetInfo(picks[0])
+        if (!info || !info.type) return ""
         return "Type: " + info.type + " | Spectra: " + info.num_spectra +
                " | Points: " + info.num_points + " | Variable: " + info.independent_var
     }
 
-    function updateDatasetInfo() {
-        datasetInfo.text = getDatasetInfoText()
-        statusLabel.text = ""
-    }
-
     function performAverage() {
-        var datasetName = datasetCombo.currentText
-        console.log("Averaging curves for dataset:", datasetName)
-
+        var datasets = datasetList.selectedDatasets
+        if (datasets.length === 0) return
         statusLabel.text = "Averaging curves..."
         statusLabel.color = accentBlue
+        root.runningTaskName = backend.runToolOnDatasets("average_curves", datasets, {})
+    }
 
-        backend.averageCurves(datasetName)
+    Component.onDestruction: {
+        // A panel that is gone cannot show a result, so its run is abandoned
+        // work — stop it. cancelOperation only fires when the named task is
+        // the one running, so a stale name here is a no-op.
+        if (root.runningTaskName) backend.cancelOperation(root.runningTaskName)
     }
 }

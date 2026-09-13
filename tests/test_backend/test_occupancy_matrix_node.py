@@ -142,7 +142,7 @@ class TestOccupancyMatrixNodeDefinition:
 
     def test_node_is_registered_in_the_analysis_category(self):
         node_def = TOOL_DEFINITIONS["OccupancyMatrix"]
-        assert node_def["category"] == "Analysis"
+        assert node_def["category"] == "Fit and features"
         assert node_def["display_name"] == "Occupancy Matrix"
 
     def test_only_the_peak_table_is_required(self):
@@ -171,7 +171,7 @@ class TestOccupancyMatrixNodeDefinition:
 
     def test_it_sits_next_to_energy_binning_in_the_palette(self):
         analysis = next(c["tools"] for c in get_tool_categories()
-                        if c["category"] == "Analysis")
+                        if c["category"] == "Fit and features")
         assert (analysis.index("OccupancyMatrix")
                 - analysis.index("EnergyBinning")) == 1
 

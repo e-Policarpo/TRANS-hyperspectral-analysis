@@ -34,16 +34,22 @@ logger = logging.getLogger(__name__)
 #: colours by them and the summary counts them. Keys are stable and
 #: persisted; :data:`REASON_LABELS` holds what a user reads.
 NO_PEAKS = "no_peaks"
+#: Peaks were found, but none on the searched carrier's side of the branch
+#: split — every one sits below the electron edge (or above the hole edge)
+#: or inside the neutral band. Distinct from NO_PEAKS because the fix is
+#: different: not the detector, the split.
+NO_BRANCH_PEAKS = "no_peaks_in_branch"
 FEW_PEAKS = "too_few_peaks"
 NO_FIT = "no_candidate"
 BAD_FIT = "error_above_limit"
 NO_PAIR = "no_carrier_pair"
 CANCELLED = "cancelled"
 
-REASONS = (NO_PEAKS, FEW_PEAKS, NO_FIT, BAD_FIT, NO_PAIR, CANCELLED)
+REASONS = (NO_PEAKS, NO_BRANCH_PEAKS, FEW_PEAKS, NO_FIT, BAD_FIT, NO_PAIR, CANCELLED)
 
 REASON_LABELS = {
     NO_PEAKS: "No peaks",
+    NO_BRANCH_PEAKS: "No peaks in the searched branch",
     FEW_PEAKS: "Too few peaks",
     NO_FIT: "No candidate",
     BAD_FIT: "Error above the limit",
@@ -96,7 +102,8 @@ class PointResult:
     rrmse: Optional[float] = None
     dims_nm: tuple = ()
     meff: Optional[float] = None
-    n_peaks: int = 0
+    n_peaks: int = 0                     # peaks found on the whole curve
+    n_targets: int = 0                   # of those, in the searched branch
     reason: str = ""                     # empty when it converged
     solution: Optional[dict] = None
     hole_size_nm: Optional[float] = None
@@ -159,12 +166,13 @@ def analyze_line_scan(scan: LineScan,
 
         targets = list(found.get('targets') or [])
         point.n_peaks = int(found.get('n_peaks', len(targets)))
+        point.n_targets = len(targets)
         logger.debug("point %d (%s) at %.3f: %d peak(s), %d target(s) in the "
                      "branch: [%s]", i, name, point.position, point.n_peaks,
                      len(targets), ", ".join(f"{t:.4f}" for t in targets[:8]))
 
         if not targets:
-            point.reason = NO_PEAKS
+            point.reason = NO_BRANCH_PEAKS if point.n_peaks > 0 else NO_PEAKS
             _log_point(point, point_started)
             results.append(point)
             continue
@@ -236,10 +244,10 @@ def _log_point(point: PointResult, started: float) -> None:
                     point.rrmse or 0.0,
                     f"{point.meff:g}" if point.meff else "?", extra, elapsed)
     else:
-        logger.info("point %3d @ %8.3f: no confinement — %s (%d peak(s)) [%.0f ms]",
+        logger.info("point %3d @ %8.3f: no confinement — %s (%d peak(s), %d in the branch) [%.0f ms]",
                     point.index, point.position,
                     REASON_LABELS.get(point.reason, point.reason),
-                    point.n_peaks, elapsed)
+                    point.n_peaks, point.n_targets, elapsed)
 
 
 def pick_best(candidates: Sequence[dict], size_fn: Callable[[dict], float],

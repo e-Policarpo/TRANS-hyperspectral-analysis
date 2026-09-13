@@ -2,7 +2,7 @@
 
 Solves a 0D quantum dot: levels, shells and addition energies.
 
-**Menu** Tools → Composite tools → Quantum Dot Solver · **Panel**
+**Menu** Tools → Confinement → Quantum Dot Solver · **Panel**
 `QuantumDotSolverTool.qml` · **Method** `solveQuantumDot()`, `solve_dot()`
 and `src/physics/quantum_dot.py`
 

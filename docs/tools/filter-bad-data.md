@@ -4,7 +4,7 @@ Separates usable spectra from junk, and — optionally — removes the curves
 that are individually sound but would distort an average. Accepts a
 **multi-dataset selection**.
 
-**Menu** Tools → Filter Bad Data · **Panel** `FilterBadDataTool.qml` ·
+**Menu** Tools → Prepare → Filter Bad Data · **Panel** `FilterBadDataTool.qml` ·
 **Method** `filter_bad_data()` · **Batch key** `filter_bad_data`
 
 ## Input
@@ -64,11 +64,31 @@ detector off.
 |---|---|
 | `<dataset> - Good Data` | the spectra that passed |
 | `<dataset> - Bad Data` | the ones that did not |
-| `<dataset> - Outliers Removed` | **one curve per point**, each the average of that point's surviving repetitions. Written only when outlier filtering is on |
+| `<dataset> - Point Averages` | **one curve per point**, each the average of that point's surviving repetitions. Written on every run; skipped only when the dataset records no point index (see below) |
 | `<dataset> - FFT Spectra` | frequency content of each spectrum |
 | `<name>_filter_report.txt` | every spectrum's scores and diagnostics |
 
 All in `<project>_outputs/curves/<name>_Filtered/`.
+
+### Point Averages
+
+Columns are numbered the way the loader numbers the overview they came from:
+a line scan is **numbered along the line**, so `P01` is where the line starts,
+not point 203 of the session. The session-wide point index is not a position —
+it stays in the per-spectrum metadata, next to `line_pos`, so the UI can show
+one against the other.
+
+Collapsing an overview's repetitions into one curve per point is what the
+filtering is for, so it happens on every run — outlier filtering only changes
+*which* curves go into the mean. With `correct_periodic` on, the mean is taken
+over the corrected curves, the same ones that went into *Good Data*.
+
+It is withheld in exactly one case: `outlier_group_by = point` on a dataset
+whose loader recorded no point index. There is then no way to tell repetitions
+of one point from measurements at different points, and averaging would
+silently collapse a whole line scan into a single curve. The report says so.
+Set `outlier_group_by = dataset` if every curve really is a repetition of one
+measurement — that gives a single averaged column, `Average`.
 
 ## Method
 

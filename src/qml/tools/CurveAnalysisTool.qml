@@ -12,12 +12,23 @@ import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
 import "../components"
 
-// Curve Analysis Tool
+// Curve Plotting (formerly "Curve Analysis"): overlay curves from one or
+// more datasets in a single graph window. A viewer — it writes nothing.
+// The file keeps its old name so the tool map and docs history still
+// point here.
 Item {
     id: root
     property var closeWindow: null
 
-    // Theme colors - reactive bindings to parent DraggableWindow
+    property bool datasetDropActive: false
+
+    function acceptDatasetDrop(names) {
+        root.refreshDatasets()
+        datasetList.addToSelection(names)
+        datasetDropActive = false
+    }
+
+    // Theme colors - reactive bindings to the hosting window
     property var parentWindow: Window.window
     property color bgDark: (parentWindow && parentWindow.bgDark !== undefined) ? parentWindow.bgDark : Theme.bgDark
     property color bgMedium: (parentWindow && parentWindow.bgMedium !== undefined) ? parentWindow.bgMedium : Theme.bgMedium
@@ -33,14 +44,15 @@ Item {
         spacing: 10
 
         Label {
-            text: "Curve Analysis"
+            text: "Curve Plotting"
             font.pixelSize: 18
             font.bold: true
             color: textLight
         }
 
         Label {
-            text: "Interactive plotting and manipulation of spectral curves."
+            text: "Overlay curves from one or more datasets in a single graph window " +
+                  "to compare them. Nothing is written."
             wrapMode: Text.Wrap
             Layout.fillWidth: true
             color: accentPurple
@@ -49,20 +61,54 @@ Item {
         GroupBox {
             title: "Dataset Selection"
             Layout.fillWidth: true
+            Layout.fillHeight: true
 
             ColumnLayout {
                 anchors.fill: parent
+                spacing: 4
 
-                DatasetComboBox {
-                    id: datasetCombo
+                DatasetMultiSelect {
+                    id: datasetList
                     Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    Layout.minimumHeight: 130
                     model: backend.getDatasetList()
-                    onCurrentIndexChanged: updateInfo()
+
+                    bgColor: bgLight
+                    borderColorNormal: root.datasetDropActive ? accentBlue : accentPurple
+                    borderColorFocus: accentPink
+                    textColor: textLight
+                    textMutedColor: textMuted
+                    selectionColor: accentPink
+                    onSelectionChanged: summaryLabel.text = root.selectionSummary()
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+
+                    Label {
+                        Layout.fillWidth: true
+                        Layout.preferredWidth: 0
+                        text: root.datasetDropActive
+                              ? "Drop to add to the selection"
+                              : "…or drag datasets here from the project browser"
+                        font.pixelSize: 10
+                        color: root.datasetDropActive ? accentBlue : textMuted
+                        elide: Text.ElideRight
+                    }
+
+                    ToolButton {
+                        text: "Refresh list"
+                        flat: true
+                        font.pixelSize: 10
+                        onClicked: root.refreshDatasets()
+                    }
                 }
 
                 Label {
-                    id: datasetInfo
-                    text: getDatasetInfo()
+                    id: summaryLabel
+                    Layout.fillWidth: true
+                    text: root.selectionSummary()
                     font.pixelSize: 10
                     color: textMuted
                     wrapMode: Text.Wrap
@@ -70,81 +116,97 @@ Item {
             }
         }
 
+        Connections {
+            target: backend
+            function onDataLoaded(name) { root.refreshDatasets() }
+        }
+
         GroupBox {
-            title: "Plot Options"
+            title: "Curves to plot (per dataset)"
             Layout.fillWidth: true
 
-            ColumnLayout {
+            GridLayout {
                 anchors.fill: parent
+                columns: 2
+                rowSpacing: 6
+                columnSpacing: 10
 
-                CheckBox {
-                    id: showGridCheck
-                    text: "Show grid"
-                    checked: true
+                Label { text: "Selection:" }
+                ComboBox {
+                    id: modeCombo
+                    Layout.fillWidth: true
+                    model: ["All curves", "First N curves", "Every Nth curve", "Index range"]
+                }
+
+                Label { text: "N:"; visible: modeCombo.currentIndex === 1 || modeCombo.currentIndex === 2 }
+                SpinBox {
+                    id: nSpin
+                    from: 1; to: 100000; value: 10; editable: true
+                    visible: modeCombo.currentIndex === 1 || modeCombo.currentIndex === 2
+                }
+
+                Label { text: "From (1-based):"; visible: modeCombo.currentIndex === 3 }
+                SpinBox {
+                    id: startSpin
+                    from: 1; to: 100000; value: 1; editable: true
+                    visible: modeCombo.currentIndex === 3
+                }
+
+                Label { text: "To (0 = last):"; visible: modeCombo.currentIndex === 3 }
+                SpinBox {
+                    id: stopSpin
+                    from: 0; to: 100000; value: 0; editable: true
+                    visible: modeCombo.currentIndex === 3
                 }
 
                 CheckBox {
-                    id: logScaleCheck
-                    text: "Log scale Y-axis"
+                    id: normalizeCheck
+                    Layout.columnSpan: 2
+                    text: "Normalise each curve to its maximum"
                     checked: false
                 }
 
-                RowLayout {
-                    Label { text: "Plot range:" }
-                    ComboBox {
-                        id: rangeCombo
-                        model: ["Full range", "Auto zoom", "Custom"]
-                    }
+                Label { text: "Vertical offset:" }
+                SpinBox {
+                    id: offsetSpin
+                    Layout.fillWidth: true
+                    from: 0; to: 1000000; value: 0; stepSize: 1; editable: true
+                    property int decimals: 3
+                    property real realValue: value / 1000
+                    textFromValue: function(value, locale) { return Number(value / 1000).toLocaleString(locale, 'f', decimals) }
+                    valueFromText: function(text, locale) { return Math.round(Number.fromLocaleString(locale, text) * 1000) }
                 }
             }
         }
 
         GroupBox {
-            title: "Curve Selection"
+            title: "Information"
             Layout.fillWidth: true
-            Layout.fillHeight: true
 
-            ColumnLayout {
-                anchors.fill: parent
-
-                Label {
-                    text: "Select curves to plot (multi-select):"
-                }
-
-                ScrollView {
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-
-                    ListView {
-                        id: curveList
-                        model: getCurveList()
-                        delegate: CheckBox {
-                            text: modelData
-                            checked: index === 0
-                        }
-                    }
-                }
+            Label {
+                text: "Curves are labelled '<dataset> - <spectrum>' so the legend still " +
+                      "says where each came from. Use a vertical offset for a waterfall " +
+                      "view of many spectra. Plotting hundreds of curves is slow — pick " +
+                      "'Every Nth' for a large map."
+                wrapMode: Text.Wrap
+                font.pixelSize: 10
+                color: textMuted
             }
         }
 
         RowLayout {
             Layout.fillWidth: true
 
-            Button {
-                text: "Plot Selected Curves"
-                enabled: datasetCombo.currentIndex >= 0
-                highlighted: true
+            ToolButton {
+                text: "Plot"
+                enabled: datasetList.selectedDatasets.length > 0
+                primary: true
                 onClicked: plotCurves()
-            }
-
-            Button {
-                text: "Export Plot"
-                enabled: false
             }
 
             Item { Layout.fillWidth: true }
 
-            Button {
+            ToolButton {
                 text: "Close"
                 onClicked: {
                     if (root.closeWindow) { root.closeWindow() } else { var win = Window.window; if (win) win.close() }
@@ -153,46 +215,35 @@ Item {
         }
     }
 
-    function getDatasetInfo() {
-        if (datasetCombo.currentIndex < 0) return "No dataset selected"
-
-        var datasetName = datasetCombo.currentText
-        var info = backend.getDatasetInfo(datasetName)
-
-        return "Type: " + info.type + " | Dimensions: " + info.dimensions +
-               " | Spectra: " + info.num_spectra + " | Points: " + info.num_points
+    function refreshDatasets() {
+        datasetList.model = backend.getDatasetList()
+        datasetList.pruneSelection()
+        summaryLabel.text = selectionSummary()
     }
 
-    function getCurveList() {
-        if (datasetCombo.currentIndex < 0) return []
-
-        var info = backend.getDatasetInfo(datasetCombo.currentText)
-        var numCurves = info.num_spectra
-        var curves = []
-
-        for (var i = 0; i < Math.min(numCurves, 20); i++) {
-            curves.push("Curve " + (i + 1))
+    function selectionSummary() {
+        var picks = datasetList.selectedDatasets
+        if (picks.length === 0) return "No dataset selected"
+        var total = 0
+        for (var i = 0; i < picks.length; i++) {
+            var info = backend.getDatasetInfo(picks[i])
+            if (info && info.num_spectra) total += info.num_spectra
         }
-
-        if (numCurves > 20) {
-            curves.push("... (" + numCurves + " total)")
-        }
-
-        return curves
-    }
-
-    function updateInfo() {
-        datasetInfo.text = getDatasetInfo()
-        curveList.model = getCurveList()
+        return picks.length + " dataset" + (picks.length > 1 ? "s" : "") + ", " + total + " spectra in total"
     }
 
     function plotCurves() {
-        console.log("Plotting curves from:", datasetCombo.currentText)
-        console.log("Note: Matplotlib integration needed for actual plotting")
-
-        // Placeholder - would need matplotlib integration
-        console.log("Plot would show selected curves with options:",
-                   "Grid:", showGridCheck.checked,
-                   "Log scale:", logScaleCheck.checked)
+        var datasets = datasetList.selectedDatasets
+        if (datasets.length === 0) return
+        var modes = ["all", "first", "every", "range"]
+        backend.plotDatasetCurves(datasets, {
+            "mode": modes[modeCombo.currentIndex],
+            "count": nSpin.value,
+            "step": nSpin.value,
+            "start": startSpin.value,
+            "stop": stopSpin.value,
+            "normalize": normalizeCheck.checked,
+            "offset": offsetSpin.realValue
+        })
     }
 }

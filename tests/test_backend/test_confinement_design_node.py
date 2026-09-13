@@ -51,8 +51,8 @@ def _line(n_points=4, well_at=(1, 2)):
 class TestTheNodeDefinition:
     def test_it_is_registered_in_the_analysis_category(self):
         node_def = TOOL_DEFINITIONS["ConfinementDesign"]
-        assert node_def["category"] == "Analysis"
-        assert node_def["display_name"] == "Confinement Design"
+        assert node_def["category"] == "Confinement"
+        assert node_def["display_name"] == "Line Scan Designer"
 
     def test_it_takes_a_dataset_and_returns_a_table_and_a_map(self):
         node_def = TOOL_DEFINITIONS["ConfinementDesign"]
@@ -93,11 +93,11 @@ class TestTheNodeDefinition:
         options = TOOL_DEFINITIONS["ConfinementDesign"]["parameters"]["match"]["options"]
         assert set(options) == set(MATCHES)
 
-    def test_it_sits_after_the_occupancy_matrix_in_the_palette(self):
-        analysis = next(c["tools"] for c in get_tool_categories()
-                        if c["category"] == "Analysis")
-        assert (analysis.index("ConfinementDesign")
-                - analysis.index("OccupancyMatrix")) == 1
+    def test_it_sits_after_the_single_spectrum_designer_in_the_palette(self):
+        confinement = next(c["tools"] for c in get_tool_categories()
+                           if c["category"] == "Confinement")
+        assert (confinement.index("ConfinementDesign")
+                - confinement.index("ConfinementDesigner")) == 1
 
     def test_its_table_feeds_map_assembly(self):
         """The point of a flat table: every column is a map away."""

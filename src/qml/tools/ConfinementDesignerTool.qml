@@ -22,6 +22,26 @@ Item {
     id: root
     property var closeWindow: null
 
+    // The task name the backend hands back when this panel submits a run.
+    // Closing the window cancels that run BY NAME: there is one worker thread,
+    // so the task in flight when a panel closes is very often somebody else's,
+    // and a blind cancelCurrentOperation() would kill it.
+    property string runningTaskName: ""
+
+    // Set by WindowManager while a browser drag hovers this tool.
+    property bool datasetDropActive: false
+
+    // Dropped datasets join the selection — see WindowManager.deliverDatasetDrop.
+    function acceptDatasetDrop(names) {
+        root.refreshDatasets()
+        datasetList.addToSelection(names)
+        datasetDropActive = false
+    }
+
+    // How many of a multi-dataset run have reported back, and their headlines.
+    property int batchExpected: 0
+    property var batchHeadlines: []
+
     property var parentWindow: Window.window
     // Each colour is resolved explicitly, and the property is named as a
     // literal rather than looked up by string.
@@ -87,6 +107,8 @@ Item {
     function searchParams() {
         return {
             "spectrum_index": spectrumSpin.value,
+            "all_spectra": allSpectraCheck.checked,
+            "group_tol_nm": groupTolSpin.realValue,
             "carrier": Vocab.keyAt(Vocab.carrierKeys, carrierCombo.currentIndex),
             "meff_e": massElectronField.text,
             "meff_h": massHoleField.text,
@@ -105,17 +127,25 @@ Item {
             "split_h": splitHSpin.realValue,
             "min_abs_V": neutralSpin.realValue,
             "height": heightSpin.realValue,
-            "baseline": "arpls"
+            "baseline": "arpls",
+            "admissible_abs_pct": admissibleAbsSpin.realValue,
+            "admissible_rel": admissibleRelSpin.realValue,
+            "min_support_frac": minSupportSpin.realValue,
+            // null, not "", so the backend's Designer(seed=…) sees None.
+            "seed": seedField.text === "" ? null : parseInt(seedField.text)
         }
     }
 
-    function datasetName() { return datasetCombo.currentText }
+    // The preview and the candidate list are one dataset's: the first one
+    // picked. The search runs over every one, in the order they were picked.
+    function datasetName() {
+        var picks = datasetList.selectedDatasets
+        return picks.length > 0 ? picks[0] : ""
+    }
 
     function refreshDatasets() {
-        var current = datasetCombo.currentText
-        datasetCombo.model = backend.getDatasetList()
-        var index = datasetCombo.model.indexOf(current)
-        datasetCombo.currentIndex = index >= 0 ? index : 0
+        datasetList.model = backend.getDatasetList()
+        datasetList.pruneSelection()
         updateDatasetInfo()
     }
 
@@ -162,16 +192,28 @@ Item {
     // Run
     // ---------------------------------------------------------------------
     function runSearch() {
-        var name = datasetName()
-        if (!name) return
+        var datasets = datasetList.selectedDatasets
+        if (datasets.length === 0) return
         root.running = true
+        progressBar.reset()
         root.candidates = []
         root.selectedCandidate = -1
+        root.batchExpected = datasets.length
+        root.batchHeadlines = []
         candidateModel.clear()
         candidateCanvas.showMessage("Searching…")
-        statusLabel.text = "Searching — a candidate is a global optimisation, " +
-                           "so this takes seconds, not milliseconds."
-        backend.runConfinementDesigner(name, searchParams())
+        var several = datasets.length > 1 ? " × " + datasets.length + " datasets, one after another" : ""
+        statusLabel.text = allSpectraCheck.checked
+            ? "Searching all " + root.spectrumCount + " spectra" + several + ", each on its own: "
+              + "every spectrum gets its own peaks, its own search and its own candidates "
+              + "(seconds each, so this is minutes). Cancel stops it between spectra."
+            : "Searching this spectrum" + several + " — each candidate is an optimisation over "
+              + "the well size for this one spectrum, so it takes seconds, not milliseconds."
+        // One batch task; each dataset's result arrives through
+        // designerCompleted and writes its own tables, named after the
+        // dataset and the search settings.
+        root.runningTaskName = backend.runToolOnDatasets("confinement_designer",
+                                                         datasets, searchParams())
     }
 
     function showCandidate(index) {
@@ -211,7 +253,12 @@ Item {
         function onDataLoaded(name) { refreshDatasets() }
 
         function onDesignerCompleted(result) {
-            root.running = false
+            var heads = root.batchHeadlines.slice()
+            heads.push((result && result.dataset ? result.dataset + ": " : "")
+                       + (result && result.candidates_total ? result.candidates_total + " candidate(s)"
+                                                            : (result && result.error ? result.error : "none")))
+            root.batchHeadlines = heads
+            root.running = heads.length < root.batchExpected
             root.candidates = (result && result.candidates) ? result.candidates : []
             candidateModel.clear()
             for (var i = 0; i < root.candidates.length; i++) {
@@ -229,18 +276,52 @@ Item {
             if (root.candidates.length > 0) {
                 showCandidate(0)
                 var edges = result.edges
-                statusLabel.text = root.candidates.length + " candidate(s)"
+                // A sweep's headline is the whole run; the list under it is
+                // one spectrum's, so say which one it is showing.
+                var swept = result.all_spectra === true
+                var head = swept
+                    ? result.candidates_total + " candidate(s) over "
+                      + result.spectra_with_candidates + "/"
+                      + result.spectra_searched + " spectra — showing "
+                      + (result.column ? result.column
+                                       : "spectrum " + result.spectrum_index)
+                    : root.candidates.length + " candidate(s)"
+                statusLabel.text = (root.batchExpected > 1 ? "[" + result.dataset + "] " : "")
+                    + head
                     + (result.pairs > 0 ? ", " + result.pairs + " pair(s)" : "")
                     + (edges && edges.gap !== undefined && edges.gap !== null
                        ? " — gap " + edges.gap.toFixed(3) + " eV"
                        : (edges && edges.E_c !== undefined && edges.E_c !== null
                           ? " — E_c " + edges.E_c.toFixed(3) + " eV" : ""))
+                    + (result.tables && result.tables.length
+                       ? " · tables: " + result.tables.join(", ") : "")
             } else {
                 candidateCanvas.showMessage(result && result.error
                                             ? result.error : "No candidates")
-                statusLabel.text = result && result.error ? result.error
-                                                          : "No candidate fits."
+                statusLabel.text = (root.batchExpected > 1 ? "[" + result.dataset + "] " : "")
+                    + (result && result.error ? result.error : "No candidate fits.")
             }
+            if (root.batchExpected > 1 && !root.running) {
+                statusLabel.text = root.batchHeadlines.length + " datasets searched — "
+                    + root.batchHeadlines.join(" · ")
+                    + ". The list shows the last one's candidates; every dataset's tables are in the browser."
+            }
+            if (!root.running) root.runningTaskName = ""
+        }
+
+        // A cancelled batch never reaches designerCompleted again, so the
+        // panel has to come out of its running state here. The batch counters
+        // go with it: left half-counted, the next run's first result would be
+        // read as the tail of this one and the headline would be nonsense.
+        function onOperationCancelled(name) {
+            if (name !== root.runningTaskName) return
+            root.runningTaskName = ""
+            root.running = false
+            root.batchExpected = 0
+            root.batchHeadlines = []
+            candidateCanvas.showMessage("Cancelled")
+            statusLabel.text = "Cancelled — nothing was written for the datasets "
+                             + "that had not finished."
         }
     }
 
@@ -260,22 +341,49 @@ Item {
         // gone when the panel's own handler runs.
         if (spectrumCanvas) spectrumCanvas.cleanup()
         if (candidateCanvas) candidateCanvas.cleanup()
+        // A search whose panel has closed has nowhere to put its candidates,
+        // and it is minutes of worker time. cancelOperation only fires when
+        // the named task is the one running, so a stale name is a no-op.
+        if (root.runningTaskName) backend.cancelOperation(root.runningTaskName)
     }
 
     // =====================================================================
     // Layout: knobs left, pictures right
     // =====================================================================
-    RowLayout {
+    // A SplitView, not a RowLayout: dataset names are longer than any pane
+    // that also leaves room for the pictures, so the divider is draggable and
+    // the reading of a name is the user's call, not a fixed 360 px.
+    SplitView {
         anchors.fill: parent
         anchors.margins: 10
-        spacing: 10
+        orientation: Qt.Horizontal
+
+        // A wide grab area with a thin rule drawn down the middle of it: 2 px
+        // is what the divider should look like, and 10 px is what it has to be
+        // to catch a mouse. SplitHandle attaches to the delegate's own root,
+        // so the rule reads the state off `splitHandle`, not off itself.
+        handle: Rectangle {
+            id: splitHandle
+            implicitWidth: 10
+            color: "transparent"
+
+            Rectangle {
+                anchors.centerIn: parent
+                width: 2
+                height: parent.height
+                radius: 1
+                color: splitHandle.SplitHandle.pressed ? root.accentPink
+                       : (splitHandle.SplitHandle.hovered ? root.accentPurple
+                                                          : root.bgLight)
+            }
+        }
 
         // ---------------- knobs ----------------
         ScrollView {
             id: paramsScroll
-            Layout.preferredWidth: 360
-            Layout.minimumWidth: 360
-            Layout.fillHeight: true
+            SplitView.preferredWidth: 360
+            SplitView.minimumWidth: 280
+            SplitView.maximumWidth: 900
             clip: true
             // Pin the content to the viewport: a ScrollView's child
             // otherwise takes its own implicit width — the widest
@@ -289,10 +397,13 @@ Item {
 
                 Label {
                     Layout.fillWidth: true
-                    text: "Which well would produce these levels? The peaks are found " +
-                          "with the same engine Confinement Analysis uses, split into " +
-                          "carriers by the sign of the bias, and each branch is searched " +
-                          "for the geometry that reproduces its ladder."
+                    text: "Which well would produce these levels? One spectrum (or " +
+                          "typed-in energies): the peaks are found with the same engine " +
+                          "Confinement Analysis uses, split into carriers by the sign of " +
+                          "the bias, and each branch is searched for the geometry that " +
+                          "reproduces its ladder — every candidate ranked, for you to " +
+                          "inspect. To run this search at every position of a line scan " +
+                          "and see how the size varies along it, use the Line Scan Designer."
                     wrapMode: Text.Wrap
                     color: accentPurple
                 }
@@ -304,27 +415,66 @@ Item {
                         anchors.fill: parent
                         columns: 2
 
-                        Label { text: "Dataset:"; color: textLight }
-                        ToolComboBox {
-                            id: datasetCombo
+                        DatasetMultiSelect {
+                            id: datasetList
+                            Layout.columnSpan: 2
                             Layout.fillWidth: true
-                            model: []
-                            onCurrentTextChanged: updateDatasetInfo()
+                            Layout.preferredHeight: 140
+                            model: backend.getDatasetList()
+
+                            bgColor: root.bgDark
+                            borderColorNormal: root.datasetDropActive ? accentBlue : bgLight
+                            borderColorFocus: accentPink
+                            textColor: textLight
+                            textMutedColor: textMuted
+                            selectionColor: accentPink
+                            onSelectionChanged: updateDatasetInfo()
+                        }
+
+                        Label {
+                            Layout.columnSpan: 2
+                            Layout.fillWidth: true
+                            text: root.datasetDropActive
+                                  ? "Drop to add to the selection"
+                                  : (datasetList.selectedDatasets.length > 1
+                                     ? datasetList.selectedDatasets.length + " datasets — searched one after another; "
+                                       + "the preview and the list are the first one's"
+                                     : "…or drag datasets here from the project browser")
+                            font.pixelSize: 10
+                            color: root.datasetDropActive ? accentBlue : textMuted
+                            wrapMode: Text.Wrap
                         }
 
                         Label { text: "Spectrum:"; color: textLight }
                         ToolSpinBox {
                             id: spectrumSpin
                             from: 0; to: 0; value: 0
+                            // Still the spectrum the preview draws and the
+                            // panel lists candidates for, even in a sweep.
+                            enabled: !allSpectraCheck.checked
                             onValueChanged: schedulePreview()
+                        }
+
+                        ToolCheckBox {
+                            id: allSpectraCheck
+                            Layout.columnSpan: 2
+                            text: root.spectrumCount > 1
+                                  ? "Search all " + root.spectrumCount + " spectra"
+                                  : "Search all spectra"
+                            checked: false
                         }
 
                         Label {
                             Layout.columnSpan: 2
                             Layout.fillWidth: true
-                            text: root.spectrumCount > 0
-                                  ? root.spectrumCount + " spectra — one is searched at a time"
-                                  : "Pick a dataset of spectra"
+                            text: root.spectrumCount <= 0
+                                  ? "Pick a dataset of spectra"
+                                  : (allSpectraCheck.checked
+                                     ? "Every spectrum is searched in turn — seconds each, so "
+                                       + root.spectrumCount + " of them is a wait. The tables hold "
+                                       + "every spectrum's candidates, each found on its own, with the "
+                                       + "sizes grouped; the list shows one spectrum's."
+                                     : root.spectrumCount + " spectra — one is searched at a time")
                             font.pixelSize: 10
                             color: textMuted
                             wrapMode: Text.Wrap
@@ -557,10 +707,86 @@ Item {
                             from: 1; to: 10000; value: 500; stepSize: 50; decimals: 2
                         }
 
-                        Label { text: "Candidates:"; color: textLight }
+                        Label { text: "Candidates per spectrum:"; color: textLight }
                         ToolSpinBox {
                             id: maxsolSpin
                             from: 1; to: 50; value: 6
+                        }
+
+                        Label { text: "Mode bandwidth (nm, 0 = auto):"; color: textLight }
+                        ToolSpinBox {
+                            id: groupTolSpin
+                            from: 0; to: 10000; value: 0; stepSize: 10; decimals: 2
+                        }
+
+                        Label {
+                            Layout.columnSpan: 2
+                            Layout.fillWidth: true
+                            text: "Every spectrum is searched on its own and reports its own " +
+                                  "candidates; nothing is fitted across spectra. The run then " +
+                                  "looks for the sizes the spectra agree on: each spectrum's " +
+                                  "candidates within its admissible band count as equals, and " +
+                                  "the modes of that pooled set are the wells (column 'group'). " +
+                                  "The bandwidth smooths the pooled sizes; 0 lets it follow " +
+                                  "the data."
+                            font.pixelSize: 10
+                            color: textMuted
+                            wrapMode: Text.Wrap
+                        }
+
+                        Label { text: "Admissible band (pp of error):"; color: textLight }
+                        ToolSpinBox {
+                            id: admissibleAbsSpin
+                            from: 0; to: 1000; value: 5; stepSize: 1; decimals: 2
+                        }
+
+                        Label { text: "Admissible band (× best error):"; color: textLight }
+                        ToolSpinBox {
+                            id: admissibleRelSpin
+                            from: 0; to: 100; value: 10; stepSize: 5; decimals: 2
+                        }
+
+                        Label {
+                            Layout.columnSpan: 2
+                            Layout.fillWidth: true
+                            text: "A spectrum's candidates count as equals when their ΔE error " +
+                                  "is within the larger of these two of its best: the ranking " +
+                                  "among near-ties is optimiser noise, not physics."
+                            font.pixelSize: 10
+                            color: textMuted
+                            wrapMode: Text.Wrap
+                        }
+
+                        Label { text: "Min. support (fraction of spectra):"; color: textLight }
+                        ToolSpinBox {
+                            id: minSupportSpin
+                            from: 0; to: 100; value: 15; stepSize: 5; decimals: 2
+                        }
+
+                        Label { text: "Seed (blank = random):"; color: textLight }
+                        TextField {
+                            id: seedField
+                            Layout.fillWidth: true
+                            text: ""
+                            placeholderText: "e.g. 42"
+                            validator: IntValidator { bottom: 0 }
+                            color: textLight
+                            background: Rectangle {
+                                color: bgDark
+                                border.color: bgLight
+                                radius: 4
+                            }
+                        }
+
+                        Label {
+                            Layout.columnSpan: 2
+                            Layout.fillWidth: true
+                            text: "A mode backed by fewer spectra than this is not reported. " +
+                                  "The seed fixes the search's random start so a run can be " +
+                                  "reproduced exactly; leave it blank for a fresh draw."
+                            font.pixelSize: 10
+                            color: textMuted
+                            wrapMode: Text.Wrap
                         }
 
                         Label { text: "Order by:"; color: textLight }
@@ -598,19 +824,22 @@ Item {
                 RowLayout {
                     Layout.fillWidth: true
 
-                    Button {
-                        text: running ? "Searching…" : "Find candidates"
+                    ToolButton {
+                        text: running ? "Searching…"
+                            : datasetList.selectedDatasets.length > 1
+                              ? "Find candidates (" + datasetList.selectedDatasets.length + ")"
+                              : "Find candidates"
                         enabled: !running && root.spectrumCount > 0
-                        highlighted: true
+                        primary: true
                         onClicked: runSearch()
                     }
-                    Button {
+                    ToolButton {
                         text: "Cancel"
                         enabled: running
                         onClicked: backend.cancelCurrentOperation()
                     }
                     Item { Layout.fillWidth: true }
-                    Button {
+                    ToolButton {
                         text: "Close"
                         onClicked: {
                             if (root.closeWindow) { root.closeWindow() }
@@ -623,9 +852,19 @@ Item {
 
         // ---------------- pictures ----------------
         ColumnLayout {
-            Layout.fillWidth: true
-            Layout.fillHeight: true
+            SplitView.fillWidth: true
+            SplitView.minimumWidth: 320
             spacing: 8
+
+            // The run's own progress and time estimate (backend.toolProgress),
+            // at the top of the plots where it is seen without scrolling the
+            // parameter column.
+            ToolProgressBar {
+                id: progressBar
+                toolName: "Confinement Designer"
+                active: root.running
+                Layout.fillWidth: true
+            }
 
             DesignerCanvas {
                 id: spectrumCanvas
@@ -709,7 +948,7 @@ Item {
                             Layout.fillWidth: true
                         }
 
-                        Button {
+                        ToolButton {
                             text: "Simulate"
                             enabled: root.selectedCandidate >= 0
                             onClicked: root.simulateSelected()

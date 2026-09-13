@@ -642,6 +642,51 @@ Item {
                 }
             }
 
+            // Which map is on screen. The tabs strip below only fills in
+            // for the two load paths that register an entry in `openMaps`;
+            // opening a dataset from the browser or dropping one on the canvas
+            // goes straight to the backend, so the tab showed a map with
+            // nothing anywhere naming it. This reads the backend's own record
+            // instead, which every load path sets.
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 26
+                color: bgDarker
+
+                RowLayout {
+                    anchors.fill: parent
+                    anchors.leftMargin: 8
+                    anchors.rightMargin: 8
+                    spacing: 8
+
+                    Label {
+                        text: mapBackend.mapName !== "" ? mapBackend.mapName
+                                                        : "No map loaded"
+                        font.pixelSize: 12
+                        font.bold: mapBackend.mapName !== ""
+                        color: mapBackend.mapName !== "" ? textLight : textMuted
+                        elide: Text.ElideMiddle
+                        Layout.fillWidth: true
+                    }
+
+                    // The channel names the view as much as the map does: one
+                    // map carries several and the canvas shows one at a time.
+                    Label {
+                        visible: mapBackend.activeChannelName !== ""
+                        text: mapBackend.activeChannelName
+                        font.pixelSize: 11
+                        color: accentBlue
+                    }
+
+                    Label {
+                        visible: mapBackend.isLineScanMode
+                        text: mapBackend.lineScanPoints + " positions"
+                        font.pixelSize: 10
+                        color: textMuted
+                    }
+                }
+            }
+
             // Map tabs bar (for multiple open maps)
             Rectangle {
                 Layout.fillWidth: true

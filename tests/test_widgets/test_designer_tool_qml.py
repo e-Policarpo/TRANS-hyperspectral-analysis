@@ -38,6 +38,12 @@ class StubBackend(QObject):
     dataLoaded = Signal(str)
     designerCompleted = Signal('QVariantMap')
     lineScanDesignCompleted = Signal('QVariantMap')
+    # The panels connect to these two as well. A Connections block whose
+    # handler names nothing on the target is only a warning at load time, so
+    # a stub that is missing a signal quietly passes the very test that is
+    # supposed to catch the rename.
+    toolProgress = Signal(str, int, int, str)
+    operationCancelled = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -45,6 +51,8 @@ class StubBackend(QObject):
         self.previews = []
         self.line_runs = []
         self.batches = []
+        self.described = []
+        self.cancelled = []
 
     @Slot(result='QVariantList')
     def getDatasetList(self):
@@ -66,17 +74,28 @@ class StubBackend(QObject):
     def runConfinementDesigner(self, name, params):
         self.runs.append((name, dict(params)))
 
-    @Slot(str, 'QVariantMap')
+    @Slot(str, 'QVariantMap', result=str)
     def runLineScanDesigner(self, name, params):
         self.line_runs.append((name, dict(params)))
+        return "Line Scan Designer " + name
 
-    @Slot(str, 'QVariantList', 'QVariantMap')
+    @Slot(str, 'QVariantList', 'QVariantMap', result=str)
     def runToolOnDatasets(self, key, names, params):
         self.batches.append((key, list(names), dict(params)))
+        return "batch"
+
+    @Slot('QVariantMap', result='QVariantMap')
+    def describeCandidate(self, candidate):
+        self.described.append(dict(candidate))
+        return {'ok': False, 'error': 'no solver here'}
 
     @Slot()
     def cancelCurrentOperation(self):
         pass
+
+    @Slot(str)
+    def cancelOperation(self, name):
+        self.cancelled.append(name)
 
 
 def _result(candidates, pairs=0, error="", edges=None):
@@ -123,19 +142,39 @@ def panel(app):
     item.deleteLater()
 
 
+def _pick(item, *names):
+    """Select datasets the way the user does — the panel picks none itself.
+
+    The dataset control is a multi-select now, and it starts empty on
+    purpose: a search is minutes, and a panel that pre-selected whatever
+    dataset happened to be first in the project would hand those minutes to
+    something nobody asked about. Everything downstream of the selection
+    therefore has to say which datasets it is about.
+    """
+    item.metaObject().invokeMethod(item, "acceptDatasetDrop",
+                                   Q_ARG("QVariant", list(names)))
+
+
 class TestItLoads:
     def test_the_panel_instantiates_without_errors(self, panel):
         item, _backend = panel
         assert item is not None
 
-    def test_it_picks_up_the_datasets_on_load(self, panel):
+    def test_it_picks_nothing_until_the_user_does(self, panel):
         item, _backend = panel
+        assert item.property("spectrumCount") == 0
+
+    def test_picking_a_dataset_picks_up_its_spectrum_count(self, panel):
+        item, _backend = panel
+        _pick(item, "Line scan")
+
         assert item.property("spectrumCount") == 5
 
     def test_it_previews_the_spectrum_it_will_search(self, panel):
         """The preview is what shows the user which peaks the search is
         about to be handed."""
         item, backend = panel
+        _pick(item, "Line scan")
         item.metaObject().invokeMethod(item, "refreshPreview")
 
         assert backend.previews, "the panel never asked for a preview"
@@ -148,6 +187,7 @@ class TestItLoads:
         from src.backend.tool_implementations import ToolImplementations
 
         item, backend = panel
+        _pick(item, "Line scan")
         item.metaObject().invokeMethod(item, "refreshPreview")
         _name, _index, params = backend.previews[-1]
 
@@ -158,6 +198,7 @@ class TestItLoads:
         from src.backend.tool_implementations import ToolImplementations
 
         item, backend = panel
+        _pick(item, "Line scan")
         item.metaObject().invokeMethod(item, "refreshPreview")
         _name, _index, params = backend.previews[-1]
         defaults = ToolImplementations.DESIGNER_DEFAULTS
@@ -167,14 +208,24 @@ class TestItLoads:
 
 
 class TestRunningAndReporting:
-    def test_running_hands_the_dataset_and_the_knobs_over(self, panel):
+    def test_running_hands_the_datasets_and_the_knobs_over(self, panel):
+        """One selection, one batch task — even for a single dataset.
+
+        Each dataset in the batch reports back through designerCompleted and
+        writes its own tables, so the panel has nothing to gain from calling
+        runConfinementDesigner directly and everything to lose: two entry
+        points would be two places for the parameter map to drift.
+        """
         item, backend = panel
+        _pick(item, "Line scan")
         item.metaObject().invokeMethod(item, "runSearch")
 
-        assert backend.runs, "the run button did not reach the backend"
-        name, params = backend.runs[-1]
-        assert name == "Line scan"
+        assert backend.batches, "the run button did not reach the backend"
+        key, names, params = backend.batches[-1]
+        assert key == "confinement_designer"
+        assert names == ["Line scan"]
         assert params['ndim'] == "1D"
+        assert backend.runs == []
         assert item.property("running") is True
 
     def test_a_finished_run_fills_the_candidate_list(self, panel):

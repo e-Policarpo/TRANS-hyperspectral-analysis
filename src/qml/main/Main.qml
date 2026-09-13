@@ -12,6 +12,7 @@ import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
 import Qt.labs.platform 1.1 as Platform
 import "../components"
+import "../components/ToolCatalog.js" as ToolCatalog
 
 ApplicationWindow {
     id: mainWindow
@@ -115,33 +116,12 @@ ApplicationWindow {
         console.log("[TIMING] Main.qml Component.onCompleted total: " + (Date.now() - t0) + "ms")
     }
 
-    // Reactive tools list based on current tab
-    // Tab indices: 0=Spectral, 1=Hyperspectral
-    property var currentTools: {
-        if (currentTabIndex === 0) {
-            return [
-                "1D FFT", "Curve Smoothing", "Image Smoothing",
-                "Derivative Calculator", "Curve Fitting", "Gradient Filter",
-                "Integration Utility", "Map Generator", "Spatial Average",
-                "Truncate Data", "Curve Analysis", "Confinement Analysis",
-                "Confinement Dimensionality",
-                "Spectral Features", "Confinement Designer",
-                "Line Scan Designer", "Quantum Well Solver",
-                "Quantum Dot Solver", "Peak Indexing",
-                "Average Curves", "Filter Bad Data", "Cosmic Ray Filter",
-                "Background Subtraction",
-                "Dirac Point Estimator", "Detect Bandgap & Doping",
-                "Spectral Axis Converter", "Multi-Peak Fitting"
-            ]
-        } else if (currentTabIndex === 1) {
-            return ["Confinement Analysis", "Confinement Dimensionality", "Spectral Features", "Image Smoothing", "Gradient Filter", "Map Discretizer", "Map Processing"]
-        } else if (currentTabIndex === 2) {
-            // The Modeling tab is a workstation: everything it does is in the
-            // workstation itself, so the tool palette has nothing to offer.
-            return []
-        }
-        return []
-    }
+    // Reactive tools list based on current tab, from the one catalog the
+    // Tools menu is also built from (components/ToolCatalog.js). Tab
+    // indices: 0=Spectral, 1=Hyperspectral; the Modeling tab is a
+    // workstation and lists nothing.
+    property var currentTools: ToolCatalog.toolsForTab(currentTabIndex)
+    property var currentToolSections: ToolCatalog.sectionsForTab(currentTabIndex)
 
 
     // ========== COLOUR SCHEME ==========
@@ -492,228 +472,50 @@ ApplicationWindow {
                 }
             }
 
-            // Three groups, one flat list. A simple tool is one operation and
-            // maps 1:1 onto a workflow node; a composite does several in one
-            // pass with decisions between them; a saved workflow is a chain
-            // the user built that nobody had to code. The headers are
-            // disabled MenuItems rather than submenus, so the per-tab
-            // visibility on each entry keeps working unchanged.
-            MenuItem {
-                text: "Tools"
-                enabled: false
-                contentItem: Text {
-                    text: "— Tools —"
-                    font.pixelSize: 11
-                    font.italic: true
-                    color: textMuted
-                    leftPadding: 10
+            // The tool entries come from components/ToolCatalog.js — the same
+            // sections, in the same order, as the tool palette: grouped by
+            // type and ordered by complexity, each section headed by a
+            // disabled MenuItem (not a submenu, so per-tab visibility on
+            // every entry keeps working). Saved workflows follow below: a
+            // chain the user built that nobody had to code.
+            Instantiator {
+                id: toolEntriesInstantiator
+                model: ToolCatalog.menuRows()
+                delegate: MenuItem {
+                    id: catalogItem
+                    required property int index
+                    required property var modelData
+                    readonly property bool isHeader: modelData.kind === "header"
+                    text: modelData.name
+                    enabled: !isHeader
+                    visible: modelData.tabs.indexOf(currentTabIndex) >= 0
+                    height: visible ? implicitHeight : 0
+                    contentItem: Text {
+                        text: catalogItem.isHeader
+                              ? "— " + catalogItem.modelData.name +
+                                (catalogItem.modelData.level ? "  ·  " + catalogItem.modelData.level : "") + " —"
+                              : catalogItem.modelData.name
+                        font.pixelSize: catalogItem.isHeader ? 11 : 13
+                        font.italic: catalogItem.isHeader
+                        color: catalogItem.isHeader ? textMuted : textLight
+                        leftPadding: catalogItem.isHeader ? 10 : 18
+                        rightPadding: 10
+                        topPadding: catalogItem.isHeader && !catalogItem.modelData.first ? 6 : 0
+                    }
+                    background: Rectangle {
+                        color: catalogItem.highlighted && !catalogItem.isHeader ? accentPink : "transparent"
+                        opacity: catalogItem.highlighted ? 0.3 : 1
+                    }
+                    onTriggered: if (!isHeader) openToolWindow(text)
                 }
-            }
-            MenuItem {
-                text: "1D FFT"
-                visible: currentTabIndex === 0
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-            MenuItem {
-                text: "Curve Smoothing"
-                visible: currentTabIndex === 0
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-            MenuItem {
-                text: "Image Smoothing"
-                visible: currentTabIndex === 0 || currentTabIndex === 1
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-            MenuItem {
-                text: "Derivative Calculator"
-                visible: currentTabIndex === 0
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-            MenuItem {
-                text: "Curve Fitting"
-                visible: currentTabIndex === 0
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-            MenuItem {
-                text: "Gradient Filter"
-                visible: currentTabIndex === 0 || currentTabIndex === 1
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-            MenuItem {
-                text: "Integration Utility"
-                visible: currentTabIndex === 0
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-            MenuItem {
-                text: "Spatial Average"
-                visible: currentTabIndex === 0
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-            MenuItem {
-                text: "Map Discretizer"
-                visible: currentTabIndex === 1
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-            MenuItem {
-                text: "Map Processing"
-                visible: currentTabIndex === 1
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-            MenuItem {
-                text: "Truncate Data"
-                visible: currentTabIndex === 0
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-            MenuItem {
-                text: "Curve Analysis"
-                visible: currentTabIndex === 0
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-            MenuItem {
-                text: "Peak Indexing"
-                visible: currentTabIndex === 0
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-            MenuItem {
-                text: "Average Curves"
-                visible: currentTabIndex === 0
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-            MenuItem {
-                text: "Filter Bad Data"
-                visible: currentTabIndex === 0
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-            MenuItem {
-                text: "Cosmic Ray Filter"
-                visible: currentTabIndex === 0
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-            MenuItem {
-                text: "Background Subtraction"
-                visible: currentTabIndex === 0
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-            MenuItem {
-                text: "Spectral Axis Converter"
-                visible: currentTabIndex === 0
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-            MenuSeparator {
-                contentItem: Rectangle {
-                    implicitHeight: 1
-                    color: borderColor
+                // Instantiated before the saved-workflow entries, so the
+                // catalog occupies the top of the menu in row order.
+                onObjectAdded: function(index, object) {
+                    toolsMenu.insertItem(index, object)
                 }
-            }
-            MenuItem {
-                text: "Composite tools"
-                enabled: false
-                contentItem: Text {
-                    text: "— Composite tools —"
-                    font.pixelSize: 11
-                    font.italic: true
-                    color: textMuted
-                    leftPadding: 10
+                onObjectRemoved: function(index, object) {
+                    toolsMenu.removeItem(object)
                 }
-            }
-            MenuItem {
-                text: "Map Generator"
-                visible: currentTabIndex === 0
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-                // Also available on the Hyperspectral tab: it is the tool that
-                // turns a map's spectra into the peak-occupancy table.
-            MenuItem {
-                text: "Confinement Analysis"
-                visible: currentTabIndex === 0 || currentTabIndex === 1
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-                // Reads the same peaks, but asks a different question of them:
-                // Confinement Analysis reports WHICH levels a spectrum has,
-                // this one asks which geometry that ladder of levels belongs
-                // to — and fits the band edge that the ladder is measured from.
-            MenuItem {
-                text: "Confinement Dimensionality"
-                visible: currentTabIndex === 0 || currentTabIndex === 1
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-                // Also on the Hyperspectral tab: it turns a map's spectra
-                // into the table that classification runs on.
-            MenuItem {
-                text: "Spectral Features"
-                visible: currentTabIndex === 0 || currentTabIndex === 1
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-                // The inverse of Confinement Analysis: that one reports which
-                // levels a spectrum has, this one asks which well would
-                // produce them.
-            MenuItem {
-                text: "Confinement Designer"
-                visible: currentTabIndex === 0
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-                // The Confinement Designer over a whole line: one search per
-                // position, and a map of where the confinement is.
-            MenuItem {
-                text: "Line Scan Designer"
-                visible: currentTabIndex === 0 || currentTabIndex === 1
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-            MenuItem {
-                text: "Quantum Well Solver"
-                // The other direction from the designer: a geometry in, its
-                // levels out, solved numerically rather than searched for.
-                visible: currentTabIndex === 0
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-            MenuItem {
-                text: "Quantum Dot Solver"
-                visible: currentTabIndex === 0
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-            MenuItem {
-                text: "Multi-Peak Fitting"
-                visible: currentTabIndex === 0
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-            MenuItem {
-                text: "Detect Bandgap & Doping"
-                visible: currentTabIndex === 0
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
-            }
-            MenuItem {
-                text: "Dirac Point Estimator"
-                visible: currentTabIndex === 0
-                height: visible ? implicitHeight : 0
-                onTriggered: openToolWindow(text)
             }
             MenuSeparator {
                 contentItem: Rectangle {
@@ -1210,6 +1012,7 @@ ApplicationWindow {
                 standalonePaletteComponent: Component {
                     ToolPalettePanel {
                         tools: currentTools
+                        sections: currentToolSections
                         onToolActivated: function(toolName) {
                             openToolWindow(toolName)
                         }
@@ -1854,7 +1657,10 @@ ApplicationWindow {
                                      "Line Scan Designer": { width: 1080, height: 740 },
                                      "Quantum Well Solver": { width: 1000, height: 700 },
                                      "Quantum Dot Solver": { width: 1060, height: 720 },
-                                     "Spectral Features": { width: 1020, height: 720 },
+                                     "Spectral Features": { width: 1020, height: 760 },
+                                     "Multi-Peak Fitting": { width: 1000, height: 720 },
+                                     "Unit Converter": { width: 900, height: 700 },
+                                     "Map Generator": { width: 520, height: 720 },
                                      "Confinement Dimensionality": { width: 640, height: 780 } })
 
     function toolWindowSize(toolName) {
@@ -1873,16 +1679,15 @@ ApplicationWindow {
         var toolMap = {
             "1D FFT": "../tools/FFT1DTool.qml",
             "Curve Smoothing": "../tools/CurveSmoothingTool.qml",
-            "Image Smoothing": "../tools/ImageSmoothingTool.qml",
             "Derivative Calculator": "../tools/DerivativeTool.qml",
             "Gradient Filter": "../tools/GradientTool.qml",
-            "Curve Fitting": "../tools/CurveFittingTool.qml",
+            // Renamed tools keep their file names; see the note atop each.
+            "Curve Background Flattening": "../tools/CurveFittingTool.qml",
             "Integration Utility": "../tools/IntegrationTool.qml",
             "Map Generator": "../tools/MapGeneratorTool.qml",
-            "Spatial Average": "../tools/SpatialAverageTool.qml",
             "Map Discretizer": "../tools/MapDiscretizerTool.qml",
             "Map Processing": "../tools/MapProcessingTool.qml",
-            "Curve Analysis": "../tools/CurveAnalysisTool.qml",
+            "Curve Plotting": "../tools/CurveAnalysisTool.qml",
             "Truncate Data": "../tools/TruncateTool.qml",
             "Confinement Analysis": "../tools/ConfinementAnalysisTool.qml",
             "Confinement Dimensionality": "../tools/ConfinementDimensionalityTool.qml",
@@ -1891,14 +1696,11 @@ ApplicationWindow {
             "Quantum Well Solver": "../tools/QuantumWellSolverTool.qml",
             "Quantum Dot Solver": "../tools/QuantumDotSolverTool.qml",
             "Spectral Features": "../tools/SpectralFeaturesTool.qml",
-            "Peak Indexing": "../tools/PeakIndexingTool.qml",
             "Filter Bad Data": "../tools/FilterBadDataTool.qml",
             "Cosmic Ray Filter": "../tools/CosmicRayFilterTool.qml",
-            "Background Subtraction": "../tools/BackgroundSubtractionTool.qml",
+            "Subtract Detector Background": "../tools/BackgroundSubtractionTool.qml",
             "Average Curves": "../tools/AverageCurvesTool.qml",
-            "Dirac Point Estimator": "../tools/DiracPointEstimatorTool.qml",
-            "Detect Bandgap & Doping": "../tools/DetectBandgapDopingTool.qml",
-            "Spectral Axis Converter": "../tools/SpectralAxisConvertTool.qml",
+            "Unit Converter": "../tools/UnitConverterTool.qml",
             "Multi-Peak Fitting": "../tools/MultiPeakFitTool.qml"
         }
 

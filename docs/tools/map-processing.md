@@ -2,7 +2,7 @@
 
 Operations on map channels — levelling, arithmetic, channel manipulation.
 
-**Menu** Tools → Map Processing · **Panel** `MapProcessingTool.qml` ·
+**Menu** Tools → Maps → Map Processing · **Panel** `MapProcessingTool.qml` ·
 **Method** `processMap()`
 
 ## Input

@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Dict, Optional, Any, List
 from datetime import datetime
 import numpy as np
+import pandas as pd
 import base64
 
 logger = logging.getLogger(__name__)
@@ -454,16 +455,44 @@ class ProjectManager:
                 if hasattr(dataset, 'spectra') and hasattr(dataset, 'metadata'):
                     # SpectralData object - use binary format for data
 
-                    # Serialize spectra DataFrame to numpy array
-                    spectra_array = dataset.spectra.values
-                    independent_var = dataset.independent_var
+                    # Serialize spectra DataFrame to numpy array. A result
+                    # table can carry text columns (a line-scan designer's
+                    # `reason`, a candidate table's `carrier`); those make
+                    # the frame an object array, which np.save refuses
+                    # without pickle — and the whole dataset used to be
+                    # dropped from the save. Text columns travel as JSON
+                    # lists beside the numeric block and are put back in
+                    # their original positions on load.
+                    spectra_frame = dataset.spectra
+                    text_columns = {}
+                    column_names = spectra_frame.columns.tolist()
+                    if spectra_frame.values.dtype == object:
+                        numeric_cols = []
+                        for col in column_names:
+                            series = spectra_frame[col]
+                            coerced = pd.to_numeric(series, errors='coerce')
+                            non_numeric = coerced.isna() & series.notna() & (series.astype(str) != '')
+                            if non_numeric.any():
+                                text_columns[str(col)] = [
+                                    '' if v is None or (isinstance(v, float) and np.isnan(v)) else str(v)
+                                    for v in series.tolist()]
+                            else:
+                                numeric_cols.append(col)
+                        spectra_array = (spectra_frame[numeric_cols]
+                                         .apply(pd.to_numeric, errors='coerce')
+                                         .to_numpy(dtype=float))
+                        numeric_names = [str(c) for c in numeric_cols]
+                    else:
+                        spectra_array = spectra_frame.values
+                        numeric_names = column_names
+                    independent_var = np.asarray(dataset.independent_var)
+                    if independent_var.dtype == object:
+                        independent_var = pd.to_numeric(pd.Series(independent_var),
+                                                        errors='coerce').to_numpy(dtype=float)
 
                     # Compress and encode as base64
                     spectra_binary = self._numpy_to_base64(spectra_array)
                     indep_binary = self._numpy_to_base64(independent_var)
-
-                    # Get column names
-                    column_names = dataset.spectra.columns.tolist()
 
                     # Safely serialize additional_info (filter out non-serializable items)
                     additional_info = self._make_json_serializable(
@@ -479,7 +508,10 @@ class ProjectManager:
                         'type': 'SpectralData',
                         'format': 'binary',
                         'shape': list(spectra_array.shape),
-                        'columns': column_names,
+                        'columns': numeric_names,
+                        # Every column in its original order, text ones included.
+                        'column_order': [str(c) for c in column_names],
+                        'text_columns': text_columns,
                         'data_binary': spectra_binary,
                         'independent_var_binary': indep_binary,
                         'independent_var_name': dataset.independent_var_name,
@@ -728,6 +760,15 @@ class ProjectManager:
 
                         # Create DataFrame
                         df = pd.DataFrame(spectra_array, columns=columns)
+                        # Text columns saved beside the numeric block go back
+                        # where they were.
+                        text_columns = data.get('text_columns') or {}
+                        if text_columns:
+                            for col, values in text_columns.items():
+                                df[col] = list(values)
+                            order = [c for c in (data.get('column_order') or []) if c in df.columns]
+                            if len(order) == len(df.columns):
+                                df = df[order]
                         indep_name = data.get('independent_var_name', 'X')
                         df.insert(0, indep_name, independent_var)
                     else:

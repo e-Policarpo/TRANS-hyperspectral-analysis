@@ -9,6 +9,7 @@ everything crossing to QML is a plain number.
 """
 
 import re
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -319,3 +320,181 @@ class TestWhatCrossesToQml:
         assert result['dataset'] == 'sts'
         assert ToolImplementations.DESIGNER_DEFAULTS['match'] == 'delta_e'
         assert ToolImplementations.DESIGNER_DEFAULTS['carrier'] == 'electrons'
+
+
+class TestSearchingEverySpectrum:
+    """One spectrum is a question; an overview is sixty-two of them.
+
+    ``all_spectra`` asks all of them in one run, and the answer has to
+    survive the window closing — which is what the tables are for.
+    """
+
+    def test_it_searches_every_spectrum(self, tool_impl):
+        result = _run(tool_impl, dataset=_dataset(n_spectra=3),
+                      all_spectra=True)
+
+        assert result['spectra_searched'] == 3
+        assert result['spectra_with_candidates'] == 3
+        assert result['candidates_total'] >= 3
+
+    def test_one_spectrum_by_default(self, tool_impl):
+        result = _run(tool_impl, dataset=_dataset(n_spectra=3))
+
+        assert result['spectra_searched'] == 1
+        assert result['all_spectra'] is False
+
+    def test_a_barren_spectrum_does_not_end_the_sweep(self, tool_impl):
+        """A position with one peak is an ordinary outcome, not a failure of
+        the run: the other spectra still get searched."""
+        good = _dataset(n_spectra=1)
+        barren = _one_peak_dataset()
+        frame = good.data.copy()
+        frame['P2'] = np.interp(frame['V'].values,
+                                barren.data['V'].values,
+                                barren.data['P1'].values)
+        mixed = SpectralData(frame, good.metadata)
+
+        result = _run(tool_impl, dataset=mixed, all_spectra=True)
+
+        assert result['spectra_searched'] == 2
+        assert result['spectra_with_candidates'] == 1
+        assert result['ok']
+
+    def test_the_panel_is_shown_a_spectrum_that_found_something(self, tool_impl):
+        """An empty list next to "3 candidates" reads as a broken tool."""
+        good = _dataset(n_spectra=1)
+        barren = _one_peak_dataset()
+        frame = good.data.copy()
+        frame.insert(1, 'P0', np.interp(frame['V'].values,
+                                        barren.data['V'].values,
+                                        barren.data['P1'].values))
+        mixed = SpectralData(frame, good.metadata)
+
+        result = _run(tool_impl, dataset=mixed, all_spectra=True,
+                      spectrum_index=0)
+
+        assert result['candidates']
+        assert result['spectrum_index'] == 1
+
+    def test_cancelling_stops_between_spectra(self, tool_impl):
+        result = _run(tool_impl, dataset=_dataset(n_spectra=3),
+                      all_spectra=True)
+        assert result['spectra_searched'] == 3
+
+        tool_impl._datasets['sts'] = _dataset(n_spectra=3)
+        cancelled = tool_impl.design_confinement(
+            CancelledTask(), 'sts',
+            {'height': 3.0, 'maxsol': 1, 'seed': 1, 'all_spectra': True})
+        assert cancelled['candidates'] == []
+
+
+def _table(tool_impl, prefix):
+    """The table registered under ``prefix (…settings)``."""
+    return next(v for k, v in tool_impl._datasets.items() if k.startswith(prefix))
+
+
+class TestTheTablesItWrites:
+    """A candidate list that only exists on screen cannot be read later."""
+
+    def test_all_four_tables_are_registered_and_exported(self, tool_impl):
+        result = _run(tool_impl, dataset=_dataset(n_spectra=2),
+                      all_spectra=True)
+
+        assert [t.split(' (')[0] for t in result['tables']] == [
+            'sts - Designer Candidates', 'sts - Designer Levels',
+            'sts - Designer Modes', 'sts - Designer Consensus']
+        # The search settings are part of the name, so a second run with
+        # another symmetry cannot replace this one.
+        assert all('(' in t and t.endswith(')') for t in result['tables'])
+        for name in result['tables']:
+            assert name in tool_impl._datasets
+        written = {Path(p).name for p in result['table_paths']}
+        assert len(written) == 4
+        for path in result['table_paths']:
+            assert Path(path).exists()
+
+    def test_a_single_spectrum_run_writes_them_too(self, tool_impl):
+        result = _run(tool_impl)
+
+        assert len(result['tables']) == 4
+
+    def test_one_row_per_candidate(self, tool_impl):
+        result = _run(tool_impl, dataset=_dataset(n_spectra=2),
+                      all_spectra=True)
+        table = _table(tool_impl, 'sts - Designer Candidates').data
+
+        assert len(table) == result['candidates_total']
+        assert set(table['column']) == {'P1', 'P2'}
+        assert (table['size_nm'] > 0).all()
+
+    def test_the_well_parameters_are_there(self, tool_impl):
+        _run(tool_impl)
+        table = _table(tool_impl, 'sts - Designer Candidates').data
+
+        for column in ('d1_nm', 'size_nm', 'meff', 'offset_eV', 'rrmse_pct',
+                       'ndim', 'coords', 'sym', 'carrier', 'n_levels'):
+            assert column in table.columns
+        assert table['d1_nm'].iloc[0] == pytest.approx(WELL_NM, rel=0.05)
+
+    def test_one_row_per_level_measured_against_simulated(self, tool_impl):
+        result = _run(tool_impl)
+        levels = _table(tool_impl, 'sts - Designer Levels').data
+        best = result['candidates'][0]
+
+        first = levels[levels['candidate'] == 0]
+        assert len(first) == len(best['targets'])
+        assert list(first['measured_eV']) == pytest.approx(best['targets'])
+        assert list(first['simulated_eV']) == pytest.approx(best['computed'])
+        assert list(first['error_pct']) == pytest.approx(best['errors_pct'])
+
+    def test_the_levels_carry_the_edge_settings_back_to_the_bias(self, tool_impl):
+        """An energy from the branch edge cannot be found on the spectrum
+        again unless the edge it was measured from travels with it."""
+        _run(tool_impl, split_e=0.25)
+        levels = _table(tool_impl, 'sts - Designer Levels').data
+        electrons = levels[levels['carrier'] == 'e']
+
+        assert (electrons['split_e_V'] == 0.25).all()
+        assert list(electrons['measured_V']) == pytest.approx(
+            [e + 0.25 for e in electrons['measured_eV']])
+        assert list(electrons['simulated_V']) == pytest.approx(
+            [e + 0.25 for e in electrons['simulated_eV']])
+
+    def test_a_hole_level_is_measured_down_from_its_own_edge(self, tool_impl):
+        _run(tool_impl, dataset=_dataset(holes=True), carrier='holes',
+             split_h=-0.30)
+        levels = _table(tool_impl, 'sts - Designer Levels').data
+        holes = levels[levels['carrier'] == 'h']
+
+        assert len(holes) > 0
+        assert list(holes['measured_V']) == pytest.approx(
+            [-0.30 - e for e in holes['measured_eV']])
+
+    def test_a_paired_run_writes_the_hole_beside_its_electron(self, tool_impl):
+        result = _run(tool_impl, dataset=_dataset(holes=True), carrier='both',
+                      pair_tol_nm=5.0)
+        if not result['pairs']:
+            pytest.skip("no pair found for this synthetic spectrum")
+        table = _table(tool_impl, 'sts - Designer Candidates').data
+        levels = _table(tool_impl, 'sts - Designer Levels').data
+
+        assert table['hole_size_nm'].notna().any()
+        # Both ladders are written, under the same candidate number.
+        assert set(levels[levels['candidate'] == 0]['carrier']) == {'e', 'h'}
+
+    def test_the_column_order_is_fixed(self, tool_impl):
+        """Two runs produce two CSVs that can be concatenated."""
+        from src.backend.tool_implementations import ToolImplementations
+
+        _run(tool_impl)
+        candidates = _table(tool_impl, 'sts - Designer Candidates').data
+        levels = _table(tool_impl, 'sts - Designer Levels').data
+
+        assert tuple(candidates.columns) == ToolImplementations.DESIGNER_CANDIDATE_COLUMNS
+        assert tuple(levels.columns) == ToolImplementations.DESIGNER_LEVEL_COLUMNS
+
+    def test_no_candidates_means_no_tables(self, tool_impl):
+        result = _run(tool_impl, dataset=_one_peak_dataset())
+
+        assert result['tables'] == []
+        assert not any(k.startswith('sts - Designer Candidates') for k in tool_impl._datasets)

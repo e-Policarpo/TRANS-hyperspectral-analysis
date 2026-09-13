@@ -74,43 +74,46 @@ Plus plain `.csv` for anything TRANS itself wrote.
 > below are the overview.
 
 
-### Tools — one operation, one dataset (or several, in sequence)
+### Tools — one operation, one dataset (or several, in sequence) (menu sections *Prepare*, *Transform*, *View*, *Maps*)
 
 | tool | does |
 |---|---|
 | **Curve Smoothing** | Savitzky–Golay, Gaussian or moving average |
 | **Derivative Calculator** | dI/dV or d²I/dV², with smoothing before and after |
 | **Integration Utility** | area under curves over bias intervals |
-| **Curve Fitting** | polynomial fit; also emits the coefficients as a dataset |
-| **Background Subtraction** | subtract one dataset from another |
+| **Curve Background Flattening** | fit a polynomial / linear / exponential background and subtract it; also emits the coefficients |
+| **Subtract Detector Background** | subtract a measured reference dataset from others |
 | **Truncate Data** | cut the sweep to a bias window |
-| **Average Curves** | one mean curve from a dataset |
-| **Peak Indexing** | index and label peaks |
-| **Curve Analysis** | per-curve summary statistics |
+| **Average Curves** | one mean curve per dataset |
+| **Curve Plotting** | overlay curves from several datasets in one graph; a viewer |
 | **Filter Bad Data** | separate usable spectra from junk — see below |
 | **Cosmic Ray Filter** | remove single-sample spikes |
-| **Spectral Axis Converter** | nm ↔ eV ↔ cm⁻¹ |
-| **1D FFT** | frequency content of a spectrum |
-| **Gradient Filter** | gradient-based filtering |
-| **Spatial Average** | average neighbouring positions |
+| **Unit Converter** | relabel units in place, convert nm ↔ eV ↔ cm⁻¹, or set x / y by formula with a preview |
+| **1D FFT** | frequency content of every spectrum, magnitude and phase |
+| **Gradient Filter** | gradient magnitude of a map or image from the browser, calibrated |
 | **Map Discretizer** | bin a map into blocks |
 | **Map Processing** | operations on map channels |
-| **Image Smoothing** | smooth an image channel |
 
-### Composite tools — a whole analysis in one run
+Every one of these takes a multi-dataset selection (Ctrl/Cmd-click, Shift-click,
+or a drag from the project browser) and processes the datasets one after
+another. Sunset from the palette — engines kept as workflow nodes or folded
+into another tool: *Image Smoothing* (workflow node), *Peak Indexing*
+(Peak Finder node; Spectral Features and Multi-Peak Fitting find peaks with a
+baseline), *Spatial Average* (a step of the Map Generator), *Detect Bandgap &
+Doping* and *Dirac Point Estimator* (feature groups of Spectral Features).
+
+### Composite tools — a whole analysis in one run (menu sections *Fit and features*, *Maps*, *Confinement*)
 
 | tool | does |
 |---|---|
-| **Map Generator** | background removal + interval integration + map assembly in one pass; writes one calibrated map per bias interval plus a joined interval map |
+| **Map Generator** | optional spatial averaging + background removal + interval integration + map assembly in one pass; writes one calibrated map per bias interval, a joined interval map, and the integrals as a dataset and CSV |
 | **Confinement Analysis** | peak finding and background in one pass; emits the occupancy table (which states exist at which bias) |
 | **Confinement Dimensionality** | 0D/1D/2D from the *ratios* between levels at the band edge |
 | **Confinement Designer** | search for the geometry whose eigenstates match your measured levels |
 | **Line Scan Designer** | one confinement search per position along a line |
 | **Quantum Well Solver** / **Quantum Dot Solver** | solve a 1D well / 0D dot directly |
-| **Spectral Features** | per-spectrum feature table (gap, doping, metallicity) |
-| **Multi-Peak Fitting** | Gaussian / Lorentzian / pseudo-Voigt multi-peak fit |
-| **Detect Bandgap & Doping** | gap size and N/P/neutral per spectrum |
-| **Dirac Point Estimator** | Dirac point from linear-slope intersections |
+| **Spectral Features** | per-spectrum feature table (gap, doping, metallicity, confined states, Dirac point) |
+| **Multi-Peak Fitting** | Gaussian / Lorentzian / pseudo-Voigt fit of every spectrum; per-spectrum peak table plus fitted curves |
 
 **Saved workflows** appear in the same menu: a workflow you built in the node
 editor, saved as `.flow`, runs over a dataset selection like any other tool.
@@ -137,7 +140,7 @@ columns named `P01R001`, `P01R002`, … — point, then repetition.
 |---|---|
 | `… - Good Data` | the spectra that passed |
 | `… - Bad Data` | the ones that did not, so you can look at them |
-| `… - Outliers Removed` | **one curve per point**, each the average of that point's surviving repetitions |
+| `… - Point Averages` | **one curve per point**, each the average of that point's surviving repetitions; numbered along the line (`P01` = the line's first position) |
 | `… - FFT Spectra` | frequency content, for spotting periodic pickup |
 | `…_filter_report.txt` | every spectrum's score, and why each rejection happened |
 
@@ -153,7 +156,7 @@ Outliers (compared within each point, 16 group(s), 8 intervals, z>3.5)
   point 10: 58 curves look like bandgap outliers, more than the 5 allowed — that is
             a distribution of values, not a few odd curves. None removed; check them by eye.
 
-Per-point averages ('… - Outliers Removed'): 13 point(s), 2014 curve(s) averaged,
+Per-point averages ('… - Point Averages'): 13 point(s), 2014 curve(s) averaged,
   1 dropped as outliers, 67 already rejected by the per-spectrum tests.
 ```
 

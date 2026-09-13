@@ -323,6 +323,58 @@ def parabolic_dot(hw_xy_meV, hw_z_meV, n_shells=5) -> List[Level]:
     return levels
 
 
+
+def _disc_levels(R, Lz, m, n_levels, width, per_channel):
+    """The ``n_levels`` lowest states of the disc, whatever its shape.
+
+    The basis used to be a fixed count — ``ceil(n_levels / 8)`` axial states,
+    three for the twenty the designer asks for — which is fine for a flat
+    lens, where the second axial level is already far above everything, and
+    wrong for a tall one: with L_z above R the low-lying spectrum IS the
+    axial ladder, and a cut at n_z = 3 leaves out states that belong in the
+    first twenty. The fit then had to explain those peaks with in-plane
+    states, and the same measurement came back as a different geometry from
+    the "cylindrical" model — which is the same formula with a deeper basis.
+
+    So the basis grows until it provably holds the lowest ``n_levels``: the
+    energy rises monotonically in each quantum number, so every excluded
+    state is at least as high as the cheapest one just past a cap. Once all
+    three of those sit above the ``n_levels``-th energy, nothing is missing.
+    A few iterations at most; the caps are only a runaway guard.
+    """
+    pref = (hbar ** 2) / (2.0 * m) / e
+    E_xy = lambda a: pref * a ** 2 / R ** 2           # noqa: E731
+    E_z = lambda nz: pref * (np.pi * nz) ** 2 / Lz ** 2   # noqa: E731
+
+    nz_max = max(2, int(np.ceil(n_levels / 8)))
+    a01 = _jn_zeros_cached(0, 1)[0]
+    for _ in range(64):
+        levels = []
+        for m_q in range(width + 1):
+            for n, a in enumerate(_jn_zeros_cached(m_q, per_channel), 1):
+                exy = E_xy(a)
+                for nz in range(1, nz_max + 1):
+                    levels.append((exy + E_z(nz), (n, m_q, nz)))
+        levels.sort(key=lambda item: item[0])
+        if len(levels) < n_levels:
+            nz_max += 1; per_channel += 1; width += 1
+            continue
+        cutoff = levels[n_levels - 1][0]
+        grow = False
+        # Cheapest state just past each cap. Each is a lower bound on
+        # everything beyond that cap, by monotonicity.
+        if E_xy(a01) + E_z(nz_max + 1) <= cutoff and nz_max < 64:
+            nz_max += 1; grow = True
+        if E_xy(_jn_zeros_cached(0, per_channel + 1)[-1]) + E_z(1) <= cutoff \
+                and per_channel < 24:
+            per_channel += 1; grow = True
+        if E_xy(_jn_zeros_cached(width + 1, 1)[0]) + E_z(1) <= cutoff \
+                and width < 24:
+            width += 1; grow = True
+        if not grow:
+            return levels
+    return levels
+
 def dot_energies(model: str, dims, meff=0.067, n_levels=20):
     """Levels of an infinite-barrier dot, in `physics.analytical`'s format.
 
@@ -358,14 +410,7 @@ def dot_energies(model: str, dims, meff=0.067, n_levels=20):
         R, Lz = float(dims[0]) * 1e-9, float(dims[1]) * 1e-9
         if R <= 0 or Lz <= 0:
             raise ValueError("R and Lz must be positive")
-        nz_max = max(2, int(np.ceil(n_levels / 8)))
-        z_energies = [((hbar ** 2) * (np.pi * nz) ** 2 / (2.0 * m * Lz ** 2) / e, nz)
-                      for nz in range(1, nz_max + 1)]
-        for m_q in range(width + 1):
-            for n, a in enumerate(_jn_zeros_cached(m_q, per_channel), 1):
-                E_xy = (hbar ** 2) * a ** 2 / (2.0 * m * R ** 2) / e
-                for E_z, nz in z_energies:
-                    out.append((E_xy + E_z, (n, m_q, nz)))
+        out = _disc_levels(R, Lz, m, n_levels, width, per_channel)
 
     elif model == DOT_PARABOLIC:
         hw_xy, hw_z = float(dims[0]), float(dims[1])

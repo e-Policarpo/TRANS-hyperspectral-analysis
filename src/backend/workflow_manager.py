@@ -551,23 +551,46 @@ class WorkflowExecutor:
                     outputs['coefficients_flat'] = coeff_ds      # -> MapGenerator (flat_data)
 
         elif tool_name == "MapGenerator":
-            # MapGenerator generates TIFF maps for all value columns in flat data
-            flat_data = inputs.get('flat_data')
-            if flat_data:
-                # Store flat data temporarily
-                dataset_name = self._get_temp_dataset_name(flat_data)
-                self.app_backend._datasets[dataset_name] = flat_data
-
-                class MockTask:
-                    cancelled = False
-                    progress = 0
-
-                # Generate all maps (one per value column/interval)
-                map_paths = self.app_backend.generate_all_maps(
-                    MockTask(), dataset_name,
-                    scan_type=params.get('scan_type', 'auto'))
-                outputs['maps'] = map_paths
-                logger.info(f"MapGenerator created {len(map_paths)} TIFF maps")
+            dataset_name = self._stage_dataset(inputs.get('dataset'), "maps") \
+                if inputs.get('dataset') is not None else None
+            if dataset_name:
+                # The spectra path: the tool's own engine, with the node's
+                # parameters passed through as its map (background, peak
+                # threshold, noise floor, spatial block, intervals).
+                run_params = dict(params or {})
+                port_intervals = inputs.get('intervals')
+                if port_intervals:
+                    run_params['interval_source'] = 'manual'
+                    run_params['intervals'] = [
+                        [iv['lower'], iv['upper']] if isinstance(iv, dict) else list(iv)
+                        for iv in port_intervals]
+                elif run_params.get('interval_source', 'detect') == 'manual':
+                    run_params['intervals'] = [
+                        [iv['lower'], iv['upper']] if isinstance(iv, dict) else list(iv)
+                        for iv in (run_params.get('intervals') or [])]
+                else:
+                    run_params.pop('intervals', None)
+                result = self.app_backend.generate_maps_from_spectra(
+                    self._Task(), dataset_name, run_params)
+                outputs['maps'] = list(result.get('map_paths') or [])
+                outputs['interval_map'] = result.get('interval_map_path') or None
+                outputs['values'] = self.app_backend._datasets.get(result.get('values_dataset'))
+                outputs['intervals_used'] = [list(iv) for iv in result.get('intervals') or []]
+                outputs['binned'] = self.app_backend._datasets.get(result.get('binned_dataset'))
+                logger.info("MapGenerator: %d map(s) from spectra", len(outputs['maps']))
+            else:
+                # The old flat-data path: one map per value column, nothing
+                # measured. Kept so saved workflows built on it still run.
+                flat_data = inputs.get('flat_data')
+                if flat_data is not None:
+                    flat_name = self._get_temp_dataset_name(flat_data)
+                    self.app_backend._datasets[flat_name] = flat_data
+                    map_paths = self.app_backend.generate_all_maps(
+                        self._Task(), flat_name,
+                        scan_type=params.get('scan_type', 'auto'))
+                    outputs['maps'] = map_paths
+                    outputs['values'] = flat_data
+                    logger.info(f"MapGenerator created {len(map_paths)} TIFF maps from flat data")
 
         elif tool_name == "MapAssembly":
             flat_data = inputs.get('flat_data')
@@ -604,18 +627,15 @@ class WorkflowExecutor:
                             if result.get('interval_map_path') else "")
 
         elif tool_name == "FFT1D":
-            dataset = inputs.get('dataset')
-            if dataset:
-                dataset_name = self._get_temp_dataset_name(dataset)
-                self.app_backend._datasets[dataset_name] = dataset
-
-                class MockTask:
-                    cancelled = False
-                    progress = 0
-
-                # _do_fft1D only takes task and dataset_name
-                result = self.app_backend._do_fft1D(MockTask(), dataset_name)
-                outputs['fft_result'] = result
+            dataset_name = self._stage_dataset(inputs.get('dataset'), "fft")
+            if dataset_name:
+                # Through the batch spec, so the node's parameters are the
+                # tool's — window, detrend, one-sided, power — with the
+                # tool's casts and defaults.
+                self._run_batch_tool('fft_1d', dataset_name, params)
+                kind = "Power" if params.get('power_spectrum') else "Magnitude"
+                outputs['fft_result'] = self._derived(dataset_name, f"FFT {kind}")
+                outputs['phase'] = self._derived(dataset_name, "FFT Phase")
 
         elif tool_name == "SpatialAverage":
             # Support multiple dataset and flat_data inputs
@@ -1021,6 +1041,73 @@ class WorkflowExecutor:
                     outputs['result_flat'] = result['result_flat']
                 logger.info(f"DataManipulation executed: {equation}")
 
+        elif tool_name == "AverageCurves":
+            dataset_name = self._stage_dataset(inputs.get('dataset'), "average")
+            if dataset_name:
+                self._run_batch_tool('average_curves', dataset_name, params)
+                outputs['average'] = self._derived(dataset_name, "Average")
+
+        elif tool_name == "SetUnits":
+            dataset = inputs.get('dataset')
+            if dataset is not None and hasattr(dataset, 'spectra'):
+                # A copy, relabelled: the node must not edit the dataset that
+                # flowed in, which may be the project's own.
+                from copy import deepcopy
+                copy = deepcopy(dataset)
+                name = self._get_temp_dataset_name(copy, "units")
+                self.app_backend._datasets[name] = copy
+                self.app_backend.relabelDatasets([name], {
+                    k: params.get(k, '') for k in ('x_unit', 'y_unit', 'x_name', 'y_name')})
+                outputs['dataset'] = self.app_backend._datasets.get(name)
+
+        elif tool_name == "AxisConvert":
+            dataset_name = self._stage_dataset(inputs.get('dataset'), "axis")
+            if dataset_name:
+                out_name = self._run_batch_tool('axis_convert', dataset_name, params)
+                outputs['converted'] = self.app_backend._datasets.get(out_name) if out_name else None
+
+        elif tool_name == "SetValues":
+            dataset_name = self._stage_dataset(inputs.get('dataset'), "formula")
+            if dataset_name:
+                out_name = self._run_batch_tool('unit_formula', dataset_name,
+                                                {**dict(params or {}), 'replace': False})
+                outputs['result'] = self.app_backend._datasets.get(out_name) if out_name else None
+
+        elif tool_name == "MultiPeakFit":
+            dataset_name = self._stage_dataset(inputs.get('dataset'), "peakfit")
+            if dataset_name:
+                self._run_batch_tool('multi_peak_fit', dataset_name, params)
+                outputs['peak_table'] = self._derived(dataset_name, "Peak Fit")
+                outputs['fitted'] = self._derived(dataset_name, "Fitted")
+
+        elif tool_name == "ConfinementDimensionality":
+            dataset_name = self._stage_dataset(inputs.get('dataset'), "dimensionality")
+            if dataset_name:
+                result = self.app_backend.analyze_confinement_dimensionality(
+                    self._Task(), dataset_name, params=dict(params or {}))
+                outputs['table'] = result.get('dimensionality')
+                logger.info("ConfinementDimensionality: %s", result.get('coherence') or '')
+
+        elif tool_name == "ConfinementDesigner":
+            dataset_name = self._stage_dataset(inputs.get('dataset'), "designer")
+            if dataset_name:
+                result = self.app_backend.design_confinement(
+                    self._Task(), dataset_name, params=dict(params or {}))
+                tables = result.get('tables') or []
+                cand = next((t for t in tables if "Designer Candidates" in t), None)
+                outputs['candidates'] = self.app_backend._datasets.get(cand) if cand else None
+                if result.get('error'):
+                    logger.warning("ConfinementDesigner: %s", result['error'])
+
+        elif tool_name == "MapDiscretizer":
+            map_path = inputs.get('map')
+            if isinstance(map_path, list):
+                map_path = map_path[0] if map_path else None
+            if map_path:
+                outputs['discretized'] = self.app_backend.discretize_map(
+                    self._Task(), str(map_path),
+                    int(params.get('target_x', 10)), int(params.get('target_y', 10)))
+
         elif tool_name == "DatasetOutput":
             dataset = inputs.get('dataset')
             if dataset:
@@ -1328,6 +1415,10 @@ class WorkflowExecutor:
                 if fft_name in self.app_backend._datasets:
                     outputs['fft_spectra'] = self.app_backend._datasets[fft_name]
 
+                averages_name = f"{base_name} - Point Averages"
+                if averages_name in self.app_backend._datasets:
+                    outputs['point_averages'] = self.app_backend._datasets[averages_name]
+
                 # Capture report text for TextOutput connection
                 if result_path:
                     try:
@@ -1478,6 +1569,54 @@ class WorkflowExecutor:
         if candidate in self.produced_output_names:
             candidate = f"{candidate}_{self._pass_index + 1}"
         return candidate
+
+    class _Task:
+        """A task object for tools run inside a workflow: never cancelled
+        from the tool's side (the executor cancels between nodes)."""
+        cancelled = False
+        progress = 0.0
+
+    def _stage_dataset(self, dataset, operation: str = "") -> Optional[str]:
+        """Register an incoming port value as a temporary dataset and return
+        its name, or None when the port carried something else (a path,
+        a string) — logged, since a downstream node handing a path down a
+        dataset port is the classic silent failure here."""
+        if dataset is None:
+            return None
+        if isinstance(dataset, str) or not hasattr(dataset, 'spectra'):
+            logger.error("%s: expected a dataset on the port, got %s",
+                         operation or "workflow", type(dataset).__name__)
+            return None
+        name = self._get_temp_dataset_name(dataset, operation)
+        self.app_backend._datasets[name] = dataset
+        return name
+
+    def _run_batch_tool(self, key: str, dataset_name: str, params: Dict[str, Any]):
+        """Run a BATCH_TOOLS-registered tool on one staged dataset.
+
+        The spec supplies the method, the parameter casts and the defaults —
+        the same ones the tool panel uses — so a node needs no parameter
+        list of its own to stay in step with the tool. Returns whatever the
+        method returned (a path or a dataset name, per the spec).
+        """
+        from src.backend import batch_tools
+        spec = batch_tools.get_spec(key)
+        if spec is None:
+            raise ValueError(f"Unknown batch tool {key!r}")
+        method = getattr(self.app_backend, spec.method)
+        task = self._Task()
+        if spec.params_as_dict:
+            return method(task, dataset_name, dict(params or {})) if spec.takes_task \
+                else method(dataset_name, dict(params or {}))
+        kwargs = spec.coerce(params)
+        return method(task, dataset_name, **kwargs) if spec.takes_task \
+            else method(dataset_name, **kwargs)
+
+    def _derived(self, dataset_name: str, suffix: str):
+        """The dataset a tool registered as ``<base> - <suffix>`` for the
+        staged input, or None."""
+        base = self.app_backend._extract_clean_base_name(dataset_name)
+        return self.app_backend._datasets.get(f"{base} - {suffix}")
 
     def _get_temp_dataset_name(self, dataset, operation: str = "") -> str:
         """Generate a temporary dataset name for internal workflow processing.

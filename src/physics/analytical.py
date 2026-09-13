@@ -152,22 +152,36 @@ def cylinder_energies(R_nm, H_nm, meff, n_levels):
     R, H = R_nm * 1e-9, H_nm * 1e-9
     mass = meff * m_e
     prefactor = (hbar**2) / (2.0 * mass)
+    E_xy = lambda x: prefactor * (x / R) ** 2 / e          # noqa: E731
+    E_ax = lambda l: prefactor * (l * pi / H) ** 2 / e      # noqa: E731
 
-    max_m = 6
-    max_n = 6
-    max_l = 10
-
-    bessel_zeros = {}
-    for m_ang in range(max_m):
-        bessel_zeros[m_ang] = jn_zeros(m_ang, max_n)
-
-    energies = []
-    for m_ang in range(max_m):
-        for n_rad in range(1, max_n + 1):
-            x_mn = bessel_zeros[m_ang][n_rad - 1]
-            for l_ax in range(1, max_l + 1):
-                E = prefactor * ((x_mn / R)**2 + (l_ax * pi / H)**2)
-                energies.append((E / e, (m_ang, n_rad, l_ax)))
-
-    energies.sort(key=lambda x: x[0])
+    # The basis grows until it provably holds the lowest n_levels. A fixed
+    # 6 x 6 x 10 used to do: enough for anything squat, and short of the
+    # axial ladder of a tall, thin cylinder, where the lowest levels ARE the
+    # axial ones. Energy rises monotonically in each quantum number, so the
+    # cheapest state just past each cap bounds everything beyond it — once
+    # all three sit above the n_levels-th energy, nothing is missing.
+    max_m, max_n, max_l = 6, 6, 10
+    for _ in range(64):
+        zeros = {m_ang: jn_zeros(m_ang, max_n) for m_ang in range(max_m)}
+        energies = []
+        for m_ang in range(max_m):
+            for n_rad in range(1, max_n + 1):
+                exy = E_xy(zeros[m_ang][n_rad - 1])
+                for l_ax in range(1, max_l + 1):
+                    energies.append((exy + E_ax(l_ax), (m_ang, n_rad, l_ax)))
+        energies.sort(key=lambda x: x[0])
+        if len(energies) < n_levels:
+            max_m += 1; max_n += 1; max_l += 1
+            continue
+        cutoff = energies[n_levels - 1][0]
+        grow = False
+        if E_xy(zeros[0][0]) + E_ax(max_l + 1) <= cutoff and max_l < 96:
+            max_l += 1; grow = True
+        if E_xy(jn_zeros(0, max_n + 1)[-1]) + E_ax(1) <= cutoff and max_n < 24:
+            max_n += 1; grow = True
+        if E_xy(jn_zeros(max_m, 1)[0]) + E_ax(1) <= cutoff and max_m < 24:
+            max_m += 1; grow = True
+        if not grow:
+            break
     return energies[:n_levels]

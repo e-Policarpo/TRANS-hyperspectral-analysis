@@ -204,12 +204,14 @@ class TestTheTableItRegisters:
         assert 'dim_1_nm' in table.columns
         assert 'reason' in table.columns
 
-    def test_the_reason_is_the_only_text_column(self, tool_impl):
-        """Everything else has to be a number, or it cannot be mapped."""
+    def test_the_text_columns_are_reason_and_provenance(self, tool_impl):
+        """Everything else has to be a number, or it cannot be mapped. The
+        provenance columns (dataset, search settings) are what keep rows
+        apart once several lines' tables are concatenated."""
         table = _table(tool_impl, _run(tool_impl))
         text = [c for c in table.columns if table[c].dtype == object]
 
-        assert text == ['reason']
+        assert text == ['reason', 'dataset', 'search']
 
     def test_it_records_where_it_came_from_and_how(self, tool_impl):
         result = _run(tool_impl)
@@ -300,15 +302,28 @@ class TestWhenItCannotRun:
         assert table['size_nm'].isna().all()
         assert result['groups'] == []
 
-    def test_cancelling_stops_the_run_and_marks_the_rest(self, tool_impl):
+    def test_cancelling_stops_the_run_and_registers_nothing(self, tool_impl):
+        """A cancelled line reports the cancel and leaves no table behind.
+
+        It used to return the partial run as a normal result. Most of those
+        positions were never visited, so the table was mostly empty by
+        construction — and once registered it sat in the browser named after
+        a real measurement, with a size map drawn from wherever the user
+        happened to press Cancel. The positions that were reached are still
+        marked CANCELLED inside ``analyze_line_scan`` (see
+        tests/test_physics/test_line_scan.py); what changed is that the tool
+        no longer publishes them. The cancel path as a whole lives in
+        tests/test_backend/test_cancel_wiring.py.
+        """
         tool_impl._datasets['line'] = _line(n_points=5)
+        before = set(tool_impl._datasets)
         result = tool_impl.design_line_scan(
             CancellingTask(after=2), 'line',
             {'height': 3.0, 'maxsol': 1, 'seed': 1, 'match': 'delta_e'})
 
-        assert result['ok'] is True          # what ran is still reported
-        reasons = [p['reason'] for p in result['points']]
-        assert 'cancelled' in reasons
+        assert result['ok'] is False
+        assert result['error'] == 'Cancelled'
+        assert set(tool_impl._datasets) == before
 
     def test_progress_reaches_the_end(self, tool_impl):
         task = MockTask()
@@ -361,5 +376,5 @@ class TestItRunsOverSeveralLines:
             {'height': 3.0, 'maxsol': 1, 'seed': 1, 'match': 'delta_e'})
 
         assert len(results) == 2
-        assert 'line A - Confinement' in tool_impl._datasets
-        assert 'line B - Confinement' in tool_impl._datasets
+        assert any(k.startswith('line A - Confinement (') for k in tool_impl._datasets)
+        assert any(k.startswith('line B - Confinement (') for k in tool_impl._datasets)

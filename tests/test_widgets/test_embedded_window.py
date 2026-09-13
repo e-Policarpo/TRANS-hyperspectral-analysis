@@ -827,8 +827,8 @@ class TestToolWindowIntegration:
         ]
         return backend
 
-    def test_peak_indexing_tool_backend_access(self, mock_backend_for_tools):
-        """Test PeakIndexingTool can access backend methods."""
+    def test_multi_peak_fit_tool_backend_access(self, mock_backend_for_tools):
+        """Test MultiPeakFitTool can access backend methods."""
         backend = mock_backend_for_tools
 
         datasets = backend.getDatasetList()
@@ -836,8 +836,8 @@ class TestToolWindowIntegration:
         assert len(datasets) == 3
         assert 'NoBaseline_Dataset_1' in datasets
 
-    def test_curve_analysis_tool_backend_access(self, mock_backend_for_tools):
-        """Test CurveAnalysisTool can access dataset info."""
+    def test_curve_plotting_tool_backend_access(self, mock_backend_for_tools):
+        """Test the Curve Plotting panel (CurveAnalysisTool.qml) can access dataset info."""
         backend = mock_backend_for_tools
 
         info = backend.getDatasetInfo('Dataset_1')
@@ -855,8 +855,8 @@ class TestToolWindowIntegration:
         assert len(maps) == 2
         assert maps[0]['title'] == 'Height Map'
 
-    def test_spatial_average_tool_backend_access(self, mock_backend_for_tools):
-        """Test SpatialAverageTool can access grid info."""
+    def test_map_generator_tool_backend_access(self, mock_backend_for_tools):
+        """Test MapGeneratorTool can access grid info (for its spatial-averaging step)."""
         backend = mock_backend_for_tools
 
         info = backend.getDatasetInfo('Dataset_1')

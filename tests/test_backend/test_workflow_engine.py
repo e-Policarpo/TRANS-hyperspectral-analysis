@@ -664,11 +664,11 @@ class TestToolDefinitions:
         # Convert to dict for easy lookup
         cat_dict = {c["category"]: c["tools"] for c in categories}
         assert "Input" in cat_dict
-        assert "Processing" in cat_dict
+        assert "Prepare" in cat_dict
         assert "Output" in cat_dict
 
         assert "DatasetInput" in cat_dict["Input"]
-        assert "CurveSmoothing" in cat_dict["Processing"]
+        assert "CurveSmoothing" in cat_dict["Prepare"]
 
         # Verify ordering: Input and Output should come first
         assert categories[0]["category"] == "Input"
@@ -702,56 +702,32 @@ class TestToolDefinitions:
         assert 'intervals' in info['port_types']
 
     def test_get_tool_categories_ordering(self):
-        """Test that categories are returned in correct order.
-
-        Expected order: Input -> Output -> Annotations -> Processing -> Analysis -> Visualization -> Image Processing
-        Image Processing should be LAST.
-        """
+        """Categories follow the Tools menu's sections, after the graph
+        plumbing: Input -> Output -> Annotations -> Prepare -> Transform ->
+        Fit and features -> Maps -> Confinement."""
         categories = get_tool_categories()
         category_list = [c["category"] for c in categories]
 
-        # Input should come before Output
-        if "Input" in category_list and "Output" in category_list:
-            assert category_list.index("Input") < category_list.index("Output")
+        assert category_list == ["Input", "Output", "Annotations", "Prepare", "Transform",
+                                 "Fit and features", "Maps", "Confinement"]
 
-        # Output should come before Annotations
-        if "Output" in category_list and "Annotations" in category_list:
-            assert category_list.index("Output") < category_list.index("Annotations")
-
-        # Annotations should come before Processing
-        if "Annotations" in category_list and "Processing" in category_list:
-            assert category_list.index("Annotations") < category_list.index("Processing")
-
-        # Processing should come before Analysis
-        if "Processing" in category_list and "Analysis" in category_list:
-            assert category_list.index("Processing") < category_list.index("Analysis")
-
-        # Analysis should come before Visualization
-        if "Analysis" in category_list and "Visualization" in category_list:
-            assert category_list.index("Analysis") < category_list.index("Visualization")
-
-        # Visualization should come before Image Processing
-        if "Visualization" in category_list and "Image Processing" in category_list:
-            assert category_list.index("Visualization") < category_list.index("Image Processing")
-
-        # Image Processing should be LAST
-        if "Image Processing" in category_list:
-            assert category_list.index("Image Processing") == len(category_list) - 1, \
-                f"Image Processing should be last but is at index {category_list.index('Image Processing')} of {len(category_list)}"
+    def test_deprecated_nodes_are_not_offered(self):
+        """Replaced by Spectral Features; still executable for saved flows."""
+        offered = {t for c in get_tool_categories() for t in c["tools"]}
+        assert "DetectBandgapDoping" not in offered
+        assert "DiracPointEstimator" not in offered
+        assert TOOL_DEFINITIONS["DetectBandgapDoping"].get("deprecated")
 
     def test_tools_within_category_ordering(self):
         """Test that tools within Processing category are in workflow order."""
         categories = get_tool_categories()
         cat_dict = {c["category"]: c["tools"] for c in categories}
 
-        if "Processing" in cat_dict:
-            processing_tools = cat_dict["Processing"]
-            # TruncateData should come before Derivative
-            if "TruncateData" in processing_tools and "Derivative" in processing_tools:
-                assert processing_tools.index("TruncateData") < processing_tools.index("Derivative")
-            # Derivative should come before Integration
-            if "Derivative" in processing_tools and "Integration" in processing_tools:
-                assert processing_tools.index("Derivative") < processing_tools.index("Integration")
+        prepare = cat_dict["Prepare"]
+        transform = cat_dict["Transform"]
+        # Units are set before the sweep is cut; Derivative comes before Integration
+        assert prepare.index("SetUnits") < prepare.index("TruncateData")
+        assert transform.index("Derivative") < transform.index("Integration")
 
     def test_display_names_homogenized(self):
         """Test that display names are simplified/homogenized."""
@@ -760,7 +736,7 @@ class TestToolDefinitions:
         assert get_tool_info("DatasetOutput")['display_name'] == "Dataset"
         assert get_tool_info("TruncateData")['display_name'] == "Truncate"
         assert get_tool_info("CurveSmoothing")['display_name'] == "Smoothing"
-        assert get_tool_info("CurveFitting")['display_name'] == "Baseline"
+        assert get_tool_info("CurveFitting")['display_name'] == "Background Flattening"
         assert get_tool_info("DataManipulation")['display_name'] == "Math Operation"
         assert get_tool_info("FFT1D")['display_name'] == "FFT"
 
@@ -803,7 +779,7 @@ class TestNewTools:
         """Test ImageDiscretizer tool is defined."""
         assert "ImageDiscretizer" in TOOL_DEFINITIONS
         tool_def = TOOL_DEFINITIONS["ImageDiscretizer"]
-        assert tool_def["category"] == "Image Processing"
+        assert tool_def["category"] == "Maps"
         assert tool_def["display_name"] == "Image Discretizer"
 
     def test_image_discretizer_parameters(self):
@@ -840,7 +816,7 @@ class TestNewTools:
         ]
         for tool_name in map_tools:
             assert tool_name in TOOL_DEFINITIONS, f"{tool_name} not found"
-            assert TOOL_DEFINITIONS[tool_name]["category"] == "Image Processing"
+            assert TOOL_DEFINITIONS[tool_name]["category"] == "Maps"
 
     def test_map_processing_tools_use_map_port_type(self):
         """Test map processing tools use MAP port type."""
@@ -888,13 +864,13 @@ class TestNewTools:
         assert node.parameters.get("node_width") == 180
         assert node.parameters.get("node_height") == 100
 
-    def test_image_processing_category_exists(self):
-        """Test Image Processing category contains merged tools."""
+    def test_maps_category_holds_image_and_map_tools(self):
+        """The Maps section holds spectra-to-map tools, map filters and image tools."""
         categories = get_tool_categories()
         cat_dict = {c["category"]: c["tools"] for c in categories}
-        assert "Image Processing" in cat_dict
+        assert "Maps" in cat_dict
 
-        image_tools = cat_dict["Image Processing"]
+        image_tools = cat_dict["Maps"]
         # Should contain both image tools and map processing tools
         assert "ImageSmoothing" in image_tools
         assert "GradientFilter" in image_tools
@@ -926,15 +902,14 @@ class TestNewTools:
         assert params["weight_partial_noise"]["type"] == "float"
         assert params["weight_partial_noise"]["default"] == 1.0
 
-    def test_filter_bad_data_in_processing_category(self):
-        """Test FilterBadData is in Processing category."""
+    def test_filter_bad_data_in_prepare_category(self):
+        """FilterBadData cleans a dataset, so it sits in Prepare."""
         tool_def = TOOL_DEFINITIONS["FilterBadData"]
-        assert tool_def["category"] == "Processing"
+        assert tool_def["category"] == "Prepare"
 
-        # Verify it appears in Processing tools list
         categories = get_tool_categories()
         cat_dict = {c["category"]: c["tools"] for c in categories}
-        assert "FilterBadData" in cat_dict["Processing"]
+        assert "FilterBadData" in cat_dict["Prepare"]
 
     def test_map_input_uses_file_select(self):
         """Test MapInput uses file_select parameter type."""
@@ -1022,9 +997,9 @@ class TestConfinementAnalysisNode:
     """The Confinement Analysis node: background + peaks in one pass, with the
     occupancy table and the two flat outputs that make it mappable."""
 
-    def test_node_is_registered_in_the_analysis_category(self):
+    def test_node_is_registered_in_the_confinement_category(self):
         node_def = TOOL_DEFINITIONS["ConfinementAnalysis"]
-        assert node_def["category"] == "Analysis"
+        assert node_def["category"] == "Confinement"
         assert node_def["display_name"] == "Confinement Analysis"
 
     def test_takes_a_single_dataset_input(self):
@@ -1128,11 +1103,11 @@ class TestConfinementAnalysisNode:
             target_node_id=integration.id, target_port_id="intervals")
         assert wf.validate_connection(conn) is True
 
-    def test_appears_first_among_the_analysis_tools(self):
+    def test_appears_first_among_the_confinement_tools(self):
         from src.backend.workflow_engine import get_tool_categories
-        analysis = next(c for c in get_tool_categories() if c["category"] == "Analysis")
-        assert analysis["tools"][0] == "ConfinementAnalysis"
-        assert "PeakFinder" in analysis["tools"], "the old tool stays available"
+        cats = {c["category"]: c["tools"] for c in get_tool_categories()}
+        assert cats["Confinement"][0] == "ConfinementAnalysis"
+        assert "PeakFinder" in cats["Fit and features"], "the old tool stays available"
 
 
 class TestConfinementDefaultsAgree:
@@ -1156,9 +1131,9 @@ class TestConfinementDefaultsAgree:
 class TestSpectralFeaturesNode:
     """Feature extraction as a workflow node — flat output so it maps."""
 
-    def test_registered_in_analysis(self):
+    def test_registered_in_fit_and_features(self):
         node_def = TOOL_DEFINITIONS["SpectralFeatures"]
-        assert node_def["category"] == "Analysis"
+        assert node_def["category"] == "Fit and features"
         assert node_def["display_name"] == "Spectral Features"
 
     def test_features_output_is_flat_so_it_can_be_mapped(self):
@@ -1193,7 +1168,7 @@ class TestSpectralFeaturesNode:
                           target_node_id=mapper.id, target_port_id="flat_data")
         assert wf.validate_connection(conn) is True
 
-    def test_takes_the_confinement_tool_position_after_it(self):
+    def test_heads_the_fit_and_features_section(self):
         from src.backend.workflow_engine import get_tool_categories
-        analysis = next(c for c in get_tool_categories() if c["category"] == "Analysis")
-        assert analysis["tools"][:2] == ["ConfinementAnalysis", "SpectralFeatures"]
+        section = next(c for c in get_tool_categories() if c["category"] == "Fit and features")
+        assert section["tools"][:2] == ["SpectralFeatures", "MultiPeakFit"]

@@ -3,7 +3,7 @@
 Finds the states in each spectrum — peak search and background removal in one
 pass — and emits the occupancy table: which states exist at which bias.
 
-**Menu** Tools → Composite tools → Confinement Analysis · **Panel**
+**Menu** Tools → Confinement → Confinement Analysis · **Panel**
 `ConfinementAnalysisTool.qml` · **Method** `analyze_confinement()`,
 `build_occupancy_matrix()`, engine in `src/processing/peak_detection.py`
 
@@ -39,7 +39,24 @@ dI/dV spectra. The panel previews the selected spectrum live
 |---|---|
 | occupancy table | 1 where a spectrum has a peak in a bin, blank elsewhere |
 | `<dataset> - Energy Bins` | the bin grid |
+| `<dataset> - Peak Count` | one row per spectrum: how many peaks, and where they sit |
 | files | `<project>_outputs/peaks/` |
+
+### Peak Count
+
+| column | meaning |
+|---|---|
+| `Peak_Count` | peaks found in that spectrum |
+| `nstates_negative` / `nstates_positive` | those peaks split by the sign of the bias (a peak at exactly 0 V counts as positive, so the two add up to `Peak_Count`) |
+| `nstates_negative_in_gap` / `nstates_positive_in_gap` | the part of each that sits inside the detected gap |
+| `gap_width`, `gap_left`, `gap_right` | the gap those in-gap counts were measured against |
+
+The columns are the ones [Spectral Features](spectral-features.md) reports
+under the same names, so a row of one table reads against a row of the other
+— but they are counted from the peaks **this** tool found, with the settings
+you set, rather than from a second search behind your back. The gap is
+detected here (`gap_delta`, `state_width_samples`, both overridable) because
+this tool has a search window, not a band gap.
 
 ## Method
 

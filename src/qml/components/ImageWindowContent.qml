@@ -1045,21 +1045,13 @@ Item {
                         }
                     }
 
-                    onWheel: function(wheel) {
-                        // Zoom about cursor: keep the image-point under the
-                        // pointer stable across the scale change.
-                        var step = wheel.angleDelta.y > 0 ? 1.15 : 1 / 1.15
-                        var newZoom = Math.max(0.05, Math.min(40.0, viewport.zoom * step))
-                        if (newZoom === viewport.zoom) return
-                        var imgPt = viewToImage(wheel.x, wheel.y)
-                        viewport.zoom = newZoom
-                        // Re-compute renderX/Y after zoom and adjust pan so
-                        // the point under the cursor still maps to the same
-                        // pixel.
-                        var newImgPt = viewToImage(wheel.x, wheel.y)
-                        viewport.panX += (newImgPt.x - imgPt.x) * viewport.effectiveScale
-                        viewport.panY += (newImgPt.y - imgPt.y) * viewport.effectiveScale
-                    }
+                    // Scroll-to-zoom was removed: a wheel nudge while reading
+                    // an image rescaled it out from under the user. The wheel
+                    // is still swallowed here rather than left unhandled, so
+                    // it cannot fall through to an ancestor and scroll
+                    // something else instead. Zoom is the two buttons in the
+                    // side panel.
+                    onWheel: function(wheel) { wheel.accepted = true }
                 }
             }
         }
@@ -1158,10 +1150,10 @@ Item {
                     }
 
                     // -------- View tools (Reset zoom / 1:1) ---------------
-                    // "Reset zoom" zeroes both wheel-zoom and any
-                    // accumulated pan so the image is fully fit to the
-                    // viewport again — the recovery button when the
-                    // user has zoomed/panned far enough to lose it.
+                    // The only way to change zoom now that the wheel no longer
+                    // does. "Reset zoom" also zeroes any accumulated pan so the
+                    // image is fully fit to the viewport again — the recovery
+                    // button when the user has panned far enough to lose it.
                     RowLayout {
                         Layout.fillWidth: true
                         spacing: 4

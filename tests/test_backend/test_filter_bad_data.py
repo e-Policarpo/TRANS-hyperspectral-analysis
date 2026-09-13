@@ -828,7 +828,7 @@ class TestOutlierRemoval(TestFilterBadDataSetup):
 
 
 class TestPerPointAverages(TestOutlierRemoval):
-    """The dataset the outlier pass exists to produce.
+    """What the filtering exists to produce.
 
     An overview holds every repetition at every point; what the analysis
     wants is one curve per point, and that average is only worth taking once
@@ -838,17 +838,21 @@ class TestPerPointAverages(TestOutlierRemoval):
     def test_written_when_outliers_are_filtered(self, tool_impl):
         tool_impl._datasets['OV'] = self._overview()
         tool_impl.filter_bad_data(MockTask(), 'OV', filter_offset_outliers=True)
-        assert 'OV - Outliers Removed' in tool_impl._datasets
+        assert 'OV - Point Averages' in tool_impl._datasets
 
-    def test_not_written_when_outlier_filtering_is_off(self, tool_impl):
+    def test_written_when_outlier_filtering_is_off(self, tool_impl):
+        """Collapsing the repetitions is worth doing on its own; outlier
+        removal only changes which curves go into the mean."""
         tool_impl._datasets['OV'] = self._overview()
         tool_impl.filter_bad_data(MockTask(), 'OV')
-        assert 'OV - Outliers Removed' not in tool_impl._datasets
+        averaged = tool_impl._datasets['OV - Point Averages']
+        assert list(averaged.spectra.columns) == ['P01', 'P02']
+        assert averaged.metadata.additional_info['outliers_removed'] is False
 
     def test_one_column_per_point(self, tool_impl):
         tool_impl._datasets['OV'] = self._overview(points=(1, 2, 3), reps=15)
         tool_impl.filter_bad_data(MockTask(), 'OV', filter_offset_outliers=True)
-        averaged = tool_impl._datasets['OV - Outliers Removed']
+        averaged = tool_impl._datasets['OV - Point Averages']
         assert list(averaged.spectra.columns) == ['P01', 'P02', 'P03']
 
     def test_the_average_excludes_the_outlier(self, tool_impl):
@@ -856,7 +860,7 @@ class TestPerPointAverages(TestOutlierRemoval):
         tool_impl._datasets['OV'] = self._overview(n_offset=1)
         tool_impl.filter_bad_data(MockTask(), 'OV', filter_offset_outliers=True)
 
-        averaged = tool_impl._datasets['OV - Outliers Removed']
+        averaged = tool_impl._datasets['OV - Point Averages']
         good = tool_impl._datasets['OV - Good Data'].spectra
         survivors = [c for c in good.columns if c.startswith('P02')]
         np.testing.assert_allclose(
@@ -869,7 +873,7 @@ class TestPerPointAverages(TestOutlierRemoval):
         tool_impl._datasets['OV'] = self._overview(n_offset=1, reps=20)
         tool_impl.filter_bad_data(MockTask(), 'OV', filter_offset_outliers=True)
 
-        for entry in (tool_impl._datasets['OV - Outliers Removed']
+        for entry in (tool_impl._datasets['OV - Point Averages']
                       .metadata.additional_info['spectrum_meta']):
             assert entry['n_input'] == 20
             assert (entry['n_averaged'] + entry['n_outliers_removed']
@@ -883,24 +887,24 @@ class TestPerPointAverages(TestOutlierRemoval):
         tool_impl._datasets['OV'] = dataset
         tool_impl.filter_bad_data(MockTask(), 'OV', filter_offset_outliers=True)
 
-        meta = (tool_impl._datasets['OV - Outliers Removed']
+        meta = (tool_impl._datasets['OV - Point Averages']
                 .metadata.additional_info['spectrum_meta'])
         assert [e['location_m'] for e in meta] == [[1e-9, 0.0], [2e-9, 0.0]]
 
     def test_it_records_where_it_came_from(self, tool_impl):
         tool_impl._datasets['OV'] = self._overview()
         tool_impl.filter_bad_data(MockTask(), 'OV', filter_offset_outliers=True)
-        info = tool_impl._datasets['OV - Outliers Removed'].metadata.additional_info
+        info = tool_impl._datasets['OV - Point Averages'].metadata.additional_info
         assert info['original'] == 'OV'
         assert info['averaged_over_reps'] is True
-        assert info['filter'] == 'outliers_removed'
+        assert info['filter'] == 'point_averages'
 
     def test_a_csv_is_written_beside_the_others(self, tool_impl):
         tool_impl._datasets['OV'] = self._overview()
         report = Path(tool_impl.filter_bad_data(
             MockTask(), 'OV', filter_offset_outliers=True))
         written = {f.name for f in report.parent.glob('*.csv')}
-        assert any('Outliers_Removed' in name for name in written), written
+        assert any('Point_Averages' in name for name in written), written
 
     def test_the_report_says_what_was_averaged(self, tool_impl):
         tool_impl._datasets['OV'] = self._overview()
@@ -917,12 +921,58 @@ class TestPerPointAverages(TestOutlierRemoval):
         tool_impl._datasets['OV'] = SpectralData(values, dataset.metadata)
         tool_impl.filter_bad_data(MockTask(), 'OV', filter_offset_outliers=True)
 
-        averaged = tool_impl._datasets['OV - Outliers Removed']
+        averaged = tool_impl._datasets['OV - Point Averages']
         assert list(averaged.spectra.columns) == ['P02']
 
     def test_whole_dataset_grouping_gives_one_average(self, tool_impl):
         tool_impl._datasets['OV'] = self._overview()
         tool_impl.filter_bad_data(MockTask(), 'OV', filter_offset_outliers=True,
                                   outlier_group_by='dataset')
-        averaged = tool_impl._datasets['OV - Outliers Removed']
+        averaged = tool_impl._datasets['OV - Point Averages']
         assert averaged.num_spectra == 1
+        # Not "P01": one curve over the whole dataset belongs to no point,
+        # however the curves under it were labelled.
+        assert list(averaged.spectra.columns) == ['Average']
+
+    def test_a_line_scan_is_numbered_along_the_line(self, tool_impl):
+        """P01 is where the line starts, not point 203 of the session.
+
+        The loader numbers a line-scan overview's own columns that way
+        (``P01R01``), and so does the averaged line-scan dataset; the session
+        -wide point index is not a position and belongs in the metadata.
+        """
+        dataset = self._overview(points=(1, 2, 3), reps=15)
+        for entry in dataset.metadata.additional_info['spectrum_meta']:
+            entry['line_pos'] = entry['point_index'] - 1
+            entry['point_index'] = 203 + 2 * (entry['line_pos'])
+        tool_impl._datasets['OV'] = dataset
+        tool_impl.filter_bad_data(MockTask(), 'OV', filter_offset_outliers=True)
+
+        averaged = tool_impl._datasets['OV - Point Averages']
+        assert list(averaged.spectra.columns) == ['P01', 'P02', 'P03']
+        # Both numbers survive, so the UI can show one against the other.
+        meta = averaged.metadata.additional_info['spectrum_meta']
+        assert [e['point_index'] for e in meta] == [203, 205, 207]
+        assert [e['line_pos'] for e in meta] == [0, 1, 2]
+
+    def test_no_point_index_means_no_average(self, tool_impl):
+        """Averaging the fallback grouping would collapse a line scan into
+        one curve and call it a point."""
+        tool_impl._datasets['OV'] = self._overview(with_meta=False)
+        report = Path(tool_impl.filter_bad_data(MockTask(), 'OV')).read_text()
+        assert 'OV - Point Averages' not in tool_impl._datasets
+        assert 'Per-point averages skipped' in report
+
+    def test_the_average_uses_the_corrected_curves(self, tool_impl):
+        """Good Data holds corrected curves; the average must be the mean of
+        those same curves, not of the uncorrected originals."""
+        tool_impl._datasets['OV'] = self._overview()
+        tool_impl.filter_bad_data(MockTask(), 'OV', correct_periodic=True)
+
+        averaged = tool_impl._datasets['OV - Point Averages'].spectra
+        good = tool_impl._datasets['OV - Good Data'].spectra
+        for point in averaged.columns:
+            members = [c for c in good.columns if c.startswith(point + 'R')]
+            np.testing.assert_allclose(
+                averaged[point].values,
+                np.nanmean(good[members].values, axis=1), equal_nan=True)

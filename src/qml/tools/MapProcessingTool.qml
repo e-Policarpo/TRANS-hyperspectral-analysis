@@ -113,7 +113,7 @@ Item {
                         readOnly: true
                     }
 
-                    Button {
+                    ToolButton {
                         text: "Browse..."
                         onClicked: imageFileDialog.open()
                     }
@@ -289,22 +289,22 @@ Item {
         RowLayout {
             Layout.fillWidth: true
 
-            Button {
+            ToolButton {
                 text: "Apply"
                 enabled: (useMapDataset.checked && mapDatasetCombo.currentIndex >= 0) ||
                         (useExternalFile.checked && imagePathField.text.length > 0)
-                highlighted: true
+                primary: true
                 onClicked: performProcessing()
             }
 
-            Button {
+            ToolButton {
                 text: "Cancel Operation"
                 onClicked: backend.cancelCurrentOperation()
             }
 
             Item { Layout.fillWidth: true }
 
-            Button {
+            ToolButton {
                 text: "Close"
                 onClicked: {
                     if (root.closeWindow) { root.closeWindow() } else { var win = root.Window.window; if (win) win.close() }

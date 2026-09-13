@@ -22,10 +22,10 @@ Designed for **STS** (Scanning Tunneling Spectroscopy) and **SNOM** (Scanning Ne
 
 | Category | Tools |
 |----------|-------|
-| **Processing** | Curve Smoothing, Derivatives, Integration, Truncate, FFT, Curve Fitting, Math Operations, Filter Bad Data |
-| **Analysis** | Peak Indexing, Bandgap & Doping Detection, Dirac Point Estimator |
-| **Spatial** | Spatial Averaging, Map Generator, Map Discretizer |
-| **Image** | Image Smoothing, Gradient Filter, Gaussian/Median Filters, Plane Leveling, Row Alignment, Normalization |
+| **Processing** | Curve Smoothing, Derivatives, Integration, Truncate, FFT, Curve Background Flattening, Subtract Detector Background, Unit Converter, Filter Bad Data |
+| **Analysis** | Spectral Features (gap, doping, metallicity, Dirac point), Multi-Peak Fitting, Confinement Analysis |
+| **Spatial** | Map Generator (with spatial averaging), Map Discretizer |
+| **Image** | Gradient Filter, Gaussian/Median Filters, Plane Leveling, Row Alignment, Normalization |
 | **Visualization** | Map Generator, Average Curves |
 
 ### Visual Workflow Editor

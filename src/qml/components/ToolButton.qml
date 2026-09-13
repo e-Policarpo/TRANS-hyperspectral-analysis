@@ -34,7 +34,9 @@ Button {
         font: buttonRoot.font
         color: !buttonRoot.enabled
                ? buttonRoot.theme.textMuted
-               : (buttonRoot.primary ? buttonRoot.theme.bgDark : buttonRoot.theme.textLight)
+               : buttonRoot.primary ? buttonRoot.theme.bgDark
+               : buttonRoot.flat ? buttonRoot.theme.accentBlue
+               : buttonRoot.theme.textLight
         horizontalAlignment: Text.AlignHCenter
         verticalAlignment: Text.AlignVCenter
         elide: Text.ElideRight
@@ -43,6 +45,9 @@ Button {
     background: Rectangle {
         radius: 4
         color: {
+            // A flat button is a link: no fill until it is hovered or pressed.
+            if (buttonRoot.flat && !buttonRoot.down && !buttonRoot.hovered)
+                return "transparent"
             if (!buttonRoot.enabled)
                 return buttonRoot.theme.bgMedium
             if (buttonRoot.primary)
@@ -55,6 +60,6 @@ Button {
         }
         border.color: buttonRoot.primary && buttonRoot.enabled
                       ? buttonRoot.theme.accentBlue : buttonRoot.theme.bgLight
-        border.width: 1
+        border.width: buttonRoot.flat ? 0 : 1
     }
 }

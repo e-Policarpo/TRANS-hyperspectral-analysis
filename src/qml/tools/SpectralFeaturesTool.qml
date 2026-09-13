@@ -51,6 +51,7 @@ Item {
     property color textLight: (parentWindow && parentWindow.textLight !== undefined) ? parentWindow.textLight : Theme.textLight
     property color textMuted: (parentWindow && parentWindow.textMuted !== undefined) ? parentWindow.textMuted : Theme.textMuted
     property color accentMagenta: (parentWindow && parentWindow.accentMagenta !== undefined) ? parentWindow.accentMagenta : Theme.accentMagenta
+    property color accentOrange: (parentWindow && parentWindow.accentOrange !== undefined) ? parentWindow.accentOrange : Theme.accentOrange
     property color borderColor: (parentWindow && parentWindow.borderColor !== undefined) ? parentWindow.borderColor : Theme.borderColor
 
     property int spectrumCount: 0
@@ -169,7 +170,13 @@ Item {
             "edge_fraction": edgeFractionSpin.realValue,
             "state_noise_sigmas": sigmaSpin.realValue,
             "state_width_samples": stateWidthSpin.value,
-            "positive_only": positiveOnlyCheck.checked
+            "positive_only": positiveOnlyCheck.checked,
+            "dirac_mode": ["auto", "manual", "off"][diracModeCombo.currentIndex],
+            "dirac_edge_trim": diracTrimSpin.realValue,
+            "dirac_left_min": diracLeftMin.realValue,
+            "dirac_left_max": diracLeftMax.realValue,
+            "dirac_right_min": diracRightMin.realValue,
+            "dirac_right_max": diracRightMax.realValue
         }
     }
 
@@ -206,6 +213,20 @@ Item {
         for (var i = 0; i < r.stateX.length; i++) {
             previewCanvas.addFixedInfiniteLine("st" + i, "vertical", r.stateX[i],
                                                root.accentPink, "")
+        }
+        // The Dirac branches as fitted lines (two points each, left pair
+        // then right pair), and the crossing itself.
+        if (r.diracLineX && r.diracLineX.length >= 2) {
+            for (var d = 0; d + 1 < r.diracLineX.length; d += 2) {
+                previewCanvas.addCurve(d === 0 ? "dirac left" : "dirac right",
+                                       [r.diracLineX[d], r.diracLineX[d + 1]],
+                                       [r.diracLineY[d], r.diracLineY[d + 1]],
+                                       String(root.accentOrange), 1.2)
+            }
+        }
+        if (r.diracX !== undefined && isFinite(r.diracX)) {
+            previewCanvas.addFixedInfiniteLine("dirac", "vertical", r.diracX,
+                                               String(root.accentOrange), "")
         }
 
         for (var k = 0; k < r.names.length; k++) {
@@ -283,7 +304,7 @@ Item {
 
                 Label {
                     text: "Reduces each spectrum to one row of physical quantities — gap, " +
-                          "doping, band-edge steepness, confined states — as a flat table. " +
+                          "doping, band-edge steepness, confined states, Dirac point — as a flat table. " +
                           "Every column becomes a spatial map, and the table is the input " +
                           "to classification."
                     wrapMode: Text.Wrap
@@ -467,6 +488,95 @@ Item {
                     }
                 }
 
+                Section {
+                    title: "Dirac point"
+                    GridLayout {
+                        anchors.fill: parent
+                        columns: 2
+
+                        Label { text: "Branch windows:"; color: textLight }
+                        FieldCombo {
+                            id: diracModeCombo
+                            Layout.fillWidth: true
+                            model: ["auto (from the gap edges)", "manual", "off"]
+                            onCurrentIndexChanged: queuePreview()
+                        }
+
+                        Label {
+                            text: "Outer trim:"
+                            color: textLight
+                            visible: diracModeCombo.currentIndex === 0
+                        }
+                        FieldBox {
+                            id: diracTrimSpin
+                            visible: diracModeCombo.currentIndex === 0
+                            from: 0; to: 49; value: 10
+                            property real realValue: value / 100.0
+                            textFromValue: function(v) { return (v / 100.0).toFixed(2) }
+                            valueFromText: function(t) { return Math.round(parseFloat(t) * 100) }
+                            onValueChanged: queuePreview()
+                        }
+
+                        Label { text: "Left branch (V):"; color: textLight; visible: diracModeCombo.currentIndex === 1 }
+                        RowLayout {
+                            visible: diracModeCombo.currentIndex === 1
+                            FieldBox {
+                                id: diracLeftMin
+                                from: -100000; to: 100000; value: -1000; stepSize: 50
+                                property real realValue: value / 1000.0
+                                textFromValue: function(v) { return (v / 1000.0).toFixed(3) }
+                                valueFromText: function(t) { return Math.round(parseFloat(t) * 1000) }
+                                onValueChanged: queuePreview()
+                            }
+                            Label { text: "to"; color: textMuted }
+                            FieldBox {
+                                id: diracLeftMax
+                                from: -100000; to: 100000; value: -200; stepSize: 50
+                                property real realValue: value / 1000.0
+                                textFromValue: function(v) { return (v / 1000.0).toFixed(3) }
+                                valueFromText: function(t) { return Math.round(parseFloat(t) * 1000) }
+                                onValueChanged: queuePreview()
+                            }
+                        }
+
+                        Label { text: "Right branch (V):"; color: textLight; visible: diracModeCombo.currentIndex === 1 }
+                        RowLayout {
+                            visible: diracModeCombo.currentIndex === 1
+                            FieldBox {
+                                id: diracRightMin
+                                from: -100000; to: 100000; value: 200; stepSize: 50
+                                property real realValue: value / 1000.0
+                                textFromValue: function(v) { return (v / 1000.0).toFixed(3) }
+                                valueFromText: function(t) { return Math.round(parseFloat(t) * 1000) }
+                                onValueChanged: queuePreview()
+                            }
+                            Label { text: "to"; color: textMuted }
+                            FieldBox {
+                                id: diracRightMax
+                                from: -100000; to: 100000; value: 1000; stepSize: 50
+                                property real realValue: value / 1000.0
+                                textFromValue: function(v) { return (v / 1000.0).toFixed(3) }
+                                valueFromText: function(t) { return Math.round(parseFloat(t) * 1000) }
+                                onValueChanged: queuePreview()
+                            }
+                        }
+
+                        Label {
+                            Layout.columnSpan: 2
+                            Layout.fillWidth: true
+                            text: "A straight line is fitted to each branch of a V-shaped " +
+                                  "spectrum and the two are intersected. In auto mode the " +
+                                  "branches run from each end of the sweep to the gap edge " +
+                                  "found above, trimmed at the outer end. Check dirac_r2_* " +
+                                  "first: on a gapped spectrum the branches are not lines and " +
+                                  "the crossing means nothing."
+                            font.pixelSize: 10
+                            color: textMuted
+                            wrapMode: Text.Wrap
+                        }
+                    }
+                }
+
                 Item { Layout.preferredHeight: 4 }
             }
         }
@@ -532,7 +642,7 @@ Item {
             }
 
             Label {
-                text: "Blue: detected gap edges.   Pink: counted in-gap states."
+                text: "Blue: detected gap edges.   Pink: counted in-gap states.   Orange: Dirac branches and crossing."
                 color: textMuted
                 font.pixelSize: 10
             }

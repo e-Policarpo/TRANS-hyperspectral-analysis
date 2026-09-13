@@ -87,15 +87,16 @@ The tool window will open as a floating, draggable panel.
 5. Click **Calculate Integration**
 6. Results are saved to `outputs/integrated/`
 
-### Example: Spatial Average
+### Example: Spatial averaging (in the Map Generator)
 
-1. Open **Tools** → **Spatial Average**
-2. Select your dataset
-3. See original grid dimensions
-4. Set **Discrete X** and **Discrete Y** for target grid
-5. View the transformation preview
-6. Click **Calculate Spatial Average**
-7. Results are saved to `outputs/curves/`
+1. Open **Tools** → **Composite tools** → **Map Generator**
+2. Select your dataset(s) — Ctrl/Cmd-click for several
+3. Under **Spatial averaging**, set the **Block width** and **Block height**
+   (2 × 2 halves the noise at four times the area)
+4. Pick the scan type so a meander is laid out correctly
+5. Click **Generate maps**
+6. The averaged spectra appear as `<name> - Spatially Averaged (2x2)`, the
+   integrals as `<name> - Map Values` and under `outputs/integrated/`
 
 ### Window Management
 

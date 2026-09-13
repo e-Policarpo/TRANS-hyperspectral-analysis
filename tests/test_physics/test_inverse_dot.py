@@ -58,9 +58,12 @@ def test_the_adapter_agrees_with_the_full_solver():
     full = [lv.E_eV for lv in _spherical_infinite(5.0, 0.067, 4, 4)][:20]
     assert fast == pytest.approx(full, rel=1e-12)
 
+    # A basis wide enough that the full solver's first twenty are the true
+    # lowest twenty — the adapter now grows its own basis to guarantee that,
+    # so matching a solver truncated at (4, 4, 3) would only test the cut.
     fast = [E for E, _ in dot_energies("disc", (10.0, 3.0), 0.067, 20)]
-    full = [lv.E_eV for lv in disc_dot(10.0, 3.0, meff=0.067, m_max=4,
-                                       n_per_channel=4, nz_max=3)][:20]
+    full = [lv.E_eV for lv in disc_dot(10.0, 3.0, meff=0.067, m_max=12,
+                                       n_per_channel=12, nz_max=12)][:20]
     assert fast == pytest.approx(full, rel=1e-12)
 
     fast = [E for E, _ in dot_energies("parabolic", (30.0, 100.0), 0.067, 20)]

@@ -228,7 +228,7 @@ class ToolImplementations:
         # Remove workflow prefix with optional operation suffix and UUID:
         # Pattern: _wf_<basename>_<optional_operation>_<6char_hex>
         # The operation can be: integrate, derivative, smooth, truncate, etc.
-        wf_match = re.match(r'^_wf_(.+?)(?:_(?:integrate|derivative|smooth|truncate|baseline|discretize))?_[a-f0-9]{6}$', name)
+        wf_match = re.match(r'^_wf_(.+?)(?:_(?:integrate|derivative|smooth|truncate|baseline|discretize|fft|average|units|axis|formula|peakfit|dimensionality|designer|maps|bandgap|dirac|features))?_[a-f0-9]{6}$', name)
         if wf_match:
             name = wf_match.group(1)
         else:
@@ -569,7 +569,7 @@ class ToolImplementations:
                         signal_name, e,
                     )
                     self.errorOccurred.emit(
-                        "Background Subtraction",
+                        "Subtract Detector Background",
                         f"{signal_name}: {e}",
                     )
                     continue
@@ -835,62 +835,156 @@ class ToolImplementations:
     # Gradient Filter (for images)
     # ========================================================================
 
+    def _resolve_field_source(self, source: str):
+        """Turn a browser ref or a file path into ``(array, info, title)``.
+
+        ``source`` is one of
+        - ``map:<id>``   — a generated map (file-backed) or an in-memory
+          multi-channel map, whose active channel is taken;
+        - ``image:<id>`` — an imported image entity;
+        - a bare path    — kept so the Gradient workflow node and older
+          call sites still work.
+
+        ``info`` is a loader-style metadata dict that
+        :func:`export_field_from_metadata` can read a pixel scale from, so
+        the result keeps the source's real dimensions.
+        """
+        from src.models.image_data import ImageData
+
+        src = str(source or "")
+        if src.startswith("map:"):
+            map_id = src[len("map:"):]
+            entry = next((m for m in self.maps if m.get('id') == map_id), None)
+            if entry is None:
+                raise ValueError(f"Map {map_id!r} not found")
+            mcm = getattr(self, '_maps_inmem', {}).get(map_id)
+            if mcm is not None:
+                ch = mcm.active_channel
+                if ch is None:
+                    raise ValueError(f"Map {entry.get('title')!r} has no active channel")
+                meta = mcm.metadata
+                info = {'units': {'dependent': ch.metadata.units}}
+                if meta.physical_size:
+                    # scale_from_metadata reads the lateral unit off units.x
+                    info['physical_size'] = list(meta.physical_size)
+                    info['units']['x'] = info['units']['y'] = meta.physical_units
+                return np.asarray(ch.data, dtype=float), info, entry.get('title') or map_id
+            path = entry.get('path') or ''
+            if not path:
+                raise ValueError(f"Map {entry.get('title')!r} has no data")
+            img = ImageData.from_file(path)
+            return self._image_entity_field(img) + (entry.get('title') or Path(path).stem,)
+        if src.startswith("image:"):
+            image_id = src[len("image:"):]
+            img = getattr(self, '_images', {}).get(image_id)
+            if img is None:
+                raise ValueError(f"Image {image_id!r} not found")
+            return self._image_entity_field(img) + (img.name,)
+        if not src or not Path(src).exists():
+            raise ValueError(f"No such image or map: {src!r}")
+        img = ImageData.from_file(src)
+        return self._image_entity_field(img) + (Path(src).stem,)
+
+    @staticmethod
+    def _image_entity_field(img):
+        """A 2-D float field plus scale info for an :class:`ImageData`.
+
+        Colour images are reduced to luminance — a gradient of a colour
+        picture is a picture-processing operation, not a measurement — but
+        a single-channel float image is taken as it is, so real values stay
+        real.
+        """
+        arr = np.asarray(img.array)
+        if arr.ndim == 3:
+            rgb = arr[..., :3].astype(float)
+            arr = rgb @ np.array([0.299, 0.587, 0.114])
+        arr = arr.astype(float)
+        info: dict = {}
+        px = getattr(img.metadata, 'pixel_size_nm', None)
+        if px:
+            dy, dx = px
+            info['pixel_size'] = {'dx': dx, 'dy': dy, 'unit': 'nm'}
+        extra = getattr(img.metadata, 'additional_info', None) or {}
+        if extra.get('pixel_size'):
+            info['pixel_size'] = extra['pixel_size']
+        if extra.get('value_unit'):
+            info['units'] = {'dependent': extra['value_unit']}
+        return arr, info
+
     def apply_gradient_filter(self, task, image_path: str, method: str = 'sobel') -> str:
         """
-        Apply gradient filter to image.
+        Gradient magnitude of a map or image.
 
         Parameters:
         -----------
         image_path : str
-            Path to image
+            A browser ref (``map:<id>`` / ``image:<id>``) or a file path —
+            see :meth:`_resolve_field_source`.
         method : str
             'sobel', 'prewitt', or 'scharr'
 
         Returns:
         --------
         output_path : str
-            Path to gradient image
+            Path to the calibrated gradient map (``.tiff``; a ``.gsf`` and
+            ``.csv`` sit beside it). The values are the gradient of the real
+            field, in the field's value unit per lateral unit — never a
+            0–255 normalisation.
         """
         try:
-            from scipy.ndimage import sobel, prewitt, generic_gradient_magnitude
+            from scipy.ndimage import sobel, prewitt, convolve
+            from src.utils.field_export import export_field_from_metadata
 
             logger.info(f"Applying {method} gradient filter to {image_path}")
 
-            # Load image
-            img = Image.open(image_path).convert('L')
-            img_array = np.array(img, dtype=float)
+            img_array, info, title = self._resolve_field_source(image_path)
+            img_array = np.where(np.isfinite(img_array), img_array,
+                                 np.nanmean(img_array) if np.isfinite(img_array).any() else 0.0)
 
             # Apply gradient
+            method = (method or 'sobel').lower()
             if method == 'sobel':
                 gradient_x = sobel(img_array, axis=1)
                 gradient_y = sobel(img_array, axis=0)
+                norm = 8.0     # sum of the positive kernel weights
             elif method == 'prewitt':
                 gradient_x = prewitt(img_array, axis=1)
                 gradient_y = prewitt(img_array, axis=0)
+                norm = 6.0
             elif method == 'scharr':
                 # Scharr operator
                 scharr_x = np.array([[-3, 0, 3], [-10, 0, 10], [-3, 0, 3]])
                 scharr_y = np.array([[-3, -10, -3], [0, 0, 0], [3, 10, 3]])
-                from scipy.ndimage import convolve
                 gradient_x = convolve(img_array, scharr_x)
                 gradient_y = convolve(img_array, scharr_y)
+                norm = 32.0
             else:
                 raise ValueError(f"Unknown method: {method}")
 
-            # Calculate magnitude
-            gradient_magnitude = np.sqrt(gradient_x**2 + gradient_y**2)
+            # Calculate magnitude, scaled so the value is a difference per
+            # pixel (the kernels sum to ``norm`` on one side). With a known
+            # pixel size that becomes a slope per lateral unit.
+            gradient_magnitude = np.sqrt(gradient_x**2 + gradient_y**2) / norm
+            value_unit = ((info.get('units') or {}).get('dependent')) or None
+            px = info.get('pixel_size')
+            if px and px.get('dx'):
+                gradient_magnitude = gradient_magnitude / float(px['dx'])
+                value_unit = f"{value_unit or 'a.u.'}/{px.get('unit', 'px')}"
+            else:
+                value_unit = f"{value_unit or 'a.u.'}/px"
+            info = dict(info, units={'dependent': value_unit})
 
-            # Normalize
-            gradient_norm = ((gradient_magnitude - gradient_magnitude.min()) /
-                           (gradient_magnitude.max() - gradient_magnitude.min()) * 255).astype(np.uint8)
-
-            # Save
-            output_path = self._ensure_output_dir('maps') / f"Gradient_{method}_{Path(image_path).stem}.png"
-            result_img = Image.fromarray(gradient_norm)
-            result_img.save(output_path)
+            safe = self._sanitize_filename(title)
+            base = self._ensure_output_dir('maps') / f"Gradient_{method}_{safe}"
+            written = export_field_from_metadata(
+                base, gradient_magnitude, info,
+                title=f"{title} – {method} gradient",
+                context=f"Gradient Filter ({image_path})",
+            )
+            output_path = written.get('tiff') or written.get('gsf') or next(iter(written.values()), '')
 
             # Status update will be handled by callback in main thread
-            logger.info(f"Gradient image saved to {output_path}")
+            logger.info(f"Gradient map saved to {output_path}")
 
             return str(output_path)
 
@@ -2099,8 +2193,13 @@ class ToolImplementations:
             task.progress = i / len(labels)
 
             map_data = self._reshape_map_values(value_columns[label], dims, scan_type)
+            # Value columns carry the Integration Utility's ``Interval_`` prefix;
+            # the map files never did, and keep their names.
+            stem = str(label)
+            if stem.lower().startswith('interval_'):
+                stem = stem[len('interval_'):]
             output_base = (folders['root']
-                           / f"{file_safe_name}_Map_{self._sanitize_filename(str(label))}")
+                           / f"{file_safe_name}_Map_{self._sanitize_filename(stem)}")
             self._save_map_images(map_data, output_base,
                                   source_metadata=getattr(source_data, 'metadata', None),
                                   folders=folders, scale=map_scale)
@@ -2259,6 +2358,104 @@ class ToolImplementations:
                 'on_a_grid': on_a_grid,
                 'cancelled': False}
 
+    @staticmethod
+    def _bin_spectra_spatially(spectra: np.ndarray, dims, scan_type: str,
+                               bin_x: int, bin_y: int, columns=None):
+        """Average neighbouring positions into blocks, respecting the layout.
+
+        The Map Generator's spatial-average step (what the Spatial Average
+        tool used to do on its own). Spectra are first laid on the grid the
+        scan actually followed — ``map_meander`` reverses odd rows, ``line``
+        is a single row — then every ``bin_y`` × ``bin_x`` block is averaged
+        into one spectrum. Averaging n curves gains √n in signal-to-noise
+        at the cost of n in area, which is the trade the user is making.
+
+        Returns ``(binned, dims, scan_type, columns, members)``: the binned
+        spectra in row-major (raster) order, the reduced ``(width, height)``,
+        the layout they are now in (``map_raster`` for a map, ``line`` for a
+        line), one column name per block, and the list of source spectrum
+        indices each block averaged. A ragged edge (a grid not divisible by
+        the block) keeps its partial blocks.
+        """
+        spectra = np.asarray(spectra, dtype=np.float64)
+        n_samples, n_spectra = spectra.shape
+        bin_x = max(1, int(bin_x))
+        bin_y = max(1, int(bin_y))
+        if bin_x == 1 and bin_y == 1:
+            return spectra, dims, scan_type, list(columns or []), [[i] for i in range(n_spectra)]
+
+        if scan_type == 'line':
+            dim_h, dim_v = n_spectra, 1
+            bin_y = 1
+        else:
+            dim_h, dim_v = int(dims[0]), int(dims[1])
+            if dim_h * dim_v != n_spectra:
+                raise ValueError(
+                    f"{n_spectra} spectra do not fill a {dim_h}x{dim_v} grid; "
+                    "set the dimensions before spatial averaging")
+
+        # Grid of source indices in acquisition order, row by row.
+        grid = np.arange(n_spectra).reshape(dim_v, dim_h)
+        if scan_type == 'map_meander':
+            grid[1::2, :] = grid[1::2, ::-1]
+
+        out_h = int(np.ceil(dim_h / bin_x))
+        out_v = int(np.ceil(dim_v / bin_y))
+        binned = np.full((n_samples, out_h * out_v), np.nan)
+        names, members = [], []
+        for r in range(out_v):
+            for c in range(out_h):
+                idx = grid[r * bin_y:(r + 1) * bin_y, c * bin_x:(c + 1) * bin_x].ravel()
+                members.append([int(i) for i in idx])
+                block = spectra[:, idx]
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore', category=RuntimeWarning)
+                    binned[:, r * out_h + c] = np.nanmean(block, axis=1)
+                names.append(f"Block_{_pad(r, out_v)}_{_pad(c, out_h)}"
+                             if scan_type != 'line' else f"Block_{_pad(c, out_h)}")
+        new_dims = (out_h, out_v)
+        new_type = 'line' if scan_type == 'line' else 'map_raster'
+        return binned, new_dims, new_type, names, members
+
+    def _register_binned_spectra(self, source, source_name: str, binned: np.ndarray,
+                                 x: np.ndarray, dims, scan_type: str, columns,
+                                 members, bin_x: int, bin_y: int) -> str:
+        """Publish the spatially averaged spectra as ``<base> - Spatially
+        Averaged (AxB)`` and return its name.
+
+        Positions are carried only for a line, as the mean of each block's
+        member positions; on a map the per-spectrum spatial keys describe
+        points that no longer exist and are dropped, leaving the reduced
+        ``dimensions`` to place the blocks.
+        """
+        frame = pd.DataFrame(binned, columns=columns)
+        frame.insert(0, source.independent_var_name, x)
+        info = {
+            'original': source_name,
+            'created_from': 'map_generator',
+            'spatial_bin': [int(bin_x), int(bin_y)],
+            'block_members': members,
+            'spatial_layout': 'line' if scan_type == 'line' else 'area',
+        }
+        src_info = getattr(source.metadata, 'additional_info', None) or {}
+        pos = src_info.get('position_m')
+        if scan_type == 'line' and pos is not None and len(pos) == sum(len(m) for m in members):
+            pos = np.asarray(pos, dtype=float)
+            info['position_m'] = [float(np.nanmean(pos[m])) for m in members]
+        meta = SpectralMetadata(
+            source_type=source.metadata.source_type,
+            dimensions=(int(dims[0]), int(dims[1])),
+            scan_mode='raster' if scan_type != 'line' else source.metadata.scan_mode,
+            units=dict(source.metadata.units or {}),
+            additional_info=info,
+        )
+        name = f"{self._extract_clean_base_name(source_name)} - Spatially Averaged ({bin_x}x{bin_y})"
+        self._datasets[name] = SpectralData(frame, meta,
+                                            topography=getattr(source, 'topography', None))
+        if not self._workflow_mode:
+            self.dataLoaded.emit(name)
+        return name
+
     def generate_maps_from_spectra(self, task, dataset_name: str,
                                    params: Optional[dict] = None) -> dict:
         """Background-correct, integrate over V intervals, and map the result.
@@ -2275,6 +2472,7 @@ class ToolImplementations:
         """
         params = {**MAP_DEFAULTS, **(params or {})}
         empty = {'map_paths': [], 'intervals': [], 'values_dataset': '',
+                 'integrated_path': '', 'binned_dataset': '',
                  'interval_map': '', 'interval_map_path': '', 'output_folder': '',
                  'scan_type': '', 'n_maps': 0}
         try:
@@ -2314,6 +2512,28 @@ class ToolImplementations:
                     "No integration intervals — detect peaks, pick an analysis "
                     "result, or enter intervals by hand.")
                 return empty
+
+            # Optional spatial averaging BEFORE anything is measured: blocks
+            # of bin_x × bin_y positions become one spectrum each, laid out
+            # on the scan's own path so a meander is not scrambled. The
+            # averaged spectra are registered as a dataset of their own, as
+            # the Spatial Average tool used to do, so what was mapped stays
+            # inspectable.
+            bin_x = max(1, int(float(params.get('bin_x', 1) or 1)))
+            bin_y = max(1, int(float(params.get('bin_y', 1) or 1)))
+            binned_name = ""
+            if bin_x > 1 or bin_y > 1:
+                (spectra, dims, scan_type, binned_columns,
+                 members) = self._bin_spectra_spatially(
+                    spectra, dims, scan_type, bin_x, bin_y,
+                    list(spectral_data.spectra.columns))
+                n_samples, n_spectra = spectra.shape
+                binned_name = self._register_binned_spectra(
+                    spectral_data, dataset_name, spectra, independent_var,
+                    dims, scan_type, binned_columns, members, bin_x, bin_y)
+                spectral_data = self._datasets[binned_name]
+                logger.info("Map Generator: spatially averaged %dx%d → %d block(s) "
+                            "of %dx%d", bin_x, bin_y, n_spectra, *dims)
 
             logger.info("Map Generator: %s — %d spectra, %s layout %s, %d interval(s)",
                         dataset_name, n_spectra, scan_type, dims, len(intervals))
@@ -2419,7 +2639,9 @@ class ToolImplementations:
                 # the fit residual.
                 values = positive_integral(block, independent_var[mask], axis=0)
 
-                label = f"{lo:.3f}_{hi:.3f}"
+                # Same column names the Integration Utility writes, so a
+                # table from either tool reads the same.
+                label = f"Interval_{lo:.3f}_{hi:.3f}"
                 value_columns[label] = values
 
             assembled = self._assemble_value_maps(
@@ -2438,9 +2660,17 @@ class ToolImplementations:
             # behind the maps stay inspectable (and re-mappable) instead of
             # living only inside the image files.
             values_name = ""
+            integrated_csv = ""
             if value_columns:
                 frame = pd.DataFrame({'Spectrum_Index': np.arange(n_spectra),
                                       **value_columns})
+                # The Integration Utility's CSV, from the same numbers: one
+                # row per spectrum, one column per interval, under
+                # <project>_outputs/integrated/.
+                integrated_csv = str(
+                    self._ensure_output_dir('integrated')
+                    / f"{self._apply_naming_convention(dataset_name, operation='Integrated')}.csv")
+                frame.to_csv(integrated_csv, index=False)
                 metadata = SpectralMetadata(
                     source_type='map_values',
                     dimensions=spectral_data.metadata.dimensions,
@@ -2460,6 +2690,9 @@ class ToolImplementations:
                         'integration_window': max(min_width, 0.0),
                         'windows_widened': widened,
                         'spectrum_columns': columns,
+                        'integrated_path': integrated_csv,
+                        'spatial_bin': [bin_x, bin_y],
+                        'binned_dataset': binned_name,
                     },
                     data_type='flat',
                 )
@@ -2482,6 +2715,8 @@ class ToolImplementations:
             return {'map_paths': map_paths,
                     'intervals': [list(iv) for iv in intervals],
                     'values_dataset': values_name,
+                    'integrated_path': integrated_csv,
+                    'binned_dataset': binned_name,
                     'interval_map': interval_map_name,
                     'interval_map_path': interval_map_path,
                     'output_folder': str(folders['root']),
@@ -3144,6 +3379,17 @@ class ToolImplementations:
     # Confinement Analysis
     # ========================================================================
 
+    #: The Peak Count table's columns, in order. ``nstates_*`` counts the
+    #: peaks this tool found, split by the sign of the bias and by whether
+    #: they sit inside the detected gap — the same quantities Spectral
+    #: Features reports, so a row of one table reads against a row of the
+    #: other. The two sides add up to ``Peak_Count``; the in-gap columns are
+    #: a subset of them.
+    PEAK_COUNT_COLUMNS = ('Spectrum_Index', 'Peak_Count',
+                          'nstates_negative', 'nstates_positive',
+                          'nstates_negative_in_gap', 'nstates_positive_in_gap',
+                          'gap_width', 'gap_left', 'gap_right')
+
     def analyze_confinement(self, task, dataset_name: str,
                             params: Optional[dict] = None,
                             fwhm_multiplier: float = 1.5,
@@ -3442,12 +3688,53 @@ class ToolImplementations:
                                 {'coefficient_columns': names, 'basis': basis, **settings},
                                 flat=True))
 
-            counts_df = pd.DataFrame({
-                'Spectrum_Index': np.arange(len(results)),
-                'Peak_Count': [len(r.peaks) for r in results],
-            })
+            # Peak Count carries the same state columns Spectral Features
+            # emits, so the two tables can be read side by side — but counted
+            # from the peaks THIS tool found, with the settings the user set,
+            # so the parts add up to Peak_Count instead of quietly coming from
+            # a second search. The gap is detected here rather than assumed:
+            # this tool has a search window, not a band gap.
+            from src.processing.spectral_features import (
+                gap_features, normalize_spectrum)
+
+            gap_delta = float((params or {}).get('gap_delta', 0.05))
+            state_width = int((params or {}).get('state_width_samples', 11))
+            count_rows = []
+            for i, result in enumerate(results):
+                normalized = normalize_spectrum(independent_var, spectra[:, i])
+                gap = gap_features(independent_var, normalized, gap_delta,
+                                   state_width)
+                left, right = gap['gap_left'], gap['gap_right']
+                has_gap = (math.isfinite(left) and math.isfinite(right)
+                           and right > left)
+
+                def _count(negative: bool, in_gap: Optional[bool] = None) -> int:
+                    return sum(
+                        1 for pk in result.peaks
+                        if (pk.x < 0) is negative
+                        and (in_gap is None
+                             or ((has_gap and left <= pk.x <= right) is in_gap))
+                    )
+
+                count_rows.append({
+                    'Spectrum_Index': i,
+                    'Peak_Count': len(result.peaks),
+                    # A peak exactly at zero bias counts as positive, so the
+                    # two sides add up to Peak_Count with nothing dropped.
+                    'nstates_negative': _count(True),
+                    'nstates_positive': _count(False),
+                    'nstates_negative_in_gap': _count(True, True),
+                    'nstates_positive_in_gap': _count(False, True),
+                    'gap_width': gap['gap_width'],
+                    'gap_left': left,
+                    'gap_right': right,
+                })
+            counts_df = pd.DataFrame(count_rows, columns=self.PEAK_COUNT_COLUMNS)
             _register('Peak Count', counts_df,
-                      _meta('peak_count', settings, flat=True))
+                      _meta('peak_count',
+                            {'gap_delta': gap_delta,
+                             'state_width_samples': state_width, **settings},
+                            flat=True))
 
             logger.info("ConfinementAnalysis: %d peaks over %d spectra, %d intervals; created %s",
                         len(peaks_df), n_spectra, len(merged_intervals),
@@ -3505,7 +3792,101 @@ class ToolImplementations:
         'min_abs_V': 0.0,
         'pair_tol_nm': 1.0,
         'sort': 'rrmse',
+        # Search every spectrum in the dataset rather than the one picked.
+        # An overview's point averages are 62 separate questions, and asking
+        # them one at a time by hand is the tool's main friction.
+        'all_spectra': False,
+        # The RNG the global search runs on. None is a fresh seed per run,
+        # which is what the tool did before this key existed — and it meant
+        # two runs of the same settings could return different geometries,
+        # so nothing could be regression-tested. Pin it to make a run
+        # repeatable.
+        'seed': None,
+        # ── the consensus, which decides what counts as "the same well" ──
+        # A candidate is admissible when its ΔE error is within this much of
+        # the best candidate that spectrum found: absolute in percentage
+        # points, or relative to the best, whichever is larger. Below that
+        # band the ranking is noise, so every candidate in it votes.
+        'admissible_abs_pct': 0.05,
+        'admissible_rel': 0.1,
+        # A mode has to be supported by this fraction of the searched spectra
+        # to survive; one spectrum is always enough to keep it alive.
+        'min_support_frac': 0.15,
+        # The old gap-clustering tolerance, now the kernel width: a positive
+        # value pins the KDE bandwidth at ln(1 + tol / median R), so "two
+        # wells within 1 nm are one well" keeps meaning what the panel's knob
+        # says it means. 0 (the default) lets the bandwidth follow the data,
+        # which is the better answer when nobody has an opinion.
+        'group_tol_nm': 0.0,
     }
+
+    #: The candidate table's columns, in order. Fixed so two runs of the tool
+    #: produce two CSVs that can be concatenated without re-aligning them.
+    DESIGNER_CANDIDATE_COLUMNS = (
+        'spectrum_index', 'column', 'candidate', 'carrier',
+        'ndim', 'coords', 'sym', 'd1_nm', 'd2_nm', 'd3_nm', 'size_nm',
+        'meff', 'offset_eV', 'rrmse_pct', 'rrmse_de_pct', 'n_levels',
+        # Which quantum numbers the measured levels were assigned to, and
+        # how many predicted levels between them were NOT measured. A
+        # ladder of five peaks matched to n = 8, 15, 17, 18, 20 has skipped
+        # eight levels the model says should be there — that is a weak
+        # match however low its RRMSE, and this is where it shows.
+        'qn_min', 'qn_max', 'levels_skipped',
+        'split_e_V', 'split_h_V', 'pair_mismatch_nm',
+        'hole_size_nm', 'hole_meff', 'hole_rrmse_pct',
+        'hole_qn_min', 'hole_qn_max', 'hole_levels_skipped',
+        # Where this candidate landed in the run's consensus (see
+        # src/physics/consensus.py). `group` is the mode index — the well
+        # the run decided this row belongs to — and -1 when the row carries
+        # no vote: a placeholder, or a candidate too far behind its own
+        # spectrum's best to be admissible. `group_size_nm` is kept as the
+        # mean size_nm inside that mode so the plots built on the old gap
+        # clustering still read; `group_R_nm` is the mode's consensus R,
+        # which is the number to trust.
+        'group', 'group_size_nm',
+        # 1 when this candidate is inside its spectrum's admissible band, 0
+        # when it was searched and rejected, NaN on a placeholder. Numeric
+        # rather than boolean so the column can be filtered and mapped like
+        # every other one.
+        'admissible', 'band_de_pct', 'weight', 'group_R_nm', 'dist_nm',
+        # Why a spectrum has no candidate row of its own (all-spectra runs):
+        # empty on a candidate, the reason on a placeholder row.
+        'n_peaks', 'reason',
+        # Which dataset and which search: several datasets and several
+        # symmetries are run through the same tool, and their CSVs are
+        # concatenated — a row has to say where it came from on its own.
+        # Last, because the first column is the table's numeric axis.
+        'dataset', 'search')
+
+    #: The level table's columns: measured against simulated, once in energy
+    #: from the branch edge and once back on the bias axis.
+    DESIGNER_LEVEL_COLUMNS = (
+        'spectrum_index', 'column', 'candidate', 'carrier', 'level', 'qn',
+        'measured_eV', 'simulated_eV', 'error_pct',
+        'measured_V', 'simulated_V', 'split_e_V', 'split_h_V',
+        'dataset', 'search')
+
+    #: The mode table's columns: one row per well the run believes in.
+    #: L_z is a range and never a value — with the offset cancelled the
+    #: vertical size is not determined by the data, and a single number
+    #: there would be the optimiser's seed dressed up as a measurement.
+    DESIGNER_MODE_COLUMNS = (
+        'mode', 'R_nm', 'R_lo_nm', 'R_hi_nm', 'Lz_lo_nm', 'Lz_hi_nm',
+        'support_spectra', 'support_frac', 'mean_rrmse_de_pct',
+        'qn_min', 'qn_max', 'levels_skipped_mean',
+        'dataset', 'search')
+
+    #: The consensus table's columns: one row per spectrum, and the only one
+    #: of the four that maps. Every column is a number that can be laid out
+    #: along the line — how many candidates the position had, how wide its
+    #: admissible band was, the radius the consensus gives it, which mode it
+    #: belongs to and how sure that is. `mode_entropy` in nats is the "is
+    #: this position undecided?" channel: 0 where one mode owns it.
+    DESIGNER_CONSENSUS_COLUMNS = (
+        'spectrum_index', 'column', 'n_candidates', 'n_admissible',
+        'best_de_pct', 'band_de_pct', 'R_lo_nm', 'R_hi_nm', 'R_consensus_nm',
+        'mode', 'mode_prob', 'mode_2nd', 'mode_2nd_prob', 'mode_entropy',
+        'dataset', 'search')
 
     @staticmethod
     def _designer_carriers(params: dict, peaks) -> list:
@@ -3577,128 +3958,111 @@ class ToolImplementations:
                            params: Optional[dict] = None) -> dict:
         """Which well produces this spectrum's ladder of levels?
 
-        One spectrum in, candidate geometries out. The peaks come from the
-        same engine Confinement Analysis uses, are split into the electron
-        and hole branches by the sign of the bias, and each branch is
-        searched separately; with both carriers asked for, the two are paired
-        by geometry, because it is one well that confines them both.
+        One spectrum in, candidate geometries out — or, with ``all_spectra``,
+        every spectrum in the dataset in turn. The peaks come from the same
+        engine Confinement Analysis uses, are split into the electron and
+        hole branches by the sign of the bias, and each branch is searched
+        separately; with both carriers asked for, the two are paired by
+        geometry, because it is one well that confines them both.
+
+        Every run writes tables, because a candidate is not one number:
+        ``… - Designer Candidates`` is one row per candidate (the geometry it
+        found), ``… - Designer Levels`` one row per level of each candidate
+        (measured against simulated, in eV from the branch edge and in volts
+        back on the spectrum), ``… - Designer Modes`` one row per well the
+        run believes in, and ``… - Designer Consensus`` one row per spectrum
+        — the mappable one. A sweep of a whole overview is otherwise a list
+        on screen that cannot be read after the window closes.
 
         Slow enough to belong on the worker — a search is ~0.25 s per
-        candidate — and cancellable between carriers and masses.
+        candidate. Cancellation is checked between spectra and between
+        carriers here, and the same flag is handed down to the search
+        itself, which asks it before every effective mass and between its
+        own optimisation passes; the longest stretch with no way out is one
+        differential_evolution run. Before this the docstring promised
+        mass-level cancellation that nothing implemented: the flag stopped
+        at the carrier loop, so a slow mass ran to the end regardless.
         """
         empty = {'ok': False, 'candidates': [], 'pairs': 0, 'edges': None,
                  'peaks': {}, 'error': '', 'dataset': dataset_name,
-                 'spectrum_index': 0}
+                 'spectrum_index': 0, 'all_spectra': False,
+                 'spectra_searched': 0, 'spectra_with_candidates': 0,
+                 'candidates_total': 0, 'tables': [], 'table_paths': [],
+                 'consensus': {}, 'diagnostics': {}}
         try:
-            from src.physics.branches import DidvCurve, analyze_curve
-            from src.physics.designer import CARRIER_BOTH, Designer
-            from src.physics.pairing import edges_from_solutions, pair_candidates
-
             if dataset_name not in self._datasets:
                 self.errorOccurred.emit("Error", "Dataset not found")
                 return {**empty, 'error': "Dataset not found"}
 
             params = {**self.DESIGNER_DEFAULTS, **(params or {})}
             spectral_data = self._datasets[dataset_name]
-            spectra = spectral_data.spectra
-            n_spectra = int(spectra.shape[1])
-            index = max(0, min(int(params.get('spectrum_index', 0)), n_spectra - 1))
+            n_spectra = int(spectral_data.spectra.shape[1])
+            selected = max(0, min(int(params.get('spectrum_index', 0)),
+                                  n_spectra - 1))
+            all_spectra = bool(params.get('all_spectra', False))
+            indices = list(range(n_spectra)) if all_spectra else [selected]
 
-            x = np.asarray(spectral_data.independent_var, dtype=np.float64)
-            y = np.asarray(spectra.values[:, index], dtype=np.float64)
-            column = str(spectra.columns[index])
-
-            peaks = analyze_curve(
-                DidvCurve(x=x, y=y, name=column), params,
-                min_abs_V=float(params.get('min_abs_V', 0.0)),
-                split_e=float(params.get('split_e', 0.0)),
-                split_h=float(params.get('split_h', 0.0)))
-
-            carriers = self._designer_carriers(params, peaks)
-            # Two targets are the minimum that means anything: one level is
-            # explained by any size at all, so the fit would be a tautology.
-            for carrier in carriers:
-                if carrier['Et'].size < 2:
-                    return {**empty,
-                            'error': (f"Only {carrier['Et'].size} peak(s) on the "
-                                      f"{carrier['label']} branch — a single level "
-                                      f"is explained by any size."),
-                            'peaks': self._designer_peak_summary(peaks, column),
-                            'spectrum_index': index}
-
-            search = {'ndim': str(params['ndim']), 'coords': str(params['coords']),
-                      'sym': str(params['sym']),
-                      'fixed': dict(params.get('fixed')
-                                    or {'d1': None, 'd2': None, 'd3': None}),
-                      'Lmin': float(params['Lmin']), 'Lmax': float(params['Lmax']),
-                      'tol': float(params['tol']), 'maxsol': int(params['maxsol']),
-                      'priority': str(params['priority']),
-                      'match': str(params['match'])}
-
-            designer = Designer(seed=params.get('seed'))
-            by_carrier = {}
-            for carrier in carriers:
+            runs = []
+            import time as _time
+            started = _time.perf_counter()
+            self._report_tool_progress(task, "Confinement Designer", 0, len(indices), started)
+            for step, index in enumerate(indices):
                 if getattr(task, 'cancelled', False):
                     logger.info("Confinement Designer cancelled")
-                    return empty
-                task.progress = 0.1
-                found = designer.search_carrier(search, carrier)
-                # Aliases before anything else: a well k times larger matches
-                # the same targets with the quantum numbers multiplied by k,
-                # and which one the optimiser lands on is the random seed.
-                #
-                # Deduplicated AFTER the reduction, not before: the search
-                # dedupes the geometries it found, and two of those collapse
-                # onto one well the moment the aliases are folded in. Without
-                # this the list showed the same candidate several times.
-                reduced = []
-                for sol in found:
-                    primary = designer.primary_alias(
-                        sol, {**search, 'Et': carrier['Et'],
-                              'meff': sol.get('meff')})
-                    if not any(abs(primary['meff'] - kept['meff']) < 1e-9
-                               and designer.is_duplicate(primary, [kept])
-                               for kept in reduced):
-                        reduced.append(primary)
-                by_carrier[carrier['carrier']] = reduced
+                    return {**empty, 'all_spectra': all_spectra,
+                            'error': 'Cancelled'}
+                # Progress across the sweep; a single spectrum's own search
+                # reports its own fractions inside the helper.
+                task.progress = step / max(1, len(indices))
+                runs.append(self._design_one_spectrum(
+                    task, spectral_data, index, params))
+                self._report_tool_progress(task, "Confinement Designer",
+                                           step + 1, len(indices), started)
 
-            paired = str(params.get('carrier')) == CARRIER_BOTH
-            pairs = []
-            if paired:
-                pairs = pair_candidates(by_carrier.get('e', []),
-                                        by_carrier.get('h', []),
-                                        tol_nm=float(params['pair_tol_nm']))
-                # The pair's own error rides on the electron candidate, which
-                # is what the list shows and sorts by.
-                for pair in pairs:
-                    pair['electron']['pair_hole'] = pair['hole']
-                    pair['electron']['pair_score'] = pair['score']
-                    pair['electron']['pair_mismatch_nm'] = pair['mismatch_nm']
-                solutions = [pair['electron'] for pair in pairs]
-            else:
-                solutions = [sol for sols in by_carrier.values() for sol in sols]
+            found = [run for run in runs if run['candidates']]
+            # The consensus and its diagnostics are computed where the rows
+            # are built; `report` is how they come back out without changing
+            # the two-value return every other caller unpacks.
+            report: dict = {}
+            tables, table_paths = self._register_designer_tables(
+                runs, dataset_name, spectral_data, params, report=report)
 
-            solutions = designer.sort_solutions(
-                solutions, str(params.get('sort', 'rrmse')), paired=bool(pairs))
+            # What the panel shows: the spectrum that was asked for, or —
+            # when a sweep found nothing there but something elsewhere — the
+            # first one that did, since an empty list next to "48 candidates"
+            # reads as a broken tool.
+            shown = next((run for run in runs if run['spectrum_index'] == selected
+                          and run['candidates']), None) or (found[0] if found else None)
+            if shown is None:
+                shown = next((run for run in runs
+                              if run['spectrum_index'] == selected), None) or runs[0]
 
-            edges = edges_from_solutions(by_carrier, pairs,
-                                         float(params.get('split_e', 0.0)),
-                                         float(params.get('split_h', 0.0)))
-
+            total = sum(len(run['candidates']) for run in runs)
             task.progress = 1.0
-            logger.info("Confinement Designer: %s[%d] — %d candidate(s)%s",
-                        dataset_name, index, len(solutions),
-                        f", {len(pairs)} pair(s)" if paired else "")
+            logger.info("Confinement Designer: %s — %d spectrum(s), %d candidate(s)",
+                        dataset_name, len(runs), total)
             return {
-                'ok': bool(solutions),
-                'candidates': [self._designer_candidate(sol, i)
-                               for i, sol in enumerate(solutions)],
-                'pairs': len(pairs),
-                'edges': edges,
-                'peaks': self._designer_peak_summary(peaks, column),
-                'error': "" if solutions else "No candidate fits within the tolerance.",
+                'ok': bool(total),
+                'candidates': shown['candidates'],
+                'pairs': shown['pairs'],
+                'edges': shown['edges'],
+                'peaks': shown['peaks'],
+                'error': shown['error'] if not total else "",
                 'dataset': dataset_name,
-                'spectrum_index': index,
+                'spectrum_index': shown['spectrum_index'],
+                'column': shown['column'],
+                'all_spectra': all_spectra,
+                'spectra_searched': len(runs),
+                'spectra_with_candidates': len(found),
+                'candidates_total': total,
+                'tables': tables,
+                'table_paths': table_paths,
+                # What the grouping decided, and whether it means anything —
+                # the panel shows the modes and the null contrast side by
+                # side, because a list of wells with no idea how tight it is
+                # invites more confidence than the data supports.
+                'consensus': report.get('consensus', {}),
+                'diagnostics': report.get('diagnostics', {}),
             }
 
         except ValueError as exc:
@@ -3710,6 +4074,615 @@ class ToolImplementations:
             logger.error(f"Confinement designer error: {e}", exc_info=True)
             self.errorOccurred.emit("Confinement Designer Error", str(e))
             return {**empty, 'error': str(e)}
+
+    @staticmethod
+    def _eta_text(seconds: float) -> str:
+        seconds = max(0.0, float(seconds))
+        if seconds < 60:
+            return f"~{seconds:.0f} s left"
+        m, s = divmod(int(round(seconds)), 60)
+        if m < 60:
+            return f"~{m}:{s:02d} left"
+        h, m = divmod(m, 60)
+        return f"~{h}:{m:02d}:{s:02d} left"
+
+    def _report_tool_progress(self, task, tool: str, done: int, total: int,
+                              started: float, unit: str = "spectrum") -> None:
+        """Emit ``toolProgress`` with a rate and a time estimate.
+
+        The estimate is the mean time per unit so far times what is left —
+        in this run, plus the runs still queued in a batch (``task.batch``
+        is ``(index, count, name)`` when the batch runner set it; the
+        remaining datasets are assumed to be this one's size).
+        """
+        signal = getattr(self, 'toolProgress', None)
+        if signal is None:
+            return
+        import time as _time
+        elapsed = _time.perf_counter() - started
+        batch = getattr(task, 'batch', None)
+        prefix = ""
+        remaining = total - done
+        if batch:
+            b_index, b_count, b_name = batch
+            prefix = f"dataset {b_index + 1}/{b_count}: {b_name} — "
+            remaining += (b_count - b_index - 1) * total
+        if done > 0:
+            per = elapsed / done
+            msg = (f"{prefix}{unit} {done}/{total} · {per:.1f} s/{unit} · "
+                   f"{self._eta_text(per * remaining)}")
+        else:
+            msg = f"{prefix}{unit} 0/{total}"
+        try:
+            signal.emit(tool, int(done), int(total), msg)
+        except Exception:                                   # noqa: BLE001
+            logger.debug("toolProgress emit failed", exc_info=True)
+
+    def _design_one_spectrum(self, task, spectral_data, index: int,
+                             params: dict) -> dict:
+        """The search for one spectrum.
+
+        Returns a run record rather than raising: in a sweep, a spectrum with
+        one peak on a branch is an ordinary outcome and must not end the run
+        for the other sixty-one. The reason travels in ``error``.
+        """
+        from src.physics.branches import DidvCurve, analyze_curve
+        from src.physics.designer import CARRIER_BOTH, Designer
+        from src.physics.pairing import edges_from_solutions, pair_candidates
+
+        spectra = spectral_data.spectra
+        x = np.asarray(spectral_data.independent_var, dtype=np.float64)
+        y = np.asarray(spectra.values[:, index], dtype=np.float64)
+        column = str(spectra.columns[index])
+        blank = {'spectrum_index': int(index), 'column': column,
+                 'candidates': [], 'pairs': 0, 'edges': None,
+                 'peaks': {}, 'error': ''}
+
+        peaks = analyze_curve(
+            DidvCurve(x=x, y=y, name=column), params,
+            min_abs_V=float(params.get('min_abs_V', 0.0)),
+            split_e=float(params.get('split_e', 0.0)),
+            split_h=float(params.get('split_h', 0.0)))
+        blank['peaks'] = self._designer_peak_summary(peaks, column)
+
+        carriers = self._designer_carriers(params, peaks)
+        # Two targets are the minimum that means anything: one level is
+        # explained by any size at all, so the fit would be a tautology.
+        for carrier in carriers:
+            if carrier['Et'].size < 2:
+                return {**blank,
+                        'error': (f"Only {carrier['Et'].size} peak(s) on the "
+                                  f"{carrier['label']} branch — a single level "
+                                  f"is explained by any size.")}
+
+        search = {'ndim': str(params['ndim']), 'coords': str(params['coords']),
+                  'sym': str(params['sym']),
+                  'fixed': dict(params.get('fixed')
+                                or {'d1': None, 'd2': None, 'd3': None}),
+                  'Lmin': float(params['Lmin']), 'Lmax': float(params['Lmax']),
+                  'tol': float(params['tol']), 'maxsol': int(params['maxsol']),
+                  'priority': str(params['priority']),
+                  'match': str(params['match'])}
+
+        designer = Designer(seed=params.get('seed'))
+        # The same flag the loops above poll, handed to the search so it can
+        # stop between masses and between optimisation passes. Without it a
+        # single carrier with three masses was one uninterruptible block, and
+        # Cancel did nothing visible until it finished.
+        def should_cancel() -> bool:
+            return bool(getattr(task, 'cancelled', False))
+
+        by_carrier = {}
+        for carrier in carriers:
+            if should_cancel():
+                logger.info("Confinement Designer cancelled")
+                return {**blank, 'error': 'Cancelled'}
+            found = designer.search_carrier(search, carrier,
+                                            should_cancel=should_cancel)
+            # A cancelled search returns what it had found so far rather than
+            # raising, so the flag has to be re-read: the partial list is not
+            # an answer to the question that was asked.
+            if should_cancel():
+                logger.info("Confinement Designer cancelled")
+                return {**blank, 'error': 'Cancelled'}
+            # Aliases before anything else: a well k times larger matches
+            # the same targets with the quantum numbers multiplied by k,
+            # and which one the optimiser lands on is the random seed.
+            #
+            # Deduplicated AFTER the reduction, not before: the search
+            # dedupes the geometries it found, and two of those collapse
+            # onto one well the moment the aliases are folded in. Without
+            # this the list showed the same candidate several times.
+            reduced = []
+            for sol in found:
+                primary = designer.primary_alias(
+                    sol, {**search, 'Et': carrier['Et'],
+                          'meff': sol.get('meff')})
+                if not any(abs(primary['meff'] - kept['meff']) < 1e-9
+                           and designer.is_duplicate(primary, [kept])
+                           for kept in reduced):
+                    reduced.append(primary)
+            by_carrier[carrier['carrier']] = reduced
+
+        paired = str(params.get('carrier')) == CARRIER_BOTH
+        pairs = []
+        if paired:
+            pairs = pair_candidates(by_carrier.get('e', []),
+                                    by_carrier.get('h', []),
+                                    tol_nm=float(params['pair_tol_nm']))
+            # The pair's own error rides on the electron candidate, which
+            # is what the list shows and sorts by.
+            for pair in pairs:
+                pair['electron']['pair_hole'] = pair['hole']
+                pair['electron']['pair_score'] = pair['score']
+                pair['electron']['pair_mismatch_nm'] = pair['mismatch_nm']
+            solutions = [pair['electron'] for pair in pairs]
+        else:
+            solutions = [sol for sols in by_carrier.values() for sol in sols]
+
+        solutions = designer.sort_solutions(
+            solutions, str(params.get('sort', 'rrmse')), paired=bool(pairs))
+
+        return {
+            **blank,
+            'candidates': [self._designer_candidate(sol, i)
+                           for i, sol in enumerate(solutions)],
+            'pairs': len(pairs),
+            'edges': edges_from_solutions(by_carrier, pairs,
+                                          float(params.get('split_e', 0.0)),
+                                          float(params.get('split_h', 0.0))),
+            'error': "" if solutions else "No candidate fits within the tolerance.",
+        }
+
+    @staticmethod
+    def _search_signature(params: dict) -> str:
+        """The part of a designer run's settings that changes what its table
+        means: geometry, symmetry, carriers, matching. Two runs over the same
+        dataset with different symmetries are two different answers and must
+        not share a name."""
+        parts = [str(params.get('ndim') or ''), str(params.get('coords') or '')]
+        sym = str(params.get('sym') or '')
+        if sym and str(params.get('ndim')) not in ('1D', '0D'):
+            parts.append(sym)
+        carrier = {'electrons': 'e', 'holes': 'h', 'both': 'e+h'}.get(
+            str(params.get('carrier') or ''), str(params.get('carrier') or ''))
+        if carrier:
+            parts.append(carrier)
+        match = str(params.get('match') or '')
+        if match:
+            parts.append({'delta_e': 'ΔE', 'absolute': 'abs', 'ratios': 'ratios'}.get(match, match))
+        return ", ".join(p for p in parts if p)
+
+    def _unique_dataset_name(self, name: str) -> str:
+        """``name``, or ``name (2)``, ``name (3)``… if it is already taken.
+
+        A result never overwrites an earlier one: a rerun with the same
+        settings is a repeat the user asked for, and the earlier run is
+        theirs to delete, not the tool's.
+        """
+        if name not in self._datasets:
+            return name
+        n = 2
+        while f"{name} ({n})" in self._datasets:
+            n += 1
+        return f"{name} ({n})"
+
+    @staticmethod
+    def _unique_path(path):
+        """The same rule for the file beside the dataset."""
+        from pathlib import Path as _P
+        path = _P(path)
+        if not path.exists():
+            return path
+        n = 2
+        while True:
+            candidate = path.with_name(f"{path.stem} ({n}){path.suffix}")
+            if not candidate.exists():
+                return candidate
+            n += 1
+
+    @staticmethod
+    def _designer_coordinate(params: dict) -> tuple:
+        """Which length the consensus groups in, and why.
+
+        The grouping needs one coordinate, and choosing it is physics rather
+        than bookkeeping: it has to be a length the data actually determined.
+        For the disc matched on level differences that is R — the in-plane
+        scale sets the spacings and L_z rides free on a cancelled offset —
+        so grouping on the geometric mean size would mix a measured number
+        with an unmeasured one and smear the wells into each other.
+
+        Returns ``(name, why)``; the reason is logged, because a silent
+        choice here is a silent change of what the tables mean.
+        """
+        from src.physics.designer import MATCH_ABSOLUTE
+        from src.physics.solution_spec import (COORDS_CIRCULAR, COORDS_DISC,
+                                               COORDS_PARABOLIC,
+                                               COORDS_SPHERICAL)
+
+        ndim = str(params.get('ndim') or '')
+        coords = str(params.get('coords') or '')
+        match = str(params.get('match') or '')
+
+        if match == MATCH_ABSOLUTE:
+            # Nothing cancels: every dimension is constrained by the absolute
+            # energies, so no one of them is the privileged measured length.
+            return 'log_size', "absolute matching — every dimension is measured"
+        if ndim == '0D' and coords == COORDS_DISC:
+            return 'log_r', "0D disc — d1 is R, L_z rides on the cancelled offset"
+        if ndim == '0D' and coords == COORDS_SPHERICAL:
+            return 'log_r', "0D sphere — R is the only dimension"
+        if ndim == '0D' and coords == COORDS_PARABOLIC:
+            # d1/d2 are confinement energies in meV here, not lengths, so the
+            # log-of-a-length invariant the consensus relies on would break.
+            return 'log_size', "0D parabolic — d1 is an energy, not a length"
+        if ndim == '1D':
+            return 'log_r', "1D box — d1 is the only dimension"
+        if ndim == '2D' and coords == COORDS_CIRCULAR:
+            return 'log_r', "2D disk — R is the only dimension"
+        return 'log_size', f"{ndim or '?'}/{coords or '?'} — no privileged dimension"
+
+    @staticmethod
+    def _designer_bandwidth(group_tol_nm: float, lengths) -> Optional[float]:
+        """The kernel width, from the panel's tolerance knob — or None.
+
+        The consensus works in log-length, so a tolerance in nm only becomes
+        a width once it is measured against a size: ``ln(1 + tol / R)`` at
+        the run's median R. That keeps "wells within `tol` of each other are
+        the same well" true where the data actually is, instead of at 1 nm
+        regardless of whether the wells are 3 nm or 30 nm across.
+
+        A tolerance of 0 returns None, which lets the bandwidth follow the
+        data (Silverman on the effective sample size). That is the better
+        default: the width of the kernel is a property of how spread the
+        candidates are, and hardcoding it decides the answer in advance.
+        """
+        tol = float(group_tol_nm or 0.0)
+        if tol <= 0:
+            return None
+        values = np.asarray([v for v in lengths if np.isfinite(v) and v > 0], float)
+        if values.size == 0:
+            return None
+        return float(np.log1p(tol / float(np.median(values))))
+
+    @staticmethod
+    def _designer_diagnostics(candidate_rows: list, coord_name: str,
+                              params: dict, result, bandwidth) -> dict:
+        """Is the consensus better than chance, and does it survive the band?
+
+        Two questions the mode list cannot answer about itself. The null
+        contrast draws one admissible candidate per spectrum at random and
+        remeasures the spread, so "three wells" can be compared against what
+        three wells would look like if the sets shared nothing. The delta
+        sweep reruns the whole thing at tighter and looser admissible bands:
+        a consensus that keeps its modes across the sweep is a property of
+        the data, one that gains a mode every time the band widens is a
+        property of the band.
+
+        Returned rather than written as a table — it is a handful of numbers
+        about the run as a whole, not per-spectrum data, and a dataset of its
+        own would clutter the list on every run.
+        """
+        from src.physics import consensus as consensus_mod
+
+        seed = params.get('seed')
+        common = {'bandwidth': bandwidth,
+                  'min_support_frac': float(params.get('min_support_frac', 0.15))}
+        null = consensus_mod.null_contrast(
+            candidate_rows, coord_name, n_draws=200, seed=seed,
+            delta_abs=float(params.get('admissible_abs_pct', 0.05)),
+            delta_rel=float(params.get('admissible_rel', 0.1)),
+            result=result, **common)
+        stability = consensus_mod.delta_stability(
+            candidate_rows, coord_name, seed=seed,
+            delta_abs=float(params.get('admissible_abs_pct', 0.05)),
+            delta_rel=float(params.get('admissible_rel', 0.1)),
+            **common)
+
+        # The draw distributions come back as numpy arrays; QML and the JSON
+        # export get plain lists, with the counts still integers.
+        null = {k: (v.tolist() if isinstance(v, np.ndarray) else v)
+                for k, v in null.items()}
+        logger.info("Confinement Designer: null contrast — observed spread "
+                    "%.4f vs median %.4f over %d draw(s), p=%.3f%s",
+                    null['observed_spread'], null['spread_median'],
+                    null['n_draws'], null['p_value'],
+                    " (tighter than chance)" if null['tighter_than_chance'] else "")
+        for record in stability:
+            logger.info("Confinement Designer: delta %.3f/%.2f — %d mode(s) at %s, "
+                        "spread %.2f%%", record['delta_abs'], record['delta_rel'],
+                        record['n_modes'],
+                        ", ".join(f"{r:.2f} nm" for r in record['modes_R_nm']) or "none",
+                        record['spread_pct'])
+        return {'null_contrast': null, 'delta_stability': stability}
+
+    def _register_designer_tables(self, runs: list, dataset_name: str,
+                                  spectral_data, params: dict,
+                                  report: Optional[dict] = None):
+        """The run as four flat tables, registered and exported.
+
+        Four rather than one because a candidate, a level, a well and a
+        position are different things: a candidate has one geometry and one
+        RRMSE, and it has as many levels as the ladder it was fitted to.
+        Flattening them into one table would repeat every geometry down the
+        rows or hide the levels in a list-valued cell, and neither survives
+        a CSV.
+
+        ``… - Designer Candidates``
+            One row per candidate: the well it found, its mass, its error,
+            and — when the carriers were paired — the hole it was paired to.
+        ``… - Designer Levels``
+            One row per level of each candidate: the measured energy against
+            the simulated one. Both are given twice, as eV from the branch
+            edge (which is what was fitted) and as the bias they sit at on
+            the spectrum, ``V = E + split_e`` for an electron and
+            ``V = split_h - E`` for a hole — so a row can be found again on
+            the curve it came from.
+        ``… - Designer Modes``
+            One row per well the run's consensus believes in: its radius and
+            the range of radii and L_z the supporting candidates spanned, how
+            many spectra voted for it, and how good their fits were.
+        ``… - Designer Consensus``
+            One row per spectrum, and the only one of the four that maps —
+            every column is a number that can be laid out along the line.
+            Which mode the position belongs to, how sure that is, and how
+            wide its own admissible band was.
+
+        ``report``, when given, is filled with the consensus and its
+        diagnostics, so the panel can show them without this returning a
+        third value that every existing caller would have to unpack.
+        """
+        split_e = float(params.get('split_e', 0.0) or 0.0)
+        split_h = float(params.get('split_h', 0.0) or 0.0)
+        nan = float('nan')
+
+        def _bias(carrier: str, energy: float) -> float:
+            """Back to the bias axis, using the edge the branch was cut at."""
+            return (split_h - energy) if carrier == 'h' else (energy + split_e)
+
+        candidate_rows, level_rows = [], []
+        def _qn_span(part):
+            """(lowest qn, highest qn, predicted levels skipped between them).
+
+            For a multi-dimensional well ``qn`` is a tuple per level; the
+            span is taken over the principal (first) quantum number.
+            """
+            qns = sorted({int(q[0]) for q in (part.get('qn') or ()) if q})
+            if not qns:
+                return nan, nan, nan
+            return qns[0], qns[-1], (qns[-1] - qns[0] + 1) - len(qns)
+
+        any_found = any(run['candidates'] for run in runs)
+        signature = self._search_signature(params)
+        for run in runs:
+            index, column = run['spectrum_index'], run['column']
+            n_peaks = len((run.get('peaks') or {}).get('peaks_V') or ())
+            if not run['candidates']:
+                # A placeholder row, so an all-spectra table says WHICH
+                # positions found nothing and why — a table with only the
+                # converged spectra in it reads as if every point converged.
+                # A run that found nothing anywhere writes no table at all.
+                if len(runs) < 2 or not any_found:
+                    continue
+                candidate_rows.append({
+                    'dataset': dataset_name, 'search': signature,
+                    'spectrum_index': int(index), 'column': column,
+                    'candidate': -1, 'carrier': '',
+                    'ndim': '', 'coords': '', 'sym': '',
+                    'd1_nm': nan, 'd2_nm': nan, 'd3_nm': nan, 'size_nm': nan,
+                    'meff': nan, 'offset_eV': nan, 'rrmse_pct': nan, 'rrmse_de_pct': nan,
+                    'n_levels': 0, 'qn_min': nan, 'qn_max': nan, 'levels_skipped': nan,
+                    'split_e_V': split_e, 'split_h_V': split_h, 'pair_mismatch_nm': nan,
+                    'hole_size_nm': nan, 'hole_meff': nan, 'hole_rrmse_pct': nan,
+                    'hole_qn_min': nan, 'hole_qn_max': nan, 'hole_levels_skipped': nan,
+                    # A placeholder never entered the consensus: NaN, not 0,
+                    # because "not admissible" and "never asked" are different
+                    # answers and only one of them is about a candidate.
+                    'group': -1, 'group_size_nm': nan,
+                    'admissible': nan, 'band_de_pct': nan, 'weight': nan,
+                    'group_R_nm': nan, 'dist_nm': nan,
+                    'n_peaks': n_peaks, 'reason': str(run.get('error') or 'no candidate'),
+                })
+                continue
+            for candidate in run['candidates']:
+                dims = list(candidate.get('dims_nm') or ())
+                hole = candidate.get('hole') or {}
+                # A paired row IS an electron-hole pair: the electron's
+                # geometry in the main columns, the hole's in hole_*. Saying
+                # 'e' here read as "electrons only converged".
+                carrier = 'e+h' if hole else str(candidate.get('carrier', 'e'))
+                qn_lo, qn_hi, skipped = _qn_span(candidate)
+                h_lo, h_hi, h_skipped = _qn_span(hole) if hole else (nan, nan, nan)
+                candidate_rows.append({
+                    'dataset': dataset_name, 'search': signature,
+                    'spectrum_index': int(index),
+                    'column': column,
+                    'candidate': int(candidate.get('index', 0)),
+                    'carrier': carrier,
+                    'ndim': str(candidate.get('ndim', '')),
+                    'coords': str(candidate.get('coords', '')),
+                    'sym': str(candidate.get('sym', '')),
+                    'd1_nm': float(dims[0]) if len(dims) > 0 else nan,
+                    'd2_nm': float(dims[1]) if len(dims) > 1 else nan,
+                    'd3_nm': float(dims[2]) if len(dims) > 2 else nan,
+                    'size_nm': float(candidate.get('size_nm', nan)),
+                    'meff': float(candidate.get('meff', nan)),
+                    'offset_eV': float(candidate.get('offset_eV', 0.0)),
+                    'rrmse_pct': float(candidate.get('rrmse', nan)),
+                    'rrmse_de_pct': float(candidate.get('rrmse_de', nan)),
+                    'n_levels': len(candidate.get('targets') or ()),
+                    'qn_min': qn_lo, 'qn_max': qn_hi, 'levels_skipped': skipped,
+                    'split_e_V': split_e,
+                    'split_h_V': split_h,
+                    # NaN, not 0: an unpaired candidate has no hole, and 0 nm
+                    # of mismatch would read as a perfect pair.
+                    'pair_mismatch_nm': float(candidate['pair_mismatch_nm'])
+                                        if 'pair_mismatch_nm' in candidate else nan,
+                    'hole_size_nm': float(hole.get('size_nm', nan)) if hole else nan,
+                    'hole_meff': float(hole.get('meff', nan)) if hole else nan,
+                    'hole_rrmse_pct': float(hole.get('rrmse', nan)) if hole else nan,
+                    'hole_qn_min': h_lo, 'hole_qn_max': h_hi, 'hole_levels_skipped': h_skipped,
+                    # Filled in below, once every spectrum's candidates are
+                    # on the table and the consensus can be taken over them.
+                    'group': -1, 'group_size_nm': nan,
+                    'admissible': nan, 'band_de_pct': nan, 'weight': nan,
+                    'group_R_nm': nan, 'dist_nm': nan,
+                    'n_peaks': n_peaks, 'reason': '',
+                })
+                # The hole of a pair is a candidate in its own right, and its
+                # levels are a different ladder — it gets its own level rows
+                # under the same candidate number.
+                for part in ([candidate, hole] if hole else [candidate]):
+                    part_carrier = str(part.get('carrier', carrier))
+                    targets = list(part.get('targets') or ())
+                    computed = list(part.get('computed') or ())
+                    errors = list(part.get('errors_pct') or ())
+                    qns = list(part.get('qn') or ())
+                    for level, measured in enumerate(targets):
+                        simulated = float(computed[level]) if level < len(computed) else nan
+                        level_rows.append({
+                            'dataset': dataset_name, 'search': signature,
+                            'spectrum_index': int(index),
+                            'column': column,
+                            'candidate': int(candidate.get('index', 0)),
+                            'carrier': part_carrier,
+                            'level': int(level),
+                            'qn': '-'.join(str(q) for q in (qns[level] if level < len(qns) else ())),
+                            'measured_eV': float(measured),
+                            'simulated_eV': simulated,
+                            'error_pct': float(errors[level]) if level < len(errors) else nan,
+                            'measured_V': _bias(part_carrier, float(measured)),
+                            'simulated_V': _bias(part_carrier, simulated),
+                            'split_e_V': split_e,
+                            'split_h_V': split_h,
+                        })
+
+        # ── which candidates describe the same well? ────────────────────
+        # Not by gap-clustering the sizes any more. That asked "are these two
+        # numbers close?" of a list that had already thrown away everything
+        # else — it grouped the best candidate of one spectrum with the sixth
+        # of another as readily as with its twin, and a run's answer moved
+        # whenever one spectrum's ranking flipped between two fits that were
+        # separated by less than the noise. The consensus instead asks each
+        # spectrum which candidates it cannot distinguish (the admissible
+        # band), gives those a shared vote, and finds the wells the whole run
+        # agrees on. See src/physics/consensus.py.
+        from src.physics import consensus as consensus_mod
+
+        group_tol = float(params.get('group_tol_nm', 0.0) or 0.0)
+        coord_name, coord_why = self._designer_coordinate(params)
+        coord = consensus_mod.coord_function(coord_name)
+        real_rows = [r for r in candidate_rows if r['candidate'] >= 0]
+        bandwidth = self._designer_bandwidth(
+            group_tol, (math.exp(coord(r)) if np.isfinite(coord(r)) else float('nan')
+                        for r in real_rows))
+        logger.info("Confinement Designer: grouping in %s (%s), bandwidth %s",
+                    coord_name, coord_why,
+                    f"{bandwidth:.4f} (from {group_tol:.3f} nm)" if bandwidth
+                    else "adaptive")
+
+        result = consensus_mod.consensus(
+            candidate_rows, coord_name,
+            delta_abs=float(params.get('admissible_abs_pct', 0.05)),
+            delta_rel=float(params.get('admissible_rel', 0.1)),
+            bandwidth=bandwidth,
+            min_support_frac=float(params.get('min_support_frac', 0.15)))
+
+        for entry in result.per_candidate:
+            row = candidate_rows[int(entry['row_index'])]
+            row['admissible'] = 1.0 if entry['admissible'] else 0.0
+            row['band_de_pct'] = float(entry['band_de_pct'])
+            row['weight'] = float(entry['weight'])
+            row['group'] = int(entry['mode'])
+            row['group_R_nm'] = float(entry['mode_R_nm'])
+            row['dist_nm'] = float(entry['dist_nm'])
+        # `group_size_nm` survives the rework as the mean size_nm inside the
+        # mode, so the plots built on the old clustering keep working — but
+        # it is the mode's R, not its size, that the consensus actually
+        # decided, and that is in `group_R_nm`.
+        sizes: dict = {}
+        for row in candidate_rows:
+            if int(row['group']) >= 0 and row['size_nm'] == row['size_nm']:
+                sizes.setdefault(int(row['group']), []).append(float(row['size_nm']))
+        means = {g: float(np.mean(v)) for g, v in sizes.items()}
+        for row in candidate_rows:
+            row['group_size_nm'] = means.get(int(row['group']), nan)
+
+        column_of = {int(run['spectrum_index']): run['column'] for run in runs}
+        mode_rows = [{**{k: m[k] for k in self.DESIGNER_MODE_COLUMNS
+                         if k in m},
+                      'dataset': dataset_name, 'search': signature}
+                     for m in result.modes]
+        consensus_rows = [{**{k: r[k] for k in self.DESIGNER_CONSENSUS_COLUMNS
+                              if k in r},
+                           'column': column_of.get(int(r['spectrum_index']), ''),
+                           'dataset': dataset_name, 'search': signature}
+                          for r in result.per_spectrum]
+
+        if report is not None and real_rows:
+            report['consensus'] = result.to_dict()
+            report['diagnostics'] = self._designer_diagnostics(
+                candidate_rows, coord_name, params, result, bandwidth)
+
+        base_name = self._extract_clean_base_name(dataset_name)
+        info = {
+            'created_from': 'confinement_designer',
+            'group_tol_nm': group_tol,
+            'n_groups': int(result.meta['n_modes']),
+            'coordinate': coord_name,
+            'bandwidth': float(result.meta['bandwidth']),
+            'admissible_abs_pct': float(result.meta['delta_abs']),
+            'admissible_rel': float(result.meta['delta_rel']),
+            'min_support_frac': float(result.meta['min_support_frac']),
+            'spread_pct': float(result.meta['spread_pct']),
+            'source_dataset': dataset_name,
+            'original_dataset': dataset_name,
+            'search': signature,
+            'sym': params.get('sym'),
+            'ndim': params.get('ndim'),
+            'coords': params.get('coords'),
+            'match': params.get('match'),
+            'carrier': params.get('carrier'),
+            'split_e': split_e,
+            'split_h': split_h,
+            'all_spectra': bool(params.get('all_spectra', False)),
+            'spectra_searched': len(runs),
+            **self._carry_spatial_info(spectral_data.metadata),
+        }
+
+        names, paths = [], []
+        for suffix, rows, columns in (
+                ('Designer Candidates', candidate_rows, self.DESIGNER_CANDIDATE_COLUMNS),
+                ('Designer Levels', level_rows, self.DESIGNER_LEVEL_COLUMNS),
+                ('Designer Modes', mode_rows, self.DESIGNER_MODE_COLUMNS),
+                ('Designer Consensus', consensus_rows,
+                 self.DESIGNER_CONSENSUS_COLUMNS)):
+            if not rows:
+                continue
+            # Fixed column order, so two runs of the same tool produce two
+            # CSVs that can be concatenated.
+            frame = pd.DataFrame(rows, columns=list(columns))
+            # The search settings are in the name, so a sweep over the
+            # symmetries leaves one table per symmetry, not the last one.
+            table_name = self._unique_dataset_name(f"{base_name} - {suffix} ({signature})")
+            metadata = SpectralMetadata(
+                source_type='confinement_designer',
+                dimensions=spectral_data.metadata.dimensions,
+                scan_mode=spectral_data.metadata.scan_mode,
+                units={'independent': 'Index', 'dependent': suffix},
+                additional_info={**info, 'table': suffix.lower().replace(' ', '_')},
+                data_type='flat',
+            )
+            self._datasets[table_name] = SpectralData(frame, metadata)
+            path = self._unique_path(self._ensure_output_dir('confinement') / (
+                self._sanitize_filename(table_name) + '.csv'))
+            frame.to_csv(path, index=False)
+            logger.info("Confinement Designer: %d row(s) -> %s", len(frame), path)
+            if not self._workflow_mode:
+                self.dataLoaded.emit(table_name)
+            names.append(table_name)
+            paths.append(str(path))
+        return names, paths
 
     @staticmethod
     def _designer_peak_summary(peaks, column: str) -> dict:
@@ -3780,7 +4753,8 @@ class ToolImplementations:
             from src.physics.branches import analyze_curve
             from src.physics.designer import (CARRIER_BOTH, CARRIER_HOLE,
                                               MATCH_ABSOLUTE, Designer)
-            from src.physics.line_scan import (NO_PAIR, analyze_line_scan,
+            from src.physics.line_scan import (CANCELLED, NO_PAIR,
+                                               analyze_line_scan,
                                                group_by_size,
                                                segments_along_line, summarize)
             from src.physics.pairing import confinement_size_nm, pair_candidates
@@ -3831,13 +4805,21 @@ class ToolImplementations:
                 return {'targets': branch, 'peaks': peaks,
                         'n_peaks': len(peaks.peaks_V)}
 
+            # One position's search is the longest stretch between two of
+            # `progress`'s cancellation checks, so the flag goes inside it as
+            # well: with several masses and a wide range that is seconds, and
+            # Cancel should not mean "after this position".
+            def should_cancel() -> bool:
+                return bool(getattr(task, 'cancelled', False))
+
             def _candidates(targets, carrier):
                 found = []
                 for meff in carrier['meffs']:
                     p = {**search, 'Et': np.asarray(targets, dtype=float),
                          'meff': meff, 'carrier': carrier['carrier']}
                     found.extend(designer.primary_alias(sol, p)
-                                 for sol in designer.find_solutions(p))
+                                 for sol in designer.find_solutions(
+                                     p, should_cancel=should_cancel))
                 return found
 
             def search_fn(found):
@@ -3863,8 +4845,13 @@ class ToolImplementations:
                 found['mismatch_nm'] = pairs[0]['mismatch_nm']
                 return [pair['electron'] for pair in pairs]
 
+            import time as _time
+            started = _time.perf_counter()
+
             def progress(index, total):
                 task.progress = index / max(1, total)
+                self._report_tool_progress(task, "Line Scan Designer", index, total,
+                                           started, unit="position")
                 return not bool(getattr(task, 'cancelled', False))
 
             logger.info("Line Scan Designer: %s — %d position(s), %s/%s, "
@@ -3877,6 +4864,23 @@ class ToolImplementations:
                 size_fn=lambda sol: confinement_size_nm(sol, sol.get('meff')),
                 min_peaks=min_peaks, max_rrmse=float(params['max_rrmse']),
                 progress=progress)
+            self._report_tool_progress(task, "Line Scan Designer", scan.n_points,
+                                       scan.n_points, started, unit="position")
+
+            # A cancelled line stops here, before anything is written. The
+            # scan breaks cleanly and marks the positions it never reached
+            # CANCELLED, so what is left is a table that is mostly empty by
+            # construction — registering it would put a dataset named after a
+            # real measurement next to the real ones, and assembling a size
+            # map from it would draw a map of where the user happened to hit
+            # Cancel. The worker discards this return value anyway, so the
+            # only thing a partial run could do is leave junk behind.
+            if getattr(task, 'cancelled', False):
+                logger.info("Line Scan Designer cancelled after %d/%d position(s)"
+                            " — nothing registered",
+                            sum(1 for r in results if r.reason != CANCELLED),
+                            scan.n_points)
+                return {**empty, 'error': 'Cancelled'}
 
             groups = group_by_size(results, float(params['group_tol_nm']))
             table_name = self._register_line_scan_table(
@@ -3931,6 +4935,7 @@ class ToolImplementations:
             'rrmse_pct': _number(point.rrmse),
             'group': (int(point.group) if point.group is not None else -1),
             'n_peaks': int(point.n_peaks),
+            'n_targets': int(getattr(point, 'n_targets', 0)),
             'reason': str(point.reason or ''),
             'converged': bool(point.converged),
         }
@@ -3961,6 +4966,9 @@ class ToolImplementations:
             'group': [float(r.group) if r.group is not None else nan for r in results],
             'meff': [r.meff if r.meff is not None else nan for r in results],
             'n_peaks': [r.n_peaks for r in results],
+            # Peaks in the searched branch: n_peaks says the detector worked,
+            # n_targets whether the split left anything to fit.
+            'n_targets': [getattr(r, 'n_targets', 0) for r in results],
         })
         for d in range(n_dims):
             frame[f'dim_{d + 1}_nm'] = [
@@ -3970,11 +4978,15 @@ class ToolImplementations:
                                      else nan for r in results]
             frame['mismatch_nm'] = [r.mismatch_nm if r.mismatch_nm is not None
                                     else nan for r in results]
-        # The only string column, and the only place a reason appears.
+        # Text columns: where a reason appears, and which dataset and search
+        # the row belongs to once several tables are concatenated.
         frame['reason'] = [r.reason or '' for r in results]
+        signature = self._search_signature(params)
+        frame['dataset'] = dataset_name
+        frame['search'] = signature
 
         base_name = self._extract_clean_base_name(dataset_name)
-        table_name = f"{base_name} - Confinement"
+        table_name = self._unique_dataset_name(f"{base_name} - Confinement ({signature})")
         metadata = SpectralMetadata(
             source_type='confinement_line',
             dimensions=spectral_data.metadata.dimensions,
@@ -3984,6 +4996,8 @@ class ToolImplementations:
                 'created_from': 'line_scan_designer',
                 'source_dataset': dataset_name,
                 'original_dataset': dataset_name,
+                'search': signature,
+                'sym': params.get('sym'),
                 'ndim': params.get('ndim'),
                 'coords': params.get('coords'),
                 'match': params.get('match'),
@@ -3996,8 +5010,8 @@ class ToolImplementations:
         )
         self._datasets[table_name] = SpectralData(frame, metadata)
 
-        path = self._ensure_output_dir('confinement') / (
-            self._sanitize_filename(table_name) + '.csv')
+        path = self._unique_path(self._ensure_output_dir('confinement') / (
+            self._sanitize_filename(table_name) + '.csv'))
         frame.to_csv(path, index=False)
         logger.info("Line Scan Designer: %d position(s) -> %s", len(frame), path)
 
@@ -4641,6 +5655,167 @@ class ToolImplementations:
             logger.error(f"Spectral feature extraction error: {e}", exc_info=True)
             self.errorOccurred.emit("Spectral Features Error", str(e))
             return empty
+
+    # ------------------------------------------------------------------
+    # Multi-peak fitting over a whole dataset
+    # ------------------------------------------------------------------
+
+    def fit_multipeak_dataset(self, task, dataset_name: str,
+                              peak_shape: str = 'gaussian',
+                              n_peaks_auto: int = 0, baseline_degree: int = 1,
+                              positive_only: bool = True) -> str:
+        """Fit a sum of peaks plus a polynomial baseline to EVERY spectrum.
+
+        Three things come out of one dataset:
+
+        - ``<base> - Peak Fit``: a flat table, one row per spectrum — peak
+          count, R², and ``peak<k>_center`` / ``_amplitude`` / ``_fwhm`` for
+          k up to the largest count found (NaN where a spectrum has fewer).
+          Being flat, every column is a spatial map via the Map Generator.
+        - ``<base> - Fitted``: the fitted curves on the source axis, one
+          column per spectrum, carrying the source's spatial keys so it
+          overlays and maps like the data it models.
+        - ``<name>_PeakFit.csv``: long format, one row per peak, with the
+          shape, width and mixing factor the table leaves out.
+
+        Peaks are detected on the whole curve but fitted to its non-negative
+        part when ``positive_only`` is set — see ``src/processing/positivity``.
+        """
+        from src.backend.peak_fitting import fit_multipeak, PeakShape
+
+        try:
+            if dataset_name not in self._datasets:
+                self.errorOccurred.emit("Error", "Dataset not found")
+                return ""
+
+            sd = self._datasets[dataset_name]
+            x = np.asarray(sd.independent_var, dtype=np.float64)
+            spectra = np.asarray(sd.spectra.values, dtype=np.float64)
+            n_spectra = spectra.shape[1] if spectra.ndim == 2 else 0
+            if n_spectra == 0:
+                self.errorOccurred.emit("Fit Failed", f"{dataset_name} has no spectra")
+                return ""
+
+            try:
+                shape = PeakShape(peak_shape)
+            except ValueError:
+                self.errorOccurred.emit("Fit Failed", f"Unknown peak shape: {peak_shape!r}")
+                return ""
+
+            out_dir = self._ensure_output_dir('peaks')
+            columns = list(sd.spectra.columns)
+
+            rows = []            # per-spectrum summary
+            long_rows = []       # one per peak
+            fitted = np.full_like(spectra, np.nan)
+            baseline = np.full_like(spectra, np.nan)
+            max_peaks = 0
+            for i in range(n_spectra):
+                if getattr(task, 'cancelled', False):
+                    logger.info("Multi-peak fit cancelled after %d/%d spectra", i, n_spectra)
+                    return ""
+                task.progress = i / n_spectra
+                y = spectra[:, i]
+                row = {'Spectrum_Index': i, 'n_peaks': 0, 'rsq': np.nan,
+                       'rss': np.nan, 'success': 0}
+                try:
+                    res = fit_multipeak(
+                        x, y, shape=shape, baseline_degree=int(baseline_degree),
+                        n_peaks_auto=(int(n_peaks_auto) if int(n_peaks_auto) > 0 else None),
+                        positive_only=bool(positive_only),
+                    )
+                except Exception as exc:                  # noqa: BLE001 - per spectrum
+                    logger.debug("Multi-peak fit failed on spectrum %d: %s", i, exc)
+                    rows.append(row)
+                    continue
+                fitted[:, i] = res.fitted_curve
+                baseline[:, i] = res.baseline_curve
+                peaks = sorted(res.peaks, key=lambda p: p.center)
+                row.update({'n_peaks': len(peaks), 'rsq': float(res.rsq),
+                            'rss': float(res.rss), 'success': int(bool(res.success))})
+                for k, pk in enumerate(peaks, start=1):
+                    row[f'peak{k}_center'] = float(pk.center)
+                    row[f'peak{k}_amplitude'] = float(pk.amplitude)
+                    row[f'peak{k}_fwhm'] = float(pk.fwhm)
+                    long_rows.append({
+                        'spectrum_index': i, 'spectrum': str(columns[i]),
+                        'peak': k, 'shape': pk.shape.value,
+                        'center': float(pk.center), 'amplitude': float(pk.amplitude),
+                        'width': float(pk.width), 'fwhm': float(pk.fwhm),
+                        'eta': (float(pk.eta) if pk.eta is not None else np.nan),
+                        'rsq': float(res.rsq),
+                    })
+                max_peaks = max(max_peaks, len(peaks))
+                rows.append(row)
+            task.progress = 1.0
+
+            # Fixed column order, NaN-padded to the largest peak count.
+            ordered = ['Spectrum_Index', 'n_peaks', 'rsq', 'rss', 'success']
+            for k in range(1, max_peaks + 1):
+                ordered += [f'peak{k}_center', f'peak{k}_amplitude', f'peak{k}_fwhm']
+            frame = pd.DataFrame(rows).reindex(columns=ordered)
+
+            base_name = self._extract_clean_base_name(dataset_name)
+            stem = self._apply_naming_convention(dataset_name, operation='PeakFit')
+            csv_path = out_dir / f"{stem}.csv"
+            pd.DataFrame(long_rows).to_csv(csv_path, index=False)
+            frame.to_csv(out_dir / f"{stem}_summary.csv", index=False)
+
+            table_name = f"{base_name} - Peak Fit"
+            table_meta = SpectralMetadata(
+                source_type='multi_peak_fit',
+                dimensions=sd.metadata.dimensions,
+                scan_mode=sd.metadata.scan_mode,
+                units={'independent': 'Index', 'dependent': 'Feature'},
+                # No 'original' key: a table is not a spectrum and must not
+                # be overlaid on the source's graph window.
+                additional_info={
+                    **self._carry_spatial_info(sd.metadata),
+                    'created_from': 'multi_peak_fit',
+                    'source_dataset': dataset_name,
+                    'feature_columns': ordered[1:],
+                    'fit_shape': shape.value,
+                    'fit_baseline_degree': int(baseline_degree),
+                    'fit_max_peaks': int(max_peaks),
+                    'positive_only': bool(positive_only),
+                    'peaks_path': str(csv_path),
+                },
+                data_type='flat',
+            )
+            self._datasets[table_name] = SpectralData(
+                frame, table_meta, topography=getattr(sd, 'topography', None))
+
+            fit_df = pd.DataFrame(fitted, columns=columns)
+            fit_df.insert(0, sd.independent_var_name, x)
+            fit_name = f"{base_name} - Fitted"
+            fit_meta = SpectralMetadata(
+                source_type=sd.metadata.source_type,
+                dimensions=sd.metadata.dimensions,
+                scan_mode=sd.metadata.scan_mode,
+                units=dict(sd.metadata.units or {}),
+                additional_info={
+                    **self._carry_spatial_info(sd.metadata),
+                    'original': dataset_name,
+                    'created_from': 'multi_peak_fit',
+                    'fit_shape': shape.value,
+                    'fit_baseline_degree': int(baseline_degree),
+                },
+            )
+            self._datasets[fit_name] = SpectralData(
+                fit_df, fit_meta, topography=getattr(sd, 'topography', None))
+
+            if not self._workflow_mode:
+                self.dataLoaded.emit(table_name)
+                self.dataLoaded.emit(fit_name)
+
+            logger.info("Multi-peak fit: %s — %d spectra, up to %d peaks, table '%s'",
+                        dataset_name, n_spectra, max_peaks, table_name)
+            return str(csv_path)
+
+        except Exception as e:
+            logger.error(f"Multi-peak fit error: {e}", exc_info=True)
+            self.errorOccurred.emit("Multi-Peak Fitting Error", str(e))
+            return ""
 
     # ------------------------------------------------------------------
     # Confinement dimensionality
@@ -5425,10 +6600,18 @@ class ToolImplementations:
         point's repetitions by default, because averaging across points is
         averaging across different places on the sample.
 
-        Creates three new datasets — '{base} - Good Data', '{base} - Bad
-        Data' and '{base} - FFT Spectra' — and exports every output of the run
-        into one folder, ``curves/{base}_Filtered/``: the three datasets as
-        CSV plus the text report.
+        Creates four new datasets — '{base} - Good Data', '{base} - Bad
+        Data', '{base} - FFT Spectra' and '{base} - Point Averages' — and
+        exports every output of the run into one folder,
+        ``curves/{base}_Filtered/``: the datasets as CSV plus the text report.
+
+        'Point Averages' is one curve per point, the mean of the repetitions
+        that survived. It is written on every run, not only an outlier one:
+        collapsing an overview's repetitions is what the filtering is for, and
+        outlier removal only changes which curves go into the mean. It is
+        withheld in one case — ``point`` grouping on a dataset whose loader
+        recorded no point index, where averaging would silently collapse a
+        whole line scan into a single curve.
 
         Returns the path to the text report.
         """
@@ -5588,20 +6771,32 @@ class ToolImplementations:
             }
             outlier_messages: List[str] = []
             outlier_kind_of: Dict[str, str] = {}
-            # Which columns belong to which point, kept past the outlier block
-            # so the per-point averages below can be built from it.
+            # Which columns belong to which point. Built on every run, not
+            # only an outlier one: the per-point averages below are an output
+            # in their own right, and a run with no outlier filtering still
+            # has repetitions worth collapsing once the bad ones are gone.
             group_columns: Dict[str, List[str]] = {}
-            if any(outlier_enabled.values()) and len(good_indices) >= 3:
+            grouping_mode = str(outlier_group_by or 'point')
+            grouped_by_point = False
+            if good_indices:
                 from src.processing import curve_outliers as _outliers
 
                 surviving = [spectra.columns[i] for i in good_indices]
                 groups = _outliers.build_groups(
                     surviving,
                     spectral_data.metadata.additional_info.get('spectrum_meta'),
-                    mode=str(outlier_group_by or 'point'),
+                    mode=grouping_mode,
                 )
                 group_columns = {label: [surviving[i] for i in indices]
                                  for label, indices in groups.items()}
+                # 'all curves' is what build_groups returns when nothing said
+                # which point a curve belongs to. In ``dataset`` mode that is
+                # the answer that was asked for; in ``point`` mode it is a
+                # fallback, and averaging on it would collapse a whole line
+                # scan into one curve.
+                grouped_by_point = 'all curves' not in groups
+
+            if group_columns and any(outlier_enabled.values()) and len(good_indices) >= 3:
                 analyses = _outliers.analyze_grouped(
                     independent_var, spectra[surviving].values, surviving, groups,
                     n_intervals=int(outlier_intervals),
@@ -5627,7 +6822,7 @@ class ToolImplementations:
 
                 report_lines.append("")
                 report_lines.append(
-                    f"Outliers (compared within {'each point' if groups and 'all curves' not in groups else 'the whole dataset'}, "
+                    f"Outliers (compared within {'each point' if grouped_by_point else 'the whole dataset'}, "
                     f"{len(groups)} group(s), {outlier_intervals} intervals, z>{outlier_z})")
                 for message in outlier_messages or ["Nothing flagged."]:
                     report_lines.append(f"  {message}")
@@ -5636,7 +6831,7 @@ class ToolImplementations:
                         "  These pass every per-spectrum test and are marked GOOD in the "
                         "table above; they are moved to Bad Data as a decision about the "
                         "population, not about the curve.")
-                if 'all curves' in groups:
+                if not grouped_by_point and grouping_mode != 'dataset':
                     report_lines.append(
                         "  NOTE: this dataset records no per-spectrum point index, so every "
                         "curve was compared against every other. That is only meaningful if "
@@ -5726,31 +6921,68 @@ class ToolImplementations:
             else:
                 report_lines.append("No good spectra found — 'Good Data' dataset not created.")
 
-            # Per-point averages, with the outliers left out.
+            # Per-point averages, with the bad curves left out.
             #
-            # This is the dataset the outlier pass exists to produce. An
-            # overview holds every repetition at every point; what the
-            # analysis actually wants is one curve per point, and an average
-            # is only worth taking once the curves that would drag it are
-            # gone. One column per point, each the NaN-aware mean of the
-            # repetitions that survived both the per-spectrum tests and the
-            # outlier pass.
-            averaged_name = f"{base_name} - Outliers Removed"
-            if group_columns and good_indices:
+            # This is what the filtering exists to produce. An overview holds
+            # every repetition at every point; what the analysis actually
+            # wants is one curve per point, and an average is only worth
+            # taking once the curves that would drag it are gone. One column
+            # per point, each the NaN-aware mean of the repetitions that
+            # survived the per-spectrum tests and, if it was asked for, the
+            # outlier pass — so it is written on every run, not only an
+            # outlier one.
+            averaged_name = f"{base_name} - Point Averages"
+            # Averaging the fallback grouping would mean averaging a whole
+            # line scan into a single curve, which is never what was meant.
+            # ``dataset`` mode is different: one population is what the user
+            # asked for, so one averaged curve is the honest answer.
+            can_average = bool(group_columns) and bool(good_indices) and (
+                grouped_by_point or grouping_mode == 'dataset')
+            if group_columns and good_indices and not can_average:
+                report_lines.append(
+                    "Per-point averages skipped: this dataset records no per-spectrum "
+                    "point index, so there is no way to tell which curves are "
+                    "repetitions of the same point. Set the outlier grouping to "
+                    "'whole dataset' if every curve really is a repetition of one "
+                    "measurement.")
+            if can_average:
                 surviving_cols = {spectra.columns[i] for i in good_indices}
+                # The average must be the mean of the curves that went into
+                # Good Data, so it takes the corrected version of any curve
+                # whose periodic noise was corrected there.
+                corrected_by_column = {
+                    spectra.columns[idx]: values
+                    for idx, values in corrected_spectra.items()
+                } if correct_periodic else {}
                 source_meta = {
                     entry.get('column'): entry
                     for entry in (spectral_data.metadata.additional_info.get(
                         'spectrum_meta') or []) if isinstance(entry, dict)
                 }
 
-                def _point_of(label: str, members: List[str]):
-                    """Point index for a group, for naming and ordering."""
+                def _number_of(members: List[str]):
+                    """The index a group's averaged column is named after.
+
+                    A line scan is numbered by **position along the line**, the
+                    way the loader already numbers the overview's own columns
+                    (``P01R01`` is the line's first position) and the averaged
+                    line-scan dataset (``P1``). Numbering the averages by the
+                    session-wide point index instead would leave ``P01R01`` and
+                    ``P203`` naming the same place in two datasets that sit
+                    side by side in the browser.
+
+                    The session-wide index is not a position, so it is only
+                    used where there is no line, and travels in the metadata
+                    either way for the UI to show alongside.
+                    """
                     for member in members:
                         entry = source_meta.get(member) or {}
-                        for key in ('point_index', 'line_pos'):
-                            if entry.get(key) is not None:
-                                return int(entry[key])
+                        if entry.get('line_pos') is not None:
+                            return int(entry['line_pos']) + 1
+                    for member in members:
+                        entry = source_meta.get(member) or {}
+                        if entry.get('point_index') is not None:
+                            return int(entry['point_index'])
                     return None
 
                 kept: List[tuple] = []
@@ -5758,22 +6990,31 @@ class ToolImplementations:
                     alive = [c for c in members if c in surviving_cols]
                     if not alive:
                         continue          # every repetition here was rejected
-                    kept.append((_point_of(label, alive), label, alive))
+                    # A whole-dataset average is one curve and belongs to no
+                    # point, however the curves under it were labelled.
+                    number = _number_of(alive) if grouped_by_point else None
+                    kept.append((number, label, alive))
 
-                # Acquisition order, with any unidentified group last.
+                # Along the line, with any unidentified group last.
                 kept.sort(key=lambda item: (item[0] is None, item[0], item[1]))
-                max_point = max((p for p, _, _ in kept if p is not None),
-                                default=len(kept))
+                max_number = max((n for n, _, _ in kept if n is not None),
+                                 default=len(kept))
 
                 avg_cols: Dict[str, np.ndarray] = {}
                 avg_meta: List[dict] = []
-                for point, label, alive in kept:
-                    name = f"P{_pad(point, max_point)}" if point is not None else label
+                for number, label, alive in kept:
+                    if number is not None:
+                        name = f"P{_pad(number, max_number)}"
+                    else:
+                        name = label if grouped_by_point else 'Average'
                     with warnings.catch_warnings():
                         # An all-NaN bias step is a real reading of "nothing
                         # survived here", not something to warn about.
                         warnings.simplefilter('ignore', category=RuntimeWarning)
-                        avg_cols[name] = np.nanmean(spectra[alive].values, axis=1)
+                        avg_cols[name] = np.nanmean(np.column_stack([
+                            corrected_by_column.get(c, spectra[c].values)
+                            for c in alive
+                        ]), axis=1)
                     template = source_meta.get(alive[0]) or {}
                     # Three numbers, because "13 averaged" on its own is
                     # ambiguous: how many the input held at this point, how
@@ -5813,8 +7054,10 @@ class ToolImplementations:
                         units=spectral_data.metadata.units.copy(),
                         additional_info={
                             'original': dataset_name,
-                            'filter': 'outliers_removed',
+                            'filter': 'point_averages',
                             'averaged_over_reps': True,
+                            'outliers_removed': any(outlier_enabled.values()),
+                            'periodic_corrected': correct_periodic,
                             'count': len(avg_cols),
                             'spectrum_meta': avg_meta,
                             'spatial_layout': src_info.get('spatial_layout')
@@ -5825,7 +7068,7 @@ class ToolImplementations:
                     )
                     averaged_dataset = SpectralData(avg_df, avg_metadata)
                     self._datasets[averaged_name] = averaged_dataset
-                    _write_dataset(averaged_dataset, 'Outliers_Removed')
+                    _write_dataset(averaged_dataset, 'Point_Averages')
                     if not self._workflow_mode:
                         self.dataLoaded.emit(averaged_name)
                     report_lines.append(

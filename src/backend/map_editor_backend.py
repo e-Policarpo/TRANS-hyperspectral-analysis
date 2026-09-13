@@ -71,6 +71,11 @@ class MapEditorBackend(QObject):
     stsAverageUpdated = Signal('QVariantMap', arguments=['result'])
     # Line-scan / point-set viewing (non-area spatially-resolved spectra).
     lineScanModeChanged = Signal()
+    # Name of whatever the tab is currently showing. The Hyperspectral tab had
+    # no on-screen indication of which map was displayed: the map-tabs strip is
+    # populated by only two of the ways a map can get in here, so opening a
+    # dataset from the browser left the view anonymous.
+    mapNameChanged = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -89,6 +94,8 @@ class MapEditorBackend(QObject):
         # Cache for QML properties
         self._channel_names: List[str] = []
         self._active_channel_name: str = ""
+        # What the header shows; "" means nothing is loaded.
+        self._map_name: str = ""
 
         # Reference to the AppBackend (set by QML), used to look up
         # in-memory MultiChannelMap entities by id without disk I/O.
@@ -152,6 +159,23 @@ class MapEditorBackend(QObject):
         if self._multi_channel_map is None:
             return 0
         return self._multi_channel_map.spectral_points
+
+    @Property(str, notify=mapNameChanged)
+    def mapName(self) -> str:
+        """Name of the map on screen, or "" when nothing is loaded."""
+        return self._map_name
+
+    def _set_map_name(self, name: str) -> None:
+        """Record what the tab is showing and tell QML.
+
+        One helper called from every path that replaces the displayed map,
+        rather than an assignment at each, so a new load path cannot quietly
+        leave the header naming the previous map.
+        """
+        name = str(name or "")
+        if name != self._map_name:
+            self._map_name = name
+            self.mapNameChanged.emit()
 
     @Property(bool, notify=lineScanModeChanged)
     def isLineScanMode(self) -> bool:
@@ -295,6 +319,7 @@ class MapEditorBackend(QObject):
         if spectral_data is None:
             logger.warning(f"loadDatasetAsLineScan: dataset not found: {name}")
             return
+        self._set_map_name(name)
 
         view = view if view in ("kymograph", "strip") else "kymograph"
         self.linkDataset(name, spectral_data)
@@ -563,6 +588,8 @@ class MapEditorBackend(QObject):
         logger.info(f"Loading in-memory map id={map_id}")
         self._exit_line_scan_mode()
         self._multi_channel_map = mcm
+        self._set_map_name(
+            getattr(getattr(mcm, "metadata", None), "name", "") or map_id)
         if self._canvas:
             active = self._multi_channel_map.active_channel
             if active:
@@ -1027,6 +1054,7 @@ class MapEditorBackend(QObject):
                 if active:
                     self._canvas.setMapData(active.data)
 
+            self._set_map_name(path.stem)
             self.mapDataChanged.emit()
             self.channelListChanged.emit()
             self.activeChannelChanged.emit(self.activeChannelName)
@@ -1060,6 +1088,7 @@ class MapEditorBackend(QObject):
         self._multi_channel_map.add_channel(
             channel_name, topo_data, ChannelType.HEIGHT, replace=True
         )
+        self._set_map_name(channel_name)
 
         if self._canvas:
             self._canvas.setMapData(topo_data)
@@ -1092,6 +1121,8 @@ class MapEditorBackend(QObject):
         """Set map data programmatically from Python"""
         self._exit_line_scan_mode()
         self._multi_channel_map = mcmap
+        self._set_map_name(
+            getattr(getattr(mcmap, "metadata", None), "name", ""))
 
         # Update canvas
         if self._canvas and mcmap.active_channel:
@@ -1124,6 +1155,7 @@ class MapEditorBackend(QObject):
         if self._canvas:
             self._canvas.setMapData(data)
 
+        self._set_map_name(name)
         self.mapDataChanged.emit()
         self.channelListChanged.emit()
         self.activeChannelChanged.emit(name)

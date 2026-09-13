@@ -3,7 +3,7 @@
 Solves a 1D quantum well directly: give it a box and a mass, get the levels
 and the wavefunctions.
 
-**Menu** Tools → Composite tools → Quantum Well Solver · **Panel**
+**Menu** Tools → Confinement → Quantum Well Solver · **Panel**
 `QuantumWellSolverTool.qml` · **Method** `solveQuantumWell()`,
 `solve_well_1d()` in `src/physics/solvers.py`
 

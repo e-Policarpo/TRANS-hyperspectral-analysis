@@ -100,30 +100,26 @@ Rectangle {
                     switch(toolItem.toolName) {
                         case "Integration Utility":
                             return "../tools/IntegrationTool.qml"
-                        case "Spatial Average":
-                            return "../tools/SpatialAverageTool.qml"
                         case "1D FFT":
                             return "../tools/FFT1DTool.qml"
                         case "Curve Smoothing":
                             return "../tools/CurveSmoothingTool.qml"
-                        case "Image Smoothing":
-                            return "../tools/ImageSmoothingTool.qml"
                         case "Derivative Calculator":
                             return "../tools/DerivativeTool.qml"
                         case "Gradient Filter":
-                            return "../tools/GradientFilterTool.qml"
-                        case "Curve Fitting":
+                            return "../tools/GradientTool.qml"
+                        case "Curve Background Flattening":
                             return "../tools/CurveFittingTool.qml"
                         case "Map Generator":
                             return "../tools/MapGeneratorTool.qml"
-                        case "Peak Finder":
-                            return "../tools/PeakFinderTool.qml"
                         case "Map Discretizer":
                             return "../tools/MapDiscretizerTool.qml"
-                        case "Curve Analysis":
+                        case "Curve Plotting":
                             return "../tools/CurveAnalysisTool.qml"
                         case "Truncate Data":
                             return "../tools/TruncateTool.qml"
+                        case "Unit Converter":
+                            return "../tools/UnitConverterTool.qml"
                         default:
                             return ""
                     }
