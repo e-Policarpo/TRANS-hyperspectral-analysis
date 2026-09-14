@@ -3871,7 +3871,8 @@ class ToolImplementations:
     #: vertical size is not determined by the data, and a single number
     #: there would be the optimiser's seed dressed up as a measurement.
     DESIGNER_MODE_COLUMNS = (
-        'mode', 'R_nm', 'R_lo_nm', 'R_hi_nm', 'Lz_lo_nm', 'Lz_hi_nm',
+        'mode', 'R_nm', 'R_lo_nm', 'R_hi_nm', 'R_min_nm', 'R_max_nm',
+        'Lz_lo_nm', 'Lz_hi_nm',
         'support_spectra', 'support_frac', 'mean_rrmse_de_pct',
         'qn_min', 'qn_max', 'levels_skipped_mean',
         'dataset', 'search')

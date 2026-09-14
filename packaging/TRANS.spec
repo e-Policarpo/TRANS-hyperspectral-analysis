@@ -26,7 +26,7 @@ engines, some of which are only imported inside functions.
 
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy_metadata
 
 # SPECPATH is where this .spec lives (packaging/); the project is its parent.
 PROJECT_ROOT = Path(SPECPATH).parent
@@ -45,8 +45,14 @@ datas = [
 
 # matplotlib ships fonts and style sheets it reads at import time.
 datas += collect_data_files("matplotlib")
-# access2theMatrix and gwyfile are pure Python but carry package data.
+# access2theMatrix is pure Python but carries package data.
 datas += collect_data_files("access2thematrix", include_py_files=True)
+# gwyfile reads its own version from importlib.metadata AT IMPORT TIME, so
+# without its dist-info in the bundle `import gwyfile` raises
+# PackageNotFoundError and every .gwy export is silently skipped. It never
+# worked in a packaged build until this line; the build script now refuses
+# to ship a bundle that lacks it.
+datas += copy_metadata("gwyfile")
 
 # --------------------------------------------------------------------------
 # Imports the analysis cannot see.

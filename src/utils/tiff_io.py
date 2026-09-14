@@ -124,6 +124,76 @@ def imagej_tiff_kwargs(data: np.ndarray,
     return kwargs
 
 
+
+def write_channel_stack_tiff(path: Union[str, Path],
+                             channels: Dict[str, np.ndarray],
+                             dx: Optional[float] = None,
+                             dy: Optional[float] = None,
+                             unit: Optional[str] = None,
+                             clip_percentile: float = 1.0) -> str:
+    """One multi-page TIFF for a whole scan: every channel a page.
+
+    An ImageJ hyperstack (``axes=CYX``), so Fiji opens it as one image with
+    a channel slider, each page carrying its channel name as the slice
+    label and its own display range — a topography and a current map do
+    not share a sensible min/max. The pixel scale rides on the same
+    resolution tags :func:`imagej_tiff_kwargs` writes, so Fiji and Gwyddion
+    read real units; Gwyddion opens each page as a separate field.
+
+    Channels are stacked as float32 when their dtypes differ (a scan mixes
+    heights and currents; a uint16 page next to a float one is not a
+    stack). All pages must share one shape — that is the definition of a
+    scan's channels, and anything else is a different image.
+    """
+    import tifffile
+
+    names = [str(n) for n in channels]
+    arrays = [np.asarray(channels[n]) for n in channels]
+    if not arrays:
+        raise ValueError("no channels to write")
+    shape = arrays[0].shape
+    if any(a.shape != shape for a in arrays):
+        raise ValueError("channel shapes differ: "
+                         + ", ".join(f"{n}:{a.shape}" for n, a in zip(names, arrays)))
+    if len({a.dtype for a in arrays}) > 1 or not np.issubdtype(arrays[0].dtype, np.floating):
+        arrays = [a.astype(np.float32) for a in arrays]
+    stack = np.stack(arrays, axis=0)
+
+    ranges = []
+    for a in arrays:
+        finite = a[np.isfinite(a)]
+        if finite.size:
+            lo = float(np.percentile(finite, clip_percentile))
+            hi = float(np.percentile(finite, 100.0 - clip_percentile))
+            if not (hi > lo):
+                hi = lo + 1.0
+        else:
+            lo, hi = 0.0, 1.0
+        ranges += [lo, hi]
+
+    metadata: Dict[str, Any] = {
+        "axes": "CYX",
+        "Labels": names,
+        "mode": "grayscale",
+        "hyperstack": True,
+        # A tuple, not a list: tifffile writes a list as one entry per
+        # element, and the IJ 'rang' block is one flat run of doubles.
+        "Ranges": tuple(ranges),
+    }
+    kwargs: Dict[str, Any] = {"imagej": True, "rowsperstrip": 64}
+    if dx and dy and dx > 0 and dy > 0:
+        ij_unit = _IJ_UNIT.get((unit or "").strip(), (unit or "").strip())
+        denom = 1_000_000
+        kwargs["resolution"] = ((int(round((1.0 / dx) * denom)), denom),
+                                (int(round((1.0 / dy) * denom)), denom))
+        if ij_unit:
+            metadata["unit"] = ij_unit
+    else:
+        logger.warning("Writing UNCALIBRATED channel stack %s — no physical "
+                       "pixel size was available.", Path(path).name)
+    tifffile.imwrite(str(path), stack, metadata=metadata, **kwargs)
+    return str(path)
+
 def write_calibrated_tiff(path: Union[str, Path],
                           data: np.ndarray,
                           dx: Optional[float] = None,

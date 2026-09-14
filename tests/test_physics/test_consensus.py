@@ -191,11 +191,33 @@ def test_a_mode_below_the_support_floor_is_discarded():
     result = consensus(rows, log_first_dim, bandwidth=0.05, min_support_frac=0.2)
     assert len(result.modes) == 1
     assert result.modes[0]['R_nm'] == pytest.approx(5.0, rel=0.05)
-    # The orphan is not deleted — it is assigned, and its distance says the
-    # assignment means nothing.
+    # The orphan is not deleted, and it is not forced onto the surviving
+    # mode either: 20 nm is far past two bandwidths of a 5 nm peak, so it
+    # belongs to no mode. Forcing it in is what used to stretch a mode's
+    # range from the pool's edge to the midpoint between peaks.
     orphan = [c for c in result.per_candidate if c['row_index'] == 10][0]
-    assert orphan['mode'] == 0
-    assert orphan['dist_nm'] > 10.0
+    assert orphan['admissible'] is True
+    assert orphan['mode'] == -1
+    assert result.meta['n_unassigned'] == 1
+    # Its spectrum fits no consensus well, and says so.
+    lonely = [p for p in result.per_spectrum if p['spectrum_index'] == 10][0]
+    assert lonely['mode'] == -1 and lonely['mode_prob'] == 0.0
+    # And the surviving mode's width is the peak's, not the pool's.
+    assert result.modes[0]['R_max_nm'] == pytest.approx(5.0, rel=0.05)
+
+
+def test_a_mode_reports_its_core_and_its_extent_separately():
+    # Ten spectra tightly at 5 nm plus one straggler at 6 nm, still inside
+    # the cutoff: the extent reaches it, the core does not.
+    rows = [_row(s, 0, r_nm=5.0 + 0.01 * s) for s in range(10)]
+    rows.append(_row(10, 0, r_nm=6.0))
+    result = consensus(rows, log_first_dim, bandwidth=0.1, min_support_frac=0.2)
+    assert len(result.modes) == 1
+    m = result.modes[0]
+    assert m['R_max_nm'] == pytest.approx(6.0)
+    assert m['R_hi_nm'] < 5.5          # the 84th percentile ignores one straggler
+    assert m['R_lo_nm'] <= m['R_hi_nm'] <= m['R_max_nm']
+    assert m['R_min_nm'] <= m['R_lo_nm']
 
 
 def test_the_support_floor_keeps_a_mode_enough_spectra_back():

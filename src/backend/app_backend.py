@@ -2854,46 +2854,38 @@ class AppBackend(ToolImplementations, QObject):
         return path
 
     def _save_image_channels_to_tiff(self, image: "ImageData") -> List[str]:
-        """One calibrated TIFF per channel of ``image``. Returns the paths.
+        """The image as ONE calibrated TIFF, its channels stacked as pages.
 
         The import-time companion to :meth:`_save_image_to_gwy`: the ``.gwy``
-        carries every channel in one document, and a TIFF holds one field,
-        so a scan with forward and backward traces becomes two files, each
-        named after its channel. A single-array image goes through
+        carries every channel in one document, and so does this — an ImageJ
+        hyperstack with the channel names as page labels, one file per scan
+        instead of a file per trace. A single-array image goes through
         :meth:`_save_image_to_tiff`, which also records the path the viewer
-        reuses; the per-channel files deliberately do not claim
-        ``image.file_path``, since that is whichever channel is on screen.
+        reuses; the stack deliberately does not claim ``image.file_path``,
+        since the viewer shows one channel and expects a plain frame there.
         """
         if not image.mode.is_single_channel:
-            logger.info("Image %r not written as TIFF per channel: colour "
-                        "image.", image.name)
+            logger.info("Image %r not written as TIFF stack: colour image.",
+                        image.name)
             return []
         names = list(image.channel_names or [])
         if len(names) <= 1:
             path = self._save_image_to_tiff(image)
             return [path] if path else []
-        try:
-            import tifffile
-        except ImportError:
-            logger.error("tifffile is required to write channel TIFFs")
+        channels = {name: image.get_channel(name) for name in names}
+        channels = {k: v for k, v in channels.items() if v is not None}
+        if not channels:
             return []
-        written = []
-        for name in names:
-            data = image.get_channel(name)
-            if data is None:
-                continue
-            safe = self._sanitize_filename(name) or "channel"
-            target = self._image_export_basename(image, f" - {safe}.tiff")
-            try:
-                tifffile.imwrite(str(target), data,
-                                 **self._pixel_scale_tiff_kwargs(image, data))
-            except Exception as e:
-                logger.error("Could not write %s: %s", target, e)
-                continue
-            written.append(str(target))
-        logger.info("Wrote %d channel TIFF%s for image %r", len(written),
-                    "" if len(written) == 1 else "s", image.name)
-        return written
+        from src.utils.tiff_io import write_channel_stack_tiff
+        dx, dy, unit = self._image_pixel_scale(image)
+        target = self._image_export_basename(image, ".tiff")
+        try:
+            path = write_channel_stack_tiff(target, channels, dx=dx, dy=dy, unit=unit)
+        except Exception as e:
+            logger.error("Could not write %s: %s", target, e)
+            return []
+        logger.info("Wrote %s (%d channels as pages)", path, len(channels))
+        return [path]
 
     @Slot(str, str, result=str)
     def exportImageAsGwy(self, image_id: str, file_path: str = "") -> str:
@@ -2961,9 +2953,10 @@ class AppBackend(ToolImplementations, QObject):
         Each absorbed scan is written out under ``<project_outputs>/images/``
         as a multi-channel **Gwyddion ``.gwy``** — so imported data is
         immediately analysable in Gwyddion with correct physical dimensions —
-        and as **one calibrated TIFF per channel**, so it is just as
-        immediately openable anywhere else. Both ride the same queued write
-        and the same "extract images" option on the import dialog.
+        and as **one calibrated TIFF with the channels as pages**, so it is
+        just as immediately openable anywhere else. Both ride the same
+        queued write and the same "extract images" option on the import
+        dialog.
 
         The write is queued on the I/O worker rather than done here: a Matrix
         session carries dozens of scan images, and writing them all inline
@@ -3025,8 +3018,8 @@ class AppBackend(ToolImplementations, QObject):
                     if self._save_image_to_gwy(img):
                         gwy += 1
                     tiff += len(self._save_image_channels_to_tiff(img))
-                logger.info("Image write done: %d/%d .gwy, %d channel TIFF(s)",
-                            gwy, len(images), tiff)
+                logger.info("Image write done: %d/%d .gwy, %d/%d .tiff",
+                            gwy, len(images), tiff, len(images))
 
             self.worker_manager.submit_io(
                 name=f"Write images #{self._image_write_seq}",

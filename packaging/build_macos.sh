@@ -72,6 +72,16 @@ echo "build dir: $BUILD_ROOT"
 
 [ -d "$APP" ] || { echo "error: $APP was not produced" >&2; exit 1; }
 
+# gwyfile reads its own version from importlib.metadata at import time; a
+# bundle without its dist-info imports it as a failure and silently writes
+# no .gwy. That shipped for months. Refuse to ship it again.
+if ! ls -d "$APP"/Contents/*/gwyfile-*.dist-info >/dev/null 2>&1 \
+   && ! ls -d "$APP"/Contents/*/*/gwyfile-*.dist-info >/dev/null 2>&1; then
+    echo "error: gwyfile dist-info is missing from the bundle; .gwy export would be silently disabled" >&2
+    echo "       (packaging/TRANS.spec must copy_metadata('gwyfile'))" >&2
+    exit 1
+fi
+
 # ---------------------------------------------------------------- sign
 # Ad-hoc signature. Enough for the app to launch on this Mac; it is NOT a
 # Developer ID signature, so a copy sent to someone else is still quarantined

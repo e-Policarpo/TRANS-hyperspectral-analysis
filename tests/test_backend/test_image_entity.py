@@ -713,21 +713,28 @@ def _two_channel_scan(name="scan"):
         name=name, mode=ImageMode.SINGLE_FLOAT)
 
 
-def test_import_writes_one_tiff_per_channel(backend, tmp_path):
-    """The .gwy carries every channel in one document; a TIFF holds one, so a
-    two-trace scan becomes two TIFFs, each named after its channel."""
+def test_import_writes_one_tiff_with_the_channels_as_pages(backend, tmp_path):
+    """The .gwy carries every channel in one document, and so does the TIFF:
+    an ImageJ hyperstack, one page per channel, named after it."""
+    import tifffile
     backend._output_base_dir = tmp_path
     img = _two_channel_scan()
 
     paths = backend._save_image_channels_to_tiff(img)
 
-    assert len(paths) == 2
-    names = sorted(Path(p).name for p in paths)
-    assert names == ["scan - Z bwd_up.tiff", "scan - Z fwd_up.tiff"] \
-        or all(n.startswith("scan - ") and n.endswith(".tiff") for n in names)
-    assert all(Path(p).exists() for p in paths)
-    # The per-channel files do not claim the viewer's path: that is whichever
-    # channel is on screen, and openImage writes it on demand.
+    assert len(paths) == 1 and Path(paths[0]).exists()
+    with tifffile.TiffFile(paths[0]) as tf:
+        assert tf.is_imagej
+        assert len(tf.pages) == 2
+        meta = tf.imagej_metadata or {}
+        assert list(meta.get("Labels") or []) == ["Z fwd/up", "Z bwd/up"]
+        assert meta.get("channels") == 2 or meta.get("images") == 2
+        stack = tf.asarray()
+    assert stack.shape[0] == 2
+    np.testing.assert_allclose(stack[0], img.get_channel("Z fwd/up"))
+    np.testing.assert_allclose(stack[1], img.get_channel("Z bwd/up"))
+    # The stack does not claim the viewer's path: that is whichever channel
+    # is on screen, and openImage writes a plain frame there on demand.
     assert not getattr(img, "file_path", None)
 
 
@@ -775,4 +782,4 @@ def test_the_queued_import_write_produces_both_formats(backend, tmp_path):
 
     written = sorted(p.name for p in (tmp_path / "images").iterdir())
     assert any(n.endswith(".gwy") for n in written)
-    assert sum(n.endswith(".tiff") for n in written) == 2
+    assert sum(n.endswith(".tiff") for n in written) == 1

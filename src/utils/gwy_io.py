@@ -28,10 +28,18 @@ logger = logging.getLogger(__name__)
 
 
 def gwy_available() -> bool:
-    """Whether ``.gwy`` export is usable in this environment."""
+    """Whether ``.gwy`` export is usable in this environment.
+
+    Says why when it is not. The packaged app shipped for months without
+    gwyfile's dist-info, so ``import gwyfile`` failed on its own
+    ``importlib.metadata`` lookup and every .gwy export was skipped without
+    a word — a silent False here is exactly what hid that.
+    """
     try:
         import gwyfile  # noqa: F401
-    except Exception:
+    except Exception as exc:                          # noqa: BLE001
+        logger.warning("gwyfile is not importable (%s: %s); .gwy export is off",
+                       type(exc).__name__, exc)
         return False
     return True
 

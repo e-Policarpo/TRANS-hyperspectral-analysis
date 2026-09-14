@@ -83,6 +83,11 @@ DELTA_REL = 0.1
 #: not a well the line shares. Floored at a single spectrum so a three-point
 #: line is not left with nothing.
 MIN_SUPPORT_FRAC = 0.2
+#: How far, in bandwidths, a candidate may sit from its nearest mode and
+#: still count as a member. Two is past the shoulder of a peak that wide;
+#: beyond it the candidate is in the valley, or in a tail the support floor
+#: already declined to call a mode.
+MAX_MODE_DISTANCE = 2.0
 
 #: Smallest kernel width, in log-coordinate units: 0.02 is 2% in R, an order
 #: below anything the designer resolves. It only ever matters when the values
@@ -372,8 +377,17 @@ def _local_maxima(density: np.ndarray, grid: np.ndarray) -> List[float]:
 
 def _assign_nearest(values: np.ndarray, mode_values: Sequence[float],
                     signatures: Optional[Sequence] = None,
-                    mode_signatures: Optional[Sequence] = None) -> np.ndarray:
-    """Index of the mode each value belongs to.
+                    mode_signatures: Optional[Sequence] = None,
+                    max_distance: Optional[float] = None) -> np.ndarray:
+    """Index of the mode each value belongs to, or -1 for none.
+
+    ``max_distance`` (in the coordinate's units) is where "nearest" stops
+    meaning "belongs". Without it the assignment is a Voronoi split of the
+    whole pool: with two modes, every candidate in the run lands in one or
+    the other, and each mode's range runs from the pool's edge to the
+    midpoint between them — the partition's extent, not the mode's width.
+    A candidate in the valley between two peaks is evidence for neither;
+    past the cutoff it is reported as belonging to no mode.
 
     Nearest in the coordinate, with one exception that implements the
     assignment-identity rule: when a candidate's quantum-number signature
@@ -391,10 +405,27 @@ def _assign_nearest(values: np.ndarray, mode_values: Sequence[float],
         if signatures is not None and mode_signatures is not None:
             allowed = [j for j, ms in enumerate(mode_signatures) if ms == signatures[k]]
         if allowed:
-            out[k] = allowed[int(np.argmin(np.abs(m[allowed] - v)))]
+            j = allowed[int(np.argmin(np.abs(m[allowed] - v)))]
         else:
-            out[k] = int(np.argmin(np.abs(m - v)))
+            j = int(np.argmin(np.abs(m - v)))
+        if max_distance is not None and abs(m[j] - v) > max_distance:
+            j = -1
+        out[k] = j
     return out
+
+
+def _weighted_quantile(values: np.ndarray, weights: np.ndarray, q: float) -> float:
+    """The value at which the running weight first reaches ``q`` of the total."""
+    v = np.asarray(values, float)
+    w = np.asarray(weights, float)
+    if v.size == 0:
+        return float('nan')
+    if w.sum() <= 0:
+        w = np.ones_like(v)
+    order = np.argsort(v)
+    v, w = v[order], w[order]
+    cum = np.cumsum(w) / w.sum()
+    return float(v[min(int(np.searchsorted(cum, q, side='left')), v.size - 1)])
 
 
 def _mode_records(values: np.ndarray, weights: np.ndarray,
@@ -608,7 +639,8 @@ class Assignment:
 
 def soft_assign(values, weights, spectrum_ids, mode_values,
                 signatures: Optional[Sequence] = None,
-                mode_signatures: Optional[Sequence] = None) -> Assignment:
+                mode_signatures: Optional[Sequence] = None,
+                max_distance: Optional[float] = None) -> Assignment:
     """Membership of each spectrum across the modes.
 
     Each admissible candidate goes to its nearest mode (subject to the
@@ -630,7 +662,11 @@ def soft_assign(values, weights, spectrum_ids, mode_values,
     lookup = {s: k for k, s in enumerate(order)}
     n_modes = len(mode_values)
     membership = np.zeros((len(order), n_modes), float)
-    nearest = _assign_nearest(v, mode_values, signatures, mode_signatures)
+    nearest = _assign_nearest(v, mode_values, signatures, mode_signatures,
+                              max_distance=max_distance)
+    # A spectrum whose whole admissible set is past the cutoff ends up with
+    # an all-zero row: it fits no well the line agrees on, and the spectrum
+    # table says so (mode -1) rather than forcing it onto the nearest.
     for k in range(v.size):
         j = int(nearest[k])
         if j >= 0:
@@ -681,7 +717,8 @@ def consensus(rows: Sequence[dict],
               spectrum_key: str = SPECTRUM_KEY,
               second_dim_key: str = 'd2_nm',
               skip_penalty: float = 1.0,
-              grid_size: int = 512) -> ConsensusResult:
+              grid_size: int = 512,
+              max_mode_distance: float = MAX_MODE_DISTANCE) -> ConsensusResult:
     """How many wells does this line contain, and which spectra sit on each?
 
     The whole pipeline: admissible sets per spectrum, one vote per spectrum
@@ -775,8 +812,11 @@ def consensus(rows: Sequence[dict],
     mode_values = [m['value'] for m in modes]
     assignment = soft_assign(v, w, id_arr, mode_values,
                              signatures if mode_signatures is not None else None,
-                             mode_signatures)
+                             mode_signatures,
+                             max_distance=float(max_mode_distance) * h)
     nearest = assignment.nearest
+    meta['n_unassigned'] = int((nearest < 0).sum())
+    meta['max_mode_distance'] = float(max_mode_distance)
     meta['n_modes'] = len(modes)
     meta['spread'] = _spread(v, id_arr, mode_values)
     meta['spread_pct'] = float((math.exp(meta['spread']) - 1.0) * 100.0) \
@@ -801,8 +841,14 @@ def consensus(rows: Sequence[dict],
         mode_rows.append({
             'mode': j,
             'R_nm': float(math.exp(m['value'])),
-            'R_lo_nm': float(r_values.min()) if r_values.size else float('nan'),
-            'R_hi_nm': float(r_values.max()) if r_values.size else float('nan'),
+            # The core, not the extent: weighted 16th-84th percentile of the
+            # members, about a sigma either side. The full extent is
+            # R_min/R_max so nothing is hidden, but the width a reader
+            # compares between modes is the width of the peak.
+            'R_lo_nm': _weighted_quantile(r_values, wts, 0.16),
+            'R_hi_nm': _weighted_quantile(r_values, wts, 0.84),
+            'R_min_nm': float(r_values.min()) if r_values.size else float('nan'),
+            'R_max_nm': float(r_values.max()) if r_values.size else float('nan'),
             # The vertical size is reported as a range, never as a value:
             # with the offset cancelled it is not determined by the data, and
             # a single number there would be the optimiser's seed dressed up
@@ -882,10 +928,11 @@ def consensus(rows: Sequence[dict],
             })
 
     logger.info("consensus: %d spectra, %d admissible candidate(s), h=%.3f -> "
-                "%d mode(s) at %s (spread %.2f%%)", n_spectra, int(v.size), h,
+                "%d mode(s) at %s (spread %.2f%%); %d candidate(s) beyond %.1f "
+                "bandwidths of any mode", n_spectra, int(v.size), h,
                 len(mode_rows), ", ".join(f"{m['R_nm']:.2f} nm x{m['support_spectra']}"
                                           for m in mode_rows) or "none",
-                meta['spread_pct'])
+                meta['spread_pct'], meta['n_unassigned'], float(max_mode_distance))
     return ConsensusResult(mode_rows, per_spectrum, per_candidate, meta)
 
 
