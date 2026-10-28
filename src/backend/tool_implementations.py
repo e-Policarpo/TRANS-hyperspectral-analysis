@@ -3775,6 +3775,9 @@ class ToolImplementations:
     #: Analysis see the same peaks.
     DESIGNER_DEFAULTS = {
         'spectrum_index': 0,
+        # Worker processes for an all-spectra sweep: 0 is every core but
+        # one, 1 the serial loop. See src/backend/designer_pool.py.
+        'workers': 0,
         'carrier': 'electrons',
         'meff_e': '0.067',
         'meff_h': '0.45',
@@ -4543,18 +4546,42 @@ class ToolImplementations:
             import time as _time
             started = _time.perf_counter()
             self._report_tool_progress(task, "Confinement Designer", 0, len(indices), started)
-            for step, index in enumerate(indices):
-                if getattr(task, 'cancelled', False):
+            from src.backend.designer_pool import (design_spectra_parallel,
+                                                   resolve_workers)
+            workers = resolve_workers(params.get('workers'), len(indices))
+            if workers > 1:
+                # Each spectrum's search is independent and builds its own
+                # seeded Designer, so the rows do not depend on the schedule.
+                logger.info("Confinement Designer: %d spectra on %d worker "
+                            "processes", len(indices), workers)
+
+                def _landed(done):
+                    task.progress = done / max(1, len(indices))
+                    self._report_tool_progress(task, "Confinement Designer",
+                                               done, len(indices), started)
+
+                runs = design_spectra_parallel(
+                    spectral_data, indices, params, workers,
+                    is_cancelled=lambda: bool(getattr(task, 'cancelled',
+                                                      False)),
+                    on_done=_landed)
+                if runs is None:
                     logger.info("Confinement Designer cancelled")
                     return {**empty, 'all_spectra': all_spectra,
                             'error': 'Cancelled'}
-                # Progress across the sweep; a single spectrum's own search
-                # reports its own fractions inside the helper.
-                task.progress = step / max(1, len(indices))
-                runs.append(self._design_one_spectrum(
-                    task, spectral_data, index, params))
-                self._report_tool_progress(task, "Confinement Designer",
-                                           step + 1, len(indices), started)
+            else:
+                for step, index in enumerate(indices):
+                    if getattr(task, 'cancelled', False):
+                        logger.info("Confinement Designer cancelled")
+                        return {**empty, 'all_spectra': all_spectra,
+                                'error': 'Cancelled'}
+                    # Progress across the sweep; a single spectrum's own
+                    # search reports its own fractions inside the helper.
+                    task.progress = step / max(1, len(indices))
+                    runs.append(self._design_one_spectrum(
+                        task, spectral_data, index, params))
+                    self._report_tool_progress(task, "Confinement Designer",
+                                               step + 1, len(indices), started)
 
             found = [run for run in runs if run['candidates']]
             # The consensus and its diagnostics are computed where the rows

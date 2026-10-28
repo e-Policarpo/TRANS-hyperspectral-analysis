@@ -252,4 +252,10 @@ def main():
 
 
 if __name__ == "__main__":
+    # A Confinement Designer sweep runs its spectra in spawned worker
+    # processes (src/backend/designer_pool.py). In the frozen app each worker
+    # is this executable started again; freeze_support is what turns it into
+    # a worker instead of a second copy of the application.
+    import multiprocessing
+    multiprocessing.freeze_support()
     sys.exit(main())

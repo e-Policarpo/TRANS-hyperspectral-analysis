@@ -481,7 +481,9 @@ Item {
             "admissible_rel": admissibleRelSpin.realValue,
             "min_support_frac": minSupportSpin.realValue,
             // null, not "", so the backend's Designer(seed=…) sees None.
-            "seed": seedField.text === "" ? null : parseInt(seedField.text)
+            "seed": seedField.text === "" ? null : parseInt(seedField.text),
+            // 0 = every core but one; 1 = one spectrum at a time.
+            "workers": workersSpin.value
         }
     }
 
@@ -1721,6 +1723,23 @@ Item {
                             text: "A mode backed by fewer spectra than this is not reported. " +
                                   "The seed fixes the search's random start so a run can be " +
                                   "reproduced exactly; leave it blank for a fresh draw."
+                            font.pixelSize: 10
+                            color: textMuted
+                            wrapMode: Text.Wrap
+                        }
+
+                        Label { text: "Worker processes:"; color: textLight }
+                        ToolSpinBox {
+                            id: workersSpin
+                            from: 0; to: 64; value: 0
+                        }
+
+                        Label {
+                            Layout.columnSpan: 2
+                            Layout.fillWidth: true
+                            text: "A sweep over all spectra searches several at once, one " +
+                                  "per process. 0 uses every core but one; 1 searches them " +
+                                  "one after another. The rows are the same either way."
                             font.pixelSize: 10
                             color: textMuted
                             wrapMode: Text.Wrap
