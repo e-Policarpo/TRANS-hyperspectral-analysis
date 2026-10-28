@@ -375,21 +375,24 @@ def _disc_levels(R, Lz, m, n_levels, width, per_channel):
             return levels
     return levels
 
-def dot_energies(model: str, dims, meff=0.067, n_levels=20):
-    """Levels of an infinite-barrier dot, in `physics.analytical`'s format.
+def _dot_states(model: str, dims, meff=0.067, n_levels=20):
+    """The raw enumerated ladder of an infinite-barrier dot, ascending.
 
-    Returns ``[(E_eV, (quantum numbers)), …]`` in ascending order — the same
-    signature as ``box_energies_1d_eV`` and friends, which is what the
-    inverse designer consumes.
+    Returns ``[(E_eV, (quantum numbers)), …]`` for the WHOLE basis it opened,
+    with no truncation — one entry per set of quantum numbers the model
+    distinguishes, which is not the same as one entry per distinct energy.
 
-    Infinite barrier only, and deliberately so: there all three models are
-    analytical (zeros of j_l, zeros of J_m, the oscillator ladder) and cost
-    microseconds, which is what a global optimiser calling this thousands of
-    times demands. A finite barrier is for the direct solver, where it is
-    solved once.
+    This is the enumeration :func:`dot_energies` has always performed; it was
+    lifted out unchanged so that :func:`dot_levels` can label the very same
+    states with their degeneracy instead of enumerating them a second time.
+    Two enumerations would eventually disagree — one of them would gain a
+    basis-growth rule the other lacked — and a degeneracy that describes a
+    slightly different ladder than the one the designer fits is worse than no
+    degeneracy at all: it would be read as a measurement.
 
-    ``dims`` follows the model: ``(R,)`` spherical, ``(R, Lz)`` disc,
-    ``(hw_xy, hw_z)`` parabolic — that last one **in meV**, not in nm.
+    ``n_levels`` sizes the basis; it does NOT trim the result. The caller
+    truncates, because "the lowest 20 entries" and "the lowest 20 distinct
+    energies" are different requests and only the caller knows which it made.
     """
     n_levels = max(1, int(n_levels))
     # How many channels to open to have at least n_levels before truncating.
@@ -427,7 +430,224 @@ def dot_energies(model: str, dims, meff=0.067, n_levels=20):
                          f"expected one of {MODELS}")
 
     out.sort(key=lambda item: item[0])
-    return out[:n_levels]
+    return out
+
+
+def dot_energies(model: str, dims, meff=0.067, n_levels=20):
+    """Levels of an infinite-barrier dot, in `physics.analytical`'s format.
+
+    Returns ``[(E_eV, (quantum numbers)), …]`` in ascending order — the same
+    signature as ``box_energies_1d_eV`` and friends, which is what the
+    inverse designer consumes.
+
+    Infinite barrier only, and deliberately so: there all three models are
+    analytical (zeros of j_l, zeros of J_m, the oscillator ladder) and cost
+    microseconds, which is what a global optimiser calling this thousands of
+    times demands. A finite barrier is for the direct solver, where it is
+    solved once.
+
+    ``dims`` follows the model: ``(R,)`` spherical, ``(R, Lz)`` disc,
+    ``(hw_xy, hw_z)`` parabolic — that last one **in meV**, not in nm.
+
+    It stays a list of bare pairs, and stays the designer's entry point, even
+    though :func:`dot_levels` now returns the same states carrying their
+    degeneracy. Two reasons, both measured rather than assumed. The signature
+    is unpackable as ``for E, _ in …`` at
+    :mod:`src.physics.level_ratio_fit` and across four test modules, so a
+    third element would break every one of them. And building twenty
+    :class:`Level` dataclasses costs tens of microseconds against an
+    objective evaluation of ~0.8 ms — a few per cent of the designer's hot
+    loop, spent on fields that loop never reads.
+    """
+    return _dot_states(model, dims, meff, n_levels)[:max(1, int(n_levels))]
+
+
+def _dot_weight(model: str, qn) -> int:
+    """How many orbital states one enumerated entry stands for.
+
+    Spin excluded, exactly as :attr:`Level.degeneracy` is defined. This is
+    the *symmetry* multiplicity of a single set of quantum numbers — the
+    projections the enumeration folded away — and nothing else; an accidental
+    coincidence between two different entries is not visible from one entry
+    and is counted by grouping (see :func:`dot_levels`).
+
+    Each rule is verified against a brute-force enumeration of the full
+    quantum-number lattice in ``tests/test_physics/test_level_degeneracy.py``,
+    because a wrong degeneracy would be read as a measurement:
+
+    ``spherical``
+        2l+1 — the m_l projections, which the radial reduction removes.
+    ``disc``
+        2 for m != 0, 1 for m = 0 — the +/-m pair. ``_disc_levels`` iterates
+        ``m_q >= 0`` only, so each of its m > 0 entries stands for two
+        states. That fold is correct and complete, not a bug: the brute force
+        over both signs reproduces its energy list exactly.
+    ``parabolic``
+        n_xy+1 — the in-plane oscillator shell. Note this one CAN be joined
+        by accidental partners: at commensurate hw_xy:hw_z the shells
+        interleave, and 20/30 meV puts (n_xy=0, n_z=2) and (n_xy=3, n_z=0) at
+        the same 0.095 eV for a total of 5 rather than the 3 this rule sees
+        for either entry alone.
+    """
+    if model == DOT_SPHERICAL:
+        return 2 * int(qn[1]) + 1
+    if model == DOT_DISC:
+        return 2 if int(qn[1]) != 0 else 1
+    if model == DOT_PARABOLIC:
+        return int(qn[0]) + 1
+    raise ValueError(f"unknown dot model: {model!r}; expected one of {MODELS}")
+
+
+def _dot_label(model: str, qn) -> str:
+    """The label ``spherical_dot`` / ``disc_dot`` / ``parabolic_dot`` uses.
+
+    Deliberately the same strings as the forward solvers produce, so a level
+    named in the Quantum Dot tool and the same level named in a designer
+    candidate table are recognisably the same level.
+    """
+    if model == DOT_SPHERICAL:
+        return orbital_label(int(qn[0]), int(qn[1]))
+    if model == DOT_DISC:
+        n, m_q, nz = (int(q) for q in qn)
+        return f"({n},{m_q:+d},{nz})" if m_q else f"({n},0,{nz})"
+    return f"({int(qn[0])},{int(qn[1])})"
+
+
+def dot_levels(model: str, dims, meff=0.067, n_levels=20,
+               distinct: bool = False) -> List[Level]:
+    """The same ladder as :func:`dot_energies`, carrying its degeneracy.
+
+    Analytic throughout, microseconds per call — it mirrors
+    :func:`_dot_states` rather than calling :func:`disc_dot` or
+    :func:`spherical_dot`, which build radial grids and run ``eigsh`` and
+    would cost seconds per candidate. Those solvers already carry
+    :attr:`Level.degeneracy` correctly; what was missing was a path from the
+    *fast* enumeration to the same field.
+
+    ``distinct`` picks which question is being asked, and the two answers
+    differ for every model with degenerate entries:
+
+    ``False`` (the default, and what the designer's ladder is)
+        One :class:`Level` per enumerated entry, the first ``n_levels`` of
+        them, in the exact order and with the exact energies
+        :func:`dot_energies` returns. ``degeneracy`` is that entry's own
+        symmetry multiplicity — how many physical states that row stands for.
+        Summing the column over the rows gives the number of orbital states:
+        a 4 nm / 5 nm lens's first eight "levels" are thirteen orbital
+        states, twenty-six with spin, which is the thing a peak assignment
+        needs to know and could not previously be told.
+
+    ``True``
+        One :class:`Level` per distinct ENERGY, the first ``n_levels`` of
+        them, with ``degeneracy`` the total over every entry at that energy —
+        symmetry multiplicity plus any accidental coincidence, which no
+        per-entry formula can see. ``quantum_numbers`` and ``label`` name the
+        lowest member of the group.
+
+    The grouping tolerance is *relative* and extremely tight
+    (:data:`src.physics.level_patterns.GROUP_RTOL`, 1e-9), because this is a
+    symmetry fact about the model: true partners here agree to machine
+    precision, since they are exact arithmetic on integers or on shared
+    Bessel zeros. It is NOT the tolerance that answers "can this measurement
+    tell these two levels apart" — that one is 3.5 k_B T, four hundred times
+    wider at 90 K, belongs to the spectrum rather than to the model, and is
+    reported separately. Conflating them would let the model claim a
+    degeneracy the data cannot see.
+
+    Degenerate groups are formed BEFORE the truncation, so ``distinct=True``
+    can never cut a group in half and report half its multiplicity.
+    """
+    n_levels = max(1, int(n_levels))
+
+    if not distinct:
+        raw = dot_energies(model, dims, meff, n_levels)
+        return [Level(E_eV=float(E), quantum_numbers=tuple(int(q) for q in qn),
+                      label=_dot_label(model, qn),
+                      degeneracy=_dot_weight(model, qn),
+                      channel=_dot_channel(model, qn), bound=True)
+                for E, qn in raw]
+
+    # Distinct energies: enumerate well past n_levels, group, then cut. The
+    # basis is sized for `factor * n_levels` entries and only that many are
+    # grouped, so the sole group the cut can split is the last one — which is
+    # therefore dropped. `factor` grows when the model turns out to be more
+    # degenerate than the first guess (a commensurate parabolic dot collapses
+    # 25 entries onto 17 energies), so no caller has to know the ratio.
+    from src.physics.analytical import group_degeneracy
+    for factor in (4, 8, 16, 32):
+        raw = _dot_states(model, dims, meff, factor * n_levels)
+        prefix = raw[:factor * n_levels]
+        groups = group_degeneracy(
+            [(E, qn, _dot_weight(model, qn)) for E, qn in prefix],
+            with_representative=True)
+        if len(groups) - 1 >= n_levels or len(prefix) < factor * n_levels:
+            complete = groups[:-1] if len(groups) > n_levels else groups
+            return [Level(E_eV=float(E),
+                          quantum_numbers=tuple(int(q) for q in qn),
+                          label=_dot_label(model, qn), degeneracy=int(g),
+                          channel=_dot_channel(model, qn), bound=True)
+                    for E, g, qn in complete[:n_levels]]
+    raise RuntimeError(  # pragma: no cover - the 32x basis is far past any use
+        f"{model} did not yield {n_levels} distinct levels at a 32x basis")
+
+
+def _dot_channel(model: str, qn) -> int:
+    """l for the sphere, |m| for the disc, the shell index for the parabola."""
+    if model == DOT_SPHERICAL:
+        return int(qn[1])
+    if model == DOT_DISC:
+        return abs(int(qn[1]))
+    return int(qn[0])
+
+
+def levels_for(ndim: str, coords: str, dims, meff=0.067, n_levels=20,
+               distinct: bool = False) -> List[Level]:
+    """Labelled levels for any geometry the inverse designer can produce.
+
+    One dispatch, mirroring :meth:`src.physics.designer.Designer.compute_energies`
+    case for case — 0D by model name, 1D a box, 2D circular or Cartesian, 3D
+    cylindrical or Cartesian. There are deliberately two functions rather than
+    one because they answer different questions (that one returns bare pairs
+    into an optimiser's inner loop; this one returns records into a table),
+    but they must never disagree about which model a configuration *means*:
+    ``test_levels_for_matches_compute_energies`` asserts the energies are
+    equal branch by branch, so a model added to one and forgotten in the
+    other fails a test rather than mislabelling a candidate.
+
+    ``dims`` is in nm, in the model's own order, except a parabolic dot's
+    ``(hw_xy, hw_z)`` in meV — the same convention
+    :meth:`~src.physics.designer.Designer.params_to_dims` hands over.
+
+    ``distinct`` is passed straight through; see :func:`dot_levels`. It
+    defaults to False, so a caller that just wants the designer's own ladge
+    labelled gets exactly that ladder.
+    """
+    # Imported here rather than at module scope: `src.physics.level_patterns`
+    # imports THIS module for `spherical_dot`, and `analytical` is what
+    # `level_patterns` builds on, so a module-level import would close a
+    # cycle at the first `import src.physics.analytical`. The cost is one
+    # sys.modules lookup per call, against a call rate of at most a dozen per
+    # spectrum.
+    from src.physics import analytical
+
+    if ndim == "0D":
+        return dot_levels(coords, dims, meff, n_levels, distinct=distinct)
+    if ndim == "1D":
+        return analytical.box_levels_1d(dims[0], meff, n_levels,
+                                        distinct=distinct)
+    if ndim == "2D":
+        if coords == "circular":
+            return analytical.disk_levels(dims[0], meff, n_levels,
+                                          distinct=distinct)
+        return analytical.box_levels_2d(dims[0], dims[1], meff, n_levels,
+                                        distinct=distinct)
+    if ndim == "3D":
+        if coords == "cylindrical":
+            return analytical.cylinder_levels(dims[0], dims[1], meff, n_levels,
+                                              distinct=distinct)
+        return analytical.box_levels_3d(dims[0], dims[1], dims[2], meff,
+                                        n_levels, distinct=distinct)
+    raise ValueError(f"unknown ndim: {ndim!r}; expected 0D, 1D, 2D or 3D")
 
 
 def hw_from_length(l_nm, meff=0.067):

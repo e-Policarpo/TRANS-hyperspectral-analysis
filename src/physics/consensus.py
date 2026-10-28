@@ -41,6 +41,34 @@ candidates between them fuse into one group. A weighted density with a
 minimum-support rule cannot chain — an intermediate candidate has to raise an
 actual peak, backed by a minimum number of *spectra*, to become a mode.
 
+**Four: a spectrum's candidate list is a sample of a PLATEAU, not of a
+posterior.** This is the one that decides the answer. The enumeration walks a
+lattice over every free dimension, so a flat basin — one R, any L_z — comes
+back once per lattice node along the axis the fit cannot see. Measured on her
+lens at L_max = 13 nm: of seventeen candidates, thirteen are the same
+R = 8.7761 nm at L_z = 1.0, 1.19, 1.30, … 4.0 nm, all at the same RRMSE of
+4.008 %, while the correct R = 3.9896 nm (the lowest error, 1.31 %) appears
+once. One vote per spectrum spread over candidates therefore hands 13/17 of
+that spectrum's vote to one basin and 1/17 to the right answer, and how big
+that majority is depends on how many nodes the lattice happened to put on the
+plateau — which is a function of ``L_max``, not of the measurement. That is
+why the reported mode moved between bounds.
+
+So before anything is weighted, each spectrum's admissible set is
+**marginalised on the grouping coordinate**: candidates that agree on the
+determined dimension to within the resolution the fit itself supports are ONE
+answer, and cast one vote between them, whatever they say about the
+dimensions the data never saw. The ambiguity is not thrown away — the range
+each collapsed dimension covered is reported with the mode (``Lz_lo_nm`` /
+``Lz_hi_nm``) and every row keeps its place in the candidate table, with
+``weight = 0`` to say it cast no vote of its own. Candidates at genuinely
+different R stay separate: the tolerance is the measurement's resolution in R
+(:func:`marginal_tolerance`), not a round number, and it is capped below the
+narrowest kernel the density can have so that the collapse can never do the
+grouping's job. This is what makes the R-marginal's mode the same number at
+L_max = 13 and 18 nm where the six-candidate podium swings by more than a
+nanometre.
+
 And a note on ranking: ``find_solutions`` seeds ``differential_evolution``
 from an unseeded RNG, so "candidate 1" is not the same geometry from one run
 to the next. Nothing in here privileges the best candidate. The unit is the
@@ -101,6 +129,46 @@ MAX_BANDWIDTH = 0.25
 #: Share of a mode's weight a minority assignment must carry before the mode
 #: is split in two. See :func:`split_modes_by_identity`.
 IDENTITY_SPLIT_FRAC = 0.25
+
+#: Where the candidate table writes each dimension, in slot order. The
+#: marginalisation reports the range every collapsed dimension covered, so a
+#: mode can say "L_z anywhere between 1.0 and 4.0 nm" instead of printing one
+#: node of a plateau to four decimals.
+DIM_COLUMNS = ('d1_nm', 'd2_nm', 'd3_nm')
+
+#: The column naming the dimensions the objective is insensitive to
+#: (``Designer.flat_dims``, in the geometry's own words, '+'-joined).
+FLAT_DIMS_KEY = 'flat_dims'
+
+#: Those words back to the slot they occupy, so a row that says "L_z" can be
+#: reported as "d2 was free". The designer's whole vocabulary, and it is
+#: unambiguous across geometries — but note that the underscore carries the
+#: meaning: ``L_z`` is the disc's second dimension and ``Lz`` the box's third.
+#: Used for REPORTING only. Nothing in the collapse depends on it, on purpose:
+#: a flag that under-reports a plateau (it did, one candidate in five) would
+#: otherwise quietly restore the thirteen-vote basin this module exists to
+#: remove.
+DIM_SLOTS = {
+    'd1': 'd1', 'd2': 'd2', 'd3': 'd3',
+    'R': 'd1', 'L': 'd1', 'Lx': 'd1', 'l_xy': 'd1',
+    'Ly': 'd2', 'L_z': 'd2', 'l_z': 'd2',
+    'Lz': 'd3',
+}
+
+#: How a fractional change in a length shows up in the energies that were
+#: matched: a box or a disc level goes as 1/L², so ``dE/E = 2 dL/L``. It is
+#: the exponent of the model, not a fudge factor, and the conservative choice
+#: where a model is linear in its parameter (the parabolic dot, whose "size"
+#: is a confinement energy) — there the true resolution is twice as coarse,
+#: so collapsing at the 1/L² figure collapses less than it could.
+MARGINAL_EXPONENT = 2.0
+
+#: The floor under that tolerance, for the degenerate case of a fit with no
+#: residual at all: two candidates still collapse when they agree to within a
+#: few ulp, which is what an optimiser polishing the same basin from two
+#: different starts actually returns (measured: 3.6e-6 relative across the
+#: thirteen nodes of the 8.7761 nm plateau).
+MIN_MARGINAL_TOL = 1e-9
 
 
 # ── coordinates ───────────────────────────────────────────────────────────
@@ -251,6 +319,201 @@ def admissible_sets(rows: Sequence[dict],
         sets.append(AdmissibleSet(spectrum_index=si, row_indices=list(indices),
                                   admissible=admissible, e_min=e_min, band=band))
     return sets
+
+
+# ── the marginal over the dimension the data determined ───────────────────
+
+def marginal_tolerance(e_min_pct: float,
+                       exponent: float = MARGINAL_EXPONENT,
+                       floor: float = MIN_MARGINAL_TOL,
+                       ceiling: float = MIN_BANDWIDTH) -> float:
+    """How close two candidates must be, in log R, to be the same answer.
+
+    Deliberately not a round number and not a knob with a default: it is the
+    **measurement's own resolution in R**, read off the fit it produced. The
+    level spacings go as R⁻², so a fractional change δ in R moves every
+    predicted spacing by ``exponent * δ``; a spectrum whose best candidate
+    still misses the spacings by ``e_min`` per cent therefore cannot tell two
+    radii apart that differ by less than ``e_min / exponent``. Two candidates
+    inside that are not two answers about R, they are one answer written
+    twice.
+
+    Because the coordinate is a logarithm, the fractional tolerance is the
+    tolerance: ``|ln(R₁/R₂)| <= e_min/100/exponent``.
+
+    The ceiling is :data:`MIN_BANDWIDTH`, the narrowest kernel the density is
+    ever given. The collapse must stay strictly finer than the grouping that
+    follows it, or it would be deciding which wells exist — which is
+    :func:`find_modes`'s job and is done there with a support rule that this
+    has none of. On her lens the tolerance comes out at 0.66 % of R against a
+    2 % floor on the kernel, so it is three times finer than the finest
+    structure the report can show.
+    """
+    e = _finite(e_min_pct)
+    if not np.isfinite(e) or e <= 0.0:
+        return float(floor)
+    scale = abs(float(e)) / 100.0 / max(1e-12, float(exponent))
+    return float(min(max(scale, float(floor)), float(ceiling)))
+
+
+def free_dims(row: dict, flat_key: str = FLAT_DIMS_KEY) -> Tuple[str, ...]:
+    """Which dimension slots this row says the objective never saw.
+
+    Reads ``Designer.flat_dims`` as the candidate table writes it — the
+    geometry's own names, '+'-joined ("L_z", "Lx+Ly") — or as a plain list of
+    either names or slots. Reporting only: it says what a collapsed range
+    MEANS, and is never asked whether two candidates may be collapsed. An
+    unknown name is logged and skipped rather than guessed at.
+    """
+    raw = row.get(flat_key)
+    if raw is None or raw == '':
+        return ()
+    if isinstance(raw, str):
+        names = [t for t in raw.replace(',', '+').split('+') if t.strip()]
+    else:
+        try:
+            names = [str(t) for t in raw]
+        except TypeError:
+            return ()
+    out: List[str] = []
+    for name in names:
+        slot = DIM_SLOTS.get(str(name).strip())
+        if slot is None:
+            logger.debug("free_dims: %r is not a dimension name I know; the "
+                         "row keeps its ambiguity range and loses only the "
+                         "label", name)
+            continue
+        if slot not in out:
+            out.append(slot)
+    return tuple(out)
+
+
+@dataclass
+class Marginal:
+    """One answer about the determined dimension, and every row saying it.
+
+    ``representative`` is the row that carries the vote — the lowest-error
+    member, so the geometry reported for the group is the best fit in it, not
+    an average of a plateau. ``members`` are all of them, representative
+    first. ``spans`` is what each dimension ranged over inside the group: the
+    ambiguity the collapse absorbed, which is reported and never discarded.
+    """
+    spectrum_index: int
+    representative: int
+    value: float
+    signature: Tuple
+    members: List[int] = field(default_factory=list)
+    tol: float = 0.0
+    spans: Dict[str, Tuple[float, float]] = field(default_factory=dict)
+    free: Tuple[str, ...] = ()
+
+    @property
+    def n_collapsed(self) -> int:
+        """How many rows this one vote stands in for, beyond the first."""
+        return max(0, len(self.members) - 1)
+
+
+def marginals(rows: Sequence[dict], sets: Sequence[AdmissibleSet],
+              coord_fn: Union[str, Callable[[dict], float]],
+              identity_fn: Optional[Callable[[dict], Tuple]] = None,
+              error_key: str = ERROR_KEY,
+              rel_tol: Optional[float] = None,
+              exponent: float = MARGINAL_EXPONENT,
+              ceiling: float = MIN_BANDWIDTH,
+              enabled: bool = True) -> Dict[int, List[Marginal]]:
+    """Per spectrum: its admissible set as answers about R, not as rows.
+
+    The fix for the plateau. Candidates of one spectrum that agree on the
+    grouping coordinate to within :func:`marginal_tolerance` — and that read
+    the ladder the same way, since two different assignments at the same
+    radius are two hypotheses and not one — are gathered into a single
+    :class:`Marginal`. The rest of the module then works on one row per
+    group, so a basin sampled thirteen times along an axis the fit cannot see
+    contributes one vote for its R instead of thirteen.
+
+    Grouping on the coordinate alone is the whole of the rule, and that is not
+    a shortcut: the vote is a statement about the coordinate, so two
+    candidates that place it in the same spot are the same statement however
+    far apart they are in a dimension the report does not group in. What they
+    disagreed about comes back as ``spans``.
+
+    Seeded from the best candidate down and each group compared against its
+    own leader rather than its neighbour, so the collapse cannot chain along
+    the axis the way gap clustering does: every member is within one tolerance
+    of the row that carries the vote.
+
+    ``ceiling`` is the width of the kernel the modes will be found with, so
+    that the collapse stays finer than the grouping in the case the caller
+    asked for a narrower one than :data:`MIN_BANDWIDTH` (the panel's "wells
+    within x nm are the same well" knob can).
+
+    ``enabled=False`` gives every admissible row its own group — the old
+    behaviour exactly, one vote per row — and is kept so the difference the
+    marginalisation makes can be measured rather than argued about.
+    """
+    coord = coord_function(coord_fn)
+    identity_of = identity_fn or identity_signature
+    out: Dict[int, List[Marginal]] = {}
+    for s in sets:
+        tol = (float(rel_tol) if rel_tol is not None
+               else marginal_tolerance(s.e_min, exponent=exponent,
+                                       ceiling=ceiling))
+        if not enabled:
+            tol = 0.0
+        groups: List[Marginal] = []
+        order = sorted(s.admissible,
+                       key=lambda i: (_finite(rows[i].get(error_key), float('inf')), i))
+        for i in order:
+            value = coord(rows[i])
+            signature = identity_of(rows[i])
+            joined = False
+            if enabled:
+                for g in groups:
+                    if g.signature == signature and abs(g.value - value) <= tol:
+                        g.members.append(i)
+                        joined = True
+                        break
+            if not joined:
+                groups.append(Marginal(spectrum_index=s.spectrum_index,
+                                       representative=i, value=value,
+                                       signature=signature, members=[i],
+                                       tol=tol))
+        for g in groups:
+            g.members.sort()
+            g.members.remove(g.representative)
+            g.members.insert(0, g.representative)
+            g.free = free_dims(rows[g.representative])
+            for slot, column in zip(('d1', 'd2', 'd3'), DIM_COLUMNS):
+                values = [_finite(rows[i].get(column)) for i in g.members]
+                values = [v for v in values if np.isfinite(v)]
+                if values:
+                    g.spans[slot] = (float(min(values)), float(max(values)))
+        out[s.spectrum_index] = groups
+        if enabled and any(g.n_collapsed for g in groups):
+            logger.debug("spectrum %d: %d admissible candidate(s) are %d "
+                         "answer(s) about the grouping coordinate (tolerance "
+                         "%.3f%% of it)", s.spectrum_index, s.n_admissible,
+                         len(groups), 100.0 * tol)
+    return out
+
+
+def voting_sets(sets: Sequence[AdmissibleSet],
+                groups: Dict[int, List[Marginal]]) -> List[AdmissibleSet]:
+    """The same sets with one admissible row per :class:`Marginal`.
+
+    A thin view, so everything downstream — the weights, the density, the
+    null draw — keeps working on ``AdmissibleSet`` and none of it has to know
+    that a collapse happened. ``row_indices`` is left whole: how many
+    candidates the spectrum actually emitted is still reported.
+    """
+    out: List[AdmissibleSet] = []
+    for s in sets:
+        picked = [g.representative for g in groups.get(s.spectrum_index, [])]
+        out.append(AdmissibleSet(spectrum_index=s.spectrum_index,
+                                 row_indices=list(s.row_indices),
+                                 admissible=picked, e_min=s.e_min,
+                                 band=s.band))
+    return out
 
 
 # ── weights ───────────────────────────────────────────────────────────────
@@ -718,14 +981,24 @@ def consensus(rows: Sequence[dict],
               second_dim_key: str = 'd2_nm',
               skip_penalty: float = 1.0,
               grid_size: int = 512,
-              max_mode_distance: float = MAX_MODE_DISTANCE) -> ConsensusResult:
+              max_mode_distance: float = MAX_MODE_DISTANCE,
+              marginalise: bool = True,
+              marginal_rel_tol: Optional[float] = None,
+              marginal_exponent: float = MARGINAL_EXPONENT) -> ConsensusResult:
     """How many wells does this line contain, and which spectra sit on each?
 
-    The whole pipeline: admissible sets per spectrum, one vote per spectrum
-    spread over its set, a weighted density in the injected coordinate, modes
-    with a minimum-support floor, a split where the quantum-number
-    assignments disagree, and a soft membership that lets an undecidable
-    spectrum stay undecided.
+    The whole pipeline: admissible sets per spectrum, the set marginalised on
+    the grouping coordinate so a plateau sampled many times is one answer, one
+    vote per spectrum spread over those answers, a weighted density in the
+    injected coordinate, modes with a minimum-support floor, a split where the
+    quantum-number assignments disagree, and a soft membership that lets an
+    undecidable spectrum stay undecided.
+
+    ``marginalise=False`` skips the collapse and votes per row, which is what
+    this did before the plateau was measured. It is kept for comparison, not
+    as an alternative: with it off, how much of a spectrum's vote a basin
+    receives depends on how many lattice nodes the enumeration put on it, and
+    so on the size bound rather than on the data.
 
     The three tables it returns answer three different questions — "what
     wells are there" (``modes``), "where is this spectrum" (``per_spectrum``),
@@ -750,16 +1023,31 @@ def consensus(rows: Sequence[dict],
                            coord_fn=coord)
     n_spectra = len(sets)
 
+    # The population that votes is one row per ANSWER, not one per candidate.
+    # See :func:`marginals`: thirteen nodes of one plateau are one answer.
+    groups = marginals(rows, sets, coord, identity_fn=identity_of,
+                       error_key=error_key, rel_tol=marginal_rel_tol,
+                       exponent=marginal_exponent,
+                       ceiling=(min(MIN_BANDWIDTH, float(bandwidth))
+                                if bandwidth else MIN_BANDWIDTH),
+                       enabled=marginalise)
+    voting = voting_sets(sets, groups)
+    group_of: Dict[int, Marginal] = {}
+    for per_spectrum_groups in groups.values():
+        for g in per_spectrum_groups:
+            for i in g.members:
+                group_of[i] = g
+
     row_index: List[int] = []
     values: List[float] = []
     weights_list: List[float] = []
     ids: List[int] = []
     signatures: List[Tuple] = []
-    weight_map = normalised_weights(rows, sets, n_levels_key=N_LEVELS_KEY,
+    weight_map = normalised_weights(rows, voting, n_levels_key=N_LEVELS_KEY,
                                     skipped_key=SKIPPED_KEY,
                                     skip_penalty=skip_penalty)
     band_of: Dict[int, float] = {}
-    for s in sets:
+    for s in voting:
         for i in s.admissible:
             band_of[i] = s.band
             row_index.append(i)
@@ -772,10 +1060,20 @@ def consensus(rows: Sequence[dict],
     w = np.asarray(weights_list, float)
     id_arr = np.asarray(ids, int)
 
+    n_admissible = int(sum(s.n_admissible for s in sets))
     meta = {
         'n_spectra': n_spectra,
         'n_rows': len(rows),
-        'n_admissible': int(v.size),
+        # Rows inside the band, as before. `n_marginals` is how many distinct
+        # answers about the coordinate those rows amount to, and the gap
+        # between the two is the plateau: 115 candidates and 55 answers on
+        # the nine-spectrum line this was measured on.
+        'n_admissible': n_admissible,
+        'n_marginals': int(v.size),
+        'n_collapsed': int(n_admissible - v.size),
+        'marginalise': bool(marginalise),
+        'marginal_tol': float(np.median([g.tol for gs in groups.values()
+                                         for g in gs])) if v.size else float('nan'),
         'delta_abs': float(delta_abs),
         'delta_rel': float(delta_rel),
         'min_support_frac': float(min_support_frac),
@@ -829,13 +1127,31 @@ def consensus(rows: Sequence[dict],
     for j, m in enumerate(modes):
         members = [k for k in range(v.size) if nearest[k] == j]
         r_values = np.array([math.exp(v[k]) for k in members], float)
-        lz = np.array([_finite(rows[row_index[k]].get(second_dim_key)) for k in members], float)
+        # The vertical range spans every row the mode stands for, collapsed
+        # ones included. Reporting only the rows that voted would hand back
+        # exactly the number the marginalisation exists to stop being
+        # printed: one node of a plateau, dressed as a measurement.
+        represented = [i for k in members
+                       for i in (group_of[row_index[k]].members
+                                 if row_index[k] in group_of else [row_index[k]])]
+        lz = np.array([_finite(rows[i].get(second_dim_key)) for i in represented], float)
         lz = lz[np.isfinite(lz)]
         errs = np.array([_finite(rows[row_index[k]].get(error_key)) for k in members], float)
         wts = np.array([w[k] for k in members], float)
         qn_lo = [_finite(rows[row_index[k]].get(QN_MIN_KEY)) for k in members]
         qn_hi = [_finite(rows[row_index[k]].get(QN_MAX_KEY)) for k in members]
         skipped = np.array([_finite(rows[row_index[k]].get(SKIPPED_KEY)) for k in members], float)
+        # Which slots the answers in this mode declared the objective never
+        # saw. Reporting only — the collapse never asked (see `free_dims`) —
+        # but a range printed with no label is a range a reader can mistake
+        # for a spread of measurements, which is the thing this module is
+        # here to stop. Union rather than intersection: if any answer in the
+        # mode says the axis was free, the mode's range along it is not a
+        # measurement.
+        free_slots = [slot for slot in ('d1', 'd2', 'd3')
+                      if any(slot in (group_of[row_index[k]].free
+                                      if row_index[k] in group_of else ())
+                             for k in members)]
         col = membership[:, j] if membership.size else np.zeros(0)
         support = int((col > 1e-12).sum())
         mode_rows.append({
@@ -855,6 +1171,11 @@ def consensus(rows: Sequence[dict],
             # as a measurement.
             'Lz_lo_nm': float(lz.min()) if lz.size else float('nan'),
             'Lz_hi_nm': float(lz.max()) if lz.size else float('nan'),
+            # …and which slots that range belongs to, as the rows reported
+            # them: 'd2' beside Lz_lo/Lz_hi says "the fit never saw this
+            # axis", empty says the rows made no such claim. Never a reason
+            # to trust the number — the collapse happens either way.
+            'free_dims': '+'.join(free_slots),
             'support_spectra': support,
             'support_frac': float(support / n_spectra) if n_spectra else 0.0,
             'mean_rrmse_de_pct': float(np.average(errs, weights=wts))
@@ -865,7 +1186,11 @@ def consensus(rows: Sequence[dict],
                                                     weights=wts[np.isfinite(skipped)]))
                                     if np.any(np.isfinite(skipped)) and wts[np.isfinite(skipped)].sum() > 0
                                     else float('nan'),
+            # How many answers the mode is made of, and how many rows those
+            # answers stand for. Equal when nothing was collapsed.
             'n_candidates': len(members),
+            'n_rows': len(represented),
+            'n_collapsed': len(represented) - len(members),
             'weight': float(wts.sum()),
             'signature': m.get('signature'),
         })
@@ -890,6 +1215,9 @@ def consensus(rows: Sequence[dict],
             'spectrum_index': s.spectrum_index,
             'n_candidates': s.n_candidates,
             'n_admissible': s.n_admissible,
+            # How many of those are distinct answers about R. Below
+            # n_admissible wherever the search sat on a plateau.
+            'n_marginals': len(groups.get(s.spectrum_index, [])),
             'best_de_pct': float(s.e_min),
             'band_de_pct': float(s.band),
             'R_lo_nm': float(r_own.min()) if r_own.size else float('nan'),
@@ -903,33 +1231,50 @@ def consensus(rows: Sequence[dict],
         })
 
     # ── the candidate table ──────────────────────────────────────────────
+    # Every row still appears, including the ones a marginal absorbed. Those
+    # carry `weight = 0` and `represented_by` — they are admissible, they sit
+    # on the mode their answer sits on, and they cast no vote of their own,
+    # which is three different facts and reads as three columns rather than
+    # as a row quietly missing from the table.
     admissible_at = {i: k for k, i in enumerate(row_index)}
     per_candidate: List[dict] = []
     for s in sets:
         for i in s.row_indices:
-            k = admissible_at.get(i)
+            g = group_of.get(i)
+            k = admissible_at.get(i if g is None else g.representative)
             if k is None:
                 per_candidate.append({
                     'row_index': i, 'admissible': False, 'band_de_pct': float(s.band),
                     'weight': 0.0, 'mode': -1, 'mode_R_nm': float('nan'),
-                    'dist_nm': float('nan'),
+                    'dist_nm': float('nan'), 'represented_by': i,
+                    'n_collapsed': 0,
                 })
                 continue
+            own = coord(rows[i])
             j = int(nearest[k])
             mode_nm = mode_rows[j]['R_nm'] if 0 <= j < len(mode_rows) else float('nan')
+            is_rep = g is None or g.representative == i
             per_candidate.append({
                 'row_index': i,
                 'admissible': True,
                 'band_de_pct': float(s.band),
-                'weight': float(w[k]),
+                'weight': float(w[k]) if is_rep else 0.0,
                 'mode': j,
                 'mode_R_nm': mode_nm,
-                'dist_nm': float(abs(math.exp(v[k]) - mode_nm)) if np.isfinite(mode_nm) else float('nan'),
+                'dist_nm': float(abs(math.exp(own) - mode_nm))
+                           if np.isfinite(mode_nm) and np.isfinite(own) else float('nan'),
+                # Which row cast this row's vote — itself, unless it was
+                # collapsed into an answer some other row carries.
+                'represented_by': i if g is None else g.representative,
+                'n_collapsed': (g.n_collapsed if (g is not None and is_rep) else 0),
             })
 
-    logger.info("consensus: %d spectra, %d admissible candidate(s), h=%.3f -> "
-                "%d mode(s) at %s (spread %.2f%%); %d candidate(s) beyond %.1f "
-                "bandwidths of any mode", n_spectra, int(v.size), h,
+    logger.info("consensus: %d spectra, %d admissible candidate(s) -> %d "
+                "answer(s) about the coordinate (%d collapsed at %.2f%%), "
+                "h=%.3f -> %d mode(s) at %s (spread %.2f%%); %d candidate(s) "
+                "beyond %.1f bandwidths of any mode",
+                n_spectra, n_admissible, int(v.size),
+                meta['n_collapsed'], 100.0 * meta['marginal_tol'], h,
                 len(mode_rows), ", ".join(f"{m['R_nm']:.2f} nm x{m['support_spectra']}"
                                           for m in mode_rows) or "none",
                 meta['spread_pct'], meta['n_unassigned'], float(max_mode_distance))
@@ -982,6 +1327,7 @@ def null_contrast(rows: Sequence[dict],
                   error_key: str = ERROR_KEY,
                   spectrum_key: str = SPECTRUM_KEY,
                   result: Optional[ConsensusResult] = None,
+                  marginalise: bool = True,
                   **consensus_kwargs) -> dict:
     """Is the consensus tighter than picking one candidate per spectrum at random?
 
@@ -1021,12 +1367,34 @@ def null_contrast(rows: Sequence[dict],
     sets = admissible_sets(rows, delta_abs=delta_abs, delta_rel=delta_rel,
                            error_key=error_key, spectrum_key=spectrum_key,
                            coord_fn=coord)
+    # The draw is over the same population the observation was taken from:
+    # one ANSWER per spectrum, not one row. Drawing from the rows instead
+    # would make the null inherit the plateau — a random pick would land on
+    # the over-sampled basin thirteen times out of seventeen and the
+    # comparison would be against a differently shaped thing.
+    #
+    # "The same population" has to mean the same tolerance too, so every knob
+    # :func:`consensus` collapses with is mirrored here — including the
+    # bandwidth-derived ceiling, which the panel's "wells within x nm are the
+    # same well" knob moves. Collapsing the observation at one tolerance and
+    # the null at another would put a difference in set size into the
+    # comparison that came from this function rather than from the data.
+    sets = voting_sets(sets, marginals(
+        rows, sets, coord,
+        identity_fn=consensus_kwargs.get('identity_fn'),
+        error_key=error_key,
+        rel_tol=consensus_kwargs.get('marginal_rel_tol'),
+        exponent=float(consensus_kwargs.get('marginal_exponent',
+                                            MARGINAL_EXPONENT)),
+        ceiling=(min(MIN_BANDWIDTH, float(bandwidth)) if bandwidth
+                 else MIN_BANDWIDTH),
+        enabled=marginalise))
     usable = [s for s in sets if s.admissible]
     if result is None:
         result = consensus(rows, coord, delta_abs=delta_abs, delta_rel=delta_rel,
                            bandwidth=bandwidth, min_support_frac=min_support_frac,
                            error_key=error_key, spectrum_key=spectrum_key,
-                           **consensus_kwargs)
+                           marginalise=marginalise, **consensus_kwargs)
     observed = float(result.meta.get('spread', float('nan')))
     out = {
         'n_draws': int(n_draws),

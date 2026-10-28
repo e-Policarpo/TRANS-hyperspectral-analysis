@@ -20,12 +20,14 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 pytest.importorskip("PySide6.QtQuick")
-from PySide6.QtCore import Q_ARG, QObject, QUrl, Signal, Slot
+from PySide6.QtCore import (Q_ARG, Q_RETURN_ARG, QMetaObject, QObject,
+                            Qt, QUrl, Signal, Slot)
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlComponent, QQmlEngine, qmlRegisterType
 
 from src.widgets.qml_designer_canvas import DesignerCanvas
 from src.widgets.qml_figure_canvas import FigureCanvasItem
+from src.physics.designer import Designer
 
 QML_ROOT = Path(__file__).resolve().parents[2] / "src" / "qml"
 TOOL_QML = QML_ROOT / "tools" / "ConfinementDesignerTool.qml"
@@ -373,3 +375,238 @@ class TestTheLineScanPanel:
 
         assert item.property("tableName") == ""
 
+
+
+class TestTheDimensionControls:
+    """The pinning and per-dimension range controls — the panel's half of the
+    highest-value fix in this tool: the engine has always honoured a pinned
+    dimension, and nothing ever sent it one.
+
+    The controls write into `dimLimits` and `searchParams` reads it there, so
+    these drive that property rather than clicking delegates: a Repeater
+    rebuilds its delegates whenever the geometry changes, and state that only
+    exists inside one of them cannot survive that.
+    """
+
+    @staticmethod
+    def _params(item, backend):
+        _pick(item, "Line scan")
+        item.metaObject().invokeMethod(item, "runSearch")
+        _key, _names, params = backend.batches[-1]
+        return params
+
+    @staticmethod
+    def _limit(pinned=False, pin=0.0, lo=0.0, hi=0.0):
+        return {"pinned": pinned, "pin": pin, "lo": lo, "hi": hi}
+
+    def test_the_dimensions_are_named_not_numbered(self, panel):
+        item, _backend = panel
+        # The panel opens on 1D cartesian, whose one dimension is a length.
+        # A `var` property comes back as a QJSValue; toVariant() is the
+        # plain Python view of it.
+        dims = item.property("dimList").toVariant()
+        assert list(dims["keys"]) == ["d1"]
+        assert list(dims["labels"]) == ["L"]
+
+    def test_the_controls_publish_themselves_on_load(self, panel):
+        """Every dimension the geometry has is in the map from the start, as
+        'not pinned, shared range' — so the map is the record of the panel
+        rather than of whatever the user happened to touch."""
+        item, _backend = panel
+        limits = item.property("dimLimits").toVariant()
+        assert set(limits) == {"d1"}
+        assert limits["d1"]["pinned"] is False
+
+    def test_nothing_is_pinned_until_the_user_pins_it(self, panel):
+        item, backend = panel
+        params = self._params(item, backend)
+
+        assert dict(params['fixed']) == {}
+        assert dict(params['box']) == {}
+
+    def test_pinning_a_dimension_sends_it(self, panel):
+        item, backend = panel
+        item.setProperty("dimLimits", {"d1": self._limit(pinned=True, pin=5.0)})
+        params = self._params(item, backend)
+
+        assert dict(params['fixed']) == {"d1": 5.0}
+        # A pinned dimension has no range: it is not being searched.
+        assert dict(params['box']) == {}
+
+    def test_a_range_of_its_own_is_sent_as_a_pair(self, panel):
+        item, backend = panel
+        item.setProperty("dimLimits", {"d1": self._limit(lo=2.0, hi=6.0)})
+        params = self._params(item, backend)
+
+        assert list(params['box']["d1"]) == [2.0, 6.0]
+
+    def test_one_end_left_blank_falls_back_to_the_shared_range(self, panel):
+        item, backend = panel
+        item.setProperty("dimLimits", {"d1": self._limit(hi=6.0)})
+        params = self._params(item, backend)
+
+        # None, not 0: the backend reads a None end as "use Lmin/Lmax", and a
+        # 0 there would be a 0 nm bound.
+        assert list(params['box']["d1"]) == [None, 6.0]
+
+    def test_a_pin_on_a_dimension_the_geometry_lost_is_not_sent(self, panel):
+        """1D has one dimension. A d2 left over from a disc is a pin on a
+        slot this search does not read, and sending it would pin nothing
+        while making the table name claim otherwise."""
+        item, backend = panel
+        item.setProperty("dimLimits", {"d2": self._limit(pinned=True, pin=5.0)})
+        params = self._params(item, backend)
+
+        assert dict(params['fixed']) == {}
+
+    def test_the_assignment_and_the_search_mode_start_where_they_were(self, panel):
+        item, backend = panel
+        params = self._params(item, backend)
+
+        assert params['assign'] == "energy"
+        assert params['search_mode'] == "sample"
+        # None, not 0 — the engine derives the window from the data, which is
+        # what it did before this field existed.
+        assert params['resolution_meV'] is None
+
+
+class TestTheBudgetThePanelPrints:
+    """The lattice size and the refinement count, before the run commits.
+
+    The panel prints both because they are what its nesting claim rests on:
+    the lattice nests by construction, and the candidate LIST inherits that
+    only because the refinement budget is a density over the box rather than
+    an absolute top-N. Printing them means computing them in QML, which
+    cannot import Python — so the panel carries a MIRROR of
+    ``Designer.lattice`` and ``Designer.polish_budget``, and a mirror nothing
+    compares against drifts.
+
+    It did drift: the engine replaced an absolute floor of 8 refinements with
+    an EXHAUSTIVE floor (a lattice of ``POLISH_ALL_BELOW`` nodes or fewer is
+    refined in full) and the panel kept the old rule, so on a 2–8 nm × 4–6 nm
+    box at 4 nodes per octave it printed "refining 8 of 27" where the engine
+    refines all 27. These tests are the comparison that was missing.
+    """
+
+    #: The panel opens on 1D cartesian with one free dimension, `d1`, and its
+    #: shared range starts at 1–20 nm with 8 lattice nodes per octave.
+    PER_OCTAVE = {'enum_per_octave': 8}
+    POLISH = {'enum_polish': 40}
+
+    @staticmethod
+    def _call(item, name, *args):
+        return QMetaObject.invokeMethod(
+            item, name, Qt.DirectConnection, Q_RETURN_ARG("QVariant"),
+            *[Q_ARG("QVariant", a) for a in args])
+
+    @staticmethod
+    def _limit(lo=0.0, hi=0.0):
+        return {"pinned": False, "pin": 0.0, "lo": lo, "hi": hi}
+
+    @pytest.mark.parametrize("lo, hi", [(0.0, 0.0), (2.0, 8.0),
+                                        (1.0, 13.0), (1.0, 25.0),
+                                        (3.0, 4.0)])
+    def test_the_lattice_size_it_prints_is_the_one_the_engine_builds(
+            self, panel, lo, hi):
+        item, _backend = panel
+        item.setProperty("dimLimits", {"d1": self._limit(lo=lo, hi=hi)})
+
+        # A blank end falls back to the shared range, exactly as the search
+        # parameters do.
+        engine = len(Designer.lattice(lo or 1.0, hi or 20.0, self.PER_OCTAVE))
+        assert item.property("latticeNodeCount") == engine
+
+    @pytest.mark.parametrize("total", [1, 4, 8, 27, 32, 33, 900, 1156, 1444])
+    def test_the_refinement_count_it_prints_is_the_budget_the_engine_uses(
+            self, panel, total):
+        """Checked against an explicit lattice size, so the exhaustive floor
+        is exercised on both sides of its threshold rather than only at
+        whatever size this panel's default range happens to give."""
+        item, _backend = panel
+        item.setProperty("dimLimits", {"d1": self._limit(lo=2.0, hi=8.0)})
+        p = dict(self.POLISH)
+
+        assert self._call(item, "polishBudget", total) == \
+            Designer.polish_budget([(2.0, 8.0)], p, total)
+
+    def test_a_lattice_under_the_floor_is_refined_in_full(self, panel):
+        """The drift itself: 27 nodes over a narrow box are all refined, and
+        the panel used to print the density's 20 (and, with two free
+        dimensions, 8)."""
+        item, _backend = panel
+        item.setProperty("dimLimits", {"d1": self._limit(lo=2.0, hi=8.0)})
+
+        assert self._call(item, "polishBudget", 27) == 27
+        assert Designer.polish_budget([(2.0, 8.0)], dict(self.POLISH), 27) == 27
+        # One node over the threshold the selection is a density again, and
+        # the panel says which rule is in force rather than printing a number
+        # whose rule the reader has to guess.
+        assert self._call(item, "polishBudget", 33) == \
+            Designer.polish_budget([(2.0, 8.0)], dict(self.POLISH), 33)
+
+    def test_the_constants_it_mirrors_are_the_engine_s(self, panel):
+        item, _backend = panel
+
+        assert item.property("polishAllBelow") == Designer.POLISH_ALL_BELOW
+        assert item.property("polishMaxFactor") == Designer.POLISH_MAX_FACTOR
+        assert item.property("polishReferenceOctaves") == \
+            pytest.approx(Designer.POLISH_REFERENCE_OCTAVES)
+
+    def test_the_budget_it_prints_is_the_one_for_the_lattice_it_prints(
+            self, panel):
+        """The two numbers are shown in one sentence, so they have to be
+        about the same lattice: the budget is evaluated AT the node count."""
+        item, _backend = panel
+        item.setProperty("dimLimits", {"d1": self._limit(lo=1.0, hi=18.0)})
+        nodes = item.property("latticeNodeCount")
+
+        assert item.property("polishBudgetCount") == \
+            Designer.polish_budget([(1.0, 18.0)], dict(self.POLISH), nodes)
+
+
+class TestTheCostItQuotes:
+    """The estimate shown before a run, and before the long-run dialog.
+
+    The panel used to describe a search as "seconds each" — a 300-spectrum
+    sweep over two masses is over two hours — and then, once it quoted the
+    measured per-spectrum rates, to quote the ENUMERATED one as a single
+    number. It is not one number: the cost follows the lattice, which the
+    nodes-per-octave control moves by a factor of 20 on its own, so a flat
+    10.6 s understates that control's top by 2.4x. The rule has to stay above
+    every measurement, because an estimate that is too low is the one that
+    gets a sweep started.
+    """
+
+    #: (lattice nodes, seconds) measured on an M1 Pro over the 1-18 nm box in
+    #: two free dimensions at 8, 16, 24 and 32 nodes per octave.
+    MEASURED = [(1156, 9.91), (4489, 16.76), (10201, 20.24), (17956, 24.28)]
+
+    @staticmethod
+    def _call(item, name, *args):
+        return QMetaObject.invokeMethod(
+            item, name, Qt.DirectConnection, Q_RETURN_ARG("QVariant"),
+            *[Q_ARG("QVariant", a) for a in args])
+
+    @pytest.mark.parametrize("nodes, seconds", MEASURED)
+    def test_it_never_quotes_less_than_the_run_took(self, panel, nodes,
+                                                    seconds):
+        item, _backend = panel
+
+        assert self._call(item, "enumSecondsFor", nodes) >= seconds
+
+    def test_it_grows_with_the_lattice(self, panel):
+        """The defect this replaced: the same 10.6 s whatever the lattice."""
+        item, _backend = panel
+        cheap = self._call(item, "enumSecondsFor", 1156)
+        dense = self._call(item, "enumSecondsFor", 200000)
+
+        assert dense > 10 * cheap
+        # ~2.9 min at the 200,000-node cap, against the ~2.5 min it really
+        # takes there — high on purpose, and the same order.
+        assert 150.0 < dense < 300.0
+
+    def test_the_sampled_rate_is_the_measured_one(self, panel):
+        """25.9 s per spectrum per mass, the upper end of five seeds."""
+        item, _backend = panel
+
+        assert item.property("secondsPerSearch") == pytest.approx(25.9)

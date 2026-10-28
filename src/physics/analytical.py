@@ -185,3 +185,252 @@ def cylinder_energies(R_nm, H_nm, meff, n_levels):
         if not grow:
             break
     return energies[:n_levels]
+
+
+# ─── degeneracy ──────────────────────────────────────────────────────────────
+#
+# Everything above returns bare (energy, quantum numbers) pairs and always
+# will: the inverse designer unpacks them as `for E, _ in …` in its hot loop,
+# and those functions are frozen byte for byte against
+# ``tests/fixtures/levels_golden.json``. What follows is purely additive — the
+# same ladders, re-presented as `quantum_dot.Level` records that carry the one
+# thing the pairs threw away, namely how many physical states each row stands
+# for.
+#
+# TWO TOLERANCES, AND THEY MUST NEVER BE CONFLATED.
+#
+#   *Exact* degeneracy is a symmetry fact about the model. Partners here are
+#   equal to machine precision because they are exact arithmetic on the same
+#   integers or the same Bessel zeros — nx^2+ny^2+nz^2 = 27 is reached by
+#   (1,1,5) and by (3,3,3) with no rounding in between. So the tolerance is
+#   relative and extremely tight: GROUP_RTOL = 1e-9, borrowed from
+#   `level_patterns` rather than redefined, so there is one number and not two.
+#
+#   *Resolvable* degeneracy is a measurement fact about a spectrum: 3.5 k_B T
+#   (27 meV at 90 K, 91 meV at 300 K), or half the smallest gap the data
+#   actually shows. It is four hundred times wider, it belongs to the
+#   spectrum rather than to the model, and it is reported in its own column by
+#   the designer — never here. A model that claimed a degeneracy the data
+#   cannot see would be read as a measurement, which is worse than reporting
+#   none.
+#
+# The old `calculadora_autoestados` package grouped with ABSOLUTE tolerances —
+# `core/eigensolver.py:30` at 1e-4 eV and `core/analytical.py:106` at 1e-6 eV.
+# Both are rejected here. 1e-4 eV (0.10 meV) is an `eigsh` convergence
+# threshold wearing a physics costume: 270x below this sample's 90 K linewidth
+# and 910x below its 300 K one, so it answers neither question. And being
+# absolute it behaves differently at the two ends of a ladder that spans
+# 0.03 to 2 eV — separating true partners at the bottom while merging
+# unrelated levels at the top. `box_energies_2d` above still carries the old
+# 1e-6 eV grouping; it is left exactly as it is because its output is frozen,
+# and nothing new is built on it.
+
+
+def group_degeneracy(entries, rtol=None, with_representative=False):
+    """Collapse an ASCENDING state list onto distinct energies.
+
+    ``entries`` are ``(E_eV, quantum_numbers)`` pairs, or
+    ``(E_eV, quantum_numbers, weight)`` triples when one entry already stands
+    for several states — the ``+/-m`` fold of a disc or cylinder, the ``2l+1``
+    fold of a sphere. A pair weighs 1, which is right for the Cartesian boxes
+    here: they enumerate every permutation of the quantum numbers as its own
+    entry, so the multiplicity is in the list rather than in a formula.
+
+    Returns the degeneracy of each distinct energy, in order — or, with
+    ``with_representative``, ``(E_eV, degeneracy, quantum_numbers)`` triples
+    naming the lowest member of each group.
+
+    DEGENERACY IS COUNTED, NEVER COMPUTED FROM A FORMULA, and the reason is
+    that a formula can only see one entry at a time while degeneracy is a
+    property of a set. Two distinct kinds of coincidence live here:
+
+    *Permutation* degeneracy, which a symmetric box has by construction — the
+    5 nm cube's first ten levels run 1, 3, 3, 3, 1, 6, 3, 3, 3, 6.
+
+    *Accidental* degeneracy, which is not a permutation of anything and which
+    no per-entry rule can predict. The first one in that same cube is
+    E = 1.2612192 eV with g = 4, where the distinct multisets (1,1,5) and
+    (3,3,3) meet because 1+1+25 = 9+9+9 = 27; in the 5 nm square the
+    ``n^2``-sum 65 gathers (1,8), (4,7), (7,4) and (8,1) into one level of
+    g = 4. A parabolic dot at a commensurate ``hw_xy:hw_z`` does the same
+    thing. Counting catches all of them; ``2l+1`` and friends catch none.
+
+    ``rtol`` defaults to :data:`src.physics.level_patterns.GROUP_RTOL`. It is
+    resolved at call time, not in the signature, only because
+    ``level_patterns`` imports THIS module at module scope — naming it as a
+    default would close an import cycle. The grouping itself delegates to
+    ``level_patterns._group_levels`` rather than repeating it: that function
+    is already relative-tolerance, already weight-carrying, and already the
+    one the level-ratio fingerprints are built on, so a disc grouped for a
+    fingerprint and the same disc grouped for a candidate table can never
+    drift apart.
+    """
+    # Local import: `level_patterns` imports `analytical` at module scope, so
+    # this direction has to stay lazy. One sys.modules lookup per call, against
+    # at most a dozen calls per spectrum.
+    from src.physics.level_patterns import GROUP_RTOL, _group_levels
+
+    states = [(float(row[0]), tuple(int(q) for q in row[1]),
+               int(row[2]) if len(row) > 2 else 1)
+              for row in entries]
+    groups = _group_levels(states, GROUP_RTOL if rtol is None else rtol)
+    if with_representative:
+        return groups
+    return [degeneracy for _E, degeneracy, _qn in groups]
+
+
+#: How many raw entries to enumerate per distinct level asked for, per model.
+#: Only used when ``distinct=True``; it sizes the over-enumeration so that
+#: groups are complete BEFORE the truncation. Degeneracy is what drives the
+#: numbers: a 3D cube spends 20 entries on 7 distinct energies, a 2D square 20
+#: on 12, a 1D line 20 on 20. They are start values — the builders below grow
+#: the factor when a geometry turns out to be more degenerate than the guess,
+#: so no caller has to know the ratio for its own aspect ratio.
+_DISTINCT_FACTOR = {"box_1d": 1, "box_2d": 3, "box_3d": 5,
+                    "disk": 2, "cylinder": 2}
+
+
+def _levels_from(produce, weight_of, label_of, n_levels, distinct,
+                 channel_of=None, factor=1):
+    """Turn a row producer's ``(E_eV, qn)`` entries into ``Level`` records.
+
+    ``produce(count)`` returns the ``count`` lowest entries, ascending — one
+    of the ``*_energies_*`` functions above, bound to its dimensions.
+
+    With ``distinct`` unset this is a relabelling and nothing more: the first
+    ``n_levels`` entries, in the order and with the energies the designer
+    fits against, each carrying its own symmetry weight.
+
+    With ``distinct`` set the entries are over-enumerated by ``factor``,
+    grouped, and only THEN truncated. That order is the whole point. Grouping
+    after a cut would report half of a degenerate group as its full
+    multiplicity, and a halved degeneracy is exactly the sort of wrong number
+    a reader takes for a measurement. The last group is dropped whenever
+    there is a spare level to drop it in favour of, since it is the only one
+    the cut can have split; and ``factor`` doubles until enough complete
+    groups exist or the producer runs out of basis, so a caller never has to
+    know how degenerate its own aspect ratio happens to be.
+    """
+    # Imported here, not at module scope: `level_patterns` already imports
+    # this module, so keeping every physics->physics edge lazy in this
+    # direction means no future module-level import can close a cycle
+    # through it.
+    from src.physics.quantum_dot import Level
+
+    def make(E, qn, degeneracy):
+        return Level(E_eV=float(E), quantum_numbers=tuple(int(q) for q in qn),
+                     label=label_of(qn), degeneracy=int(degeneracy),
+                     channel=0 if channel_of is None else channel_of(qn),
+                     bound=True)
+
+    n_levels = max(1, int(n_levels))
+    if not distinct:
+        return [make(E, qn, weight_of(qn))
+                for E, qn in produce(n_levels)[:n_levels]]
+
+    for _ in range(6):
+        want = n_levels * factor
+        rows = produce(want)
+        groups = group_degeneracy([(E, qn, weight_of(qn)) for E, qn in rows],
+                                  with_representative=True)
+        exhausted = len(rows) < want      # the producer's basis ran out
+        if len(groups) > n_levels:
+            return [make(E, qn, g) for E, g, qn in groups[:-1][:n_levels]]
+        if exhausted:
+            # Nothing more to be had: every group present is complete, since
+            # the producer had no further state to add to any of them.
+            return [make(E, qn, g) for E, g, qn in groups[:n_levels]]
+        factor *= 2
+    raise RuntimeError(  # pragma: no cover - 64x the basis is far past any use
+        f"could not assemble {n_levels} complete distinct levels")
+
+
+def box_levels_1d(L_nm, meff=0.067, n_levels=20, distinct=False):
+    """The 1D box ladder of :func:`box_energies_1d_eV`, carrying degeneracy.
+
+    A line has none: E ~ n^2 is strictly increasing, so every level is simple
+    and ``distinct`` changes nothing. The function exists anyway, so that
+    :func:`src.physics.quantum_dot.levels_for` has one branch per geometry and
+    a caller never has to special-case the one model that happens to be
+    non-degenerate today.
+    """
+    return _levels_from(lambda k: box_energies_1d_eV(L_nm, meff, k),
+                        lambda qn: 1, lambda qn: f"n={int(qn[0])}",
+                        n_levels, distinct,
+                        factor=_DISTINCT_FACTOR["box_1d"])
+
+
+def box_levels_2d(Lx_nm, Ly_nm, meff=0.067, n_levels=20, distinct=False):
+    """The 2D rectangular ladder of :func:`box_energies_2d_eV`, with degeneracy.
+
+    Every (nx, ny) permutation is its own entry upstream, so each weighs one
+    and the multiplicity is obtained by counting. At Lx = Ly that recovers the
+    familiar 1, 2, 1, 2, 2, 2, 1, … of a square, and it also catches the
+    accidental levels a permutation count would miss — see
+    :func:`group_degeneracy`.
+    """
+    return _levels_from(lambda k: box_energies_2d_eV(Lx_nm, Ly_nm, meff, k),
+                        lambda qn: 1,
+                        lambda qn: f"({int(qn[0])},{int(qn[1])})",
+                        n_levels, distinct,
+                        factor=_DISTINCT_FACTOR["box_2d"])
+
+
+def box_levels_3d(Lx_nm, Ly_nm, Lz_nm, meff=0.067, n_levels=20, distinct=False):
+    """The 3D rectangular ladder of :func:`box_energies_3d_eV`, with degeneracy.
+
+    Same counting argument as :func:`box_levels_2d`, one dimension up, where
+    it matters much more: a cube spends 20 enumerated entries on only 7
+    distinct energies, so a search that asks for "twenty levels" and gets a
+    flat list is really fitting against seven — which is precisely why
+    ``distinct`` is offered.
+    """
+    return _levels_from(
+        lambda k: box_energies_3d_eV(Lx_nm, Ly_nm, Lz_nm, meff, k),
+        lambda qn: 1,
+        lambda qn: f"({int(qn[0])},{int(qn[1])},{int(qn[2])})",
+        n_levels, distinct, factor=_DISTINCT_FACTOR["box_3d"])
+
+
+def disk_levels(R_nm, meff=0.067, n_levels=20, distinct=False):
+    """The 2D disk ladder of :func:`disk_energies`, carrying degeneracy.
+
+    ``disk_energies`` iterates ``m >= 0`` only, so every ``m != 0`` entry
+    stands for the ``+m``/``-m`` pair and weighs 2 while ``m = 0`` weighs 1.
+    Weighting by entry count instead would halve the multiplicity of every
+    angular level.
+
+    A LIMIT OF THE UNDERLYING ENUMERATION, RECORDED RATHER THAN PAPERED OVER:
+    ``disk_energies`` opens a fixed 8 x 8 basis (``m = 0..7``, ``n = 1..8``),
+    so it can return at most 64 entries and — more importantly — its sorted
+    list first goes wrong at rank 18, where the true ladder's ``j_{8,1}``
+    falls outside the basis. This function inherits that exactly, on purpose:
+    :meth:`src.physics.designer.Designer.compute_energies` fits against
+    ``disk_energies``, and a labelled ladder that disagreed with the fitted
+    one would mislabel candidates. ``test_disk_energies_basis_is_capped`` pins
+    the rank so the gap is visible to whoever widens that basis, at which
+    point this docstring and that test both change together.
+    """
+    return _levels_from(lambda k: disk_energies(R_nm, meff, k),
+                        lambda qn: 1 if int(qn[0]) == 0 else 2,
+                        lambda qn: f"(m={int(qn[0])},n={int(qn[1])})",
+                        n_levels, distinct,
+                        channel_of=lambda qn: abs(int(qn[0])),
+                        factor=_DISTINCT_FACTOR["disk"])
+
+
+def cylinder_levels(R_nm, H_nm, meff=0.067, n_levels=20, distinct=False):
+    """The cylinder ladder of :func:`cylinder_energies`, carrying degeneracy.
+
+    ``(m, n, l)``: the same ``+/-m`` fold as the disk, times an axial ladder
+    that is simple. Unlike :func:`disk_levels` there is no basis cap to
+    inherit — ``cylinder_energies`` grows ``max_m``, ``max_n`` and ``max_l``
+    until the cheapest state past each cap provably sits above the
+    ``n_levels``-th energy.
+    """
+    return _levels_from(
+        lambda k: cylinder_energies(R_nm, H_nm, meff, k),
+        lambda qn: 1 if int(qn[0]) == 0 else 2,
+        lambda qn: f"({int(qn[0])},{int(qn[1])},{int(qn[2])})",
+        n_levels, distinct, channel_of=lambda qn: abs(int(qn[0])),
+        factor=_DISTINCT_FACTOR["cylinder"])

@@ -3818,6 +3818,119 @@ class ToolImplementations:
         # says it means. 0 (the default) lets the bandwidth follow the data,
         # which is the better answer when nobody has an opinion.
         'group_tol_nm': 0.0,
+        # ── which geometry the search is allowed to reach ──────────────
+        # `fixed` pins a dimension OUT of the search: {'d2': 5.0} searches R
+        # at L_z = 5 nm exactly. The engine has always honoured it; until now
+        # nothing sent it one, so every run searched every dimension. It is
+        # the highest-value knob on a lens matched by ΔE, where the offset
+        # cancels and L_z is unmeasurable by construction: pinned at 2 / 5 /
+        # 10 nm the search returns ONE candidate, the same one at Lmax = 13
+        # and 18 and whatever the seed, instead of a podium that is redrawn
+        # every run.
+        #
+        # `box` gives each dimension its own interval, {'d1': (lo, hi), …}.
+        # One shared (Lmin, Lmax) is only right when the dimensions are
+        # equally determined, and here they are not: R is pinned to about a
+        # hundred picometres by the data and L_z is not measured at all, so a
+        # single slider lets L_z wander to whatever ceiling was picked for R.
+        # An absent entry, or a None at either end, falls back to Lmin/Lmax —
+        # so None here is exactly the search the tool has always run.
+        'fixed': None,
+        'box': None,
+        # Which model level each measured level is compared to. ASSIGN_ENERGY
+        # is what find_matches has always done; the others exist to ask
+        # whether the answer survives a different assignment. ORTHOGONAL to
+        # `priority`, which decides how much each target counts once the
+        # assignment is made — two different questions that used to be one
+        # combo box because only one of them was reachable.
+        'assign': 'energy',
+        # How far apart two model levels have to be for this measurement to
+        # see both, in meV. It only ever feeds the diagnostic columns
+        # (n_tied, unresolvable, resolution_meV), never the score.
+        #
+        # None means "derive it from `temperature_K` below", and with neither
+        # given the columns stay EMPTY. They used to be filled from half the
+        # smallest measured gap, which is a LOWER BOUND on the resolution
+        # rather than the resolution: on the 4x5 nm lens's six targets that is
+        # 6.07 meV, four times finer than the measurement really is, and at
+        # that window every runaway geometry reports unresolvable = False.
+        # (3.75, 5.0) nm has its levels 26.3 meV apart, (3.2, 10.0) 21.5 meV,
+        # (2.9, 14.5) 16.9 meV, (2.1, 18.0) 25.8 meV — all four below the real
+        # 3.5 k_B T window, all four silently called resolved. An empty cell
+        # says "not measured"; a derived one said "fine", which is the answer
+        # she would have acted on. The window is stated or it is absent.
+        'resolution_meV': None,
+        # The measurement temperature, in kelvin, and so the basis of the
+        # resolution window: 3.5 k_B T — 27 meV at 90 K, 28.6 at 94, 91 at
+        # 300. Defaulted rather than left blank because the flag has to fire
+        # out of the box, and defaulted to 94 K because that is the
+        # temperature THESE spectra were taken at — the by-hand sheet they
+        # were checked against is labelled "T = 94 K, k_B T = 8 meV", and the
+        # dI/dV resolution work in this file reads the same 28.6 mV thermal
+        # kernel from it. It is a number this project already measured, not a
+        # number invented here and not a default borrowed from another panel:
+        # the Confinement Dimensionality panel asks for the temperature and
+        # starts at 0, which is the right shape for a tool that refuses to
+        # make thermal statements without one and the wrong shape for a
+        # column that has to fire out of the box.
+        #
+        # Nothing about it is silent: the panel asks for it with the derived
+        # window printed beside it, the run logs it, and
+        # every candidate row carries `resolution_basis` saying which
+        # temperature (or which fallback) the `resolution_meV` beside it came
+        # from. 0 or None means "no temperature" and hands the question back
+        # to the engine's data-derived bound — with the row saying so.
+        #
+        # An explicit `resolution_meV` always wins: a number typed in is a
+        # number somebody measured.
+        # Unset. The measurement temperature is hers to state — 3.5 k_B T is
+        # 27 meV at 90 K and 91 meV at 300 K, and she has datasets at both, so
+        # any shipped default is wrong for most runs and silently wrong at
+        # that. With this at 0 the diagnostic columns stay empty until the
+        # panel is told, which is the whole point of the window.
+        'temperature_K': 0.0,
+        # 'sample' is find_solutions: a few good geometries from random
+        # restarts, which is what the tool has always done and stays the
+        # default. 'enumerate' is the deterministic lattice pass — no RNG
+        # anywhere, and the full population rather than a top-`maxsol`
+        # podium.
+        #
+        # The lattice is NESTED, and the candidate LIST with it now: it is
+        # anchored at Lmin and truncated only at the top, and the budget
+        # is a density over the box rather than an absolute top-N, so the
+        # refined fraction does not depend on the ceiling. Widening the
+        # range adds candidates and moves none of the ones already found.
+        # See Designer.polish_budget and Designer.refinement_box for the
+        # two halves of that, and :meth:`_designer_find` for what it cost
+        # before they existed.
+        'search_mode': 'sample',
+        'enum_per_octave': 8,
+        'enum_polish': 40,
+        # The lattice's size cap. enumerate_solutions refuses rather than
+        # spending a quarter of an hour on a three-dimensional lattice, and
+        # until now nothing could move the ceiling it refuses at — the engine
+        # read a key no caller set. None is the engine's own 200,000.
+        'enum_max_nodes': None,
+        # How close two geometries have to be to count as one candidate,
+        # relative to their size. The engine has always read it and nothing
+        # ever sent it; None is the engine's default (absolute, 0.1 nm per
+        # dimension). Worth reaching on a plateau, where thirteen nodes along
+        # an unmeasurable axis are thirteen rows describing one well.
+        'dup_rel': None,
+        # Two more engine keys are deliberately NOT here, so that "nothing
+        # sets it" is a decision rather than an oversight:
+        #
+        # `reject_unresolvable` drops every candidate whose levels are closer
+        # together than the resolution window. Once a temperature is given
+        # that is most of this disc's population — including the correct 4 nm
+        # well, whose ladder is also unresolved at 3.5 k_B T. Dropping them
+        # would delete the evidence the `unresolvable` column exists to show.
+        # The column is the honest form of the same fact.
+        #
+        # `seed_aspect` seeds non-cubic starting geometries. Nothing here
+        # asks a question it answers: the seeds are already gated per
+        # dimension by `box`, and an aspect list is a third way of saying the
+        # same thing, in the units of neither the panel nor the sample.
     }
 
     #: The candidate table's columns, in order. Fixed so two runs of the tool
@@ -3832,6 +3945,41 @@ class ToolImplementations:
         # eight levels the model says should be there — that is a weak
         # match however low its RRMSE, and this is where it shows.
         'qn_min', 'qn_max', 'levels_skipped',
+        # ── what the fit could and could not see ───────────────────────
+        # A column that says a dimension is unconstrained is worth more than
+        # a third decimal place on it.
+        #
+        # `flat_dims` names the dimensions the objective is literally
+        # insensitive to — moved by ±2 % the error does not change BIT FOR
+        # BIT, so the number printed for them is one arbitrary point of a
+        # plateau and not a measurement. Named in the geometry's own terms
+        # ('L_z', not 'd2'). Empty when the fit saw every dimension.
+        'flat_dims',
+        # How many model levels lie within one resolution window of a
+        # matched one: the count of assignments this measurement cannot rule
+        # out, 1 when the ladder is resolved. `resolution_meV` is the window
+        # it was counted in — n_tied without it is uninterpretable — and
+        # `resolution_basis` says where that window came from: "3.5 k_B T at
+        # 94 K", the number typed in, or the engine's data-derived lower
+        # bound. `unresolvable` is 1 when the model's mean level spacing
+        # across the fitted window is below that window, which is the state
+        # in which the error has stopped discriminating between geometries
+        # and a lower RRMSE means nothing at all.
+        #
+        # n_tied is counted inside a FINITE ladder: the model is solved to
+        # max(3 x n_levels, 20) states, so the count is bounded by that basis
+        # and reads "at least this many", not "exactly this many". Feed more
+        # peaks in and the ceiling rises with them.
+        'n_tied', 'resolution_meV', 'resolution_basis', 'unresolvable',
+        # The degeneracies behind the matched levels: their sum and the
+        # largest single one. A peak assigned to a doublet and a peak
+        # assigned to a singlet used to be reported identically.
+        'g_sum', 'g_max',
+        # `n_distinct` below n_levels means two measured levels were
+        # assigned to the SAME model level — which nearest-in-energy
+        # matching allows, and which is worth seeing. `qn_sum` is how high
+        # up the ladder the assignment sits.
+        'n_distinct', 'qn_sum',
         'split_e_V', 'split_h_V', 'pair_mismatch_nm',
         'hole_size_nm', 'hole_meff', 'hole_rrmse_pct',
         'hole_qn_min', 'hole_qn_max', 'hole_levels_skipped',
@@ -3862,6 +4010,11 @@ class ToolImplementations:
     #: from the branch edge and once back on the bias axis.
     DESIGNER_LEVEL_COLUMNS = (
         'spectrum_index', 'column', 'candidate', 'carrier', 'level', 'qn',
+        # How many states this one row stands for. A peak assigned to a
+        # doublet and a peak assigned to a singlet used to print identically;
+        # for a 4 nm / 5 nm lens the eight matched rows stand for thirteen
+        # orbital states. NaN when the level table could not be built.
+        'degeneracy',
         'measured_eV', 'simulated_eV', 'error_pct',
         'measured_V', 'simulated_V', 'split_e_V', 'split_h_V',
         'dataset', 'search')
@@ -3916,6 +4069,298 @@ class ToolImplementations:
         return carriers
 
     @staticmethod
+    def _designer_dim_names(ndim: str, coords: str, sym: str) -> dict:
+        """``{'d1': 'R', 'd2': 'L_z'}`` — the dimensions in HER terms.
+
+        The engine calls them d1/d2/d3 because it has to name the slots of a
+        vector it knows nothing else about. Nothing the user reads should:
+        "L_z is unconstrained" is a statement about her lens, "d2 is
+        unconstrained" is a statement about an array index. Every panel
+        label, every pinning control and the ``flat_dims`` column go through
+        here.
+
+        Only the keys the geometry actually HAS, in order, which is exactly
+        the set that can be pinned or given its own interval: a square is one
+        length occupying two slots, a tetragonal cell is d1 and d3 with no
+        d2. Taken from ``Designer.dim_keys`` rather than restated, so a new
+        symmetry cannot be named here and forgotten there.
+
+        A mirror of this table lives in ``DesignerVocabulary.js`` — QML
+        cannot import Python, and the panel has to draw the controls before
+        any search has run. Keep the two in step.
+        """
+        from src.physics.designer import DOT_ROWS, Designer
+        from src.physics.solution_spec import (COORDS_CARTESIAN,
+                                               COORDS_CYLINDRICAL)
+
+        p = {'ndim': ndim, 'coords': coords, 'sym': sym,
+             'fixed': {'d1': None, 'd2': None, 'd3': None}}
+        try:
+            keys = list(dict.fromkeys(Designer.dim_keys(p)))
+        except Exception:                                    # noqa: BLE001
+            return {}
+
+        if ndim == '0D':
+            rows = DOT_ROWS.get(coords, ())
+            return {k: (rows[i] if i < len(rows) else k)
+                    for i, k in enumerate(keys)}
+        if ndim == '1D':
+            return {'d1': 'L'}
+        if ndim == '2D':
+            if coords == COORDS_CARTESIAN:
+                # A square is ONE length filling both slots; calling it Lx
+                # would invite the question of where Ly went.
+                return ({'d1': 'L'} if len(keys) == 1
+                        else {'d1': 'Lx', 'd2': 'Ly'})
+            return {'d1': 'R'}
+        if coords == COORDS_CYLINDRICAL:
+            return {'d1': 'R', 'd2': 'L_z'}
+        names = {'d1': 'Lx', 'd2': 'Ly', 'd3': 'Lz'}
+        if len(keys) == 1:                                   # cubic
+            names['d1'] = 'L'
+        return {k: names[k] for k in keys}
+
+    @staticmethod
+    def _designer_fixed(params: dict) -> dict:
+        """The pinned dimensions, as the engine wants them.
+
+        Always all three keys: ``Designer.free_keys`` indexes ``p['fixed']``
+        directly, so a panel that sent only the one dimension it pinned would
+        take the search down with a KeyError. A blank, a None or anything
+        unparseable means "not pinned", which is what every run did before
+        the panel could pin anything — so the default here is the old
+        behaviour exactly, not an approximation of it.
+        """
+        given = params.get('fixed') or {}
+        out = {'d1': None, 'd2': None, 'd3': None}
+        for key in out:
+            value = given.get(key)
+            if value is None or value == '':
+                continue
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                logger.info("Confinement Designer: %s pinned to %r, which is "
+                            "not a length — searching it instead", key, value)
+                continue
+            if not math.isfinite(value) or value <= 0:
+                logger.info("Confinement Designer: %s pinned to %g, which is "
+                            "not a usable length — searching it instead",
+                            key, value)
+                continue
+            out[key] = value
+        return out
+
+    @staticmethod
+    def _designer_box(params: dict) -> dict:
+        """Per-dimension search intervals, ``{'d1': (lo, hi), …}``.
+
+        A missing entry, or a None at either end, means "use Lmin/Lmax" —
+        ``Designer._box`` resolves that — so an empty dict is byte-identical
+        to the single shared interval the panel used to send. Only the ends
+        the user actually set travel; a 0 from a spin box is "unset", because
+        no dimension of a real well is 0 nm wide.
+        """
+        given = params.get('box') or {}
+        out = {}
+        for key in ('d1', 'd2', 'd3'):
+            entry = given.get(key)
+            if entry is None:
+                continue
+            try:
+                lo, hi = entry
+            except (TypeError, ValueError):
+                logger.info("Confinement Designer: range for %s is %r, which "
+                            "is not a (min, max) — using the shared range",
+                            key, entry)
+                continue
+            ends = []
+            for end in (lo, hi):
+                try:
+                    end = None if end is None or end == '' else float(end)
+                except (TypeError, ValueError):
+                    end = None
+                ends.append(None if end is not None
+                            and (not math.isfinite(end) or end <= 0) else end)
+            if ends[0] is None and ends[1] is None:
+                continue
+            if (ends[0] is not None and ends[1] is not None
+                    and ends[1] < ends[0]):
+                logger.info("Confinement Designer: range for %s is %g to %g — "
+                            "the ends are the wrong way round, using the "
+                            "shared range", key, ends[0], ends[1])
+                continue
+            out[key] = (ends[0], ends[1])
+        return out
+
+    #: FWHM of -df/dE, 4 ln(1 + sqrt 2) k_B T. The number usually quoted as
+    #: "3.5 k_B T"; written exactly so the meV it gives can be checked against
+    #: the same constant in ConfinementDimensionalityTool and in
+    #: edge_analysis.THERMAL_FWHM_FACTOR rather than drifting from them.
+    THERMAL_FWHM_KT = 3.5254943480781717
+    #: eV per kelvin.
+    K_B_EV_PER_K = 8.617333262e-5
+
+    @classmethod
+    def _designer_resolution(cls, params: dict) -> tuple:
+        """``(window in meV or None, what that window is)``.
+
+        The window is the diagnostic yardstick: how far apart two model levels
+        have to be for this measurement to have seen both, which is what
+        ``n_tied`` is counted in and what ``unresolvable`` is decided against.
+        It never enters the score.
+
+        Three bases, in order, and the returned text names whichever was used
+        because a tie count without its window is uninterpretable:
+
+        ``resolution_meV``
+            A number somebody typed. It wins over everything: a measured
+            resolution beats a derived one.
+        ``temperature_K``
+            3.5 k_B T — 27 meV at 90 K, 91 meV at 300 K. The physical floor on
+            what a tunnelling spectrum can separate. There is no default: she
+            has data at both temperatures, so a shipped number would be wrong
+            for most runs and wrong without saying so.
+        neither
+            ``None``, and the diagnostic columns stay EMPTY. The engine used
+            to fall back to half the smallest gap the spectrum resolved; that
+            is a lower bound on the resolution rather than the resolution, it
+            came out at 6.07 meV against a real 27 meV on the 4x5 lens, and
+            at that window every runaway geometry passed as resolvable. An
+            empty cell says "not measured"; a derived one said "fine", which
+            is the answer she would have acted on.
+        """
+        explicit = params.get('resolution_meV')
+        if explicit not in (None, ''):
+            try:
+                value = float(explicit)
+            except (TypeError, ValueError):
+                value = float('nan')
+            if math.isfinite(value) and value > 0:
+                return value, f"{value:g} meV as given"
+            logger.info("Confinement Designer: resolution %r is not a window "
+                        "— deriving it instead", explicit)
+        try:
+            temperature = float(params.get('temperature_K') or 0.0)
+        except (TypeError, ValueError):
+            temperature = 0.0
+        if math.isfinite(temperature) and temperature > 0:
+            window = cls.THERMAL_FWHM_KT * cls.K_B_EV_PER_K * temperature * 1e3
+            return window, f"3.5 k_B T at {temperature:g} K"
+        return None, "not set — no measurement resolution given"
+
+    @classmethod
+    def _designer_shared_range(cls, params: dict) -> tuple:
+        """``(Lmin, Lmax)`` widened to hold every per-dimension interval.
+
+        ``Designer.bounds`` reads the per-dimension box; the analytical-seed
+        gate in ``find_solutions`` (``Lmin <= L_est <= Lmax``) and
+        ``primary_alias``'s lower gate still read the SHARED pair. Left
+        unreconciled the two disagree: a dimension boxed to [18, 25] nm inside
+        a shared range of [1, 18] is a dimension the search is allowed to
+        reach and the seed gate is not allowed to aim at, so the box silently
+        costs the run its analytical starting points.
+
+        Widened, never narrowed, and only ever by a box the user set — the
+        gates are gates on an ESTIMATE, and a wider gate lets more seeds
+        through where a narrower one would drop geometries the box permits.
+        The dimensions themselves keep their own intervals: see
+        :meth:`_designer_box_resolved`, which materialises the shared range
+        into an explicit entry for every dimension first, so widening the
+        shared pair cannot widen a dimension that was never boxed.
+        """
+        lo = float(params.get('Lmin', 1.0))
+        hi = float(params.get('Lmax', 20.0))
+        for entry_lo, entry_hi in cls._designer_box(params).values():
+            if entry_lo is not None:
+                lo = min(lo, float(entry_lo))
+            if entry_hi is not None:
+                hi = max(hi, float(entry_hi))
+        return lo, hi
+
+    @classmethod
+    def _designer_box_resolved(cls, params: dict, keys) -> dict:
+        """The box with every searched dimension given an explicit interval.
+
+        Empty in, empty out — an untouched panel sends no box and the search
+        runs on the single shared interval exactly as it always has.
+
+        With a box set, the dimensions that were NOT boxed are written out at
+        the shared (Lmin, Lmax) as it stands BEFORE
+        :meth:`_designer_shared_range` widens it. Without that, boxing one
+        dimension past the shared ceiling would quietly raise the ceiling for
+        every other dimension too — the search would be told to widen R
+        because L_z was pinned wide, which is the opposite of what a
+        per-dimension control is for.
+        """
+        box = cls._designer_box(params)
+        if not box:
+            return {}
+        lo, hi = float(params.get('Lmin', 1.0)), float(params.get('Lmax', 20.0))
+        resolved = {}
+        for key in keys:
+            entry = box.get(key)
+            entry_lo, entry_hi = entry if entry is not None else (None, None)
+            resolved[key] = (lo if entry_lo is None else float(entry_lo),
+                             hi if entry_hi is None else float(entry_hi))
+        return resolved
+
+    @staticmethod
+    def _designer_inverted_ranges(params: dict) -> list:
+        """The per-dimension ranges whose ends are the wrong way round.
+
+        ``_designer_box`` drops them and falls back to the shared range, which
+        is the safe thing to DO and the wrong thing to say nothing about:
+        "from 10, to 3" for R is a request to search a narrow band, and
+        falling back searches the whole of [Lmin, Lmax] — the opposite of what
+        was asked, in the control whose only purpose is to stop a dimension
+        wandering. The panel refuses to launch on one of these; a scripted
+        caller gets it back in the run's ``error`` rather than in a log line
+        nobody is reading.
+        """
+        given = params.get('box') or {}
+        bad = []
+        for key in ('d1', 'd2', 'd3'):
+            entry = given.get(key)
+            if entry is None:
+                continue
+            try:
+                lo, hi = entry
+                lo = None if lo is None or lo == '' else float(lo)
+                hi = None if hi is None or hi == '' else float(hi)
+            except (TypeError, ValueError):
+                continue
+            if (lo is not None and hi is not None and lo > 0 and hi > 0
+                    and hi < lo):
+                bad.append((key, lo, hi))
+        return bad
+
+    @classmethod
+    def _log_designer_limits(cls, params: dict) -> None:
+        """Say what the search was allowed to reach, in her names for it.
+
+        Silent unless something was pinned or narrowed: a default run has
+        nothing to report that the rest of the log does not already say, and
+        a line that appears on every run is a line nobody reads.
+        """
+        fixed = {k: v for k, v in cls._designer_fixed(params).items()
+                 if v is not None}
+        box = cls._designer_box(params)
+        if not fixed and not box:
+            return
+        names = cls._designer_dim_names(str(params.get('ndim') or ''),
+                                        str(params.get('coords') or ''),
+                                        str(params.get('sym') or ''))
+        lo_shared, hi_shared = params.get('Lmin'), params.get('Lmax')
+        parts = [f"{names.get(k, k)} pinned at {v:g} nm"
+                 for k, v in sorted(fixed.items())]
+        parts += [f"{names.get(k, k)} in "
+                  f"[{lo if lo is not None else lo_shared:g}, "
+                  f"{hi if hi is not None else hi_shared:g}] nm"
+                  for k, (lo, hi) in sorted(box.items())]
+        logger.info("Confinement Designer: %s", "; ".join(parts))
+
+    @staticmethod
     def _designer_candidate(sol: dict, index: int) -> dict:
         """One candidate as plain numbers, for QML and for the plot.
 
@@ -3949,6 +4394,43 @@ class ToolImplementations:
             'errors_pct': errors,
             'qn': [[int(q) for q in (m.get('qn') or ())] for m in matches],
         }
+        # ── the facts Designer.annotate puts on an accepted candidate ──
+        # Absent on a candidate whose level table could not be built (the
+        # annotation is allowed to fail without taking the search with it),
+        # so every one of these is read defensively and a missing one stays
+        # missing rather than becoming a 0 that reads as a measurement.
+        nan = float('nan')
+        names = ToolImplementations._designer_dim_names(
+            str(sol.get('ndim', '')), str(sol.get('coords', '')),
+            str(sol.get('sym', '')))
+        # Named, not keyed: this is the column that tells her the fit never
+        # saw L_z, and it has to say "L_z".
+        out['flat_dims'] = [names.get(k, k) for k in (sol.get('flat_dims') or ())]
+        # Per matched level, and empty rather than a list of zeros when the
+        # level table could not be built: "one state" and "we never found
+        # out" are different answers.
+        # NaN for a match the annotation could not reach, never 1: the list
+        # is built as soon as ANY match carries a degeneracy, and a level
+        # whose quantum numbers were missing would otherwise be handed back
+        # as a fabricated singlet — "this peak is one state" is a claim, and
+        # it is the wrong one to make by default.
+        out['degeneracy'] = ([float(m['degeneracy']) if 'degeneracy' in m else nan
+                              for m in matches]
+                             if any('degeneracy' in m for m in matches) else [])
+        for key in ('n_tied', 'qn_sum', 'n_distinct', 'g_sum', 'g_max'):
+            value = sol.get(key)
+            out[key] = nan if value is None else float(value)
+        res = sol.get('resolution_eV')
+        out['resolution_meV'] = nan if res is None else float(res) * 1e3
+        # What that window IS. n_tied counted in a window nobody can name is
+        # a number with no units, and the window is the whole difference
+        # between "unresolvable" firing on the runaway geometries and firing
+        # on none of them.
+        out['resolution_basis'] = str(sol.get('resolution_basis', ''))
+        out['mean_spacing_meV'] = (nan if sol.get('mean_spacing_eV') is None
+                                   else float(sol['mean_spacing_eV']) * 1e3)
+        out['unresolvable'] = (nan if sol.get('unresolvable') is None
+                               else float(bool(sol['unresolvable'])))
         if hole:
             out['hole'] = ToolImplementations._designer_candidate(hole, index)
             out['pair_score'] = float(sol.get('pair_score', float('nan')))
@@ -3975,8 +4457,26 @@ class ToolImplementations:
         — the mappable one. A sweep of a whole overview is otherwise a list
         on screen that cannot be read after the window closes.
 
-        Slow enough to belong on the worker — a search is ~0.25 s per
-        candidate. Cancellation is checked between spectra and between
+        Slow enough to belong on the worker, and unpredictably so on one of
+        the two paths. Measured on an M1 Pro over this 0D disc under delta_e
+        with six targets, one free pair of dimensions and one mass: the
+        enumerated search takes 9.5-9.8 s PER SPECTRUM PER MASS, and the default sampled search is NOT one number: over five seeds on
+        the same spectrum it took 13.1, 15.1, 16.3, 42.5 and 73.8 s — a 5.6x
+        spread, median 16.3 s. That variance is structural, not noise:
+        ``find_solutions`` stops at ``maxsol``, so a spectrum whose quota
+        fills early runs a few DE passes and one whose quota never fills runs
+        all twelve. Enumeration over the same spectrum took 9.5, 9.7 and 9.8 s
+        — it has no RNG, so it costs what it costs. For a 300-spectrum sweep
+        that is the difference between planning for 50 minutes and not knowing
+        whether to plan for 65 minutes or six hours.
+        A 300-spectrum sweep is therefore ~50 min enumerated and anywhere
+        from ~65 min to ~6 h sampled, for ONE mass and ONE carrier — and the
+        panel allows several masses and both carriers, so it multiplies. (The
+        superseded "~0.25 s per candidate" was a per-candidate figure read
+        as if it were the whole search.) The panel shows the estimate before
+        the run commits; this is the number it shows it from.
+
+        Cancellation is checked between spectra and between
         carriers here, and the same flag is handed down to the search
         itself, which asks it before every effective mass and between its
         own optimisation passes; the longest stretch with no way out is one
@@ -3996,6 +4496,42 @@ class ToolImplementations:
                 return {**empty, 'error': "Dataset not found"}
 
             params = {**self.DESIGNER_DEFAULTS, **(params or {})}
+            # Once per run, not once per spectrum: what the search was
+            # allowed to reach is a property of the run, and a sweep over
+            # sixty positions would otherwise say it sixty times. Silent on
+            # a default run, so the log reads exactly as it always did.
+            # An inverted per-dimension range is a request the tool cannot
+            # honour, and the old behaviour — drop it, log at INFO, search
+            # the whole shared range — is the OPPOSITE of what was asked in
+            # the control whose only purpose is to stop a dimension
+            # wandering. Refused out loud instead. The panel refuses before
+            # it launches; this is the same refusal for a workflow node or a
+            # scripted caller, which have no panel to refuse in.
+            inverted = self._designer_inverted_ranges(params)
+            if inverted:
+                names = self._designer_dim_names(
+                    str(params.get('ndim') or ''),
+                    str(params.get('coords') or ''),
+                    str(params.get('sym') or ''))
+                said = "; ".join(f"{names.get(k, k)} from {lo:g} to {hi:g} nm"
+                                 for k, lo, hi in inverted)
+                message = (f"The range is the wrong way round ({said}). "
+                           f"Swap the ends — searching the shared range "
+                           f"instead would search the opposite of what was "
+                           f"asked for.")
+                logger.info("Confinement Designer: %s", message)
+                return {**empty, 'error': message}
+            self._log_designer_limits(params)
+            # Said once per run, on every run: the window n_tied and
+            # unresolvable are counted against, and what it is. A window with
+            # no basis is a count with no units, and the number the tool used
+            # to derive by itself (half the smallest measured gap, 6.07 meV
+            # on the 4x5 lens) is four times finer than the measurement and
+            # reported every runaway geometry as resolved.
+            window_meV, window_basis = self._designer_resolution(params)
+            logger.info("Confinement Designer: resolution window %s — %s",
+                        "from the data" if window_meV is None
+                        else f"{window_meV:.1f} meV", window_basis)
             spectral_data = self._datasets[dataset_name]
             n_spectra = int(spectral_data.spectra.shape[1])
             selected = max(0, min(int(params.get('spectrum_index', 0)),
@@ -4128,7 +4664,7 @@ class ToolImplementations:
         for the other sixty-one. The reason travels in ``error``.
         """
         from src.physics.branches import DidvCurve, analyze_curve
-        from src.physics.designer import CARRIER_BOTH, Designer
+        from src.physics.designer import ASSIGN_ENERGY, CARRIER_BOTH, Designer
         from src.physics.pairing import edges_from_solutions, pair_candidates
 
         spectra = spectral_data.spectra
@@ -4156,15 +4692,42 @@ class ToolImplementations:
                                   f"{carrier['label']} branch — a single level "
                                   f"is explained by any size.")}
 
+        resolution_meV, resolution_basis = self._designer_resolution(params)
+        # The shared pair the analytical-seed gate reads, widened to hold
+        # every per-dimension interval — and the per-dimension intervals
+        # written out first, so widening the shared pair cannot widen a
+        # dimension nobody boxed. Both are no-ops on a run with no box.
+        box = self._designer_box_resolved(params, ('d1', 'd2', 'd3'))
+        shared_lo, shared_hi = self._designer_shared_range(params)
         search = {'ndim': str(params['ndim']), 'coords': str(params['coords']),
                   'sym': str(params['sym']),
-                  'fixed': dict(params.get('fixed')
-                                or {'d1': None, 'd2': None, 'd3': None}),
-                  'Lmin': float(params['Lmin']), 'Lmax': float(params['Lmax']),
+                  'fixed': self._designer_fixed(params),
+                  'Lmin': shared_lo, 'Lmax': shared_hi,
+                  # Per-dimension intervals. Empty is the shared (Lmin, Lmax)
+                  # the panel has always sent, resolved by Designer._box.
+                  'box': box,
                   'tol': float(params['tol']), 'maxsol': int(params['maxsol']),
                   'priority': str(params['priority']),
+                  # Which model level each target is compared to — a
+                  # different question from `priority`, which decides how
+                  # much each target counts once that is settled.
+                  'assign': str(params.get('assign') or ASSIGN_ENERGY),
+                  # The diagnostic window and what it is: 3.5 k_B T at the
+                  # measurement temperature by default, an explicit number
+                  # when one was given, None to fall back to the engine's
+                  # data-derived bound. Diagnostics only; it never enters the
+                  # score. The temperature travels too, so the engine can
+                  # derive the same window if it would rather.
+                  'resolution_meV': resolution_meV,
+                  'temperature_K': params.get('temperature_K'),
+                  'enum_per_octave': params.get('enum_per_octave'),
+                  'enum_polish': params.get('enum_polish'),
+                  # Engine knobs that had no way in until now: the lattice's
+                  # size cap, and how close two geometries have to be to be
+                  # one candidate. None on both is the engine's own default.
+                  'enum_max_nodes': params.get('enum_max_nodes'),
+                  'dup_rel': params.get('dup_rel'),
                   'match': str(params['match'])}
-
         designer = Designer(seed=params.get('seed'))
         # The same flag the loops above poll, handed to the search so it can
         # stop between masses and between optimisation passes. Without it a
@@ -4178,8 +4741,20 @@ class ToolImplementations:
             if should_cancel():
                 logger.info("Confinement Designer cancelled")
                 return {**blank, 'error': 'Cancelled'}
-            found = designer.search_carrier(search, carrier,
-                                            should_cancel=should_cancel)
+            try:
+                found = self._designer_find(designer, search, carrier, params,
+                                            should_cancel)
+            except ValueError as exc:
+                # A lattice over the node cap, and anything else the search
+                # refuses on its settings. It is the same refusal for every
+                # spectrum, so raising it would abort a 300-spectrum sweep on
+                # spectrum 1 with nothing written; reported here it becomes
+                # this spectrum's reason, lands in the placeholder row of the
+                # candidate table, and the sweep says so 300 times instead of
+                # vanishing once.
+                logger.info("Confinement Designer: %s branch not searched: %s",
+                            carrier['label'], exc)
+                return {**blank, 'error': f"{carrier['label']}: {exc}"}
             # A cancelled search returns what it had found so far rather than
             # raising, so the flag has to be re-read: the partial list is not
             # an answer to the question that was asked.
@@ -4199,8 +4774,14 @@ class ToolImplementations:
                 primary = designer.primary_alias(
                     sol, {**search, 'Et': carrier['Et'],
                           'meff': sol.get('meff')})
+                # Same duplicate test as everywhere else in the run: the
+                # engine reads `dup_rel` in both search modes, and a fold
+                # that used the absolute 0.1 nm while the search used a
+                # fractional one would put back the rows the search merged.
+                # None — the default — is the absolute test, unchanged.
                 if not any(abs(primary['meff'] - kept['meff']) < 1e-9
-                           and designer.is_duplicate(primary, [kept])
+                           and designer.is_duplicate(
+                               primary, [kept], rel=search.get('dup_rel'))
                            for kept in reduced):
                     reduced.append(primary)
             by_carrier[carrier['carrier']] = reduced
@@ -4223,6 +4804,13 @@ class ToolImplementations:
 
         solutions = designer.sort_solutions(
             solutions, str(params.get('sort', 'rrmse')), paired=bool(pairs))
+        # The window's basis rides on the candidate, not on the run: a row in
+        # a CSV concatenated from four runs has to say which temperature its
+        # own n_tied was counted at.
+        for sol in solutions:
+            sol['resolution_basis'] = resolution_basis
+            if sol.get('pair_hole') is not None:
+                sol['pair_hole']['resolution_basis'] = resolution_basis
 
         return {
             **blank,
@@ -4234,6 +4822,90 @@ class ToolImplementations:
                                           float(params.get('split_h', 0.0))),
             'error': "" if solutions else "No candidate fits within the tolerance.",
         }
+
+    @staticmethod
+    def _designer_find(designer, search: dict, carrier: dict, params: dict,
+                       should_cancel) -> list:
+        """One carrier's candidates, by whichever search was asked for.
+
+        ``search_mode = 'sample'`` — the default, and what this tool has
+        always run — is :meth:`Designer.search_carrier`: random restarts, a
+        few good geometries, capped at ``maxsol``.
+
+        ``'enumerate'`` is the deterministic pass. It answers a different
+        question: not "give me a few good geometries" but "how many are
+        there, and where?". Three differences matter to what the tables
+        mean, so it is opt-in and never a silent substitution.
+
+        It has no RNG, so a rerun of the same settings gives the same rows.
+
+        And it is nested — the property the geometric lattice exists to
+        provide, and the one the panel tells the user about. Two things make
+        it true, both in the engine:
+        :meth:`~src.physics.designer.Designer.polish_budget` scales the
+        refinement budget with the box in octaves instead of refining an
+        absolute top-40, so the refined FRACTION does not depend on the
+        ceiling; and
+        :meth:`~src.physics.designer.Designer.refinement_box` confines each
+        refinement to one lattice step around its own node, so the same node
+        lands on the same point whatever the ceiling.
+
+        It was not nested before either of those, and this panel and these
+        docstrings said it was. Measured at the shipped defaults (0D disc,
+        delta_e, two free dimensions, 8 nodes per octave, Lmin 1) with a
+        fixed top-40 over the whole box: 900 lattice nodes and 17 candidates
+        at Lmax 13, 1156 and 19 at 18, 1444 and 16 at 25 — R = 6.4681 nm
+        existed at 13 and was gone at 18, and widening 18 to 25 REDUCED the
+        count. With the budget scaled and the refinements confined it is
+        21 -> 23 -> 24, every earlier geometry reproduced exactly.
+
+        Two edges where it honestly lapses, both said out loud in the panel:
+        a node within one lattice step of the top of the range has its cell
+        clipped by the ceiling, so raising the ceiling can move it — that is
+        the range genuinely ending; and past
+        ``POLISH_MAX_FACTOR * enum_polish`` the selection is an absolute
+        top-N again. The panel prints the lattice size and the budget beside
+        the control so both are visible before the run.
+
+        And it is NOT truncated to ``maxsol``. ``maxsol`` is a display
+        quota; truncating an enumeration whose purpose is counting would
+        defeat it, and the population is what the consensus takes its
+        R-marginal over — that marginal has its mode at the same R at 13 and
+        18 nm, where the top-six median moves by more than a nanometre.
+        ``enum_polish`` (40) is what actually bounds the row count.
+
+        Cost, measured on an M1 Pro over this disc with six targets, two free
+        dimensions, Lmin 1 / Lmax 18 and one mass: 10.6 s per spectrum per
+        mass enumerated against 25.9 s sampled — the ratio is about 2.4, not
+        the 4.4 s / 10.5 s once quoted.
+
+        The mass loop and the deduplication are search_carrier's, repeated
+        here for the same reason it has them: the same geometry at a
+        different mass is a different answer, not a duplicate.
+        """
+        if str(params.get('search_mode') or 'sample') != 'enumerate':
+            return designer.search_carrier(search, carrier,
+                                           should_cancel=should_cancel)
+
+        found = []
+        for meff in carrier['meffs']:
+            if should_cancel():
+                break
+            pm = {**search, 'Et': carrier['Et'], 'meff': meff,
+                  'carrier': carrier['carrier']}
+            found.extend(designer.enumerate_solutions(
+                pm, should_cancel=should_cancel))
+        unique = []
+        for sol in sorted(found, key=lambda x: x['RRMSE']):
+            if not any(abs(sol['meff'] - kept['meff']) < 1e-9
+                       and designer.is_duplicate(sol, [kept],
+                                                 rel=search.get('dup_rel'))
+                       for kept in unique):
+                unique.append(sol)
+        logger.info("Confinement Designer: enumerated %d distinct %s "
+                    "candidate(s) over %d mass(es)", len(unique),
+                    carrier['label'], len(carrier['meffs']))
+        return unique
 
     @staticmethod
     def _search_signature(params: dict) -> str:
@@ -4252,6 +4924,22 @@ class ToolImplementations:
         match = str(params.get('match') or '')
         if match:
             parts.append({'delta_e': 'ΔE', 'absolute': 'abs', 'ratios': 'ratios'}.get(match, match))
+        # A pinned dimension and an enumerated box are different questions
+        # asked of the same data, and their tables must not share a name: a
+        # run at L_z = 5 nm is not a run that searched L_z, and a population
+        # is not a podium. Only appended when they are not the default, so
+        # every existing table keeps the name it had.
+        assign = str(params.get('assign') or 'energy')
+        if assign != 'energy':
+            parts.append(assign)
+        if str(params.get('search_mode') or 'sample') == 'enumerate':
+            parts.append('enumerated')
+        names = ToolImplementations._designer_dim_names(
+            str(params.get('ndim') or ''), str(params.get('coords') or ''),
+            str(params.get('sym') or ''))
+        for key, value in sorted((ToolImplementations._designer_fixed(params)).items()):
+            if value is not None:
+                parts.append(f"{names.get(key, key)}={value:g}nm")
         return ", ".join(p for p in parts if p)
 
     def _unique_dataset_name(self, name: str) -> str:
@@ -4473,6 +5161,10 @@ class ToolImplementations:
                     'd1_nm': nan, 'd2_nm': nan, 'd3_nm': nan, 'size_nm': nan,
                     'meff': nan, 'offset_eV': nan, 'rrmse_pct': nan, 'rrmse_de_pct': nan,
                     'n_levels': 0, 'qn_min': nan, 'qn_max': nan, 'levels_skipped': nan,
+                    'flat_dims': '', 'n_tied': nan, 'resolution_meV': nan,
+                    'resolution_basis': '',
+                    'unresolvable': nan, 'g_sum': nan, 'g_max': nan,
+                    'n_distinct': nan, 'qn_sum': nan,
                     'split_e_V': split_e, 'split_h_V': split_h, 'pair_mismatch_nm': nan,
                     'hole_size_nm': nan, 'hole_meff': nan, 'hole_rrmse_pct': nan,
                     'hole_qn_min': nan, 'hole_qn_max': nan, 'hole_levels_skipped': nan,
@@ -4513,6 +5205,19 @@ class ToolImplementations:
                     'rrmse_de_pct': float(candidate.get('rrmse_de', nan)),
                     'n_levels': len(candidate.get('targets') or ()),
                     'qn_min': qn_lo, 'qn_max': qn_hi, 'levels_skipped': skipped,
+                    # What the fit could and could not see. `flat_dims` is a
+                    # '+'-joined list of names and empty when the fit saw
+                    # every dimension — empty because "nothing was flat" is
+                    # the good case and should not shout.
+                    'flat_dims': '+'.join(candidate.get('flat_dims') or ()),
+                    'n_tied': float(candidate.get('n_tied', nan)),
+                    'resolution_meV': float(candidate.get('resolution_meV', nan)),
+                    'resolution_basis': str(candidate.get('resolution_basis', '')),
+                    'unresolvable': float(candidate.get('unresolvable', nan)),
+                    'g_sum': float(candidate.get('g_sum', nan)),
+                    'g_max': float(candidate.get('g_max', nan)),
+                    'n_distinct': float(candidate.get('n_distinct', nan)),
+                    'qn_sum': float(candidate.get('qn_sum', nan)),
                     'split_e_V': split_e,
                     'split_h_V': split_h,
                     # NaN, not 0: an unpaired candidate has no hole, and 0 nm
@@ -4539,6 +5244,7 @@ class ToolImplementations:
                     computed = list(part.get('computed') or ())
                     errors = list(part.get('errors_pct') or ())
                     qns = list(part.get('qn') or ())
+                    degens = list(part.get('degeneracy') or ())
                     for level, measured in enumerate(targets):
                         simulated = float(computed[level]) if level < len(computed) else nan
                         level_rows.append({
@@ -4549,6 +5255,8 @@ class ToolImplementations:
                             'carrier': part_carrier,
                             'level': int(level),
                             'qn': '-'.join(str(q) for q in (qns[level] if level < len(qns) else ())),
+                            'degeneracy': (float(degens[level])
+                                           if level < len(degens) else nan),
                             'measured_eV': float(measured),
                             'simulated_eV': simulated,
                             'error_pct': float(errors[level]) if level < len(errors) else nan,
@@ -4647,6 +5355,21 @@ class ToolImplementations:
             'split_e': split_e,
             'split_h': split_h,
             'all_spectra': bool(params.get('all_spectra', False)),
+            # What the search was allowed to reach, recorded beside the
+            # numbers it produced: a table of radii found at L_z pinned to
+            # 5 nm is not the same table as one that searched L_z, and six
+            # months later nothing else on the file says which it was.
+            'assign': str(params.get('assign') or 'energy'),
+            'search_mode': str(params.get('search_mode') or 'sample'),
+            # The diagnostic window and where it came from. n_tied and
+            # unresolvable are counted against it, so a table that does not
+            # carry it cannot be read six months later.
+            'resolution_meV': self._designer_resolution(params)[0],
+            'resolution_basis': self._designer_resolution(params)[1],
+            'temperature_K': params.get('temperature_K'),
+            'fixed': {k: v for k, v in self._designer_fixed(params).items()
+                      if v is not None},
+            'box': {k: list(v) for k, v in self._designer_box(params).items()},
             'spectra_searched': len(runs),
             **self._carry_spatial_info(spectral_data.metadata),
         }
@@ -4783,8 +5506,13 @@ class ToolImplementations:
 
             search = {'ndim': str(params['ndim']), 'coords': str(params['coords']),
                       'sym': str(params['sym']),
-                      'fixed': dict(params.get('fixed')
-                                    or {'d1': None, 'd2': None, 'd3': None}),
+                      # Through the same normaliser as the point designer,
+                      # which fills in the keys free_keys indexes directly.
+                      # The line-scan panel sends no pinning today; when it
+                      # does, a half-filled map must not be a KeyError in
+                      # the middle of a sixty-position sweep.
+                      'fixed': self._designer_fixed(params),
+                      'box': self._designer_box(params),
                       'Lmin': float(params['Lmin']), 'Lmax': float(params['Lmax']),
                       'tol': float(params['max_rrmse']),
                       'maxsol': int(params['maxsol']),

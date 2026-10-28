@@ -13,19 +13,48 @@ spectrum the data cannot place says so instead of being forced onto a well,
 and that the null contrast is reproducible.
 """
 
+import json
 import math
+from pathlib import Path
 
 import numpy as np
 import pytest
 
-from src.physics.consensus import (AdmissibleSet, ConsensusResult,
+from src.physics.consensus import (AdmissibleSet, ConsensusResult, Marginal,
                                    admissible_sets, candidate_weight,
                                    consensus, coord_function, default_bandwidth,
-                                   delta_stability, find_modes,
+                                   delta_stability, find_modes, free_dims,
                                    identity_signature, log_first_dim,
-                                   log_size_nm, MAX_BANDWIDTH, MIN_BANDWIDTH,
+                                   log_size_nm, marginal_tolerance, marginals,
+                                   MARGINAL_EXPONENT, MAX_BANDWIDTH,
+                                   MIN_BANDWIDTH, MIN_MARGINAL_TOL,
                                    normalised_weights, null_contrast,
-                                   soft_assign)
+                                   soft_assign, voting_sets)
+
+#: Real enumerated candidates for her lens, at the two size bounds the
+#: question is about. See the fixture's own ``_provenance``: it is
+#: ``Designer.enumerate_solutions`` on the 0D disc under delta_e, which has no
+#: RNG at all, so the file is a recording and not a sample. Regenerating it
+#: costs about three minutes, which is why it is a file.
+FIXTURE = Path(__file__).resolve().parents[1] / 'fixtures' / 'designer_plateau.json'
+
+
+def _enumerated(lmax):
+    """Every candidate the enumeration returned for the whole line."""
+    with open(FIXTURE) as fh:
+        return json.load(fh)['rows'][lmax]
+
+
+def _one_spectrum(lmax, index=0):
+    """Spectrum 0 is the noiseless ladder of the true 4 x 5 nm lens."""
+    return [r for r in _enumerated(lmax) if r['spectrum_index'] == index]
+
+
+#: The whole searched population, rather than the tie band: every candidate
+#: the search accepted under its 5% tolerance votes. That is the state the
+#: plateau was measured in — on noisy spectra the best fit is itself a few per
+#: cent out and the band admits the flat basin.
+WHOLE_POPULATION = dict(delta_abs=5.0, delta_rel=0.0)
 
 
 def _row(spectrum, candidate=0, r_nm=5.0, err=1.0, n_levels=4, skipped=0,
@@ -85,6 +114,320 @@ def test_a_wider_tolerance_admits_more():
     assert admissible_sets(rows)[0].n_admissible == 1
     assert admissible_sets(rows, delta_rel=0.5)[0].n_admissible == 2
     assert admissible_sets(rows, delta_abs=1.0)[0].n_admissible == 3
+
+
+# ─── the marginal over the axis the fit cannot see ───────────────────────────
+
+def _plateau(spectrum, r_nm, lz_values, err=4.008, first=0, **kwargs):
+    """One basin, sampled once per lattice node along L_z."""
+    return [_row(spectrum, first + c, r_nm=r_nm, err=err, lz_nm=lz, **kwargs)
+            for c, lz in enumerate(lz_values)]
+
+
+def test_the_collapse_tolerance_is_the_fits_own_resolution_in_r():
+    # E goes as R^-2, so a fit that still misses the spacings by 1.31% cannot
+    # place R better than 0.655% — and two candidates inside that are one
+    # answer written twice, not two answers.
+    assert marginal_tolerance(1.311456) == pytest.approx(0.01311456 / 2)
+    assert marginal_tolerance(1.0, exponent=1.0) == pytest.approx(0.01)
+    # It is never allowed to reach the density's own resolution: the collapse
+    # may not decide which wells exist.
+    assert marginal_tolerance(100.0) == MIN_BANDWIDTH
+    assert marginal_tolerance(0.0) == MIN_MARGINAL_TOL
+    assert marginal_tolerance(float('nan')) == MIN_MARGINAL_TOL
+    assert MARGINAL_EXPONENT == 2.0
+
+
+def test_a_plateau_sampled_thirteen_times_is_one_answer():
+    # Her measured case, from the fixture: of the seventeen candidates the
+    # enumeration returns at L_max = 13 nm, thirteen are the same
+    # R = 8.7761 nm at thirteen different L_z, all at RRMSE 4.008%.
+    rows = _one_spectrum('13.0')
+    assert len(rows) == 17
+    basin = [r for r in rows if abs(r['d1_nm'] - 8.7761) < 1e-3]
+    assert len(basin) == 13
+    assert min(r['d2_nm'] for r in basin) == pytest.approx(1.0)
+    assert max(r['d2_nm'] for r in basin) == pytest.approx(4.0)
+    assert max(r['rrmse_de_pct'] for r in basin) - \
+           min(r['rrmse_de_pct'] for r in basin) < 1e-3
+
+    sets = admissible_sets(rows, coord_fn=log_first_dim, **WHOLE_POPULATION)
+    groups = marginals(rows, sets, log_first_dim)[0]
+    assert isinstance(groups[0], Marginal)
+    # Seventeen rows, four answers about R.
+    assert len(groups) == 4
+    biggest = max(groups, key=lambda g: len(g.members))
+    assert len(biggest.members) == 14         # the plateau, and the near node
+    assert biggest.n_collapsed == 13
+    # The vote it carries: one share in four, not thirteen in seventeen.
+    weights = normalised_weights(rows, voting_sets(sets, {0: groups}))
+    assert sum(weights.values()) == pytest.approx(1.0)
+    assert len(weights) == 4
+    assert weights[biggest.representative] < 0.4
+    # ... against 13/17 of it before, which is what the mode followed.
+    before = normalised_weights(rows, sets)
+    assert sum(before[i] for i in biggest.members) > 0.6
+
+
+def test_the_collapse_never_outruns_the_kernel_that_follows_it():
+    # Deciding which wells exist is find_modes's job, and it has a support
+    # rule this has none of. So the collapse is capped at the narrowest
+    # kernel the density will be given — including a narrower one the caller
+    # asked for, which the panel's "wells within x nm are the same well" knob
+    # can produce.
+    assert marginal_tolerance(8.0, ceiling=0.005) == 0.005
+    rows = [_row(0, c, r_nm=5.0 * (1 + 0.01 * c), err=8.0) for c in range(3)]
+    sets = admissible_sets(rows, coord_fn=log_first_dim, **WHOLE_POPULATION)
+    assert len(marginals(rows, sets, log_first_dim)[0]) == 1
+    assert len(marginals(rows, sets, log_first_dim, ceiling=0.005)[0]) == 3
+
+
+def test_two_radii_the_data_can_tell_apart_stay_two_answers():
+    # 1% errors put the resolution in R at 0.5%: 5.00 and 5.01 nm are one
+    # answer, 5.00 and 5.10 nm are two. Nothing is collapsed because it is
+    # "close" — only because the measurement cannot resolve it.
+    close = [_row(0, 0, r_nm=5.0, err=1.0), _row(0, 1, r_nm=5.01, err=1.0)]
+    apart = [_row(0, 0, r_nm=5.0, err=1.0), _row(0, 1, r_nm=5.10, err=1.0)]
+    for rows, expected in ((close, 1), (apart, 2)):
+        sets = admissible_sets(rows, coord_fn=log_first_dim, **WHOLE_POPULATION)
+        assert len(marginals(rows, sets, log_first_dim)[0]) == expected
+
+
+def test_the_same_radius_read_as_two_ladders_stays_two_answers():
+    # Same R to the last digit, but one candidate reads the peaks as n = 1..4
+    # and the other as n = 2..5. Two hypotheses, two votes.
+    rows = [_row(0, 0, r_nm=5.0, qn_min=1), _row(0, 1, r_nm=5.0, qn_min=2)]
+    sets = admissible_sets(rows, coord_fn=log_first_dim, **WHOLE_POPULATION)
+    groups = marginals(rows, sets, log_first_dim)[0]
+    assert len(groups) == 2
+    assert {g.signature for g in groups} == {(1, 0), (2, 0)}
+
+
+def test_the_collapsed_range_is_reported_and_not_discarded():
+    # The whole point is that L_z becomes a range instead of one node of a
+    # plateau printed to four decimals.
+    lz = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0]
+    rows = [r for s in range(4) for r in _plateau(s, 8.0, lz)]
+    sets = admissible_sets(rows, coord_fn=log_first_dim, **WHOLE_POPULATION)
+    group = marginals(rows, sets, log_first_dim)[0][0]
+    assert group.spans['d2'] == (1.0, 4.0)
+    assert group.spans['d1'] == (8.0, 8.0)
+
+    result = consensus(rows, log_first_dim, bandwidth=0.05, **WHOLE_POPULATION)
+    mode = result.modes[0]
+    assert mode['Lz_lo_nm'] == pytest.approx(1.0)
+    assert mode['Lz_hi_nm'] == pytest.approx(4.0)
+    assert mode['n_candidates'] == 4        # four answers, one per spectrum
+    assert mode['n_rows'] == 24             # standing for twenty-four rows
+    assert mode['n_collapsed'] == 20
+
+
+def test_every_row_keeps_its_place_and_says_who_voted_for_it():
+    rows = [r for s in range(3) for r in _plateau(s, 8.0, [1.0, 2.0, 3.0])]
+    result = consensus(rows, log_first_dim, bandwidth=0.05, **WHOLE_POPULATION)
+    assert len(result.per_candidate) == len(rows)
+    assert all(c['admissible'] for c in result.per_candidate)
+    # One row per spectrum casts the vote; the other two sit on the same mode
+    # carrying none, and name the row that spoke for them.
+    voted = [c for c in result.per_candidate if c['weight'] > 0]
+    assert len(voted) == 3
+    assert sum(c['weight'] for c in result.per_candidate) == pytest.approx(3.0)
+    assert {c['mode'] for c in result.per_candidate} == {0}
+    for c in result.per_candidate:
+        assert c['represented_by'] in {v['row_index'] for v in voted}
+    assert [p['n_marginals'] for p in result.per_spectrum] == [1, 1, 1]
+
+
+def test_a_spectrum_still_carries_exactly_one_vote_after_the_collapse():
+    rows = _plateau(0, 8.0, [1.0, 1.5, 2.0]) + [_row(0, 9, r_nm=4.0, err=1.3)]
+    sets = admissible_sets(rows, coord_fn=log_first_dim, **WHOLE_POPULATION)
+    groups = marginals(rows, sets, log_first_dim)
+    weights = normalised_weights(rows, voting_sets(sets, groups))
+    assert sum(weights.values()) == pytest.approx(1.0)
+    assert len(weights) == 2
+
+
+def test_marginalise_false_votes_once_per_row_as_before():
+    rows = _plateau(0, 8.0, [1.0, 1.5, 2.0])
+    sets = admissible_sets(rows, coord_fn=log_first_dim, **WHOLE_POPULATION)
+    groups = marginals(rows, sets, log_first_dim, enabled=False)
+    assert [len(g.members) for g in groups[0]] == [1, 1, 1]
+    result = consensus(rows, log_first_dim, bandwidth=0.05, marginalise=False,
+                       **WHOLE_POPULATION)
+    assert result.meta['n_marginals'] == result.meta['n_admissible'] == 3
+    assert result.meta['n_collapsed'] == 0
+
+
+def test_free_dims_names_the_slots_the_fit_never_saw():
+    # Reporting only — the collapse never asks. The designer writes the
+    # geometry's own words, '+'-joined, and the underscore carries the
+    # meaning: L_z is the disc's second dimension, Lz the box's third.
+    assert free_dims({'flat_dims': 'L_z'}) == ('d2',)
+    assert free_dims({'flat_dims': 'Lx+Ly'}) == ('d1', 'd2')
+    assert free_dims({'flat_dims': 'Lz'}) == ('d3',)
+    assert free_dims({'flat_dims': ''}) == ()
+    assert free_dims({}) == ()
+    assert free_dims({'flat_dims': ['d2']}) == ('d2',)
+    assert free_dims({'flat_dims': 'R_outer'}) == ()      # unknown, not guessed
+
+
+def test_the_collapse_does_not_depend_on_the_flatness_flag():
+    """Whatever ``flat_dims`` says, the same rows collapse the same way.
+
+    ``Designer.flat_dims`` is a bit-equality test on the score, and in
+    ``delta_e`` a constant axial energy is added to every level and taken off
+    again as the offset, so it under-reports a plateau it cannot help
+    under-reporting (measured: 2 of the 13 nodes of the 8.7761 nm basin).
+    If the collapse consulted it, the eleven unflagged nodes would go back to
+    casting eleven votes — the exact defect this module removes. So the flag
+    is read for the LABEL and never for the decision, and that has to keep
+    being true while the flag itself is being repaired.
+    """
+    lz = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0]
+    plain = [r for s in range(4) for r in _plateau(s, 8.0, lz)]
+    variants = {
+        'absent': plain,
+        'flagged': [{**r, 'flat_dims': 'L_z'} for r in plain],
+        # What flat_dims actually returns on a plateau it only partly sees:
+        # the first node flagged and the rest bare.
+        'partial': [{**r, 'flat_dims': 'L_z' if r['candidate'] == 0 else ''}
+                    for r in plain],
+        'wrong': [{**r, 'flat_dims': 'R'} for r in plain],
+        'unknown': [{**r, 'flat_dims': 'R_outer'} for r in plain],
+    }
+    shapes = {}
+    for name, rows in variants.items():
+        sets = admissible_sets(rows, coord_fn=log_first_dim, **WHOLE_POPULATION)
+        groups = marginals(rows, sets, log_first_dim)
+        shapes[name] = [[len(g.members) for g in groups[s]] for s in sorted(groups)]
+        result = consensus(rows, log_first_dim, bandwidth=0.05, **WHOLE_POPULATION)
+        assert result.meta['n_collapsed'] == 20
+        assert result.modes[0]['R_nm'] == pytest.approx(8.0)
+    assert len(set(map(str, shapes.values()))) == 1, shapes
+
+
+def test_a_mode_says_which_axis_its_vertical_range_is_free_along():
+    """The range is reported either way; the label says what it means.
+
+    An unlabelled 1.0-4.0 nm reads as a spread of measurements. It is not —
+    it is the extent of one basin along an axis the fit never saw, and the
+    mode carries the rows' own word for that.
+    """
+    lz = [1.0, 2.0, 3.0, 4.0]
+    flagged = [{**r, 'flat_dims': 'L_z'}
+               for s in range(4) for r in _plateau(s, 8.0, lz)]
+    mode = consensus(flagged, log_first_dim, bandwidth=0.05,
+                     **WHOLE_POPULATION).modes[0]
+    assert mode['free_dims'] == 'd2'
+    assert (mode['Lz_lo_nm'], mode['Lz_hi_nm']) == pytest.approx((1.0, 4.0))
+    # No claim in the rows, no claim in the mode — the range still stands,
+    # because the collapse never needed the flag to make it.
+    bare = [r for s in range(4) for r in _plateau(s, 8.0, lz)]
+    plain = consensus(bare, log_first_dim, bandwidth=0.05,
+                      **WHOLE_POPULATION).modes[0]
+    assert plain['free_dims'] == ''
+    assert (plain['Lz_lo_nm'], plain['Lz_hi_nm']) == pytest.approx((1.0, 4.0))
+    # One answer in the mode saying the axis was free is enough: a mode whose
+    # range is part plateau cannot report that range as a measurement.
+    mixed = [{**r, 'flat_dims': 'L_z' if r['spectrum_index'] == 0 else ''}
+             for s in range(4) for r in _plateau(s, 8.0, lz)]
+    assert consensus(mixed, log_first_dim, bandwidth=0.05,
+                     **WHOLE_POPULATION).modes[0]['free_dims'] == 'd2'
+
+
+# ─── the property the whole module is for ────────────────────────────────────
+
+def test_the_r_marginal_mode_is_the_same_at_both_size_bounds():
+    """The answer must not depend on where the upper bound was put.
+
+    L_z is unmeasurable under delta_e, so widening the box from 13 to 18 nm
+    adds nodes along an axis the fit cannot see and nothing else. The mode of
+    the R-marginal is therefore the same number at both bounds — 4.02 nm
+    against a true 4.0 nm well — while the candidate lists it is computed
+    from have nothing in common: 115 rows against 126, and a flat basin that
+    is sampled 64 times in each.
+    """
+    modes = {}
+    for lmax in ('13.0', '18.0'):
+        result = consensus(_enumerated(lmax), log_first_dim,
+                           min_support_frac=0.15, **WHOLE_POPULATION)
+        modes[lmax] = max(result.modes, key=lambda m: m['weight'])['R_nm']
+        assert result.meta['n_collapsed'] > 50
+    assert modes['13.0'] == pytest.approx(4.0, rel=0.02)
+    assert modes['18.0'] == pytest.approx(modes['13.0'], abs=0.05)
+
+
+def test_without_the_marginal_the_mode_follows_the_size_bound():
+    """The defect this replaces, measured on the same rows.
+
+    Voting per row hands the flat basin 64 votes out of 115, and what is left
+    decides the answer by how many lattice nodes each bound happened to leave
+    on the plateau: the mode moves twenty-four times further between the two
+    bounds than it does once the plateau is one answer.
+    """
+    modes = {}
+    for lmax in ('13.0', '18.0'):
+        result = consensus(_enumerated(lmax), log_first_dim,
+                           min_support_frac=0.15, marginalise=False,
+                           **WHOLE_POPULATION)
+        modes[lmax] = max(result.modes, key=lambda m: m['weight'])['R_nm']
+        # And the basin the data rules out (nothing above R = 7 nm is
+        # admissible at any L_z) is a mode of its own, on the strength of
+        # being sampled 64 times.
+        assert any(m['R_nm'] > 8.0 for m in result.modes)
+    assert abs(modes['13.0'] - modes['18.0']) > 0.1
+
+    with_marginal = {
+        lmax: max(consensus(_enumerated(lmax), log_first_dim,
+                            min_support_frac=0.15, **WHOLE_POPULATION).modes,
+                  key=lambda m: m['weight'])['R_nm']
+        for lmax in ('13.0', '18.0')}
+    assert abs(with_marginal['13.0'] - with_marginal['18.0']) < \
+           abs(modes['13.0'] - modes['18.0']) / 10.0
+
+
+def test_the_null_draw_is_over_answers_and_not_over_lattice_nodes():
+    # The null picks one candidate per spectrum at random. Picking from the
+    # rows would make it inherit the plateau — thirteen of its seventeen
+    # draws would land on the same basin — and the observation would be
+    # compared against a differently shaped thing.
+    rows = _enumerated('13.0')
+    null = null_contrast(rows, log_first_dim, n_draws=20, seed=3,
+                         min_support_frac=0.15, **WHOLE_POPULATION)
+    plain = null_contrast(rows, log_first_dim, n_draws=20, seed=3,
+                          marginalise=False, min_support_frac=0.15,
+                          **WHOLE_POPULATION)
+    assert null['mean_set_size'] < plain['mean_set_size'] / 1.5
+    assert np.isfinite(null['p_value'])
+
+
+def test_the_null_collapses_at_the_same_tolerance_the_observation_did():
+    """Same population means the same tolerance, not just the same rule.
+
+    The collapse tolerance is capped by the kernel the modes are found with,
+    and the panel's "wells within x nm are the same well" knob sets that
+    kernel. If the null collapsed at the default cap while the observation
+    collapsed at the caller's narrower one, the two would be drawn from sets
+    of different sizes — and set size is exactly what the comparison is
+    sensitive to. Measured on the fixture at ``bandwidth=0.001``: 58 answers
+    in the observation against 55 in the null before this was mirrored.
+    """
+    rows = _enumerated('13.0')
+    for bandwidth in (None, 0.001):
+        result = consensus(rows, log_first_dim, bandwidth=bandwidth,
+                           min_support_frac=0.15, **WHOLE_POPULATION)
+        null = null_contrast(rows, log_first_dim, n_draws=5, seed=1,
+                             bandwidth=bandwidth, min_support_frac=0.15,
+                             **WHOLE_POPULATION)
+        assert null['mean_set_size'] == pytest.approx(
+            result.meta['n_marginals'] / result.meta['n_spectra'])
+    # A narrower kernel collapses less, so the two bandwidths are genuinely
+    # different populations and the check above is not vacuous.
+    assert consensus(rows, log_first_dim, bandwidth=0.001,
+                     min_support_frac=0.15,
+                     **WHOLE_POPULATION).meta['n_marginals'] > \
+           consensus(rows, log_first_dim, min_support_frac=0.15,
+                     **WHOLE_POPULATION).meta['n_marginals']
 
 
 # ─── weights ─────────────────────────────────────────────────────────────────

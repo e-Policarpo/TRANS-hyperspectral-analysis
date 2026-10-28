@@ -1,0 +1,435 @@
+{
+ "0D|disc||(4.0, 4.0, 4.0)": [],
+ "0D|disc||(4.0, 4.0, None)": [],
+ "0D|disc||(4.0, None, 4.0)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "0D|disc||(4.0, None, None)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "0D|disc||(None, 4.0, 4.0)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "0D|disc||(None, 4.0, None)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "0D|disc||(None, None, 4.0)": [
+  [
+   1.0,
+   20.0
+  ],
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "0D|disc||(None, None, None)": [
+  [
+   1.0,
+   20.0
+  ],
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "0D|parabolic||(4.0, 4.0, 4.0)": [],
+ "0D|parabolic||(4.0, 4.0, None)": [],
+ "0D|parabolic||(4.0, None, 4.0)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "0D|parabolic||(4.0, None, None)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "0D|parabolic||(None, 4.0, 4.0)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "0D|parabolic||(None, 4.0, None)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "0D|parabolic||(None, None, 4.0)": [
+  [
+   1.0,
+   20.0
+  ],
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "0D|parabolic||(None, None, None)": [
+  [
+   1.0,
+   20.0
+  ],
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "0D|spherical||(4.0, 4.0, 4.0)": [],
+ "0D|spherical||(4.0, 4.0, None)": [],
+ "0D|spherical||(4.0, None, 4.0)": [],
+ "0D|spherical||(4.0, None, None)": [],
+ "0D|spherical||(None, 4.0, 4.0)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "0D|spherical||(None, 4.0, None)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "0D|spherical||(None, None, 4.0)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "0D|spherical||(None, None, None)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "1D|cartesian||(4.0, 4.0, 4.0)": [],
+ "1D|cartesian||(4.0, 4.0, None)": [],
+ "1D|cartesian||(4.0, None, 4.0)": [],
+ "1D|cartesian||(4.0, None, None)": [],
+ "1D|cartesian||(None, 4.0, 4.0)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "1D|cartesian||(None, 4.0, None)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "1D|cartesian||(None, None, 4.0)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "1D|cartesian||(None, None, None)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "2D|cartesian|rectangular|(4.0, 4.0, 4.0)": [],
+ "2D|cartesian|rectangular|(4.0, 4.0, None)": [],
+ "2D|cartesian|rectangular|(4.0, None, 4.0)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "2D|cartesian|rectangular|(4.0, None, None)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "2D|cartesian|rectangular|(None, 4.0, 4.0)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "2D|cartesian|rectangular|(None, 4.0, None)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "2D|cartesian|rectangular|(None, None, 4.0)": [
+  [
+   1.0,
+   20.0
+  ],
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "2D|cartesian|rectangular|(None, None, None)": [
+  [
+   1.0,
+   20.0
+  ],
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "2D|cartesian|square|(4.0, 4.0, 4.0)": [],
+ "2D|cartesian|square|(4.0, 4.0, None)": [],
+ "2D|cartesian|square|(4.0, None, 4.0)": [],
+ "2D|cartesian|square|(4.0, None, None)": [],
+ "2D|cartesian|square|(None, 4.0, 4.0)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "2D|cartesian|square|(None, 4.0, None)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "2D|cartesian|square|(None, None, 4.0)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "2D|cartesian|square|(None, None, None)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "2D|circular||(4.0, 4.0, 4.0)": [],
+ "2D|circular||(4.0, 4.0, None)": [],
+ "2D|circular||(4.0, None, 4.0)": [],
+ "2D|circular||(4.0, None, None)": [],
+ "2D|circular||(None, 4.0, 4.0)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "2D|circular||(None, 4.0, None)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "2D|circular||(None, None, 4.0)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "2D|circular||(None, None, None)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "3D|cartesian|cubic|(4.0, 4.0, 4.0)": [],
+ "3D|cartesian|cubic|(4.0, 4.0, None)": [],
+ "3D|cartesian|cubic|(4.0, None, 4.0)": [],
+ "3D|cartesian|cubic|(4.0, None, None)": [],
+ "3D|cartesian|cubic|(None, 4.0, 4.0)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "3D|cartesian|cubic|(None, 4.0, None)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "3D|cartesian|cubic|(None, None, 4.0)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "3D|cartesian|cubic|(None, None, None)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "3D|cartesian|orthorhombic|(4.0, 4.0, 4.0)": [],
+ "3D|cartesian|orthorhombic|(4.0, 4.0, None)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "3D|cartesian|orthorhombic|(4.0, None, 4.0)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "3D|cartesian|orthorhombic|(4.0, None, None)": [
+  [
+   1.0,
+   20.0
+  ],
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "3D|cartesian|orthorhombic|(None, 4.0, 4.0)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "3D|cartesian|orthorhombic|(None, 4.0, None)": [
+  [
+   1.0,
+   20.0
+  ],
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "3D|cartesian|orthorhombic|(None, None, 4.0)": [
+  [
+   1.0,
+   20.0
+  ],
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "3D|cartesian|orthorhombic|(None, None, None)": [
+  [
+   1.0,
+   20.0
+  ],
+  [
+   1.0,
+   20.0
+  ],
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "3D|cartesian|tetragonal|(4.0, 4.0, 4.0)": [],
+ "3D|cartesian|tetragonal|(4.0, 4.0, None)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "3D|cartesian|tetragonal|(4.0, None, 4.0)": [],
+ "3D|cartesian|tetragonal|(4.0, None, None)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "3D|cartesian|tetragonal|(None, 4.0, 4.0)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "3D|cartesian|tetragonal|(None, 4.0, None)": [
+  [
+   1.0,
+   20.0
+  ],
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "3D|cartesian|tetragonal|(None, None, 4.0)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "3D|cartesian|tetragonal|(None, None, None)": [
+  [
+   1.0,
+   20.0
+  ],
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "3D|cylindrical||(4.0, 4.0, 4.0)": [],
+ "3D|cylindrical||(4.0, 4.0, None)": [],
+ "3D|cylindrical||(4.0, None, 4.0)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "3D|cylindrical||(4.0, None, None)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "3D|cylindrical||(None, 4.0, 4.0)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "3D|cylindrical||(None, 4.0, None)": [
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "3D|cylindrical||(None, None, 4.0)": [
+  [
+   1.0,
+   20.0
+  ],
+  [
+   1.0,
+   20.0
+  ]
+ ],
+ "3D|cylindrical||(None, None, None)": [
+  [
+   1.0,
+   20.0
+  ],
+  [
+   1.0,
+   20.0
+  ]
+ ]
+}

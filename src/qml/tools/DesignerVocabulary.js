@@ -24,6 +24,19 @@ var matchLabels = ["Absolute energies", "Differences (ΔE)", "ΔE ratios"]
 var priorityKeys = ["uniform", "ground_state", "low_quantum_numbers"]
 var priorityLabels = ["Uniform", "Ground state only", "Low quantum numbers"]
 
+// Which model level each measured level is compared to. A DIFFERENT question
+// from `priority`, which decides how much each target counts once that
+// comparison is made — the two were one combo box for as long as only one of
+// them was reachable, and they are not one question.
+var assignKeys = ["energy", "sequential", "low_quantum_numbers", "mixed"]
+var assignLabels = ["Nearest energy", "Sequential states",
+                    "Lowest quantum numbers",
+                    "Mixed (energy and quantum numbers)"]
+
+var searchModeKeys = ["sample", "enumerate"]
+var searchModeLabels = ["Sample (random restarts)",
+                        "Enumerate (deterministic lattice)"]
+
 var sortKeys = ["rrmse", "rrmse_delta_e", "size_asc", "size_desc",
                 "anisotropy", "ground_state"]
 var sortLabels = ["Error (RRMSE)", "Error in the spacings (ΔE)",
@@ -54,6 +67,36 @@ function symsFor(ndim, coords) {
                 labels: ["Cubic (Lx = Ly = Lz)", "Tetragonal (Lx = Ly)",
                          "Orthorhombic"]}
     return {keys: [""], labels: ["—"]}
+}
+
+// The dimensions a geometry actually has, in her terms rather than the
+// engine's — {keys: ["d1", "d2"], labels: ["R", "L_z"]} for a lens. These are
+// exactly the dimensions that can be pinned or given a range of their own: a
+// square is ONE length filling two slots, and a tetragonal cell is d1 and d3
+// with no d2, so the list is not simply "one per dimensionality".
+//
+// A mirror of ToolImplementations._designer_dim_names, which derives the same
+// list from Designer.dim_keys. QML cannot import Python and the panel has to
+// draw these controls before any search has run, so the table exists twice;
+// keep the two in step.
+function dimsFor(ndim, coords, sym) {
+    if (ndim === "0D") {
+        if (coords === "spherical") return {keys: ["d1"], labels: ["R"]}
+        if (coords === "parabolic") return {keys: ["d1", "d2"],
+                                            labels: ["l_xy", "l_z"]}
+        return {keys: ["d1", "d2"], labels: ["R", "L_z"]}
+    }
+    if (ndim === "1D") return {keys: ["d1"], labels: ["L"]}
+    if (ndim === "2D") {
+        if (coords === "circular") return {keys: ["d1"], labels: ["R"]}
+        if (sym === "square") return {keys: ["d1"], labels: ["L"]}
+        return {keys: ["d1", "d2"], labels: ["Lx", "Ly"]}
+    }
+    if (coords === "cylindrical") return {keys: ["d1", "d2"],
+                                          labels: ["R", "L_z"]}
+    if (sym === "cubic") return {keys: ["d1"], labels: ["L"]}
+    if (sym === "tetragonal") return {keys: ["d1", "d3"], labels: ["Lx", "Lz"]}
+    return {keys: ["d1", "d2", "d3"], labels: ["Lx", "Ly", "Lz"]}
 }
 
 // Pick a key by combo index, clamped — a combo whose model was just replaced
