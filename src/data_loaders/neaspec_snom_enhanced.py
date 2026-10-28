@@ -281,6 +281,10 @@ class NeaSpecSNOMEnhancedLoader(BaseDataLoader):
 
                 logger.info(f"Created SpectralData for {key}: {spectral_data.num_spectra} spectra")
 
+        # Every channel combination came out of one export file, so they
+        # all share its header — one parsed dict, attached to each.
+        self.attach_headers(results.values(), filepath)
+
         self.last_loaded_path = filepath
         logger.info(f"Successfully loaded NeaSpec SNOM data: {len(results)} channel combinations")
 

@@ -442,6 +442,9 @@ class ParkAFMLoader(BaseDataLoader):
                 dummy_df, meta,
                 topography.data if topography else None)
 
+        self.attach_session_headers(spectral_data,
+                                    list(tiff_files) + list(ppt_files))
+
         self.last_loaded_path = directory
         return spectral_data, topography
 
@@ -452,11 +455,14 @@ class ParkAFMLoader(BaseDataLoader):
             raise FileNotFoundError(f"File not found: {filepath}")
 
         if filepath.suffix == '.ps-ppt':
-            return self._load_ppt_as_spectral(filepath)
+            spectral_data = self._load_ppt_as_spectral(filepath)
         elif filepath.suffix in ('.tiff', '.tif'):
-            return self._load_tiff_as_spectral(filepath)
+            spectral_data = self._load_tiff_as_spectral(filepath)
         else:
             raise ValueError(f"Unsupported file: {filepath.suffix}")
+
+        self.attach_headers(spectral_data, filepath)
+        return spectral_data
 
     # ── Smart import ──────────────────────────────────────────────────
 
@@ -607,6 +613,15 @@ class ParkAFMLoader(BaseDataLoader):
         all_channels.update(tiff_channels)
         all_channels.update(ppt_channels)
         spectral_data.metadata.additional_info['channels'] = all_channels
+
+        # The full headers of every file in this session: the .ps-ppt
+        # scan.start / ppt.param records (geometry, rate, setpoint,
+        # cantilever calibration) and each .tiff's tags plus Park's private
+        # scan-parameter block. One parsed dict per file, shared by the
+        # datasets it produced.
+        _session_files = list(siblings_tiff) + list(siblings_ppt)
+        for _ds in [spectral_data, *all_channels.values()]:
+            self.attach_session_headers(_ds, _session_files)
 
         # Assemble the collected per-TIFF previews into multi-channel images —
         # one per pixel geometry, so a scan's channels/directions ride in a

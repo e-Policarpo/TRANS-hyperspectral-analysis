@@ -205,6 +205,8 @@ class NanosurfSTSLoader(BaseDataLoader):
         if progress_callback:
             progress_callback(len(nid_files), len(nid_files), "Complete!")
 
+        self.attach_session_headers(spectral_data, nid_files)
+
         self.last_loaded_path = directory
         logger.info(f"Successfully loaded STS data: {spectral_data}")
 
@@ -298,7 +300,9 @@ class NanosurfSTSLoader(BaseDataLoader):
         
         # Create SpectralData
         spectral_data = SpectralData(df, metadata)
-        
+
+        self.attach_headers(spectral_data, filepath)
+
         self.last_loaded_path = filepath
         logger.info(f"Successfully loaded single file: {spectral_data}")
         

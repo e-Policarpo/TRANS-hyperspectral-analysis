@@ -285,7 +285,9 @@ class NeaSpecSNOMLoader(BaseDataLoader):
             additional_channels[channel] = channel_df
         
         spectral_data.metadata.additional_info['harmonic_channels'] = additional_channels
-        
+
+        self.attach_headers(spectral_data, filepath)
+
         self.last_loaded_path = filepath
         logger.info(f"Successfully loaded NeaSpec SNOM data: {spectral_data}")
         

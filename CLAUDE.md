@@ -63,6 +63,74 @@ Reference: <https://gwyddion.net/documentation/user-guide-en/gsf.html>
 - Don't assume the lateral unit is µm; route through `src/utils/units.py`,
   which handles m/mm/µm/nm/Å/pm and returns `None` for non-length units.
 
+## Loaders parse the WHOLE header
+
+**Rule: a loader reads every field the instrument wrote, not just the ones it
+needs to build a dataset.** Feedback gains, cantilever and scan-head identity,
+lock-in and KPFM settings, grating and CCD readout, integration time — these
+are what an acquisition has to be reported with, and they used to be read past
+and lost.
+
+| Layer | Module | Purpose |
+|---|---|---|
+| Parsing | `src/data_loaders/raw_header.py` | one function per format, metadata only |
+| Attaching | `BaseDataLoader.attach_headers` / `attach_session_headers` | put it on the loaded data |
+| Rendering | `src/utils/metadata_report.py` | one readable text report |
+| Writing | `AppBackend._write_scan_parameters_report` | `imported/scan_parameters.txt` |
+
+Supported: Nanosurf `.nid` (INI sections, with the `D[3]*[N/m]` typed notation
+decoded), NeaSpec `.txt`/`.dat`, Omicron `.Z_flat`/`.I_flat` and MATRIX
+`_0001.mtrx`, Park `.ps-ppt` and `.tiff`, WITec `.wip` (every acquisition's
+info text).
+
+### Omicron MATRIX: the header is a log, so there is also an inventory
+
+A MATRIX `_0001.mtrx` is not a static header but a timestamped event log:
+an initial parameter snapshot, then every parameter change (`PMOD`), every
+data file written (`BREF`) and every annotation (`MARK`, incl.
+`STS_LOCATION`). `raw_header` reports only the end state.
+**`src/data_loaders/mtrx_inventory.py`** replays the whole log and reconciles
+it with the disk: one entry per measurement (`kind`, `run`, `scan`) with its
+time, STS location, `parameter_epoch` and `changed_since_previous`, plus
+severity-graded flags (`file_missing`, `file_elsewhere`, `not_in_header`,
+`incomplete`, `truncated`, `channel_missing`, `scan_absent`, `run_absent`,
+`stopped_early`, `header_chain_gap`, `stream_truncated`, `no_end_marker`, …).
+Every MATRIX import writes `imported/matrix_inventory/<session>.inventory.json`
++ `.txt` on the I/O worker (`AppBackend._write_matrix_inventories`; user data
+folder when no project is open), and each dataset carries the paths under
+`additional_info['matrix_inventory']`. CLI:
+`python -m src.data_loaders.mtrx_inventory <session file or folder> [-o DIR]`.
+
+- Image and spectroscopy runs have **separate** run counters.
+- Drift compensation rewrites `XYScanner.X/Y_Offset` several times a second
+  (~10^6 writes a session). Parameters written more often than measurements
+  are taken are **tracked**: their value sits on each measurement, and the
+  history keeps only jumps above the largest *recurring* step size (pixel
+  re-registration steps recur; operator moves do not). Do not put them back
+  into the epochs — one epoch per measurement and a 228 MB JSON.
+- An image stopped early is `info`, not damage: every image in the sampled
+  sessions was stopped mid-frame.
+
+### How a new loader joins in
+
+Add a `parse_*_header` to `raw_header.py`, wire it into `read_raw_header`'s
+dispatch, and call `self.attach_headers(data, filepath)` (one file) or
+`self.attach_session_headers(primary, files)` (a session) before returning.
+Every import then picks it up with no further work: the backend collects
+`raw_header` / `raw_headers` off whatever is loaded, de-duplicates by source
+path and rewrites one report covering every file in the project.
+
+### Don't
+
+- Don't let a header read raise. `read_raw_header` returns `None` for anything
+  it cannot parse — a metadata read must never fail an import.
+- Don't copy a header per channel. Attach the **same** dict object; a Nanosurf
+  header is ~900 keys and a session has hundreds of datasets.
+- Don't interpret values while parsing. Keep what the instrument wrote
+  (`"3µm"`, `"922m°"`); unit conversion belongs in the loader.
+- Don't put measurement values in the report. Arrays and frames are summarised
+  by shape — the report is metadata only.
+
 ## Negative LDOS is not a measurement
 
 dI/dV is proportional to a density of states, and a density of states cannot

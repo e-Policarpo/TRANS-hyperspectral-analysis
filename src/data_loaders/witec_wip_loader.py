@@ -32,6 +32,7 @@ from ..models.spectral_data import SpectralData, SpectralMetadata
 from .session_organization import spatial_info
 from ..models.topography_data import TopographyData
 from .base_loader import BaseDataLoader, ProgressCallback
+from .raw_header import wip_header_from_project
 from .witec_wip.wip_parser import (
     WipBitmap,
     WipGraph,
@@ -495,6 +496,16 @@ class WitecWipLoader(BaseDataLoader):
             info.update(session_span)
         primary.metadata.additional_info["session_label"] = session_label
         primary.metadata.additional_info.update(session_span)
+
+        # Every acquisition's full info text — grating, spectral range, CCD
+        # temperature and readout settings, integration time, accumulations,
+        # objective, stage position — not just the handful of fields the
+        # loader itself consumes. Built from the project parsed above, so the
+        # .wip is not read a second time.
+        self.attach_headers(
+            [primary, *channels.values()], filepath,
+            header=wip_header_from_project(project, filepath),
+        )
 
         # Acquisition info, excitation wavelength, and spectral cursors —
         # all attached to the primary dataset's additional_info so the

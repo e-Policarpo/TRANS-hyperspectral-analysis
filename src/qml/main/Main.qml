@@ -384,6 +384,14 @@ ApplicationWindow {
                 enabled: backend.projectReady
                 onTriggered: importImageDialog.open()
             }
+            // A curve from outside the project, taken as dI/dV as it is —
+            // for refining a simulation against a spectrum that never went
+            // through the pipeline. Also on the two confinement panels.
+            MenuItem {
+                text: "Import CSV as dI/dV..."
+                enabled: backend.projectReady
+                onTriggered: importDidvCsvDialog.open()
+            }
 
             MenuSeparator {
                 contentItem: Rectangle {
@@ -1975,6 +1983,21 @@ ApplicationWindow {
         } else {
             loader.openOnLoad = true
             loader.active = true
+        }
+    }
+
+    // Import a curve CSV as dI/dV. The dialect is sniffed on the Python
+    // side (comma or semicolon, '.' or ',' decimals, header or none); the
+    // numbers are taken at their word. A copy in the project's own dialect
+    // lands in <outputs>/imported/.
+    Platform.FileDialog {
+        id: importDidvCsvDialog
+        title: "Import a CSV as dI/dV spectra"
+        nameFilters: ["CSV files (*.csv)", "All files (*)"]
+        fileMode: Platform.FileDialog.OpenFile
+        onAccepted: {
+            var name = backend.importDidvCsv(file.toString())
+            if (name) console.log("Imported CSV as dI/dV:", name)
         }
     }
 

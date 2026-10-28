@@ -98,6 +98,7 @@ class OmicronFlatLoader(BaseDataLoader):
         )
         spectral_data = SpectralData(dummy_df, dummy_metadata,
                                      topography.data if topography else None)
+        self.attach_session_headers(spectral_data, flat_files)
 
         self.last_loaded_path = directory
         return spectral_data, topography
@@ -123,6 +124,9 @@ class OmicronFlatLoader(BaseDataLoader):
             instrument="Omicron Matrix"
         )
         spectral_data = SpectralData(dummy_df, metadata, topography.data)
+        self.attach_headers(spectral_data, filepath)
+        if topography is not None:
+            self.attach_headers(topography, filepath)
         self.last_loaded_path = filepath
         return spectral_data
 

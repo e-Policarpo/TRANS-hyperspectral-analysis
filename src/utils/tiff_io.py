@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
 import numpy as np
 
@@ -40,6 +40,20 @@ _IJ_UNIT = {
     "µm": "micron", "um": "micron", "micron": "micron", "microns": "micron",
     "nm": "nm", "mm": "mm", "cm": "cm", "m": "meter",
 }
+
+
+def _clean_unit(unit: Optional[str]) -> str:
+    """A unit string safe to put in an ImageJ description.
+
+    The description is a line-based ``key=value`` block and per-channel units
+    are packed one-per-channel separated by tabs, so a unit carrying a tab or
+    a newline would silently corrupt every field after it. ``=`` is dropped
+    for a sharper reason: tifffile parses each line with a bare
+    ``line.split('=')`` and unpacks two values, so a second ``=`` anywhere on
+    the line raises and the whole line is skipped — the field would be written
+    and then never read back. No real unit contains any of the three.
+    """
+    return " ".join(str(unit or "").replace("=", "").split())
 
 
 def imagej_tiff_kwargs(data: np.ndarray,
@@ -130,7 +144,9 @@ def write_channel_stack_tiff(path: Union[str, Path],
                              dx: Optional[float] = None,
                              dy: Optional[float] = None,
                              unit: Optional[str] = None,
-                             clip_percentile: float = 1.0) -> str:
+                             clip_percentile: float = 1.0,
+                             value_units: Optional[Mapping[str, str]] = None,
+                             default_value_unit: Optional[str] = None) -> str:
     """One multi-page TIFF for a whole scan: every channel a page.
 
     An ImageJ hyperstack (``axes=CYX``), so Fiji opens it as one image with
@@ -139,6 +155,14 @@ def write_channel_stack_tiff(path: Union[str, Path],
     not share a sensible min/max. The pixel scale rides on the same
     resolution tags :func:`imagej_tiff_kwargs` writes, so Fiji and Gwyddion
     read real units; Gwyddion opens each page as a separate field.
+
+    ``value_units`` maps channel name → Z-axis unit (e.g. ``{"Z fwd/up":
+    "m", "I fwd/up": "A"}``), with ``default_value_unit`` covering any
+    channel not listed — the same pair :func:`src.utils.gwy_io.write_gwy`
+    takes, so a scan's ``.gwy`` and its TIFF describe their numbers
+    identically. Without them the pages are calibrated in *x* and *y* but
+    their values are bare floats that say nothing about being metres, amps
+    or volts.
 
     Channels are stacked as float32 when their dtypes differ (a scan mixes
     heights and currents; a uint16 page next to a float one is not a
@@ -180,6 +204,19 @@ def write_channel_stack_tiff(path: Union[str, Path],
         # element, and the IJ 'rang' block is one flat run of doubles.
         "Ranges": tuple(ranges),
     }
+    # Z units, positional like Labels and Ranges: ImageJ has no per-channel
+    # unit field, so they ride in the description as one tab-separated run in
+    # channel order. Written only when at least one channel has a unit, so a
+    # scan that knows none adds no empty tag.
+    declared = dict(value_units or {})
+    per_channel = [_clean_unit(declared.get(n) or default_value_unit)
+                   for n in names]
+    if any(per_channel):
+        metadata["value_units"] = "\t".join(per_channel)
+    else:
+        logger.warning("Channel stack %s carries no Z units — its pages will "
+                       "open as bare numbers.", Path(path).name)
+
     kwargs: Dict[str, Any] = {"imagej": True, "rowsperstrip": 64}
     if dx and dy and dx > 0 and dy > 0:
         ij_unit = _IJ_UNIT.get((unit or "").strip(), (unit or "").strip())
@@ -247,7 +284,10 @@ def read_tiff_calibration(path: Union[str, Path]) -> Optional[Dict[str, Any]]:
     exports and reads third-party files.
 
     Returns ``{'dx', 'dy', 'unit', 'value_unit'}`` or ``None`` when the file
-    carries no usable calibration. ``dx`` / ``dy`` are in ``unit``.
+    carries no usable calibration. ``dx`` / ``dy`` are in ``unit``. A channel
+    stack written by :func:`write_channel_stack_tiff` also carries
+    ``'value_units'``: one unit per channel, in the order of the ImageJ
+    ``Labels``, with ``''`` where the unit was unknown.
     """
     try:
         import tifffile
@@ -284,5 +324,9 @@ def read_tiff_calibration(path: Union[str, Path]) -> Optional[Dict[str, Any]]:
     if not unit:
         return None
 
-    return {"dx": dx, "dy": dy, "unit": str(unit),
-            "value_unit": ij.get("value_unit")}
+    out: Dict[str, Any] = {"dx": dx, "dy": dy, "unit": str(unit),
+                           "value_unit": ij.get("value_unit")}
+    stacked = ij.get("value_units")
+    if stacked:
+        out["value_units"] = str(stacked).split("\t")
+    return out

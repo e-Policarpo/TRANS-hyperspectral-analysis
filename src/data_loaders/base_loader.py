@@ -18,6 +18,7 @@ import numpy as np
 from ..models.spectral_data import SpectralData, SpectralMetadata
 from ..models.topography_data import TopographyData, TopographyMetadata
 from ..utils.naming import padded_series
+from .raw_header import attach_raw_header, read_raw_header
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,10 @@ class BaseDataLoader(ABC):
         self.supported_extensions: List[str] = []
         self.loader_type: str = "base"
         self.last_loaded_path: Optional[Path] = None
+        # Parsed file headers, keyed by path: a session import reads the same
+        # file's header from several code paths, and the dict is shared by
+        # every dataset the file produces rather than copied per channel.
+        self._header_cache: Dict[str, Optional[Dict[str, Any]]] = {}
         
     @abstractmethod
     def load_from_directory(self, directory: Path) -> Tuple[SpectralData, Optional[TopographyData]]:
@@ -75,6 +80,67 @@ class BaseDataLoader(ABC):
         """
         pass
     
+    # ── Full-header metadata ────────────────────────────────────────
+
+    def read_file_header(self, filepath: Path) -> Optional[Dict[str, Any]]:
+        """The complete parsed header of ``filepath`` (cached per loader).
+
+        See :mod:`src.data_loaders.raw_header`: every field the instrument
+        wrote, not just the ones this loader needs to build a dataset.
+        Returns None for a format with no readable header.
+        """
+        key = str(filepath)
+        if key not in self._header_cache:
+            self._header_cache[key] = read_raw_header(Path(filepath))
+        return self._header_cache[key]
+
+    def attach_headers(self, targets: Any, filepath: Path,
+                       header: Optional[Dict[str, Any]] = None
+                       ) -> Optional[Dict[str, Any]]:
+        """Attach ``filepath``'s full header to the object(s) it produced.
+
+        ``targets`` may be one loaded object, an iterable of them, or an
+        ``additional_info`` dict. Every target ends up sharing one header
+        object under ``additional_info['raw_header']``, which the import
+        writes out as a scan-parameter report.
+
+        Pass ``header`` when the loader has already parsed it — a container
+        format (``.wip``) should not be read twice.
+        """
+        if header is None:
+            header = self.read_file_header(filepath)
+        else:
+            self._header_cache[str(filepath)] = header
+        return attach_raw_header(targets, Path(filepath), header)
+
+    def attach_session_headers(self, target: Any,
+                               filepaths: List[Path]
+                               ) -> List[Dict[str, Any]]:
+        """Attach the headers of every file of a multi-file session.
+
+        A session import (a directory of .nid files, a MATRIX run) produces
+        datasets that do not map one-to-one onto source files, so the whole
+        set is recorded on the overview object under
+        ``additional_info['raw_headers']``.
+        """
+        headers = [h for h in (self.read_file_header(Path(f))
+                               for f in filepaths) if h]
+        if not headers:
+            return []
+        info = target
+        if not isinstance(info, dict):
+            meta = getattr(target, 'metadata', None)
+            info = getattr(meta, 'additional_info', None)
+        if isinstance(info, dict):
+            existing = info.get('raw_headers')
+            if isinstance(existing, list):
+                seen = {h.get('source_file') for h in existing}
+                existing.extend(h for h in headers
+                                if h.get('source_file') not in seen)
+            else:
+                info['raw_headers'] = headers
+        return headers
+
     def validate_directory(self, directory: Path) -> bool:
         """
         Validate that directory exists and contains supported files.

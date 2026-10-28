@@ -9,6 +9,7 @@ import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
+import QtQuick.Dialogs
 import TransQML 1.0
 import "../components"
 import "../map_editor/Fmt.js" as Fmt  // shared sci-notation helper
@@ -325,6 +326,25 @@ Item {
         updateSpectrumRange()
     }
 
+    // The file is presumed to follow the dataset convention (bias in V down
+    // the first column, one dI/dV spectrum per further column) — no
+    // detection, so a wrong file is a dataset with wrong numbers, not an
+    // error. The new dataset becomes the current one.
+    FileDialog {
+        id: didvCsvDialog
+        title: "Import a CSV as dI/dV spectra"
+        nameFilters: ["CSV files (*.csv)", "All files (*)"]
+        onAccepted: {
+            var name = backend.importDidvCsv(selectedFile.toString())
+            if (!name) return
+            refreshDatasets()
+            var i = datasetCombo.model.indexOf(name)
+            if (i >= 0) datasetCombo.currentIndex = i
+            statusLabel.text = "Imported " + name + " — taken as dI/dV as it is."
+            statusLabel.color = textMuted
+        }
+    }
+
     function updateSpectrumRange() {
         if (datasetCombo.currentIndex < 0) return
         var info = backend.getDatasetInfo ? backend.getDatasetInfo(datasetCombo.currentText) : null
@@ -400,6 +420,15 @@ Item {
                             id: datasetCombo
                             Layout.fillWidth: true
                             onCurrentTextChanged: updateSpectrumRange()
+                        }
+
+                        // A curve from outside the project, taken as dI/dV as
+                        // it is: the way to refine a simulation against a
+                        // spectrum that never went through the pipeline.
+                        ToolButton {
+                            Layout.fillWidth: true
+                            text: "Import CSV as dI/dV…"
+                            onClicked: didvCsvDialog.open()
                         }
 
                         RowLayout {

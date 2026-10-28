@@ -490,16 +490,150 @@ class AppBackend(ToolImplementations, QObject):
         to_persist = dict(datasets)
         self._persist_batch_seq += 1
 
+        # Snapshot the headers on this (main) thread: the report covers every
+        # file loaded so far, and self._datasets can change under the worker.
+        headers = self._collect_scan_headers()
+
         def _write_batch(task):
             for _name, _ds in to_persist.items():
                 if task.cancelled:
                     return
                 self._autosave_imported_dataset(_name, _ds)
+            if not task.cancelled:
+                self._write_scan_parameters_report(headers)
 
         self.worker_manager.submit_io(
             name=f"Persist imports #{self._persist_batch_seq}",
             operation=_write_batch,
         )
+
+    #: Where MATRIX session inventories go, under the project's ``imported``
+    #: folder (or the user data folder when no project is open).
+    MATRIX_INVENTORY_DIRNAME = "matrix_inventory"
+
+    def _matrix_inventory_dir(self) -> Path:
+        if self._output_base_dir is not None:
+            return self._output_base_dir / 'imported' / self.MATRIX_INVENTORY_DIRNAME
+        from src.utils.app_paths import user_data_dir
+        return user_data_dir() / self.MATRIX_INVENTORY_DIRNAME
+
+    def _write_matrix_inventories(self, requests) -> None:
+        """Build and write each MATRIX session's inventory on the I/O worker.
+
+        The inventory replays the whole parameter log and reads the head of
+        every data file — tens of seconds for a 200k-file session — so it
+        runs after the import, never inside it. Output: one
+        ``<session>.inventory.json`` + ``.txt`` per session in
+        :meth:`_matrix_inventory_dir`.
+        """
+        if not requests:
+            return
+        requests = list(requests)
+        out_dir = self._matrix_inventory_dir()
+        self._persist_batch_seq += 1
+
+        def _job(task):
+            from src.data_loaders.mtrx_inventory import (
+                build_session_inventory, write_inventory)
+            written = []
+            for req in requests:
+                if task.cancelled:
+                    break
+                try:
+                    inv = build_session_inventory(
+                        req['base'], Path(req['directory']),
+                        not_loaded=req.get('not_loaded') or ())
+                    if req.get('label'):
+                        inv['session']['label'] = req['label']
+                    jpath, _tpath = write_inventory(inv, out_dir)
+                    written.append(str(jpath))
+                    sm = inv['summary']
+                    logger.info(
+                        "MATRIX inventory %s: %d measurements, %d flagged → %s",
+                        req['base'], sum(sm['measurements'].values()),
+                        sm['measurements_flagged'], jpath)
+                except Exception as e:  # never let a report break an import
+                    logger.warning("Could not write MATRIX inventory for %s: %s",
+                                   req.get('base'), e)
+            return written
+
+        def _done(written):
+            if written:
+                self.statusChanged.emit(
+                    f"MATRIX inventory written to {out_dir}"
+                    f" ({len(written)} session{'s' if len(written) != 1 else ''})")
+
+        self.worker_manager.submit_io(
+            name=f"MATRIX inventory #{self._persist_batch_seq}",
+            operation=_job, on_finished=_done)
+
+    #: One combined, human-readable dump of every loaded file's acquisition
+    #: parameters. Sits next to the imported CSVs because that is where the
+    #: measurements they describe are written.
+    SCAN_PARAMETERS_FILENAME = "scan_parameters.txt"
+
+    def _collect_scan_headers(self) -> list:
+        """Every parsed instrument header currently loaded, de-duplicated.
+
+        Loaders attach the full header of each measurement file to the data
+        it produced — ``raw_header`` for a single file, ``raw_headers`` for a
+        multi-file session — and share one dict across a file's channels, so
+        de-duplicating by source path collapses a session's hundred datasets
+        back to its handful of files.
+        """
+        headers: list = []
+        seen: set = set()
+
+        def _take(info) -> None:
+            if not isinstance(info, dict):
+                return
+            candidates = []
+            one = info.get('raw_header')
+            if isinstance(one, dict):
+                candidates.append(one)
+            many = info.get('raw_headers')
+            if isinstance(many, list):
+                candidates.extend(h for h in many if isinstance(h, dict))
+            for header in candidates:
+                key = header.get('source_file') or id(header)
+                if key in seen:
+                    continue
+                seen.add(key)
+                headers.append(header)
+
+        for source in (self._datasets, self._images):
+            for entity in list(source.values()):
+                _take(getattr(getattr(entity, 'metadata', None),
+                              'additional_info', None))
+        return headers
+
+    def _write_scan_parameters_report(self, headers: Optional[list] = None
+                                      ) -> Optional[str]:
+        """Write the combined scan-parameter report for the whole project.
+
+        Metadata only: one section per measurement file, with everything its
+        header carried. Returns the path written, or None when there is no
+        project open or nothing to report.
+        """
+        if self._output_base_dir is None:
+            return None
+        if headers is None:
+            headers = self._collect_scan_headers()
+        if not headers:
+            return None
+        try:
+            from src.utils.metadata_report import write_report
+
+            out = (self._ensure_output_dir('imported')
+                   / self.SCAN_PARAMETERS_FILENAME)
+            written = write_report(
+                out, headers,
+                note=f"Project: {self._output_base_dir.name}",
+            )
+            return str(written) if written else None
+        except Exception as e:
+            logger.warning("Could not write scan-parameter report: %s", e)
+            return None
 
     #: Longest filename stem a tool will produce. Filesystems allow 255 bytes
     #: per component; this leaves room for an extension and a disambiguating
@@ -1410,6 +1544,122 @@ class AppBackend(ToolImplementations, QObject):
         logger.info(f"Import measurement requested for tab {self._current_tab}")
         # Dialog will be opened from QML, which will call importFromFiles or importFromFolder
 
+    @staticmethod
+    def _read_curve_csv(path: "Path") -> "Optional[pd.DataFrame]":
+        """Read a curve CSV whatever dialect it came in.
+
+        The convention is ``,`` fields, ``.`` decimals and a header row, and
+        that is what TRANS writes. What a pt-BR spreadsheet writes is
+        ``;`` or ``,`` fields, ``,`` decimals, quoted numbers and often no
+        header at all — and a curve that went through Numbers or Excel on
+        the way here is the normal case for "refine the model against this
+        spectrum I have". So the dialects are tried in turn and the first
+        that yields a numeric table wins; a headerless file gets ``V`` and
+        ``S01…`` as names. Returns None when nothing reads as numbers.
+        """
+        def _is_number(tok: str, decimal: str) -> bool:
+            tok = tok.strip().strip('"').strip("'")
+            if decimal == ',':
+                tok = tok.replace('.', '').replace(',', '.')
+            try:
+                float(tok)
+                return True
+            except ValueError:
+                return False
+
+        try:
+            first = path.open('r', encoding='utf-8-sig', errors='replace').readline()
+        except OSError:
+            return None
+        for sep, decimal in ((',', '.'), (';', ','), (',', ','), ('\t', '.'), ('\t', ',')):
+            tokens = first.rstrip('\r\n').split(sep)
+            if len(tokens) < 2:
+                continue
+            header = None if all(_is_number(t, decimal) for t in tokens) else 0
+            try:
+                frame = pd.read_csv(path, sep=sep, decimal=decimal, header=header,
+                                    thousands=None, encoding='utf-8-sig')
+            except Exception:                           # noqa: BLE001
+                continue
+            frame = frame.dropna(axis=1, how='all')
+            frame = frame.apply(pd.to_numeric, errors='coerce')
+            frame = frame.dropna(axis=0, how='all')
+            if frame.shape[1] < 2 or len(frame) < 2 or frame.iloc[:, 0].isna().any():
+                continue
+            if header is None:
+                frame.columns = ['V'] + [f'S{i:02d}' for i in range(1, frame.shape[1])]
+            return frame.reset_index(drop=True)
+        return None
+
+    @Slot(str, result=str)
+    def importDidvCsv(self, file_path: str) -> str:
+        """Register a CSV as a dI/dV dataset, taking it at its word.
+
+        For the confinement tools, whose users refine a simulation against
+        a curve they already have: bias in volts down the first column, one
+        dI/dV spectrum per further column, becomes a dataset the tools can
+        pick, stamped as a first derivative so nothing downstream tries to
+        differentiate it again. No detection, no smoothing, no zigzag
+        correction: the numbers are presumed already to be what the tools
+        want. The dialect is not presumed — see :meth:`_read_curve_csv`.
+
+        Returns the dataset name, or "" (with ``errorOccurred``) when the
+        file does not read as a numeric table.
+        """
+        path = Path(str(file_path or "").replace("file://", "")).expanduser()
+        if not path.is_file():
+            self.errorOccurred.emit("Import dI/dV CSV", f"Not a file: {path}")
+            return ""
+        frame = self._read_curve_csv(path)
+        if frame is None:
+            self.errorOccurred.emit(
+                "Import dI/dV CSV",
+                f"{path.name} does not read as a curve table: the first column "
+                "must be the bias (V) and every other column one dI/dV "
+                "spectrum. Comma or semicolon fields, '.' or ',' decimals and "
+                "a missing header are all fine; this file gave no numbers.")
+            return ""
+        n_spectra = frame.shape[1] - 1
+        metadata = SpectralMetadata(
+            source_type='csv',
+            dimensions=(n_spectra, 1),
+            scan_mode='point',
+            units={'independent': 'V', 'dependent': 'a.u.'},
+            additional_info={
+                'derivative_order': 1,
+                'imported_as': 'dI/dV',
+                'source_file': str(path),
+                'x_label': str(frame.columns[0]),
+            },
+        )
+        name = self._unique_dataset_name(f"{path.stem} - 1st Derivative")
+        try:
+            self._datasets[name] = SpectralData(frame, metadata)
+        except Exception as exc:                        # noqa: BLE001
+            self.errorOccurred.emit("Import dI/dV CSV",
+                                    f"{path.name} could not become a dataset: {exc}")
+            return ""
+        # The curve travels with the project, in the project's own dialect:
+        # a re-import of ``imported/<name>.csv`` needs no sniffing, and the
+        # original — wherever it was, whatever its decimals — is no longer
+        # something the project depends on.
+        if self._output_base_dir is not None:
+            try:
+                out = self._unique_path(self._ensure_output_dir('imported')
+                                        / (self._sanitize_filename(name) + '.csv'))
+                frame.to_csv(out, index=False)
+                metadata.additional_info['saved_as'] = str(out)
+                logger.info("Imported curve saved to %s", out)
+            except Exception as exc:                    # noqa: BLE001
+                logger.warning("Imported curve %r not saved into the project: %s",
+                               name, exc)
+        self._mark_project_modified()
+        self.status = f"Imported {path.name} as dI/dV ({n_spectra} spectra, {len(frame)} points)"
+        logger.info("Imported %s as dI/dV dataset %r (%d spectra, %d points)",
+                    path, name, n_spectra, len(frame))
+        self.dataLoaded.emit(name)
+        return name
+
     @Slot('QVariantList')
     def importFromFiles(self, file_paths):
         """Import from a list of file paths."""
@@ -1690,10 +1940,22 @@ class AppBackend(ToolImplementations, QObject):
         """
         loader = self.omicron_sts_loader
         sessions = spectral_data.metadata.additional_info.get('sessions', [])
+        requests = spectral_data.metadata.additional_info.get(
+            'matrix_inventory_requests') or []
         result = {
             'datasets': {}, 'active_dataset': None,
             'matrix_maps': [], 'browser_folders': {},
+            'matrix_inventory_requests': requests,
         }
+        # Where each session's inventory will be written, so a dataset can
+        # say where its full acquisition account lives.
+        inv_paths = {}
+        if requests:
+            inv_dir = self._matrix_inventory_dir()
+            inv_paths = {
+                r['base']: {'json': str(inv_dir / f"{r['base']}.inventory.json"),
+                            'txt': str(inv_dir / f"{r['base']}.inventory.txt")}
+                for r in requests}
 
         def _add(name, ds, label):
             result['datasets'][name] = ds
@@ -1768,6 +2030,12 @@ class AppBackend(ToolImplementations, QObject):
 
             # Scan pictures ride on the first dataset for the image-absorb path.
             first_ds.metadata.additional_info['images'] = session.get('images', [])
+
+            paths = inv_paths.get(session.get('base'))
+            if paths:
+                for name, ds in result['datasets'].items():
+                    if result['browser_folders'].get(f"dataset:{name}") == label:
+                        ds.metadata.additional_info['matrix_inventory'] = paths
 
             for m in session['maps']:
                 entry = dict(m)
@@ -2033,6 +2301,9 @@ class AppBackend(ToolImplementations, QObject):
         # Persist the imported datasets to disk as CSV (on the I/O worker),
         # mirroring how tool outputs are written into the project structure.
         self._persist_imported_datasets(result['datasets'])
+        # Omicron MATRIX: the full per-session account of every measurement,
+        # parameter change and missing file, also on the I/O worker.
+        self._write_matrix_inventories(result.get('matrix_inventory_requests'))
 
         # Surface images and notes attached by loaders BEFORE the broadcast
         # signal so the subsequent browser refresh sees them. Snapshot the
@@ -2665,7 +2936,30 @@ class AppBackend(ToolImplementations, QObject):
         from src.utils.tiff_io import imagej_tiff_kwargs
         arr = image.array if data is None else data
         dx, dy, unit = AppBackend._image_pixel_scale(image)
-        return imagej_tiff_kwargs(arr, dx=dx, dy=dy, unit=unit)
+        return imagej_tiff_kwargs(arr, dx=dx, dy=dy, unit=unit,
+                                  value_unit=AppBackend._image_value_unit(image))
+
+    @staticmethod
+    def _image_value_unit(image: "ImageData") -> Optional[str]:
+        """Z-axis unit of ``image``, when a loader recorded one.
+
+        ``additional_info['unit']`` is the *value* unit — metres for a
+        topography, amps for a current map. The lateral unit is a different
+        quantity and lives under ``['pixel_size']['unit']``; mixing the two
+        labels a height map in microns. A multi-channel image prefers its
+        active channel's entry in ``channel_units``, which is the channel the
+        single-frame TIFF is actually written from.
+        """
+        meta = getattr(image, "metadata", None)
+        ai = getattr(meta, "additional_info", None) or {}
+        per_channel = ai.get("channel_units")
+        active = getattr(image, "active_channel_name", None)
+        if isinstance(per_channel, dict) and active:
+            unit = per_channel.get(active)
+            if unit:
+                return str(unit)
+        unit = ai.get("unit")
+        return str(unit) if unit else None
 
     def _save_image_to_tiff(self, image: "ImageData") -> Optional[str]:
         """Persist ``image`` as a TIFF on disk and return its absolute path.
@@ -2680,29 +2974,33 @@ class AppBackend(ToolImplementations, QObject):
             except Exception:
                 pass
         try:
-            import tifffile
+            import tifffile  # noqa: F401 - availability probe; the write
+            # itself goes through tiff_io, which is the one place that
+            # guarantees an export carries its physical dimensions.
         except ImportError:
             logger.error("tifffile is required to save image entities")
             return None
+        from src.utils.tiff_io import write_calibrated_tiff
         target = self._image_export_basename(image, ".tiff")
+        dx, dy, unit = self._image_pixel_scale(image)
         try:
-            tifffile.imwrite(
-                str(target), image.array,
-                **self._pixel_scale_tiff_kwargs(image),
-            )
+            written = write_calibrated_tiff(
+                target, image.array, dx=dx, dy=dy, unit=unit,
+                value_unit=self._image_value_unit(image),
+                context=f"image {image.name!r}")
         except Exception as e:
             logger.error("Could not write %s: %s", target, e)
             return None
-        image.file_path = str(target)
+        image.file_path = written
         return image.file_path
 
     def _save_image_to_gsf(self, image: "ImageData") -> List[str]:
         """Write ``image`` as Gwyddion Simple Field(s). Returns the paths.
 
         Not written automatically: the import path writes ``.gwy`` (every
-        channel in one document) and one TIFF per channel — see
-        :meth:`_absorb_dataset_images`. GSF is the on-demand single-field
-        export for the cases that want exactly that.
+        channel in one document) and one TIFF per scan with the channels as
+        pages — see :meth:`_absorb_dataset_images`. GSF is the on-demand
+        single-field export for the cases that want exactly that.
 
         A multi-channel scan yields **one file per channel** (GSF holds a single
         field), so every trace direction is separately openable. Colour images
@@ -2878,9 +3176,13 @@ class AppBackend(ToolImplementations, QObject):
             return []
         from src.utils.tiff_io import write_channel_stack_tiff
         dx, dy, unit = self._image_pixel_scale(image)
+        info = image.metadata.additional_info or {}
         target = self._image_export_basename(image, ".tiff")
         try:
-            path = write_channel_stack_tiff(target, channels, dx=dx, dy=dy, unit=unit)
+            path = write_channel_stack_tiff(
+                target, channels, dx=dx, dy=dy, unit=unit,
+                value_units=info.get('channel_units') or {},
+                default_value_unit=info.get('unit'))
         except Exception as e:
             logger.error("Could not write %s: %s", target, e)
             return []

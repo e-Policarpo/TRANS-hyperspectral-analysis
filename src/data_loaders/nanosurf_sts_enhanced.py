@@ -1176,6 +1176,7 @@ class NanosurfSTSEnhancedLoader(BaseDataLoader):
             )
         if topo_geometry is not None:
             sd.metadata.additional_info["topo_geometry"] = topo_geometry
+        self.attach_session_headers(sd, nid_files)
         if progress_callback:
             progress_callback(len(nid_files), len(nid_files), "Complete!")
         self.last_loaded_path = directory
@@ -1339,6 +1340,14 @@ class NanosurfSTSEnhancedLoader(BaseDataLoader):
         # Return the mixed channel as primary, but store others in metadata
         primary_data = results['Mixed']
         primary_data.metadata.additional_info['channels'] = results
+
+        # The complete .nid headers of every file in this session — scan
+        # geometry, feedback gains, cantilever and scan-head identity,
+        # spectroscopy sweep, KPFM/lock-in settings. Shared by all channels
+        # (one parsed dict, not a copy each) so whichever dataset the user
+        # ends up with can report the conditions it was measured under.
+        for _channel in results.values():
+            self.attach_session_headers(_channel, nid_files)
 
         # Surface every Image channel (Z-Axis / Amplitude / Phase / Sensor,
         # forward + backward) as ImageData entries so the browser's Images

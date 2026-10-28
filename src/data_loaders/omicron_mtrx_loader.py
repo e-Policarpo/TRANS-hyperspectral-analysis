@@ -221,6 +221,8 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
 
         primary = self._build_primary(
             [session], session.get('images', []), str(filepath.parent))
+        primary.metadata.additional_info['matrix_inventory_requests'] = [
+            self._inventory_request(base, filepath.parent, session)]
         if progress_callback:
             progress_callback(1, 1, "Complete!")
         self.last_loaded_path = filepath
@@ -259,6 +261,7 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
 
         sessions: List[dict] = []
         images: List[Tuple[str, Any]] = []
+        built: Dict[str, dict] = {}
         # Labels are resolved together: the acquisition time is dropped unless
         # two sessions share a date, where it is the only thing telling them
         # apart.
@@ -280,11 +283,18 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
             if session and session['batches']:
                 sessions.append(session)
                 images.extend(session.get('images', []))
+                built[base] = session
 
         if not sessions:
             raise ValueError(f"No spectroscopy data found in {directory}")
 
         primary = self._build_primary(sessions, images, str(directory))
+        # Every session in the folder gets an inventory — including the
+        # image-only ones dropped above and any that failed to build: what
+        # the folder holds is the point, not only what became a dataset.
+        primary.metadata.additional_info['matrix_inventory_requests'] = [
+            self._inventory_request(b, directory, built.get(b))
+            for b in sorted(found)]
         if progress_callback:
             progress_callback(len(bases), len(bases), "Complete!")
         self.last_loaded_path = directory
@@ -333,6 +343,7 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
             sweep_channels=sweep_channels,
         )
         spectral_data = SpectralData(df, metadata)
+        self.attach_headers(spectral_data, filepath)
         self.last_loaded_path = filepath
         return spectral_data
 
@@ -531,6 +542,7 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
 
         sample_name = dataset_name = ''
         batches: Dict[Any, dict] = {}
+        not_loaded: List[str] = []
         total = len(primary_files)
         for done, f in enumerate(primary_files):
             if done % 64 == 0:
@@ -549,6 +561,8 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
             if curve is None and header_is_own:
                 curve = self._curve_via_a2m(self._new_md(), f)
             if curve is None:
+                # Reported in the session inventory, not silently dropped.
+                not_loaded.append(f.name)
                 continue
             sample_name = sample_name or curve.get('sample_name', '')
             dataset_name = dataset_name or curve.get('dataset_name', '')
@@ -614,6 +628,11 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
             'label': label,
             'base': base,
             'header': str(header),
+            # The session's complete MATRIX parameter tree (every instrument
+            # setting in the _0001.mtrx stream, not just the STS location and
+            # lock-in entries the loader reads). Stamped onto each dataset
+            # built from this session by the build_* methods below.
+            'raw_header': self.read_file_header(header),
             # The session's own folder — not the header's, which may have been
             # borrowed from a sibling directory.
             'source_dir': str(directory),
@@ -625,6 +644,8 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
             'dataset_name': dataset_name,
             'channel': primary_channel,
             'channels_present': sorted(present),
+            # Primary-channel files that could not be read as curves.
+            'not_loaded_files': not_loaded,
             'spatial_layout': spatial_layout,
             'batches': ordered,
             'line_scans': line_scans,
@@ -1723,6 +1744,10 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
             dataset_name=session['dataset_name'],
             session_label=session['label'],
             matrix_kind='overview',
+            # The session's full MATRIX parameter tree travels with every
+            # dataset built from it, so the conditions behind a curve are
+            # readable wherever that curve ends up.
+            raw_header=session.get('raw_header'),
             spectrum_meta=spectrum_meta,
             sweep_channels=sweep_channels,
             # Resolution needs the modulation as much as the temperature;
@@ -1765,6 +1790,10 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
             sample_name=session['sample_name'],
             session_label=session['label'],
             matrix_kind='point',
+            # The session's full MATRIX parameter tree travels with every
+            # dataset built from it, so the conditions behind a curve are
+            # readable wherever that curve ends up.
+            raw_header=session.get('raw_header'),
             point_index=batch['point_index'],
             location_px=list(batch['location_px']) if batch['location_px'] else None,
             location_m=list(batch['location_m']) if batch['location_m'] else None,
@@ -1834,6 +1863,10 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
             dataset_name=session['dataset_name'],
             session_label=session['label'],
             matrix_kind='line_scan',
+            # The session's full MATRIX parameter tree travels with every
+            # dataset built from it, so the conditions behind a curve are
+            # readable wherever that curve ends up.
+            raw_header=session.get('raw_header'),
             line_scan_id=line_scan['id'],
             line_scan_reps=line_scan['reps'],
             sweep_direction=sweep,
@@ -1911,6 +1944,10 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
             dataset_name=session['dataset_name'],
             session_label=session['label'],
             matrix_kind='line_scan_overview',
+            # The session's full MATRIX parameter tree travels with every
+            # dataset built from it, so the conditions behind a curve are
+            # readable wherever that curve ends up.
+            raw_header=session.get('raw_header'),
             line_scan_id=line_scan['id'],
             line_scan_reps=line_scan['reps'],
             line_scan_points=len(pts),
@@ -1933,6 +1970,21 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
         ai['images'] = images
         ai['source_directory'] = source
         return primary
+
+    @staticmethod
+    def _inventory_request(base: str, directory: Path,
+                           session: Optional[dict]) -> dict:
+        """What :func:`.mtrx_inventory.build_session_inventory` needs to
+        account for one session later, off the import path. Bytes are not
+        kept: a session header can be 100 MB+, and the inventory re-reads
+        it on the I/O worker."""
+        return {
+            'base': base,
+            'directory': str(directory),
+            'label': session.get('label') if session else None,
+            'not_loaded': list(session.get('not_loaded_files', []))
+            if session else [],
+        }
 
     # ------------------------------------------------------------------
     # Header discovery
