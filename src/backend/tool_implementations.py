@@ -4887,14 +4887,21 @@ class ToolImplementations:
             return designer.search_carrier(search, carrier,
                                            should_cancel=should_cancel)
 
-        found = []
-        for meff in carrier['meffs']:
-            if should_cancel():
-                break
-            pm = {**search, 'Et': carrier['Et'], 'meff': meff,
-                  'carrier': carrier['carrier']}
-            found.extend(designer.enumerate_solutions(
-                pm, should_cancel=should_cancel))
+        # Per mass by default. One shared search moves the lattice's anchor
+        # (it starts at the union box's floor), and the enumeration is
+        # sensitive to that anchor: on the 4/6 nm lens the true well is found
+        # from Lmin 0.9-1.0 nm and missed from 0.85 or 1.05. A shared search
+        # would therefore answer differently from the per-mass one for
+        # reasons that have nothing to do with the masses.
+        # `share_mass_search` opts in.
+        search = {**search,
+                  'share_mass_search': bool(params.get('share_mass_search',
+                                                       False))}
+        found = designer.search_masses(
+            search, carrier,
+            lambda pm, _label: designer.enumerate_solutions(
+                pm, should_cancel=should_cancel),
+            should_cancel=should_cancel)
         unique = []
         for sol in sorted(found, key=lambda x: x['RRMSE']):
             if not any(abs(sol['meff'] - kept['meff']) < 1e-9
@@ -5542,14 +5549,20 @@ class ToolImplementations:
                 return bool(getattr(task, 'cancelled', False))
 
             def _candidates(targets, carrier):
-                found = []
-                for meff in carrier['meffs']:
-                    p = {**search, 'Et': np.asarray(targets, dtype=float),
-                         'meff': meff, 'carrier': carrier['carrier']}
-                    found.extend(designer.primary_alias(sol, p)
-                                 for sol in designer.find_solutions(
-                                     p, should_cancel=should_cancel))
-                return found
+                # Every mass from one search where the masses allow it —
+                # see Designer.shares_mass_search. Each candidate carries its
+                # own mass, so the alias test runs at that mass.
+                carrier = {**carrier, 'Et': np.asarray(targets, dtype=float)}
+                found = designer.search_masses(
+                    search, carrier,
+                    lambda pm, _label: designer.find_solutions(
+                        pm, should_cancel=should_cancel),
+                    should_cancel=should_cancel)
+                return [designer.primary_alias(
+                            sol, {**search, 'Et': carrier['Et'],
+                                  'meff': sol['meff'],
+                                  'carrier': carrier['carrier']})
+                        for sol in found]
 
             def search_fn(found):
                 solutions = _candidates(found['targets'], primary)

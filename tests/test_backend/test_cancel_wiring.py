@@ -554,8 +554,10 @@ class TestTheDesignerSearchStopsWhereItIs:
         return designer
 
     def _search(self, designer, should_cancel):
+        # Per mass: what is under test is the cancel between the masses'
+        # searches, which a shared search (one for all three) does not have.
         return designer.search_carrier(
-            _search_params(),
+            {**_search_params(), 'share_mass_search': False},
             {'carrier': 'e', 'label': 'electron',
              'Et': np.array([0.05, 0.20, 0.45]), 'meffs': list(self.MEFFS)},
             should_cancel=should_cancel)

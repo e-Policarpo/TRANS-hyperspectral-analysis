@@ -1716,16 +1716,156 @@ class Designer:
                     ", %d distinct candidate(s)", total, len(window), len(sols))
         return sols
 
+    # ─── one search for every effective mass ─────────────────────────────
+
+    def shares_mass_search(self, p, meffs) -> bool:
+        """Can one search stand in for every mass in ``meffs``?
+
+        Every model here depends on the mass and the lengths only through
+        m*·L²: the hard-wall ladders are hbar²k²/(2 m* L²), and the parabolic
+        dot's hbar*omega is hbar²/(m* l²) of the length it is searched in. So
+        the geometry that fits at m₂ is the one that fits at m₁ with every
+        length times sqrt(m₁/m₂), at the same error — measured on the lens to
+        5e-14 relative, which is float noise. Searching each mass separately
+        finds the same population again, rescaled, at full price per mass.
+
+        Not when a dimension is pinned: a pinned length cannot rescale, so
+        the equivalence breaks. ``p['share_mass_search'] = False`` restores
+        the per-mass searches.
+        """
+        if len(meffs) < 2 or not p.get('share_mass_search', True):
+            return False
+        return all(v is None for v in (p.get('fixed') or {}).values())
+
+    def _free_opt(self, sol, p, meff) -> List[float]:
+        """The optimiser vector that produced ``sol['dims']`` at ``meff``."""
+        keys = self.dim_keys(p)
+        parabolic = (p['ndim'] == "0D" and p['coords'] == COORDS_PARABOLIC)
+        out = []
+        for key in self.free_keys(p):
+            d = sol['dims'][keys.index(key)]
+            out.append(length_from_hw(d, meff) if parabolic else float(d))
+        return out
+
+    def reference_search(self, p, meffs) -> dict:
+        """The search, at ``meffs[0]``, whose box covers every mass's box.
+
+        A length L at mass m is the length L·sqrt(m/m_ref) at the reference
+        mass, so each free dimension's interval is mapped there and the union
+        taken. The lattice is anchored at the union's floor, so it is the
+        same lattice for the same mass list — but not the lattice a
+        single-mass run builds. For :meth:`find_solutions` that does not
+        matter, its starts are random anyway. For :meth:`enumerate_solutions`
+        it does: the enumeration depends on where its lattice is anchored
+        (on the 4/6 nm lens, Lmin 0.9-1.0 nm finds the true well and 0.85 or
+        1.05 misses it), so the backend keeps enumeration per mass unless
+        asked otherwise.
+        """
+        m_ref = float(meffs[0])
+        box = {}
+        for key in self.free_keys(p):
+            lo, hi = self._box(p, key)
+            scaled = [(lo * np.sqrt(m / m_ref), hi * np.sqrt(m / m_ref))
+                      for m in meffs]
+            box[key] = (min(s[0] for s in scaled), max(s[1] for s in scaled))
+        return {**p, 'meff': m_ref, 'box': box,
+                'Lmin': min(b[0] for b in box.values()),
+                'Lmax': max(b[1] for b in box.values())}
+
+    def rescale_to_mass(self, sols, p_ref, p_m) -> list:
+        """The reference search's candidates, as candidates at ``p_m['meff']``.
+
+        Each one is moved to its equivalent geometry, kept only if that lies
+        inside this mass's own box (a relative 1e-9 of slack, so a candidate
+        on the edge is not lost to the rounding of the square root), and
+        rebuilt by :meth:`extract_solution` at this mass — so its ladder,
+        offset, annotations and ``meff`` are this mass's, computed rather
+        than copied. The tolerance and ``reject_unresolvable`` are applied
+        again on the rebuilt candidate.
+        """
+        k = np.sqrt(p_ref['meff'] / p_m['meff'])
+        bounds = self.bounds(p_m)
+        out = []
+        for sol in sols:
+            opt = [v * k for v in self._free_opt(sol, p_ref, p_ref['meff'])]
+            inside = all(lo * (1 - 1e-9) <= v <= hi * (1 + 1e-9)
+                         for v, (lo, hi) in zip(opt, bounds))
+            if not inside:
+                continue
+            opt = [min(max(v, lo), hi) for v, (lo, hi) in zip(opt, bounds)]
+            try:
+                s = self.extract_solution(opt, p_m)
+            except Exception:
+                logger.debug("rescale_to_mass: candidate %r could not be "
+                             "rebuilt at m*=%g; dropped", sol.get('dims'),
+                             p_m['meff'], exc_info=True)
+                continue
+            if s['RRMSE'] > p_m['tol']:
+                continue
+            if p_m.get('reject_unresolvable') and s.get('unresolvable'):
+                continue
+            out.append(s)
+        return out
+
+    def search_masses(self, p: dict, carrier: dict, search,
+                      progress: Optional[Callable[[str], None]] = None,
+                      should_cancel: Optional[Callable[[], bool]] = None
+                      ) -> list:
+        """``search(pm)`` once per mass, or once for all of them.
+
+        ``search`` is :meth:`find_solutions` or :meth:`enumerate_solutions`
+        with its keyword arguments bound. When :meth:`shares_mass_search`
+        allows it, it runs once over :meth:`reference_search` and every mass
+        gets the rescaled population; otherwise it runs per mass, as it
+        always has. The candidates come back unsorted and undeduplicated —
+        that is the caller's, which knows its quota.
+        """
+        meffs = list(carrier['meffs'])
+        base = {**p, 'Et': carrier['Et'], 'carrier': carrier['carrier']}
+        if self.shares_mass_search(base, meffs):
+            if should_cancel is not None and should_cancel():
+                return []
+            p_ref = self.reference_search(base, meffs)
+            label = (f"{carrier['label']}s, one search for m* = "
+                     + ", ".join(f"{m:g}" for m in meffs))
+            if progress is not None:
+                progress(f"Searching {label}…")
+            ref = search(p_ref, label)
+            found = []
+            for meff in meffs:
+                found.extend(self.rescale_to_mass(ref, p_ref,
+                                                  {**base, 'meff': meff}))
+            logger.info("search %s: one search, %d reference candidate(s), "
+                        "%d over %d mass(es)", carrier['label'], len(ref),
+                        len(found), len(meffs))
+            return found
+
+        found = []
+        for meff in meffs:
+            if should_cancel is not None and should_cancel():
+                logger.info("search %s cancelled before m*=%g: %d candidate(s)"
+                            " kept", carrier['label'], meff, len(found))
+                break
+            label = f"{carrier['label']}s with m* = {meff:g}"
+            if progress is not None:
+                progress(f"Searching {label}…")
+            sols = search({**base, 'meff': meff}, label)
+            logger.info("search %s m*=%g: %d candidate(s)",
+                        carrier['label'], meff, len(sols))
+            found.extend(sols)
+        return found
+
     def search_carrier(self, p: dict, carrier: dict,
                        progress: Optional[Callable[[str], None]] = None,
                        should_cancel: Optional[Callable[[], bool]] = None
                        ) -> list:
-        """Search one carrier's candidates, once per effective mass.
+        """Search one carrier's candidates at every effective mass.
 
-        Different masses are different searches — the same energy with a
-        larger mass asks for a larger well — and each candidate comes out
-        stamped with its own, so the final list can mix them without losing
-        track of which mass produced which geometry.
+        The same energy with a larger mass asks for a larger well, and each
+        candidate comes out stamped with its own mass, so the final list can
+        mix them without losing track of which mass produced which geometry.
+        Where the masses allow it the search runs ONCE and every mass gets
+        the rescaled population — see :meth:`search_masses`.
 
         ``should_cancel`` is asked before each mass and handed down to
         ``find_solutions``, which polls it between its own optimisation
@@ -1740,25 +1880,15 @@ class Designer:
         ``find_solutions`` prefixed with that mass, so the wait inside one
         mass's search is visible too and not just the gaps between them.
         """
-        found = []
-        for meff in carrier['meffs']:
-            if should_cancel is not None and should_cancel():
-                logger.info("search %s cancelled before m*=%g: %d candidate(s)"
-                            " kept", carrier['label'], meff, len(found))
-                break
-            pm = {**p, 'Et': carrier['Et'], 'meff': meff,
-                  'carrier': carrier['carrier']}
-            label = f"{carrier['label']}s with m* = {meff:g}"
-            if progress is not None:
-                progress(f"Searching {label}…")
-            sols = self.find_solutions(
+        def search(pm, label):
+            return self.find_solutions(
                 pm,
                 progress=(None if progress is None else
-                          lambda msg, _label=label: progress(f"{_label}: {msg}")),
+                          lambda msg: progress(f"{label}: {msg}")),
                 should_cancel=should_cancel)
-            logger.info("search %s m*=%g: %d candidate(s)",
-                        carrier['label'], meff, len(sols))
-            found.extend(sols)
+
+        found = self.search_masses(p, carrier, search, progress=progress,
+                                   should_cancel=should_cancel)
 
         # The same geometry AND the same mass is a duplicate; the same
         # geometry at different masses is not — they are distinct answers to
