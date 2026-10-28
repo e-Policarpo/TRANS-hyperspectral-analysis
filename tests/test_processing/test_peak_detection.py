@@ -963,3 +963,59 @@ def test_prominence_finds_the_states_without_inventing_any():
         assert found.size and np.min(np.abs(found - c)) < 0.02, c
     for px in found:
         assert np.min(np.abs(centers - px)) < 0.02, f"invented a peak at {px}"
+
+
+# ---------------------------------------------------------------------------
+# Smoothing decided from the threshold, and what it merges recovered
+# ---------------------------------------------------------------------------
+
+def test_auto_smoothing_follows_the_threshold():
+    from src.processing.peak_detection import auto_smooth_half_width as auto
+    # Noise maxima reach ~6.2 sigma unsmoothed; a boxcar of 2h+1 divides
+    # that by sqrt(2h+1). The window is the smallest that puts them under.
+    assert auto(7.0) == 0
+    assert auto(5.0) == 1
+    assert auto(3.0) == 2
+    assert auto(2.0) == 2          # capped at the old five-sample average
+    assert auto(5.0, "range") == 2  # no sigma to reason with: the old default
+
+
+def test_the_product_defaults_ask_for_auto_and_the_bare_engine_does_not():
+    from src.processing.peak_detection import params_from_dict, CONFINEMENT_DEFAULTS
+    assert Params().smooth_points == 0                       # identity
+    p = params_from_dict(CONFINEMENT_DEFAULTS)
+    assert p.smooth_points is None                           # decide per threshold
+    assert params_from_dict({'smooth_points': -1}).smooth_points is None
+    assert params_from_dict({'smooth_points': 2}).smooth_points == 2
+
+
+def test_a_shoulder_the_smoothing_merges_is_recovered_when_unmistakable():
+    """Two narrow peaks four samples apart: a five-sample average folds them
+    into one maximum. The raw curve still has both, at hundreds of sigma,
+    and no reading of the data makes the second one noise."""
+    rng = np.random.default_rng(11)
+    x = np.linspace(-0.6, 0.6, 512)
+    dx = x[1] - x[0]
+    y = (_gaussians(x, (0.0,), amplitude=1e-7, width=1.2 * dx)
+         + _gaussians(x, (4 * dx,), amplitude=6e-8, width=1.2 * dx)
+         + rng.normal(0, 3e-10, x.size))
+    merged = find_peaks(x, y, Params(height=3.0, height_mode="noise",
+                                     smooth_points=2, baseline="none"))
+    # Sanity on the premise: with the recovery pass both survive at 3 sigma.
+    assert len(merged) == 2, [pk.x for pk in merged]
+    assert sorted(round(pk.x, 4) for pk in merged) == pytest.approx([0.0, 4 * dx], abs=dx)
+
+
+def test_the_recovery_pass_adds_nothing_on_pure_noise():
+    rng = np.random.default_rng(5)
+    x = np.linspace(-0.6, 0.6, 512)
+    y = rng.normal(0, 1e-9, x.size)
+    n_with = len(find_peaks(x, y, Params(height=3.0, height_mode="noise",
+                                         smooth_points=2, baseline="none")))
+    # Whatever the smoothed search lets through at 3 sigma, the raw pass
+    # cannot add a maximum above 12.4 sigma to noise that tops out near 6.
+    from src.processing.peak_detection import UNMISTAKABLE_SIGMAS, noise_sigma
+    from scipy.signal import find_peaks as _fp
+    _, props = _fp(y, prominence=0)
+    assert props["prominences"].max() < UNMISTAKABLE_SIGMAS * noise_sigma(y)
+    assert n_with <= 3

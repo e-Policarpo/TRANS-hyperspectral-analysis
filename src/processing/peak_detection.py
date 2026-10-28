@@ -64,6 +64,48 @@ def savgol(y: np.ndarray, half_width: int, polyorder: int = 2) -> np.ndarray:
     return _signal.savgol_filter(y, window_length=window, polyorder=min(polyorder, window - 1))
 
 
+#: The prominence a local maximum of pure noise can reach, in sigmas of that
+#: noise (sigma measured on the raw curve, as the threshold is), over one
+#: spectrum. Measured, not guessed: on 400 draws of 256 Gaussian samples
+#: the tallest noise maximum reached 5.1 sigma at the median and 6.2 at the
+#: 95th percentile (6.4 at 512 samples, 6.9 at 1024). Smoothing exists to
+#: keep these below the detection threshold — nothing else.
+NOISE_MAXIMUM_SIGMAS = 6.2
+#: A raw-curve maximum this many sigmas prominent is beyond anything noise
+#: produces, twice over. It is a peak whether or not the smoothing kept it.
+UNMISTAKABLE_SIGMAS = 2.0 * NOISE_MAXIMUM_SIGMAS
+#: Never wider than the five-sample average the defaults always used.
+AUTO_SMOOTH_MAX_HALF_WIDTH = 2
+
+
+def auto_smooth_half_width(height_sigma: float, height_mode: str = "noise") -> int:
+    """How much to smooth before looking for peaks: exactly enough that
+    noise cannot clear the threshold, and no more.
+
+    The threshold is ``height_sigma`` times the noise, measured on the RAW
+    curve. A boxcar of ``2h + 1`` samples leaves the noise at
+    ``sigma / sqrt(2h + 1)`` while the threshold stays where it is, so the
+    smallest ``h`` with ``NOISE_MAXIMUM_SIGMAS / sqrt(2h + 1) <= height_sigma``
+    is the one that makes a noise maximum unable to pass. At 7 sigma and
+    above that is no smoothing at all; at 5 a three-sample window; at 3 and
+    below the old five — which is where the fixed 2 came from, and why it
+    was right for a 2-3 sigma threshold. What it cost — shoulders merged
+    into their neighbour — is recovered separately: see
+    ``UNMISTAKABLE_SIGMAS`` in :func:`analyze`.
+
+    In the span-relative modes the threshold has no sigma to compare with,
+    and the old five-sample window stays.
+    """
+    if height_mode != "noise":
+        return AUTO_SMOOTH_MAX_HALF_WIDTH
+    k = float(height_sigma)
+    if not np.isfinite(k) or k <= 0:
+        return AUTO_SMOOTH_MAX_HALF_WIDTH
+    needed = (NOISE_MAXIMUM_SIGMAS / k) ** 2       # samples the window must span
+    half = int(np.ceil((needed - 1.0) / 2.0))
+    return int(min(max(half, 0), AUTO_SMOOTH_MAX_HALF_WIDTH))
+
+
 def smooth(y: np.ndarray, kind: str, half_width: int) -> np.ndarray:
     """Apply the named smoother. ``half_width < 1`` or ``none`` is a no-op."""
     if int(half_width) < 1 or kind == "none":
@@ -601,7 +643,10 @@ class Params:
     height: float = 5.0
     height_mode: str = "range"
     smooth_type: str = "average"
-    smooth_points: int = 0
+    # A fixed half-width, 0 for none — the primitive stays the identity.
+    # None means "decide from the threshold" (``auto_smooth_half_width``);
+    # the product defaults ask for that, the bare engine never does.
+    smooth_points: Optional[int] = 0
     # Suavizar derivada
     deriv_smooth_type: str = "none"
     deriv_smooth_points: int = 2
@@ -662,11 +707,13 @@ class Params:
 #: the identity (no background, no smoothing) as befits a primitive:
 #:
 #: - ``poly-iter`` because the band edges otherwise bury the in-gap states.
-#: - ``smooth_points=2`` because on real, noisy spectra an unsmoothed search
-#:   over-detects badly -- on 1%-noise test data it found 278 peaks where 53
-#:   were planted, against 47 with a 5-sample window. QtiPlot defaults to no
-#:   smoothing, but it is used one curve at a time with the result on screen;
-#:   here a hyperspectral run is unattended.
+#: - ``smooth_points=None`` (decided from the threshold) where it used to be
+#:   a fixed 2. The 2 was there because an unsmoothed search over-detected
+#:   badly -- on 1%-noise test data 278 peaks where 53 were planted, against
+#:   47 with a 5-sample window -- but that was under a span-relative
+#:   threshold. Under the noise-relative one the window follows from the
+#:   threshold (see ``auto_smooth_half_width``): none at 3 sigma, three
+#:   samples at 2, the old five only below that.
 #:
 #: Must stay in step with the ConfinementAnalysis node definition; a test
 #: asserts they agree.
@@ -684,7 +731,11 @@ CONFINEMENT_DEFAULTS = {
     # against ModPoly's 3.8 ms.
     'baseline': 'arpls',
     'height': 2.0,
-    'smooth_points': 2,
+    # -1 = decide from the threshold (``params_from_dict`` turns it into
+    # None; a None here would be skipped as "unset"): none at 7 sigma and
+    # above, three samples at 5, the old five at 3 and below. A fixed 2
+    # smoothed a clean curve at a threshold that did not need it.
+    'smooth_points': -1,
     # Measured against planted states (synthetic STS, 15 runs x 4 states) and
     # on real 4.5 K line-scan data:
     #
@@ -722,6 +773,9 @@ def params_from_dict(raw: Optional[dict]) -> Params:
         if key in _INT_PARAM_FIELDS:
             value = int(value)
             if key == 'max_peaks' and value <= 0:
+                value = None
+            # A spin box cannot send None; below zero means "decide for me".
+            if key == 'smooth_points' and value < 0:
                 value = None
         elif key in ('xmin', 'xmax'):
             value = float(value)
@@ -835,7 +889,9 @@ def analyze(x: np.ndarray, y: np.ndarray, params: Optional[Params] = None) -> An
                         baseline=empty, y_corrected=y[idx], peaks=[])
 
     xw, yw_raw = x[idx], y[idx]
-    yw = smooth(yw_raw, p.smooth_type, p.smooth_points)
+    half_width = (p.smooth_points if p.smooth_points is not None
+                  else auto_smooth_half_width(p.height, p.height_mode))
+    yw = smooth(yw_raw, p.smooth_type, half_width)
 
     baseline = estimate_baseline(
         xw, yw, p.baseline, p.baseline_degree, p.baseline_iterations, p.direction,
@@ -852,6 +908,7 @@ def analyze(x: np.ndarray, y: np.ndarray, params: Optional[Params] = None) -> An
                         baseline=baseline, y_corrected=corrected, peaks=[])
 
     threshold = (p.height / 100.0) * span
+    sigma = 0.0          # the raw noise, known only in the noise-relative mode
     if p.height_mode == "noise":
         # A prominence measured against the curve's SPAN is meaningless on a
         # spectrum whose span is set by the band edges: 5% of that rejects
@@ -862,7 +919,8 @@ def analyze(x: np.ndarray, y: np.ndarray, params: Optional[Params] = None) -> An
         # correlates neighbouring samples, so a second-difference estimate of
         # the smoothed curve reads well below the real measurement noise and
         # the threshold lets every wiggle through.
-        threshold = p.height * noise_sigma(yw_raw - baseline)
+        sigma = noise_sigma(yw_raw - baseline)
+        threshold = p.height * sigma
     # Same dust, but on a flat stretch of an otherwise varying curve: those
     # candidates come back with a prominence of exactly 0 from scipy, while a
     # real peak is orders of magnitude above this floor.
@@ -907,6 +965,46 @@ def analyze(x: np.ndarray, y: np.ndarray, params: Optional[Params] = None) -> An
                     y_corrected=float(corrected[i]),
                     prominence=float(prom),
                 )
+
+        # What the smoothing merged away. A five-sample average folds a
+        # shoulder into its neighbour — on a real curve it lost a 35 sigma
+        # and an 18 sigma peak — and no threshold recovers a maximum that
+        # no longer exists. So the RAW corrected curve is searched once more
+        # for maxima beyond anything noise can produce; those are peaks on
+        # any reading, and are added unless one was already found within
+        # the smoothing window.
+        if p.height_mode == "noise" and half_width > 0 and sigma > 0:
+            ys_raw = (yw_raw - baseline) * sign
+            raw_candidates = _local_maxima(ys_raw, xw)
+            if raw_candidates:
+                raw_proms = _prominences(ys_raw, raw_candidates)
+                strong = [(i, prom) for i, prom in zip(raw_candidates, raw_proms)
+                          if prom >= UNMISTAKABLE_SIGMAS * sigma]
+                # One-to-one: each unmistakable raw maximum claims the nearest
+                # found peak within the window, strongest first. A merged
+                # maximum sits BETWEEN the two it swallowed, within reach of
+                # both — so the first claims it and the second, with nothing
+                # left to claim, is added. The claimed peak takes the raw
+                # position: for a maximum this far above the noise the raw
+                # curve places it better than the smoothed one.
+                claimed = set()
+                for i, prom in sorted(strong, key=lambda t: -t[1]):
+                    full_i = int(idx[i])
+                    near = [k for k in found
+                            if abs(full_i - k) <= half_width and k not in claimed]
+                    peak = Peak(index=full_i, x=float(xw[i]), y=float(yw_raw[i]),
+                                y_corrected=float(ys_raw[i] * sign),
+                                prominence=float(prom))
+                    if near:
+                        k = min(near, key=lambda q: abs(q - full_i))
+                        claimed.add(k)
+                        if k != full_i:
+                            del found[k]
+                        found[full_i] = peak
+                        claimed.add(full_i)
+                    elif full_i not in found:
+                        found[full_i] = peak
+                        claimed.add(full_i)
 
     peaks = sorted(found.values(), key=lambda pk: pk.x)
 
