@@ -106,6 +106,14 @@ echo "architecture: $(lipo -archs "$APP/Contents/MacOS/TRANS" 2>/dev/null || ech
 # needs no administrator password and is indexed by Spotlight and Launchpad
 # just like /Applications.
 if [ "${1:-}" = "--install" ] || [ "${2:-}" = "--install" ]; then
+    # Never install a bundle older than the source it is supposed to carry.
+    # A build that failed early leaves the previous dist in place, and
+    # copying that forward looks exactly like a successful update.
+    NEWEST_SRC="$(find src -type f \( -name '*.py' -o -name '*.qml' -o -name '*.js' \) -newer "$APP/Contents/MacOS/TRANS" | head -1)"
+    if [ -n "$NEWEST_SRC" ]; then
+        echo "error: $APP is older than $NEWEST_SRC — refusing to install a stale build" >&2
+        exit 1
+    fi
     mkdir -p "$HOME/Applications"
     rm -rf "$HOME/Applications/T.R.A.N.S..app"
     cp -R "$APP" "$HOME/Applications/"

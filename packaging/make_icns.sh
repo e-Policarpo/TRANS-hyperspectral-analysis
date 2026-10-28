@@ -11,6 +11,15 @@ SRC="assets/icon.png"
 SET="build/icon.iconset"
 OUT="assets/icon.icns"
 
+# Up to date already: skip. iconutil is an Xcode tool and refuses to run
+# until the Xcode licence has been accepted (after every Xcode update), and
+# the icon is the one build step that does not need to run at all when the
+# .png has not changed.
+if [ -f "$OUT" ] && [ ! "$SRC" -nt "$OUT" ]; then
+    echo "icon: $OUT is up to date"
+    exit 0
+fi
+
 [ -f "$SRC" ] || { echo "missing $SRC" >&2; exit 1; }
 
 rm -rf "$SET"; mkdir -p "$SET"
