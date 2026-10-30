@@ -633,7 +633,11 @@ Item {
             var heads = root.batchHeadlines.slice()
             heads.push((result && result.dataset ? result.dataset + ": " : "")
                        + (result && result.candidates_total ? result.candidates_total + " candidate(s)"
-                                                            : (result && result.error ? result.error : "none")))
+                                                            : (result && result.error ? result.error : "none"))
+                       // The run's one seed — drawn when the field was blank
+                       // — so a good run can be repeated exactly.
+                       + (result && result.seed !== undefined && result.seed !== null
+                          ? " · seed " + result.seed : ""))
             root.batchHeadlines = heads
             root.running = heads.length < root.batchExpected
             root.candidates = (result && result.candidates) ? result.candidates : []

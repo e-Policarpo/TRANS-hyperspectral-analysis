@@ -177,7 +177,8 @@ class TestRowsSayWhereTheyCameFrom:
                                                    'carrier': 'both', 'match': 'delta_e'})
         cand = stub._datasets[names[0]].data
         lev = stub._datasets[names[1]].data
-        assert list(cand.columns[-2:]) == ['dataset', 'search'] and list(lev.columns[-2:]) == ['dataset', 'search']
+        tail = ['dataset', 'search', 'seed']
+        assert list(cand.columns[-3:]) == tail and list(lev.columns[-3:]) == tail
         assert cand.loc[0, 'dataset'] == 'lineA' and lev.loc[0, 'dataset'] == 'lineA'
         assert cand.loc[0, 'search'] == '2D, cartesian, tetragonal, e+h, ΔE'
         assert stub._datasets[names[0]].metadata.additional_info['sym'] == 'tetragonal'

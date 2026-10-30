@@ -668,7 +668,7 @@ class TestTheTablesTheGroupingWrites:
 
         for suffix in ('Candidates', 'Modes', 'Consensus'):
             table = _table(tool, suffix)
-            assert list(table.columns[-2:]) == ['dataset', 'search']
+            assert list(table.columns[-3:]) == ['dataset', 'search', 'seed']
             assert set(table['dataset']) == {'sts'}
             assert set(table['search']) == {'1D, cartesian, e, ΔE'}
 

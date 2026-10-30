@@ -117,13 +117,97 @@ class PointResult:
 
 # ── point-by-point analysis ──────────────────────────────────────────────
 
+def analyze_point(curve: DidvCurve, index: int, position: float, name: str,
+                  targets_fn: Callable[[DidvCurve], dict],
+                  search_fn: Callable[[dict], List[dict]],
+                  size_fn: Callable[[dict], float],
+                  min_peaks: int = 2,
+                  max_rrmse: Optional[float] = None) -> PointResult:
+    """One position: its peaks, its search, its verdict.
+
+    Everything a position needs comes in through the arguments, so a
+    process pool can run positions independently and get the result the
+    serial loop gets.
+    """
+    point = PointResult(index=index, position=float(position), name=name)
+    point_started = time.perf_counter()
+    try:
+        found = targets_fn(curve)
+    except Exception as exc:
+        logger.warning("point %d (%s): peak analysis failed — %s",
+                       index, name, exc)
+        point.reason = NO_PEAKS
+        return point
+
+    targets = list(found.get('targets') or [])
+    point.n_peaks = int(found.get('n_peaks', len(targets)))
+    point.n_targets = len(targets)
+    logger.debug("point %d (%s) at %.3f: %d peak(s), %d target(s) in the "
+                 "branch: [%s]", index, name, point.position, point.n_peaks,
+                 len(targets), ", ".join(f"{t:.4f}" for t in targets[:8]))
+
+    if not targets:
+        point.reason = NO_BRANCH_PEAKS if point.n_peaks > 0 else NO_PEAKS
+        _log_point(point, point_started)
+        return point
+    if len(targets) < min_peaks:
+        # With a single peak there is no ladder: any size "explains" one
+        # isolated level, and the fit would be a tautology.
+        point.reason = FEW_PEAKS
+        _log_point(point, point_started)
+        return point
+
+    try:
+        candidates = search_fn(found)
+    except Exception:
+        logger.exception("point %d (%s): search failed", index, name)
+        candidates = []
+
+    logger.debug("point %d: %d candidate(s) — %s", index, len(candidates),
+                 ", ".join(f"{size_fn(c):.3f} nm ({c.get('RRMSE', float('nan')):.3f}%)"
+                           for c in candidates[:6]) or "none")
+
+    if not candidates:
+        point.reason = found.get('reason') or NO_FIT
+        _log_point(point, point_started)
+        return point
+
+    best = pick_best(candidates, size_fn)
+    rrmse = float(best.get('RRMSE', float('nan')))
+    if max_rrmse is not None and not (rrmse <= max_rrmse):
+        point.reason = BAD_FIT
+        point.rrmse = rrmse
+        _log_point(point, point_started)
+        return point
+
+    point.size_nm = float(size_fn(best))
+    point.rrmse = rrmse
+    point.dims_nm = tuple(best.get('dims', ()))
+    point.meff = best.get('meff')
+    point.solution = best
+    point.hole_size_nm = found.get('hole_size_nm')
+    point.mismatch_nm = found.get('mismatch_nm')
+    _log_point(point, point_started)
+    return point
+
+
+def point_name(scan: LineScan, index: int) -> str:
+    return scan.names[index] if index < len(scan.names) else f"#{index}"
+
+
+def cancelled_point(scan: LineScan, index: int, position: float) -> PointResult:
+    return PointResult(index=index, position=float(position),
+                       name=point_name(scan, index), reason=CANCELLED)
+
+
 def analyze_line_scan(scan: LineScan,
                       targets_fn: Callable[[DidvCurve], dict],
                       search_fn: Callable[[dict], List[dict]],
                       size_fn: Callable[[dict], float],
                       min_peaks: int = 2,
                       max_rrmse: Optional[float] = None,
-                      progress: Optional[Callable[[int, int], bool]] = None
+                      progress: Optional[Callable[[int, int], bool]] = None,
+                      point_fn: Optional[Callable[..., PointResult]] = None
                       ) -> List[PointResult]:
     """Run the search at every position and return one result per point.
 
@@ -132,93 +216,41 @@ def analyze_line_scan(scan: LineScan,
     candidates; ``size_fn`` extracts the confinement size from a candidate.
     ``progress`` is called at each point and may return False to stop — a
     long scan has to be cancellable.
+
+    ``point_fn(curve, index, position, name)``, when given, replaces the
+    two functions with a whole position's analysis — what the Line Scan
+    Designer passes, so its serial loop and its process pool run the same
+    :meth:`~src.backend.line_scan_pool.LinePointSearch.run`.
     """
     positions = scan.positions_nm()
     results: List[PointResult] = []
     started = time.perf_counter()
+    log_start(scan, min_peaks, max_rrmse)
+
+    for i in range(scan.n_points):
+        if progress is not None and not progress(i, scan.n_points):
+            results.extend(cancelled_point(scan, j, positions[j])
+                           for j in range(i, scan.n_points))
+            break
+        if point_fn is not None:
+            results.append(point_fn(scan.curve(i), i, float(positions[i]),
+                                    point_name(scan, i)))
+            continue
+        results.append(analyze_point(scan.curve(i), i, positions[i],
+                                     point_name(scan, i), targets_fn,
+                                     search_fn, size_fn, min_peaks, max_rrmse))
+
+    log_finish(results, started)
+    return results
+
+
+def log_start(scan: LineScan, min_peaks: int, max_rrmse: Optional[float]) -> None:
     logger.info("line scan: %d positions, at least %d peak(s) per point, "
                 "maximum error %s", scan.n_points, min_peaks,
                 "unbounded" if max_rrmse is None else f"{max_rrmse:g}%")
 
-    for i in range(scan.n_points):
-        name = scan.names[i] if i < len(scan.names) else f"#{i}"
-        point = PointResult(index=i, position=float(positions[i]), name=name)
 
-        if progress is not None and not progress(i, scan.n_points):
-            point.reason = CANCELLED
-            results.append(point)
-            for j in range(i + 1, scan.n_points):
-                results.append(PointResult(
-                    index=j, position=float(positions[j]),
-                    name=scan.names[j] if j < len(scan.names) else f"#{j}",
-                    reason=CANCELLED))
-            break
-
-        point_started = time.perf_counter()
-        try:
-            found = targets_fn(scan.curve(i))
-        except Exception as exc:
-            logger.warning("point %d (%s): peak analysis failed — %s",
-                           i, name, exc)
-            point.reason = NO_PEAKS
-            results.append(point)
-            continue
-
-        targets = list(found.get('targets') or [])
-        point.n_peaks = int(found.get('n_peaks', len(targets)))
-        point.n_targets = len(targets)
-        logger.debug("point %d (%s) at %.3f: %d peak(s), %d target(s) in the "
-                     "branch: [%s]", i, name, point.position, point.n_peaks,
-                     len(targets), ", ".join(f"{t:.4f}" for t in targets[:8]))
-
-        if not targets:
-            point.reason = NO_BRANCH_PEAKS if point.n_peaks > 0 else NO_PEAKS
-            _log_point(point, point_started)
-            results.append(point)
-            continue
-        if len(targets) < min_peaks:
-            # With a single peak there is no ladder: any size "explains" one
-            # isolated level, and the fit would be a tautology.
-            point.reason = FEW_PEAKS
-            _log_point(point, point_started)
-            results.append(point)
-            continue
-
-        try:
-            candidates = search_fn(found)
-        except Exception:
-            logger.exception("point %d (%s): search failed", i, name)
-            candidates = []
-
-        logger.debug("point %d: %d candidate(s) — %s", i, len(candidates),
-                     ", ".join(f"{size_fn(c):.3f} nm ({c.get('RRMSE', float('nan')):.3f}%)"
-                               for c in candidates[:6]) or "none")
-
-        if not candidates:
-            point.reason = found.get('reason') or NO_FIT
-            _log_point(point, point_started)
-            results.append(point)
-            continue
-
-        best = pick_best(candidates, size_fn)
-        rrmse = float(best.get('RRMSE', float('nan')))
-        if max_rrmse is not None and not (rrmse <= max_rrmse):
-            point.reason = BAD_FIT
-            point.rrmse = rrmse
-            _log_point(point, point_started)
-            results.append(point)
-            continue
-
-        point.size_nm = float(size_fn(best))
-        point.rrmse = rrmse
-        point.dims_nm = tuple(best.get('dims', ()))
-        point.meff = best.get('meff')
-        point.solution = best
-        point.hole_size_nm = found.get('hole_size_nm')
-        point.mismatch_nm = found.get('mismatch_nm')
-        _log_point(point, point_started)
-        results.append(point)
-
+def log_finish(results: Sequence[PointResult], started: float) -> None:
     converged = sum(1 for r in results if r.converged)
     elapsed = time.perf_counter() - started
     logger.info("line scan finished: %d of %d positions converged in %.1f s "
@@ -228,7 +260,6 @@ def analyze_line_scan(scan: LineScan,
                                 key=lambda kv: -kv[1]):
         logger.info("  no confinement: %dx %s", count,
                     REASON_LABELS.get(reason, reason))
-    return results
 
 
 def _log_point(point: PointResult, started: float) -> None:

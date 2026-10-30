@@ -4007,7 +4007,9 @@ class ToolImplementations:
         # symmetries are run through the same tool, and their CSVs are
         # concatenated — a row has to say where it came from on its own.
         # Last, because the first column is the table's numeric axis.
-        'dataset', 'search')
+        # `seed` is the run's one RNG seed — the one given, or the one drawn
+        # when the field was blank — so any run can be repeated exactly.
+        'dataset', 'search', 'seed')
 
     #: The level table's columns: measured against simulated, once in energy
     #: from the branch edge and once back on the bias axis.
@@ -4020,7 +4022,7 @@ class ToolImplementations:
         'degeneracy',
         'measured_eV', 'simulated_eV', 'error_pct',
         'measured_V', 'simulated_V', 'split_e_V', 'split_h_V',
-        'dataset', 'search')
+        'dataset', 'search', 'seed')
 
     #: The mode table's columns: one row per well the run believes in.
     #: L_z is a range and never a value — with the offset cancelled the
@@ -4031,7 +4033,7 @@ class ToolImplementations:
         'Lz_lo_nm', 'Lz_hi_nm',
         'support_spectra', 'support_frac', 'mean_rrmse_de_pct',
         'qn_min', 'qn_max', 'levels_skipped_mean',
-        'dataset', 'search')
+        'dataset', 'search', 'seed')
 
     #: The consensus table's columns: one row per spectrum, and the only one
     #: of the four that maps. Every column is a number that can be laid out
@@ -4043,7 +4045,7 @@ class ToolImplementations:
         'spectrum_index', 'column', 'n_candidates', 'n_admissible',
         'best_de_pct', 'band_de_pct', 'R_lo_nm', 'R_hi_nm', 'R_consensus_nm',
         'mode', 'mode_prob', 'mode_2nd', 'mode_2nd_prob', 'mode_entropy',
-        'dataset', 'search')
+        'dataset', 'search', 'seed')
 
     @staticmethod
     def _designer_carriers(params: dict, peaks) -> list:
@@ -4525,6 +4527,8 @@ class ToolImplementations:
                 logger.info("Confinement Designer: %s", message)
                 return {**empty, 'error': message}
             self._log_designer_limits(params)
+            params = {**params,
+                      'seed': self._run_seed(params, "Confinement Designer")}
             # Said once per run, on every run: the window n_tied and
             # unresolvable are counted against, and what it is. A window with
             # no basis is a count with no units, and the number the tool used
@@ -4547,8 +4551,17 @@ class ToolImplementations:
             started = _time.perf_counter()
             self._report_tool_progress(task, "Confinement Designer", 0, len(indices), started)
             from src.backend.designer_pool import (design_spectra_parallel,
-                                                   resolve_workers)
-            workers = resolve_workers(params.get('workers'), len(indices))
+                                                   plan_workers)
+            workers, spread = plan_workers(params.get('workers'), len(indices))
+            mapper = None
+            if spread > 1:
+                # Too few spectra to give each its own worker: spread each
+                # search's independent passes over the pool instead.
+                from src.backend.compute_pool import PoolMapper
+                mapper = PoolMapper(spread)
+                logger.info("Confinement Designer: %d spectrum(s), each "
+                            "search on %d worker processes",
+                            len(indices), spread)
             if workers > 1:
                 # Each spectrum's search is independent and builds its own
                 # seeded Designer, so the rows do not depend on the schedule.
@@ -4579,7 +4592,7 @@ class ToolImplementations:
                     # search reports its own fractions inside the helper.
                     task.progress = step / max(1, len(indices))
                     runs.append(self._design_one_spectrum(
-                        task, spectral_data, index, params))
+                        task, spectral_data, index, params, mapper=mapper))
                     self._report_tool_progress(task, "Confinement Designer",
                                                step + 1, len(indices), started)
 
@@ -4627,6 +4640,7 @@ class ToolImplementations:
                 # invites more confidence than the data supports.
                 'consensus': report.get('consensus', {}),
                 'diagnostics': report.get('diagnostics', {}),
+                'seed': params['seed'],
             }
 
         except ValueError as exc:
@@ -4638,6 +4652,27 @@ class ToolImplementations:
             logger.error(f"Confinement designer error: {e}", exc_info=True)
             self.errorOccurred.emit("Confinement Designer Error", str(e))
             return {**empty, 'error': str(e)}
+
+    @staticmethod
+    def _run_seed(params: dict, tool: str) -> int:
+        """The one seed a whole run searches with, drawn when none was given.
+
+        Every spectrum or position builds its own ``Designer`` from this
+        seed, so the rows do not depend on how the work was scheduled, and
+        a blank field no longer means an unrepeatable run: the drawn seed is
+        logged and written beside the results.
+        """
+        seed = params.get('seed')
+        if seed is None or seed == '':
+            # 31 bits: the panel's seed field (an IntValidator) takes no
+            # more, and a drawn seed has to be one the user can type back.
+            seed = int(np.random.SeedSequence().generate_state(1)[0]) >> 1
+            logger.info("%s: seed %d (drawn; enter it to repeat this run)",
+                        tool, seed)
+        else:
+            seed = int(seed)
+            logger.info("%s: seed %d", tool, seed)
+        return seed
 
     @staticmethod
     def _eta_text(seconds: float) -> str:
@@ -4683,7 +4718,7 @@ class ToolImplementations:
             logger.debug("toolProgress emit failed", exc_info=True)
 
     def _design_one_spectrum(self, task, spectral_data, index: int,
-                             params: dict) -> dict:
+                             params: dict, mapper=None) -> dict:
         """The search for one spectrum.
 
         Returns a run record rather than raising: in a sweep, a spectrum with
@@ -4755,7 +4790,7 @@ class ToolImplementations:
                   'enum_max_nodes': params.get('enum_max_nodes'),
                   'dup_rel': params.get('dup_rel'),
                   'match': str(params['match'])}
-        designer = Designer(seed=params.get('seed'))
+        designer = Designer(seed=params.get('seed'), mapper=mapper)
         # The same flag the loops above poll, handed to the search so it can
         # stop between masses and between optimisation passes. Without it a
         # single carrier with three masses was one uninterruptible block, and
@@ -5189,6 +5224,7 @@ class ToolImplementations:
                     continue
                 candidate_rows.append({
                     'dataset': dataset_name, 'search': signature,
+                    'seed': params.get('seed'),
                     'spectrum_index': int(index), 'column': column,
                     'candidate': -1, 'carrier': '',
                     'ndim': '', 'coords': '', 'sym': '',
@@ -5222,6 +5258,7 @@ class ToolImplementations:
                 h_lo, h_hi, h_skipped = _qn_span(hole) if hole else (nan, nan, nan)
                 candidate_rows.append({
                     'dataset': dataset_name, 'search': signature,
+                    'seed': params.get('seed'),
                     'spectrum_index': int(index),
                     'column': column,
                     'candidate': int(candidate.get('index', 0)),
@@ -5283,6 +5320,7 @@ class ToolImplementations:
                         simulated = float(computed[level]) if level < len(computed) else nan
                         level_rows.append({
                             'dataset': dataset_name, 'search': signature,
+                            'seed': params.get('seed'),
                             'spectrum_index': int(index),
                             'column': column,
                             'candidate': int(candidate.get('index', 0)),
@@ -5354,12 +5392,14 @@ class ToolImplementations:
         column_of = {int(run['spectrum_index']): run['column'] for run in runs}
         mode_rows = [{**{k: m[k] for k in self.DESIGNER_MODE_COLUMNS
                          if k in m},
-                      'dataset': dataset_name, 'search': signature}
+                      'dataset': dataset_name, 'search': signature,
+                      'seed': params.get('seed')}
                      for m in result.modes]
         consensus_rows = [{**{k: r[k] for k in self.DESIGNER_CONSENSUS_COLUMNS
                               if k in r},
                            'column': column_of.get(int(r['spectrum_index']), ''),
-                           'dataset': dataset_name, 'search': signature}
+                           'dataset': dataset_name, 'search': signature,
+                           'seed': params.get('seed')}
                           for r in result.per_spectrum]
 
         if report is not None and real_rows:
@@ -5381,6 +5421,7 @@ class ToolImplementations:
             'source_dataset': dataset_name,
             'original_dataset': dataset_name,
             'search': signature,
+            'seed': params.get('seed'),
             'sym': params.get('sym'),
             'ndim': params.get('ndim'),
             'coords': params.get('coords'),
@@ -5508,14 +5549,11 @@ class ToolImplementations:
         empty = {'ok': False, 'dataset': '', 'map_paths': [], 'groups': [],
                  'summary': {}, 'error': '', 'points': []}
         try:
-            from src.physics.branches import analyze_curve
             from src.physics.designer import (CARRIER_BOTH, CARRIER_HOLE,
-                                              MATCH_ABSOLUTE, Designer)
-            from src.physics.line_scan import (CANCELLED, NO_PAIR,
-                                               analyze_line_scan,
+                                              MATCH_ABSOLUTE)
+            from src.physics.line_scan import (CANCELLED, analyze_line_scan,
                                                group_by_size,
                                                segments_along_line, summarize)
-            from src.physics.pairing import confinement_size_nm, pair_candidates
 
             if dataset_name not in self._datasets:
                 self.errorOccurred.emit("Error", "Dataset not found")
@@ -5536,7 +5574,6 @@ class ToolImplementations:
                 return {**empty, 'error': "No carrier selected"}
             paired = str(params.get('carrier')) == CARRIER_BOTH
             hole_first = str(params.get('carrier')) == CARRIER_HOLE
-            primary = carriers[0]
 
             search = {'ndim': str(params['ndim']), 'coords': str(params['coords']),
                       'sym': str(params['sym']),
@@ -5552,21 +5589,20 @@ class ToolImplementations:
                       'maxsol': int(params['maxsol']),
                       'priority': str(params['priority']),
                       'match': str(params['match'])}
-            designer = Designer(seed=params.get('seed'))
-
-            split_e = float(params.get('split_e', 0.0) or 0.0)
-            split_h = float(params.get('split_h', 0.0) or 0.0)
+            params = {**params,
+                      'seed': self._run_seed(params, "Line Scan Designer")}
             # In delta-E only the differences count, so a lone peak defines no
             # ladder; in absolute energies one level is already a constraint.
             min_peaks = 1 if search['match'] == MATCH_ABSOLUTE else 2
-
-            def targets_fn(curve):
-                peaks = analyze_curve(curve, params, split_e=split_e,
-                                      split_h=split_h,
-                                      min_abs_V=float(params.get('min_abs_V', 0.0)))
-                branch = peaks.hole_eV if hole_first else peaks.electron_eV
-                return {'targets': branch, 'peaks': peaks,
-                        'n_peaks': len(peaks.peaks_V)}
+            from src.backend.designer_pool import _requested
+            from src.backend.line_scan_pool import (MIN_POINTS_FOR_POOL,
+                                                    LinePointSearch,
+                                                    analyze_line_parallel)
+            # Every position builds its own Designer from the run's one
+            # seed, so the rows are the same on one process or eight.
+            plan = LinePointSearch(params, search, carriers, paired,
+                                   hole_first, min_peaks,
+                                   float(params['max_rrmse']))
 
             # One position's search is the longest stretch between two of
             # `progress`'s cancellation checks, so the flag goes inside it as
@@ -5574,45 +5610,6 @@ class ToolImplementations:
             # Cancel should not mean "after this position".
             def should_cancel() -> bool:
                 return bool(getattr(task, 'cancelled', False))
-
-            def _candidates(targets, carrier):
-                # Every mass from one search where the masses allow it —
-                # see Designer.shares_mass_search. Each candidate carries its
-                # own mass, so the alias test runs at that mass.
-                carrier = {**carrier, 'Et': np.asarray(targets, dtype=float)}
-                found = designer.search_masses(
-                    search, carrier,
-                    lambda pm, _label: designer.find_solutions(
-                        pm, should_cancel=should_cancel),
-                    should_cancel=should_cancel)
-                return [designer.primary_alias(
-                            sol, {**search, 'Et': carrier['Et'],
-                                  'meff': sol['meff'],
-                                  'carrier': carrier['carrier']})
-                        for sol in found]
-
-            def search_fn(found):
-                solutions = _candidates(found['targets'], primary)
-                if not paired:
-                    return solutions
-
-                # Both carriers: the position only counts when the two close
-                # on the same well — the pair's requirement, point by point.
-                hole_targets = found['peaks'].hole_eV
-                if len(hole_targets) < 2:
-                    found['reason'] = NO_PAIR
-                    return []
-                holes = _candidates(hole_targets, carriers[-1])
-                pairs = pair_candidates(solutions, holes,
-                                        tol_nm=float(params['pair_tol_nm']),
-                                        max_pairs=int(params['maxsol']))
-                if not pairs:
-                    found['reason'] = NO_PAIR
-                    return []
-                found['hole_size_nm'] = confinement_size_nm(
-                    pairs[0]['hole'], pairs[0]['hole'].get('meff'))
-                found['mismatch_nm'] = pairs[0]['mismatch_nm']
-                return [pair['electron'] for pair in pairs]
 
             import time as _time
             started = _time.perf_counter()
@@ -5628,11 +5625,26 @@ class ToolImplementations:
                         search['ndim'], search['coords'], search['match'],
                         params.get('carrier'))
 
-            results = analyze_line_scan(
-                scan, targets_fn, search_fn,
-                size_fn=lambda sol: confinement_size_nm(sol, sol.get('meff')),
-                min_peaks=min_peaks, max_rrmse=float(params['max_rrmse']),
-                progress=progress)
+            workers = min(_requested(params.get('workers')), scan.n_points)
+            if workers > 1 and scan.n_points >= MIN_POINTS_FOR_POOL:
+                results = analyze_line_parallel(
+                    scan, plan, workers, is_cancelled=should_cancel,
+                    on_done=lambda done: progress(done, scan.n_points))
+            else:
+                # A line too short to give each position a worker spreads
+                # each position's own search over the pool instead.
+                mapper = None
+                if (scan.n_points < MIN_POINTS_FOR_POOL
+                        and _requested(params.get('workers')) > 1):
+                    from src.backend.compute_pool import PoolMapper
+                    mapper = PoolMapper(_requested(params.get('workers')))
+                results = analyze_line_scan(
+                    scan, None, None, size_fn=plan.size,
+                    min_peaks=min_peaks, max_rrmse=float(params['max_rrmse']),
+                    progress=progress,
+                    point_fn=lambda curve, i, position, name: plan.run(
+                        curve, i, position, name, should_cancel,
+                        mapper=mapper))
             self._report_tool_progress(task, "Line Scan Designer", scan.n_points,
                                        scan.n_points, started, unit="position")
 
@@ -5680,6 +5692,7 @@ class ToolImplementations:
                               'end': float(seg['end']),
                               'count': int(seg['count'])}
                              for seg in segments_along_line(results)],
+                'seed': params['seed'],
                 'error': '',
             }
 
@@ -5753,6 +5766,9 @@ class ToolImplementations:
         signature = self._search_signature(params)
         frame['dataset'] = dataset_name
         frame['search'] = signature
+        # The run's one seed: every position searched with it, so this
+        # number and the settings repeat the table exactly.
+        frame['seed'] = params.get('seed')
 
         base_name = self._extract_clean_base_name(dataset_name)
         table_name = self._unique_dataset_name(f"{base_name} - Confinement ({signature})")
@@ -5766,6 +5782,7 @@ class ToolImplementations:
                 'source_dataset': dataset_name,
                 'original_dataset': dataset_name,
                 'search': signature,
+                'seed': params.get('seed'),
                 'sym': params.get('sym'),
                 'ndim': params.get('ndim'),
                 'coords': params.get('coords'),

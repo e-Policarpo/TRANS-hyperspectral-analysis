@@ -181,6 +181,10 @@ Item {
                 + (summary.total || 0) + " position(s) converged, "
                 + (result.groups ? result.groups.length : 0) + " size group(s)"
                 + (parts.length > 0 ? " — " + parts.join(", ") : "")
+                // The seed every position searched with — drawn when the
+                // field was blank — so the run can be repeated exactly.
+                + (result.seed !== undefined && result.seed !== null
+                   ? " · seed " + result.seed : "")
         }
 
         // A cancelled search never reaches lineScanDesignCompleted, so this is
