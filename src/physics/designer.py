@@ -231,6 +231,50 @@ def parse_masses(text: str, what: str) -> list:
     return sorted(set(masses))
 
 
+# ── units of work a process pool can run ────────────────────────────────────
+#
+# Module-level so they pickle. Each builds a throwaway Designer: the objective
+# reads nothing off the instance but the parameters it is handed, so the
+# value a worker computes is the value the serial loop would have. Errors
+# come back as None, which the caller treats exactly as the serial loop
+# treats the exception it swallows.
+
+def _pool_minimize(job):
+    """One L-BFGS-B descent: ``(fun, x)`` or None."""
+    p, start, bounds = job
+    try:
+        res = minimize(Designer(seed=0).objective, start, args=(p,),
+                       method='L-BFGS-B', bounds=bounds)
+    except Exception:
+        return None
+    return res.fun, res.x
+
+
+def _pool_evolve(job):
+    """One differential-evolution pass from a given seed: ``(fun, x)`` or None."""
+    p, bounds, seed = job
+    try:
+        res = differential_evolution(Designer(seed=0).objective, bounds,
+                                     args=(p,), maxiter=200, tol=0.01,
+                                     seed=seed)
+    except Exception:
+        return None
+    return res.fun, res.x
+
+
+def _pool_score(job):
+    """The objective at each lattice node of a chunk, None where it raised."""
+    p, nodes = job
+    designer = Designer(seed=0)
+    out = []
+    for node in nodes:
+        try:
+            out.append(designer.objective(list(node), p))
+        except Exception:
+            out.append(None)
+    return out
+
+
 class Designer:
     """The search itself: no widgets, no plots, no state beyond its seed.
 
@@ -249,10 +293,18 @@ class Designer:
     ``match``     one of the ``MATCH_*`` keys
     """
 
-    def __init__(self, seed: Optional[int] = None):
+    def __init__(self, seed: Optional[int] = None, mapper=None):
         # Seedable so a test can pin the global optimisation; entropy-seeded
         # by default, exactly as the search has always run.
         self._rng = np.random.default_rng(seed)
+        # Anything with ``workers`` and ``map(fn, jobs, should_cancel)`` —
+        # in the app, :class:`src.backend.compute_pool.PoolMapper`. With one,
+        # the independent passes of a search run on it and are replayed in
+        # serial order, so the candidates are the serial ones bit for bit.
+        self.mapper = mapper
+
+    def _parallel(self) -> bool:
+        return self.mapper is not None and getattr(self.mapper, 'workers', 1) > 1
 
     # ─── the geometry under test ─────────────────────────────────────────
 
@@ -1253,6 +1305,10 @@ class Designer:
             sols.append(self.extract_solution([], p))
             return sols
 
+        if self._parallel():
+            return self._find_solutions_parallel(p, bounds, progress,
+                                                 should_cancel)
+
         # Analytical estimates
         m = p['meff'] * m_e
         nest = len(p['Et'])
@@ -1308,6 +1364,90 @@ class Designer:
                         sols.append(s)
             except Exception:
                 pass
+
+        sols.sort(key=lambda x: x['RRMSE'])
+        return sols[:p['maxsol']]
+
+    def _accept(self, out, p, sols) -> None:
+        """The serial loop's acceptance step, for one pooled ``(fun, x)``."""
+        if out is None:
+            return
+        fun, x = out
+        try:
+            if fun <= p['tol']:
+                s = self.extract_solution(x, p)
+                if not self.is_duplicate(s, sols, rel=p.get('dup_rel')):
+                    sols.append(s)
+        except Exception:
+            pass
+
+    def _find_solutions_parallel(self, p, bounds, progress, should_cancel):
+        """:meth:`find_solutions` with its independent passes on ``mapper``.
+
+        Every analytical start is refined at once, then the global passes run
+        in waves of ``mapper.workers``. Results are replayed in the serial
+        order through the serial acceptance step, and the wave stops being
+        read the moment the quota fills — so the candidates are the serial
+        ones, bit for bit. The seeds come from the same RNG in the same
+        order; the passes a wave ran past the quota are speculative, and the
+        RNG is rewound to where the serial loop would have left it, so a
+        later search on this Designer draws what it always drew.
+
+        Cancel is checked between waves (and by the mapper while it waits);
+        a pass already running finishes, which is at most one pass.
+        """
+        sols = []
+        m = p['meff'] * m_e
+        ndim_int = max(1, int(p['ndim'][0]))
+        pf = hbar ** 2 * np.pi ** 2 / (2.0 * m)
+        starts = []
+        for Er in p['Et']:
+            L_est = np.sqrt(ndim_int * pf / (Er * e)) * 1e9
+            if p['Lmin'] <= L_est <= p['Lmax']:
+                starts.extend(self._seed_starts(L_est, len(bounds), bounds, p))
+        if should_cancel is not None and should_cancel():
+            return sols
+        if starts:
+            if progress is not None:
+                progress(f"analytical estimates ({len(starts)} in parallel)")
+            outs = self.mapper.map(_pool_minimize,
+                                   [(p, s, bounds) for s in starts],
+                                   should_cancel)
+            if outs is None:
+                logger.info("find_solutions cancelled during the analytical "
+                            "estimates")
+                return sols
+            for out in outs:
+                self._accept(out, p, sols)
+
+        npass = p['maxsol'] * 2
+        state = self._rng.bit_generator.state
+        seeds = [int(self._rng.integers(10000)) for _ in range(npass)]
+        used = 0
+        wave = max(1, self.mapper.workers)
+        while used < npass and len(sols) < p['maxsol']:
+            if should_cancel is not None and should_cancel():
+                logger.info("find_solutions cancelled after %d/%d global "
+                            "pass(es): %d candidate(s) kept",
+                            used, npass, len(sols))
+                break
+            batch = seeds[used:used + wave]
+            if progress is not None:
+                progress(f"global search passes {used + 1}-"
+                         f"{used + len(batch)}/{npass}")
+            outs = self.mapper.map(_pool_evolve,
+                                   [(p, bounds, s) for s in batch],
+                                   should_cancel)
+            if outs is None:
+                break
+            for out in outs:
+                if len(sols) >= p['maxsol']:
+                    break
+                used += 1
+                self._accept(out, p, sols)
+        self._rng.bit_generator.state = state
+        for _ in range(used):
+            self._rng.integers(10000)
 
         sols.sort(key=lambda x: x['RRMSE'])
         return sols[:p['maxsol']]
@@ -1654,6 +1794,10 @@ class Designer:
                 f"'enum_per_octave' (now {p.get('enum_per_octave') or 8}) or "
                 f"raise 'enum_max_nodes'")
 
+        if self._parallel():
+            return self._enumerate_parallel(p, bounds, axes, total, progress,
+                                            should_cancel)
+
         scored = []
         for i, node in enumerate(itertools.product(*axes)):
             if (i % 64) == 0 and should_cancel is not None and should_cancel():
@@ -1714,6 +1858,74 @@ class Designer:
         sols.sort(key=lambda x: x['RRMSE'])
         logger.info("enumerate_solutions: %d lattice node(s), %d refinement(s)"
                     ", %d distinct candidate(s)", total, len(window), len(sols))
+        return sols
+
+    def _enumerate_parallel(self, p, bounds, axes, total, progress,
+                            should_cancel):
+        """:meth:`enumerate_solutions`' two phases on ``mapper``.
+
+        The lattice is scored in contiguous chunks and concatenated in
+        product order, so the stable sort ranks it exactly as the serial
+        pass did; the refinements run in batches and are replayed in rank
+        order through the same acceptance rules. Same population, bit for
+        bit. Cancel is checked between batches and returns what was kept.
+        """
+        nodes = list(itertools.product(*axes))
+        workers = max(1, self.mapper.workers)
+        size = max(16, -(-len(nodes) // (workers * 4)))
+        chunks = [nodes[i:i + size] for i in range(0, len(nodes), size)]
+        if progress is not None:
+            progress(f"scoring {total} lattice nodes on {workers} processes")
+        outs = self.mapper.map(_pool_score, [(p, c) for c in chunks],
+                               should_cancel)
+        if outs is None:
+            logger.info("enumerate_solutions cancelled while scoring the "
+                        "lattice")
+            return []
+        scored = [(err, node) for chunk, errs in zip(chunks, outs)
+                  for node, err in zip(chunk, errs) if err is not None]
+        scored.sort(key=lambda entry: entry[0])
+
+        npolish = self.polish_budget(bounds, p, total)
+        window = scored[:npolish]
+        sols = []
+        batch = workers * 2
+        for k in range(0, len(window), batch):
+            if should_cancel is not None and should_cancel():
+                logger.info("enumerate_solutions cancelled after %d/%d "
+                            "refinements: %d candidate(s) kept",
+                            k, len(window), len(sols))
+                break
+            if progress is not None:
+                progress(f"refining lattice nodes {k + 1}-"
+                         f"{min(k + batch, len(window))}/{len(window)}")
+            part = window[k:k + batch]
+            outs = self.mapper.map(
+                _pool_minimize,
+                [(p, list(node), self.refinement_box(node, bounds, p))
+                 for _err, node in part],
+                should_cancel)
+            if outs is None:
+                break
+            for (_err, node), out in zip(part, outs):
+                if out is None or out[0] > p['tol']:
+                    continue
+                try:
+                    s = self.extract_solution(out[1], p)
+                except Exception:
+                    logger.debug("enumerate_solutions: candidate from node %r "
+                                 "could not be built; dropped", node,
+                                 exc_info=True)
+                    continue
+                if p.get('reject_unresolvable') and s.get('unresolvable'):
+                    continue
+                if not self.is_duplicate(s, sols, rel=p.get('dup_rel')):
+                    sols.append(s)
+
+        sols.sort(key=lambda x: x['RRMSE'])
+        logger.info("enumerate_solutions: %d lattice node(s), %d refinement(s)"
+                    ", %d distinct candidate(s), on %d processes",
+                    total, len(window), len(sols), workers)
         return sols
 
     # ─── one search for every effective mass ─────────────────────────────

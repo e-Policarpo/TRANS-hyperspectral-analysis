@@ -1,59 +1,80 @@
-"""Confinement Designer sweeps, one spectrum per worker process.
+"""Confinement Designer sweeps on the shared process pool.
 
-Each spectrum's search is independent of every other — its own peaks, its
-own ``Designer(seed=...)`` built fresh inside ``_design_one_spectrum`` — so a
-sweep is embarrassingly parallel, and the result does not depend on how the
-spectra are scheduled: a seeded run gives the same rows with one worker or
-eight. Threads would not help: the search is pure Python under the GIL.
+Two grains of parallelism, never nested (a worker cannot feed the pool):
 
-Processes are started with ``spawn``, the only start method that is safe
-under Qt on macOS and the one a PyInstaller bundle supports (``main.py``
-calls ``multiprocessing.freeze_support()`` for it). A worker never imports
-Qt: everything ``_design_one_spectrum`` reaches is a static or class method
-of ``ToolImplementations``, so it is called on the class itself.
+* **One spectrum per worker** when there are enough spectra to fill it.
+  Each spectrum's search is independent of every other — its own peaks, its
+  own ``Designer(seed=...)`` built fresh inside ``_design_one_spectrum`` —
+  so the sweep is embarrassingly parallel and a seeded run gives the same
+  rows with one worker or eight.
+* **One search spread over the workers** when there are only one or two
+  spectra: the search's own independent passes (analytical refinements,
+  differential-evolution passes, lattice chunks, enumeration refinements) go
+  to the pool through :class:`~src.backend.compute_pool.PoolMapper` and are
+  replayed in serial order, so the candidates are again the serial ones.
+
+The pool itself lives in :mod:`src.backend.compute_pool` and is kept for the
+session, so neither grain pays the ~1 s worker start-up per run. A worker
+never imports Qt: everything ``_design_one_spectrum`` reaches is a static or
+class method of ``ToolImplementations``, so it is called on the class itself.
 """
 
 from __future__ import annotations
 
 import logging
-import multiprocessing
-import os
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
-from typing import Callable, List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
+from src.backend import compute_pool
+from src.backend.compute_pool import default_workers  # noqa: F401  (re-export)
+
 logger = logging.getLogger(__name__)
 
-#: Fewer spectra than this are searched in-process: a spawned worker costs
-#: about a second to start (it imports numpy, scipy and pandas afresh), which
-#: a single spectrum's ~2 s search does not repay.
+#: From this many spectra up, a sweep runs one spectrum per worker. Below
+#: it, each spectrum's search is spread over the workers instead: one
+#: spectrum per worker would leave the rest of the pool idle.
 MIN_SPECTRA_FOR_POOL = 3
 
-_cancel_event = None
 
-
-def default_workers() -> int:
-    """Every core but one, so the interface stays responsive."""
-    return max(1, (os.cpu_count() or 2) - 1)
-
-
-def resolve_workers(requested, n_spectra: int) -> int:
-    """How many processes a sweep of ``n_spectra`` actually gets.
-
-    ``requested`` 0 or None is automatic; 1 is the old serial loop; anything
-    larger is a ceiling. Never more workers than spectra.
-    """
+def _requested(requested) -> int:
     try:
         want = int(requested or 0)
     except (TypeError, ValueError):
         want = 0
-    if want <= 0:
-        want = default_workers()
+    return default_workers() if want <= 0 else want
+
+
+def resolve_workers(requested, n_spectra: int) -> int:
+    """How many processes a sweep of ``n_spectra`` runs spectra on.
+
+    ``requested`` 0 or None is automatic; 1 is the old serial loop; anything
+    larger is a ceiling. Never more workers than spectra, and 1 below
+    :data:`MIN_SPECTRA_FOR_POOL` — those sweeps parallelise inside the
+    search instead (:func:`search_workers`).
+    """
     if n_spectra < MIN_SPECTRA_FOR_POOL:
         return 1
-    return max(1, min(want, n_spectra))
+    return max(1, min(_requested(requested), n_spectra))
+
+
+def search_workers(requested, n_spectra: int) -> int:
+    """How many processes ONE spectrum's search is spread over.
+
+    The complement of :func:`resolve_workers`: the requested count for a
+    sweep too short to fill the pool with spectra, 1 otherwise (and 1 when
+    the serial loop was asked for).
+    """
+    if n_spectra >= MIN_SPECTRA_FOR_POOL:
+        return 1
+    return max(1, _requested(requested))
+
+
+def plan_workers(requested, n_spectra: int) -> Tuple[int, int]:
+    """``(spectrum workers, search workers)`` — at most one of them above 1."""
+    return (resolve_workers(requested, n_spectra),
+            search_workers(requested, n_spectra))
 
 
 class _OneSpectrum:
@@ -70,21 +91,19 @@ class _OneSpectrum:
 class _WorkerTask:
     """What ``_design_one_spectrum`` polls for Cancel, read across processes."""
 
+    def __init__(self, slot):
+        self.slot = slot
+
     @property
     def cancelled(self) -> bool:
-        return _cancel_event is not None and _cancel_event.is_set()
-
-
-def _init_worker(event) -> None:
-    global _cancel_event
-    _cancel_event = event
+        return compute_pool.cancelled(self.slot)
 
 
 def _search_one(job):
-    index, x, y, column, params = job
+    index, x, y, column, params, slot = job
     from src.backend.tool_implementations import ToolImplementations
     run = ToolImplementations._design_one_spectrum(
-        ToolImplementations, _WorkerTask(), _OneSpectrum(x, y, column), 0,
+        ToolImplementations, _WorkerTask(slot), _OneSpectrum(x, y, column), 0,
         params)
     run['spectrum_index'] = int(index)
     return run
@@ -106,36 +125,13 @@ def design_spectra_parallel(spectral_data, indices: Sequence[int],
     x = np.asarray(spectral_data.independent_var, dtype=np.float64)
     values = spectral_data.spectra.values
     columns = spectral_data.spectra.columns
-    ctx = multiprocessing.get_context('spawn')
-    event = ctx.Event()
-    runs: dict = {}
-    with ProcessPoolExecutor(max_workers=workers, mp_context=ctx,
-                             initializer=_init_worker,
-                             initargs=(event,)) as pool:
-        pending = {pool.submit(_search_one,
-                               (int(i), x, np.asarray(values[:, i]),
-                                str(columns[i]), params)): int(i)
-                   for i in indices}
-        try:
-            while pending:
-                done, _ = wait(pending, timeout=0.25,
-                               return_when=FIRST_COMPLETED)
-                if is_cancelled():
-                    event.set()
-                    for future in pending:
-                        future.cancel()
-                    logger.info("Confinement Designer cancelled with %d "
-                                "spectrum(s) still queued or running",
-                                len(pending))
-                    return None
-                for future in done:
-                    index = pending.pop(future)
-                    runs[index] = future.result()
-                    if on_done is not None:
-                        on_done(len(runs))
-        except BaseException:
-            event.set()
-            for future in pending:
-                future.cancel()
-            raise
-    return [runs[int(i)] for i in indices]
+    with compute_pool.CancelToken() as token:
+        runs = compute_pool.run_ordered(
+            _search_one,
+            [(int(i), x, np.asarray(values[:, i]), str(columns[i]), params,
+              token.slot) for i in indices],
+            workers, is_cancelled=is_cancelled, token=token, on_done=on_done)
+    if runs is None:
+        logger.info("Confinement Designer cancelled with spectra still "
+                    "queued or running")
+    return runs
