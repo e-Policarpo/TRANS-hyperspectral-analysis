@@ -342,24 +342,56 @@ def _disc_levels(R, Lz, m, n_levels, width, per_channel):
     three of those sit above the ``n_levels``-th energy, nothing is missing.
     A few iterations at most; the caps are only a runaway guard.
     """
+    E, qn = _disc_ladder(R, Lz, m, n_levels, width, per_channel)
+    return [(E[i], qn[i]) for i in range(len(qn))]
+
+
+@lru_cache(maxsize=256)
+def _disc_basis(width: int, per_channel: int, nz_max: int):
+    """The disc basis as arrays, in the order the loop below used to build it.
+
+    ``a2`` is each Bessel zero squared and ``z2`` each ``(pi*nz)**2``, both
+    computed as Python floats exactly as the scalar expressions did, so the
+    vectorised energies round identically. Order is m outer, n, then nz
+    inner — the stable argsort in :func:`_disc_ladder` depends on it to break
+    ties the way ``list.sort`` did.
+    """
+    a2, z2, qn = [], [], []
+    for m_q in range(width + 1):
+        for n, a in enumerate(_jn_zeros_cached(m_q, per_channel), 1):
+            sq = a ** 2
+            for nz in range(1, nz_max + 1):
+                a2.append(sq)
+                z2.append((np.pi * nz) ** 2)
+                qn.append((n, m_q, nz))
+    return np.array(a2), np.array(z2), tuple(qn)
+
+
+def _disc_ladder(R, Lz, m, n_levels, width, per_channel):
+    """:func:`_disc_levels` as ``(energies, quantum numbers)``, ascending.
+
+    The same basis-growth loop, evaluated on arrays: the designer calls this
+    thousands of times per search and the per-state Python loop was ~60 % of
+    every objective evaluation. Energies are bit-identical to the scalar
+    loop's (same operations in the same order) and so is the tie order.
+    """
     pref = (hbar ** 2) / (2.0 * m) / e
-    E_xy = lambda a: pref * a ** 2 / R ** 2           # noqa: E731
-    E_z = lambda nz: pref * (np.pi * nz) ** 2 / Lz ** 2   # noqa: E731
+    R2, Lz2 = R ** 2, Lz ** 2
+    E_xy = lambda a: pref * a ** 2 / R2               # noqa: E731
+    E_z = lambda nz: pref * (np.pi * nz) ** 2 / Lz2   # noqa: E731
 
     nz_max = max(2, int(np.ceil(n_levels / 8)))
     a01 = _jn_zeros_cached(0, 1)[0]
     for _ in range(64):
-        levels = []
-        for m_q in range(width + 1):
-            for n, a in enumerate(_jn_zeros_cached(m_q, per_channel), 1):
-                exy = E_xy(a)
-                for nz in range(1, nz_max + 1):
-                    levels.append((exy + E_z(nz), (n, m_q, nz)))
-        levels.sort(key=lambda item: item[0])
-        if len(levels) < n_levels:
+        a2, z2, qn = _disc_basis(width, per_channel, nz_max)
+        energies = pref * a2 / R2 + pref * z2 / Lz2
+        order = np.argsort(energies, kind='stable')
+        energies = energies[order].tolist()
+        levels = (energies, [qn[i] for i in order.tolist()])
+        if len(energies) < n_levels:
             nz_max += 1; per_channel += 1; width += 1
             continue
-        cutoff = levels[n_levels - 1][0]
+        cutoff = energies[n_levels - 1]
         grow = False
         # Cheapest state just past each cap. Each is a lower bound on
         # everything beyond that cap, by monotonicity.
@@ -458,8 +490,21 @@ def dot_energies(model: str, dims, meff=0.067, n_levels=20):
     :class:`Level` dataclasses costs tens of microseconds against an
     objective evaluation of ~0.8 ms — a few per cent of the designer's hot
     loop, spent on fields that loop never reads.
+
+    The disc builds only the pairs it returns: its ladder comes out of
+    :func:`_disc_ladder` already in :func:`_dot_states`' order, and the
+    designer asks for 20 of a basis of 60 or more.
     """
-    return _dot_states(model, dims, meff, n_levels)[:max(1, int(n_levels))]
+    n = max(1, int(n_levels))
+    if model == DOT_DISC:
+        R, Lz = float(dims[0]) * 1e-9, float(dims[1]) * 1e-9
+        if R <= 0 or Lz <= 0:
+            raise ValueError("R and Lz must be positive")
+        width = min(8, max(2, int(round(np.sqrt(n)))))
+        per_channel = max(2, int(np.ceil(n / (width + 1))))
+        E, qn = _disc_ladder(R, Lz, meff * m_e, n, width, per_channel)
+        return list(zip(E[:n], qn[:n]))
+    return _dot_states(model, dims, meff, n_levels)[:n]
 
 
 def _dot_weight(model: str, qn) -> int:
