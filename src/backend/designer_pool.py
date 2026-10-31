@@ -100,13 +100,15 @@ class _WorkerTask:
 
 
 def _search_one(job):
-    index, x, y, column, params, slot = job
+    index, x, y, column, params, slot, memo = job
     from src.backend.tool_implementations import ToolImplementations
     run = ToolImplementations._design_one_spectrum(
         ToolImplementations, _WorkerTask(slot), _OneSpectrum(x, y, column), 0,
-        params)
+        params, memo=memo)
     run['spectrum_index'] = int(index)
-    return run
+    # The memo comes back with what this search added, so the next run in
+    # the session — whichever worker it lands on — starts from it.
+    return run, memo
 
 
 def design_spectra_parallel(spectral_data, indices: Sequence[int],
@@ -125,13 +127,25 @@ def design_spectra_parallel(spectral_data, indices: Sequence[int],
     x = np.asarray(spectral_data.independent_var, dtype=np.float64)
     values = spectral_data.spectra.values
     columns = spectral_data.spectra.columns
+    from src.backend import designer_memo
+    from src.backend.tool_implementations import ToolImplementations
+    jobs, keys = [], []
+    for i in indices:
+        y = np.asarray(values[:, i], dtype=np.float64)
+        memo = ToolImplementations._designer_memo(params, x, y)
+        keys.append(None if memo is False
+                    else designer_memo.fingerprint(x, y))
+        jobs.append((int(i), x, y, str(columns[i]), params, None, memo))
     with compute_pool.CancelToken() as token:
-        runs = compute_pool.run_ordered(
-            _search_one,
-            [(int(i), x, np.asarray(values[:, i]), str(columns[i]), params,
-              token.slot) for i in indices],
-            workers, is_cancelled=is_cancelled, token=token, on_done=on_done)
-    if runs is None:
+        jobs = [job[:5] + (token.slot,) + job[6:] for job in jobs]
+        out = compute_pool.run_ordered(
+            _search_one, jobs, workers, is_cancelled=is_cancelled,
+            token=token, on_done=on_done)
+    if out is None:
         logger.info("Confinement Designer cancelled with spectra still "
                     "queued or running")
-    return runs
+        return None
+    for key, (_run, memo) in zip(keys, out):
+        if key is not None:
+            designer_memo.put(key, memo)
+    return [run for run, _memo in out]

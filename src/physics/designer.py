@@ -30,6 +30,7 @@ from scipy.optimize import minimize, differential_evolution
 from src.physics.analytical import (box_energies_1d_eV, box_energies_2d_eV,
                                     box_energies_3d_eV, cylinder_energies,
                                     disk_energies)
+from src.physics.enum_memo import FAILED, OK, UNKNOWN, objective_key
 from src.physics.pairing import confinement_size_nm
 from src.physics.quantum_dot import (dot_energies, hw_from_length,
                                      length_from_hw, levels_for)
@@ -293,7 +294,7 @@ class Designer:
     ``match``     one of the ``MATCH_*`` keys
     """
 
-    def __init__(self, seed: Optional[int] = None, mapper=None):
+    def __init__(self, seed: Optional[int] = None, mapper=None, memo=None):
         # Seedable so a test can pin the global optimisation; entropy-seeded
         # by default, exactly as the search has always run.
         self._rng = np.random.default_rng(seed)
@@ -302,6 +303,12 @@ class Designer:
         # the independent passes of a search run on it and are replayed in
         # serial order, so the candidates are the serial ones bit for bit.
         self.mapper = mapper
+        # An :class:`~src.physics.enum_memo.EnumerationMemo`, or None. Only
+        # the enumeration reads it: its node scores and cell refinements do
+        # not depend on the range, so a rerun with a changed range computes
+        # only what is new. The sampled search depends on the range in every
+        # pass and never touches it.
+        self.memo = memo
 
     def _parallel(self) -> bool:
         return self.mapper is not None and getattr(self.mapper, 'workers', 1) > 1
@@ -1794,139 +1801,162 @@ class Designer:
                 f"'enum_per_octave' (now {p.get('enum_per_octave') or 8}) or "
                 f"raise 'enum_max_nodes'")
 
-        if self._parallel():
-            return self._enumerate_parallel(p, bounds, axes, total, progress,
-                                            should_cancel)
-
-        scored = []
-        for i, node in enumerate(itertools.product(*axes)):
-            if (i % 64) == 0 and should_cancel is not None and should_cancel():
-                logger.info("enumerate_solutions cancelled after %d/%d lattice "
-                            "nodes", i, total)
-                break
-            if progress is not None and (i % 256) == 0:
-                progress(f"lattice node {i + 1}/{total}")
-            try:
-                scored.append((self.objective(list(node), p), node))
-            except Exception:
-                continue
-        scored.sort(key=lambda entry: entry[0])
-
-        npolish = self.polish_budget(bounds, p, total)
-        window = scored[:npolish]
-        sols = []
-        for k, (_err, node) in enumerate(window):
-            if should_cancel is not None and should_cancel():
-                logger.info("enumerate_solutions cancelled after %d/%d "
-                            "refinements: %d candidate(s) kept",
-                            k, len(window), len(sols))
-                break
-            if progress is not None:
-                progress(f"refining lattice node {k + 1}/{len(window)}")
-            try:
-                res = minimize(self.objective, list(node), args=(p,),
-                               method='L-BFGS-B',
-                               bounds=self.refinement_box(node, bounds, p))
-            except Exception:
-                continue
-            if res.fun > p['tol']:
-                continue
-            try:
-                s = self.extract_solution(res.x, p)
-            except Exception:
-                # Same rule as `find_solutions`, which wraps its whole
-                # refine-and-extract block: one candidate that cannot be
-                # built is a candidate dropped, never an enumeration
-                # abandoned. `extract_solution` reaches `annotate` ->
-                # `flat_dims` -> `score_dims`, so anything the level tables
-                # or the sensitivity probe can raise used to take the entire
-                # population down with it and return nothing at all.
-                logger.debug("enumerate_solutions: candidate from node %r "
-                             "could not be built; dropped", node,
-                             exc_info=True)
-                continue
-            if p.get('reject_unresolvable') and s.get('unresolvable'):
-                # Not a bad fit — an undecidable one. The model's levels
-                # across the fitted window are closer together than the
-                # measurement resolves, so the error has stopped
-                # discriminating between geometries. Off by default: it is a
-                # judgement about the DATA, and the user makes it.
-                continue
-            if not self.is_duplicate(s, sols, rel=p.get('dup_rel')):
-                sols.append(s)
-
-        sols.sort(key=lambda x: x['RRMSE'])
-        logger.info("enumerate_solutions: %d lattice node(s), %d refinement(s)"
-                    ", %d distinct candidate(s)", total, len(window), len(sols))
-        return sols
-
-    def _enumerate_parallel(self, p, bounds, axes, total, progress,
-                            should_cancel):
-        """:meth:`enumerate_solutions`' two phases on ``mapper``.
-
-        The lattice is scored in contiguous chunks and concatenated in
-        product order, so the stable sort ranks it exactly as the serial
-        pass did; the refinements run in batches and are replayed in rank
-        order through the same acceptance rules. Same population, bit for
-        bit. Cancel is checked between batches and returns what was kept.
-        """
-        nodes = list(itertools.product(*axes))
-        workers = max(1, self.mapper.workers)
-        size = max(16, -(-len(nodes) // (workers * 4)))
-        chunks = [nodes[i:i + size] for i in range(0, len(nodes), size)]
-        if progress is not None:
-            progress(f"scoring {total} lattice nodes on {workers} processes")
-        outs = self.mapper.map(_pool_score, [(p, c) for c in chunks],
-                               should_cancel)
-        if outs is None:
+        key = objective_key(p) if self.memo is not None else None
+        scored = self._score_lattice(p, axes, total, key, progress,
+                                     should_cancel)
+        if scored is None:
             logger.info("enumerate_solutions cancelled while scoring the "
                         "lattice")
             return []
-        scored = [(err, node) for chunk, errs in zip(chunks, outs)
-                  for node, err in zip(chunk, errs) if err is not None]
         scored.sort(key=lambda entry: entry[0])
 
         npolish = self.polish_budget(bounds, p, total)
         window = scored[:npolish]
-        sols = []
-        batch = workers * 2
+        sols, refined = self._refine_window(p, bounds, window, key, progress,
+                                            should_cancel)
+        sols.sort(key=lambda x: x['RRMSE'])
+        logger.info("enumerate_solutions: %d lattice node(s), %d refinement(s)"
+                    " (%d reused), %d distinct candidate(s)%s", total,
+                    len(window), len(window) - refined, len(sols),
+                    f", on {self.mapper.workers} processes"
+                    if self._parallel() else "")
+        return sols
+
+    def _score_lattice(self, p, axes, total, key, progress, should_cancel):
+        """``[(error, node), …]`` in product order, raising nodes left out.
+
+        The same list the serial pass always built. With a memo, nodes it
+        already holds are read rather than evaluated: the score is the
+        objective at that node, and nothing the range decides enters it.
+        Node ``k`` of an axis is ``lo * r**k`` whatever the ceiling, so the
+        grid is indexed by ``k`` under the anchor ``(lows, per_octave)``.
+        None when cancelled.
+        """
+        shape = tuple(len(axis) for axis in axes)
+        grid = None
+        if key is not None:
+            raw = p.get('enum_per_octave')
+            anchor = (tuple(float(axis[0]) for axis in axes),
+                      float(8 if raw is None or raw == 0 else raw))
+            grid = self.memo.grid(key, anchor, shape)
+            region = tuple(slice(0, n) for n in shape)
+            todo = [idx for idx in np.ndindex(*shape)
+                    if grid.state[region][idx] == UNKNOWN]
+        else:
+            todo = list(np.ndindex(*shape))
+
+        def node_at(idx):
+            return tuple(axes[d][k] for d, k in enumerate(idx))
+
+        errs: list = []
+        if self._parallel() and todo:
+            workers = max(1, self.mapper.workers)
+            size = max(16, -(-len(todo) // (workers * 4)))
+            chunks = [todo[i:i + size] for i in range(0, len(todo), size)]
+            if progress is not None:
+                progress(f"scoring {len(todo)}/{total} lattice nodes on "
+                         f"{workers} processes")
+            outs = self.mapper.map(
+                _pool_score, [(p, [node_at(i) for i in c]) for c in chunks],
+                should_cancel)
+            if outs is None:
+                return None
+            errs = [err for out in outs for err in out]
+        else:
+            for n, idx in enumerate(todo):
+                if (n % 64) == 0 and should_cancel is not None \
+                        and should_cancel():
+                    return None
+                if progress is not None and (n % 256) == 0:
+                    progress(f"lattice node {n + 1}/{len(todo)}"
+                             + (f" ({total - len(todo)} reused)"
+                                if len(todo) < total else ""))
+                try:
+                    errs.append(self.objective(list(node_at(idx)), p))
+                except Exception:
+                    errs.append(None)
+
+        if grid is None:
+            return [(err, node_at(idx)) for idx, err in zip(todo, errs)
+                    if err is not None]
+        for idx, err in zip(todo, errs):
+            if err is None:
+                grid.state[idx] = FAILED
+            else:
+                grid.value[idx] = err
+                grid.state[idx] = OK
+        return [(float(grid.value[idx]), node_at(idx))
+                for idx in np.ndindex(*shape) if grid.state[idx] == OK]
+
+    def _refine_window(self, p, bounds, window, key, progress, should_cancel):
+        """Refine the ranked nodes and keep what passes, in rank order.
+
+        Each refinement is L-BFGS-B from the node inside its own cell, so a
+        memo can hand back one computed in an earlier run whenever the node
+        AND the cell are the same — a node near an old ceiling had a
+        clipped cell and is refined again. Pooled refinements run in
+        batches; acceptance is the serial loop's, in the serial order, so
+        the population is the same whichever way the work was done.
+        Returns ``(candidates, refinements actually run)``.
+        """
+        sols: list = []
+        refined = 0
+        batch = max(1, self.mapper.workers) * 2 if self._parallel() else 1
         for k in range(0, len(window), batch):
             if should_cancel is not None and should_cancel():
                 logger.info("enumerate_solutions cancelled after %d/%d "
                             "refinements: %d candidate(s) kept",
                             k, len(window), len(sols))
                 break
-            if progress is not None:
-                progress(f"refining lattice nodes {k + 1}-"
-                         f"{min(k + batch, len(window))}/{len(window)}")
-            part = window[k:k + batch]
-            outs = self.mapper.map(
-                _pool_minimize,
-                [(p, list(node), self.refinement_box(node, bounds, p))
-                 for _err, node in part],
-                should_cancel)
-            if outs is None:
-                break
-            for (_err, node), out in zip(part, outs):
+            part = [(node, self.refinement_box(node, bounds, p))
+                    for _err, node in window[k:k + batch]]
+            outs = [None] * len(part)
+            missing = []
+            for i, (node, box) in enumerate(part):
+                found = False
+                if key is not None:
+                    found, outs[i] = self.memo.refinement(key, node, box)
+                if not found:
+                    missing.append(i)
+            if missing:
+                if progress is not None:
+                    progress(f"refining lattice nodes {k + 1}-"
+                             f"{k + len(part)}/{len(window)}")
+                jobs = [(p, list(part[i][0]), part[i][1]) for i in missing]
+                if self._parallel():
+                    got = self.mapper.map(_pool_minimize, jobs, should_cancel)
+                    if got is None:
+                        break
+                else:
+                    got = [_pool_minimize(job) for job in jobs]
+                refined += len(missing)
+                for i, out in zip(missing, got):
+                    outs[i] = out
+                    if key is not None:
+                        self.memo.store_refinement(key, *part[i], out)
+            for (node, _box), out in zip(part, outs):
                 if out is None or out[0] > p['tol']:
                     continue
                 try:
                     s = self.extract_solution(out[1], p)
                 except Exception:
+                    # One candidate that cannot be built is a candidate
+                    # dropped, never an enumeration abandoned: extract
+                    # reaches annotate -> flat_dims -> score_dims, and
+                    # anything those raise used to empty the population.
                     logger.debug("enumerate_solutions: candidate from node %r "
                                  "could not be built; dropped", node,
                                  exc_info=True)
                     continue
                 if p.get('reject_unresolvable') and s.get('unresolvable'):
+                    # Not a bad fit — an undecidable one. The model's levels
+                    # across the fitted window are closer together than the
+                    # measurement resolves. Off by default: it is a judgement
+                    # about the DATA, and the user makes it.
                     continue
                 if not self.is_duplicate(s, sols, rel=p.get('dup_rel')):
                     sols.append(s)
-
-        sols.sort(key=lambda x: x['RRMSE'])
-        logger.info("enumerate_solutions: %d lattice node(s), %d refinement(s)"
-                    ", %d distinct candidate(s), on %d processes",
-                    total, len(window), len(sols), workers)
-        return sols
+        return sols, refined
 
     # ─── one search for every effective mass ─────────────────────────────
 

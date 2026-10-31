@@ -3778,6 +3778,10 @@ class ToolImplementations:
         # Worker processes for an all-spectra sweep: 0 is every core but
         # one, 1 the serial loop. See src/backend/designer_pool.py.
         'workers': 0,
+        # Reuse an enumeration's node scores and cell refinements when the
+        # same spectrum is enumerated again with a different range — exact,
+        # see src/physics/enum_memo.py. False recomputes everything.
+        'enum_reuse': True,
         'carrier': 'electrons',
         'meff_e': '0.067',
         'meff_h': '0.45',
@@ -4654,6 +4658,15 @@ class ToolImplementations:
             return {**empty, 'error': str(e)}
 
     @staticmethod
+    def _designer_memo(params: dict, x, y):
+        """This spectrum's enumeration memo, or False when none applies."""
+        if str(params.get('search_mode') or 'sample') != 'enumerate' \
+                or not params.get('enum_reuse', True):
+            return False
+        from src.backend import designer_memo
+        return designer_memo.memo_for(designer_memo.fingerprint(x, y))
+
+    @staticmethod
     def _run_seed(params: dict, tool: str) -> int:
         """The one seed a whole run searches with, drawn when none was given.
 
@@ -4718,7 +4731,7 @@ class ToolImplementations:
             logger.debug("toolProgress emit failed", exc_info=True)
 
     def _design_one_spectrum(self, task, spectral_data, index: int,
-                             params: dict, mapper=None) -> dict:
+                             params: dict, mapper=None, memo=None) -> dict:
         """The search for one spectrum.
 
         Returns a run record rather than raising: in a sweep, a spectrum with
@@ -4790,7 +4803,15 @@ class ToolImplementations:
                   'enum_max_nodes': params.get('enum_max_nodes'),
                   'dup_rel': params.get('dup_rel'),
                   'match': str(params['match'])}
-        designer = Designer(seed=params.get('seed'), mapper=mapper)
+        # The enumeration memo: None looks this spectrum up in the session
+        # registry, False runs without one, anything else is used as given
+        # (what a pool worker is handed). The sampled search never reads it.
+        if memo is None:
+            memo = self._designer_memo(params, x, y)
+        # `is False`, not truthiness: an empty memo has len 0 and is falsy,
+        # and `memo or None` threw away every memo on its first use.
+        designer = Designer(seed=params.get('seed'), mapper=mapper,
+                            memo=None if memo is False else memo)
         # The same flag the loops above poll, handed to the search so it can
         # stop between masses and between optimisation passes. Without it a
         # single carrier with three masses was one uninterruptible block, and

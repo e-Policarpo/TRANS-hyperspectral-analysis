@@ -98,3 +98,55 @@ def test_a_blank_seed_is_drawn_once_and_recorded(tool_impl):  # noqa: F811
 ])
 def test_one_grain_of_parallelism_at_a_time(requested, n, expected):
     assert plan_workers(requested, n) == expected
+
+
+# ── reusing an enumeration across a changed range ──────────────────────────
+
+from src.backend import designer_memo  # noqa: E402
+from src.physics.enum_memo import (EnumerationMemo, RANGE_ONLY,  # noqa: E402
+                                   objective_key)
+import tests.test_backend.test_designer_consensus as C  # noqa: E402
+
+
+@pytest.mark.parametrize('all_spectra', [True, False])
+def test_a_rerun_with_a_wider_range_writes_the_fresh_tables(tmp_path,
+                                                           all_spectra):
+    """Pool sweep (memo shipped to and from the workers) and one spectrum
+    (memo in-process): after a run at 13 nm, the run at 18 nm reuses its
+    nodes and must write what a run with reuse switched off writes."""
+    designer_memo.clear()
+    run = dict(search_mode='enumerate', all_spectra=all_spectra)
+    C._run(tmp_path / "warm", C.TWO_WELLS, Lmax=13.0, **run)
+    hits = sum(m.hits for m in designer_memo._memos.values())
+    warm_tool, warm = C._run(tmp_path / "reuse", C.TWO_WELLS, Lmax=18.0, **run)
+    # The rerun really reused the first run's refinements — a memo that is
+    # silently dropped also writes the fresh tables, so this is the check
+    # that the test tests anything.
+    assert sum(m.hits for m in designer_memo._memos.values()) > hits
+    cold_tool, cold = C._run(tmp_path / "cold", C.TWO_WELLS, Lmax=18.0,
+                             enum_reuse=False, **run)
+    assert warm['candidates_total'] == cold['candidates_total'] > 0
+    for suffix in ('Candidates', 'Levels'):
+        pd.testing.assert_frame_equal(C._table(warm_tool, suffix),
+                                      C._table(cold_tool, suffix))
+
+
+def test_the_key_ignores_only_what_the_objective_never_reads():
+    p = _lens()
+    assert objective_key({**p, 'Lmax': 25.0, 'tol': 1.0}) == objective_key(p)
+    for changed in ({'meff': 0.39}, {'match': 'absolute'},
+                    {'Et': p['Et'] * 1.01}, {'coords': 'spherical'},
+                    {'fixed': {'d1': 4.0, 'd2': None, 'd3': None}}):
+        assert objective_key({**p, **changed}) != objective_key(p)
+    # The fields the objective path reads must never be range-only.
+    assert not RANGE_ONLY & {'Et', 'meff', 'ndim', 'coords', 'sym', 'fixed',
+                             'match', 'priority', 'assign'}
+
+
+def test_a_memoised_enumeration_matches_a_fresh_one_after_each_range_change():
+    memo = EnumerationMemo()
+    for Lmin, Lmax in ((1.0, 13.0), (1.0, 18.0), (0.9, 18.0), (1.0, 13.0)):
+        p = {**_lens(), 'Lmin': Lmin, 'Lmax': Lmax}
+        fresh = Designer().enumerate_solutions(p)
+        reused = Designer(memo=memo).enumerate_solutions(p)
+        assert _key(reused) == _key(fresh)

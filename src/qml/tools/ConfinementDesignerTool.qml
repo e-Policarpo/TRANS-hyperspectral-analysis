@@ -432,6 +432,7 @@ Item {
                                        searchModeCombo.currentIndex),
             "enum_per_octave": enumPerOctaveSpin.value,
             "enum_polish": enumPolishSpin.value,
+            "enum_reuse": enumReuseCheck.checked,
             // Two engine knobs that used to be read by the search and set by
             // nothing. null, not 0, for both: the engine's own defaults are
             // the 200,000-node cap and the absolute 0.1 nm duplicate test,
@@ -1451,6 +1452,31 @@ Item {
                             id: enumMaxNodesSpin
                             from: 0; to: 2000000; value: 0; stepSize: 50000
                             visible: searchModeCombo.currentIndex === 1
+                        }
+
+                        // Exact, not an approximation: a node's score and its
+                        // one-cell refinement do not depend on the range, so a
+                        // rerun after changing L_max reads them back and
+                        // computes only the new nodes (src/physics/enum_memo.py).
+                        ToolCheckBox {
+                            id: enumReuseCheck
+                            Layout.columnSpan: 2
+                            visible: searchModeCombo.currentIndex === 1
+                            text: "Reuse earlier enumerations of these spectra"
+                            checked: true
+                        }
+                        Label {
+                            Layout.columnSpan: 2
+                            Layout.fillWidth: true
+                            visible: searchModeCombo.currentIndex === 1
+                            text: "Raising L_max keeps every lattice node, so a rerun only " +
+                                  "computes the new ones and the cells the old ceiling " +
+                                  "clipped; the result is the same as a fresh run, bit for " +
+                                  "bit. Changing L_min moves every node, so nothing is " +
+                                  "reused. Kept for this session only."
+                            font.pixelSize: 10
+                            color: textMuted
+                            wrapMode: Text.Wrap
                         }
 
                         Label {
