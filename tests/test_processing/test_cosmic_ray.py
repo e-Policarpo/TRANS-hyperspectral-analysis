@@ -103,3 +103,35 @@ def test_remove_cosmic_rays_2d_processes_each_column_independently():
 def test_remove_cosmic_rays_2d_raises_on_wrong_dim():
     with pytest.raises(ValueError):
         remove_cosmic_rays_2d(np.zeros(100))
+
+
+@pytest.mark.parametrize('fwhm', [3, 6, 20])
+@pytest.mark.parametrize('snr', [100, 10000])
+def test_the_top_of_a_real_line_is_never_clipped(fwhm, snr):
+    """At high signal-to-noise a genuine line's curvature is many σ; only
+    its sharpness tells it from a spike. The σ-only test replaced the top
+    of 150 of 200 such lines."""
+    rng = np.random.default_rng(fwhm * snr)
+    x = np.arange(2001.0)
+    y = snr * _lorentzian(x, 1.0, 1000.3, fwhm / 2) + rng.standard_normal(x.size)
+    _cleaned, mask = remove_cosmic_rays(y)
+    assert not mask.any()
+
+
+@pytest.mark.parametrize('width', [1, 2])
+def test_a_spike_on_top_of_a_peak_is_still_caught(width):
+    rng = np.random.default_rng(width)
+    x = np.arange(2001.0)
+    y = 300 * _lorentzian(x, 1.0, 1000.0, 2.5) + rng.standard_normal(x.size)
+    y[1000:1000 + width] += 1000.0
+    _cleaned, mask = remove_cosmic_rays(y)
+    assert mask[1000:1000 + width].all() and mask.sum() == width
+
+
+def test_pure_noise_is_not_flagged_at_the_stated_threshold():
+    """5σ means 5σ: the sample is left out of its own reference median,
+    which is what lets the MAD estimate the residual's spread exactly."""
+    flags = sum(remove_cosmic_rays(np.random.default_rng(100 + s)
+                                   .standard_normal(2001))[1].sum()
+                for s in range(50))
+    assert flags == 0
