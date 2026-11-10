@@ -20,8 +20,15 @@ from pathlib import Path
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
-# Import and run main
-from src.main import main
-
 if __name__ == "__main__":
+    # The designer pools (src/backend/compute_pool.py) spawn worker
+    # processes. In the frozen app each worker is this executable started
+    # again, and run.py -- not src/main.py -- is the frozen entry point, so
+    # freeze_support must be called HERE. It runs before the application
+    # import so a worker does not pay for loading Qt, and so it never
+    # reaches main(): without it every worker opens another copy of TRANS.
+    import multiprocessing
+    multiprocessing.freeze_support()
+
+    from src.main import main
     sys.exit(main())
