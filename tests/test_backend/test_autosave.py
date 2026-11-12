@@ -321,3 +321,41 @@ class TestAutosaveGate:
         assert not manager._dirty
         manager._on_modified_changed(True)     # a change during the write
         assert manager._dirty
+
+
+class TestSaveSnapshotsLiveState:
+    """A save runs on the IO worker while tools add datasets on the compute
+    worker; serializing the live dict died with "dictionary changed size
+    during iteration" and the autosave was lost (2026-11-12)."""
+
+    def test_save_works_on_copies_of_the_live_containers(self, tmp_path):
+        from types import SimpleNamespace
+        from src.backend.app_backend import AppBackend
+
+        captured = {}
+
+        def save_project(path, data, fast=False):
+            captured.update(data)
+            return True
+
+        fake = SimpleNamespace(
+            _embedded_window_states=[], _map_editor_backend=None,
+            _datasets={'a': object()}, _active_dataset='a', _current_tab=0,
+            _window_id_counter=0, output_files=['x.csv'], maps=[],
+            _maps_inmem={}, _images={}, _notes={}, _naming_convention=None,
+            _browser_tree={'folders': {'f': ['a']}},
+            project_manager=SimpleNamespace(save_project=save_project))
+        task = SimpleNamespace(cancelled=False)
+
+        AppBackend._do_save_project(fake, task, tmp_path / 'p.hrt', fast=True)
+
+        assert captured['datasets'] == fake._datasets
+        for key, live in (('datasets', fake._datasets),
+                          ('output_files', fake.output_files),
+                          ('maps_inmem', fake._maps_inmem),
+                          ('browser_tree', fake._browser_tree)):
+            assert captured[key] is not live, key
+        # a dataset added mid-save does not reach the dict being serialized
+        fake._datasets['b'] = object()
+        assert 'b' not in captured['datasets']
+        assert captured['browser_tree']['folders'] is not fake._browser_tree['folders']

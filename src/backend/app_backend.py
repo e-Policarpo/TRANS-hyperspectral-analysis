@@ -166,6 +166,20 @@ _FFT_WINDOWS = {
 }
 
 
+def _snapshot_nested(obj, attempts: int = 5):
+    """Deep copy of a nested container another thread may be editing.
+
+    A deepcopy walks in Python, so it can still meet a concurrent resize;
+    that raises RuntimeError and the copy is simply retried."""
+    import copy
+    for _ in range(attempts - 1):
+        try:
+            return copy.deepcopy(obj)
+        except RuntimeError:
+            continue
+    return copy.deepcopy(obj)
+
+
 class AppBackend(ToolImplementations, QObject):
     """
     Main application backend that bridges QML UI to Python logic.
@@ -5511,14 +5525,19 @@ class AppBackend(ToolImplementations, QObject):
             except Exception as e:
                 logger.warning(f"Could not get map editor state: {e}")
 
-        # Gather project data
+        # Gather project data. The containers are snapshotted, not passed
+        # live: a save runs on the IO worker while tools on the compute
+        # worker keep adding datasets/maps, and serializing a live dict
+        # died with "dictionary changed size during iteration" — an
+        # autosave that coincided with a batch tool was lost. dict()/list()
+        # copies run in C under the GIL, so the snapshot itself is atomic.
         project_data = {
             'created': datetime.now().isoformat(),
             'metadata': {
                 'name': project_path.stem,
                 'description': 'TRANS-QML Project'
             },
-            'datasets': self._datasets,
+            'datasets': dict(self._datasets),
             'tables': table_states,
             'graphs': graph_states,
             'image_windows': image_window_states,
@@ -5527,14 +5546,14 @@ class AppBackend(ToolImplementations, QObject):
                 'current_tab': self._current_tab,
                 'window_counter': self._window_id_counter
             },
-            'output_files': self.output_files,
-            'maps': self.maps,
-            'maps_inmem': self._maps_inmem,
-            'images': self._images,
-            'notes': self._notes,
+            'output_files': list(self.output_files),
+            'maps': list(self.maps),
+            'maps_inmem': dict(self._maps_inmem),
+            'images': dict(self._images),
+            'notes': dict(self._notes),
             'naming_convention': self._naming_convention,
             'map_editor': map_editor_state,
-            'browser_tree': self._browser_tree,
+            'browser_tree': _snapshot_nested(self._browser_tree),
         }
 
         success = self.project_manager.save_project(project_path, project_data,
