@@ -102,9 +102,10 @@ echo
 echo "built: $APP  ($(du -sh "$APP" | cut -f1))"
 echo "architecture: $(lipo -archs "$APP/Contents/MacOS/TRANS" 2>/dev/null || echo unknown)"
 
-# --install copies it where macOS expects an app to live. ~/Applications
-# needs no administrator password and is indexed by Spotlight and Launchpad
-# just like /Applications.
+# --install replaces the copy in /Applications — the one that is actually
+# launched. Installing to ~/Applications instead left two copies, and the
+# Dock kept opening the stale /Applications one (2026-11-12). Any copy in
+# ~/Applications is moved to the Trash so only one remains.
 if [ "${1:-}" = "--install" ] || [ "${2:-}" = "--install" ]; then
     # Never install a bundle older than the source it is supposed to carry.
     # A build that failed early leaves the previous dist in place, and
@@ -114,10 +115,18 @@ if [ "${1:-}" = "--install" ] || [ "${2:-}" = "--install" ]; then
         echo "error: $APP is older than $NEWEST_SRC — refusing to install a stale build" >&2
         exit 1
     fi
-    mkdir -p "$HOME/Applications"
-    rm -rf "$HOME/Applications/T.R.A.N.S..app"
-    cp -R "$APP" "$HOME/Applications/"
-    echo "installed: $HOME/Applications/T.R.A.N.S..app"
+    if pgrep -f "T.R.A.N.S..app/Contents/MacOS/TRANS" >/dev/null; then
+        echo "error: TRANS is running — quit it before installing" >&2
+        exit 1
+    fi
+    DEST="/Applications/T.R.A.N.S..app"
+    rm -rf "$DEST"
+    ditto "$APP" "$DEST"
+    if [ -d "$HOME/Applications/T.R.A.N.S..app" ]; then
+        mv "$HOME/Applications/T.R.A.N.S..app" \
+           "$HOME/.Trash/T.R.A.N.S. ($(date +%Y%m%d-%H%M%S)).app"
+    fi
+    echo "installed: $DEST"
 fi
 
 echo
