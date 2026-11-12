@@ -129,7 +129,12 @@ Item {
         // Measured on the engine this drives: roughly a quarter of a second
         // per candidate per position. Saying so up front is the difference
         // between a wait and a hang.
-        var seconds = root.spectrumCount * perPointSpin.value * 0.25
+        // With both carriers each side is searched for at least six
+        // geometries, so a pair can be found (PAIRED_SEARCH_MIN in
+        // src/backend/line_scan_pool.py), whatever "Candidates / point" says.
+        var paired = Vocab.keyAt(Vocab.carrierKeys, carrierCombo.currentIndex) === "both"
+        var searched = paired ? 2 * Math.max(perPointSpin.value, 6) : perPointSpin.value
+        var seconds = root.spectrumCount * searched * 0.25
         if (seconds < 90) return "about " + Math.round(seconds) + " s"
         return "about " + Math.round(seconds / 60) + " min"
     }

@@ -378,3 +378,55 @@ class TestItRunsOverSeveralLines:
         assert len(results) == 2
         assert any(k.startswith('line A - Confinement (') for k in tool_impl._datasets)
         assert any(k.startswith('line B - Confinement (') for k in tool_impl._datasets)
+
+
+# ─── how many geometries a paired position gets to choose from ─────────────
+#
+# ``maxsol`` used to set both the candidates searched per carrier and the
+# pairs reported. At the panel's default of 1 the pairing was handed one
+# electron and one hole geometry, and nearly every position of a real line
+# came back "No electron-hole pair" (5/64 converged, against 50/64 with six).
+
+class TestPairedSearchWidth:
+    def _searched(self, monkeypatch, carrier_mode, maxsol):
+        from src.backend import line_scan_pool
+        from src.physics import branches, designer
+        from src.physics.branches import DidvCurve, DidvPeaks
+
+        seen = []
+
+        def fake_search_masses(self, search, carrier, run, should_cancel=None):
+            seen.append((carrier['carrier'], int(search['maxsol'])))
+            return []
+
+        monkeypatch.setattr(designer.Designer, 'search_masses',
+                            fake_search_masses)
+        monkeypatch.setattr(branches, 'analyze_curve',
+                            lambda *a, **k: DidvPeaks(
+                                electron_eV=[0.1, 0.2, 0.3],
+                                hole_eV=[0.1, 0.25, 0.4],
+                                peaks_V=[-0.4, -0.25, -0.1, 0.1, 0.2, 0.3]))
+        paired = carrier_mode == 'both'
+        carriers = ([{'carrier': 'e'}, {'carrier': 'h'}] if paired
+                    else [{'carrier': 'e'}])
+        plan = line_scan_pool.LinePointSearch(
+            {'seed': 1, 'maxsol': maxsol, 'pair_tol_nm': 1.0},
+            {'ndim': '0D', 'coords': 'disc', 'maxsol': maxsol},
+            carriers, paired, False, 2, 12.5)
+        x = np.linspace(-0.5, 0.5, 101)
+        plan.run(DidvCurve(x=x, y=np.ones_like(x)), 0, 0.0, 'P1',
+                 lambda: False)
+        return seen
+
+    def test_both_carriers_search_at_least_six_each(self, monkeypatch):
+        from src.backend.line_scan_pool import PAIRED_SEARCH_MIN
+        seen = self._searched(monkeypatch, 'both', maxsol=1)
+        assert seen == [('e', PAIRED_SEARCH_MIN), ('h', PAIRED_SEARCH_MIN)]
+
+    def test_asking_for_more_than_the_floor_is_honoured(self, monkeypatch):
+        seen = self._searched(monkeypatch, 'both', maxsol=9)
+        assert seen == [('e', 9), ('h', 9)]
+
+    def test_one_carrier_searches_exactly_what_was_asked(self, monkeypatch):
+        seen = self._searched(monkeypatch, 'electrons', maxsol=1)
+        assert seen == [('e', 1)]

@@ -29,6 +29,17 @@ logger = logging.getLogger(__name__)
 #: Shorter lines are searched in-process; the pool is not worth the trip.
 MIN_POINTS_FOR_POOL = 3
 
+#: Candidates searched per carrier when a position must close on an
+#: electron-hole pair, whatever the number of rows asked for. ``maxsol``
+#: used to set both: at the panel's default of 1 the pairing was handed one
+#: electron and one hole geometry, which rarely agree within ``pair_tol_nm``,
+#: and nearly every position came back "No electron-hole pair". Measured on
+#: a 64-point 0D disc line at m* 0.322/0.39: 5/64 positions converged with
+#: one candidate per carrier, 50/64 with six -- the Confinement Designer's
+#: own default (``DESIGNER_DEFAULTS['maxsol']``), and what it scores on the
+#: same spectra. ``maxsol`` still caps the pairs REPORTED.
+PAIRED_SEARCH_MIN = 6
+
 
 class LinePointSearch:
     """Everything one position's search needs, as picklable data."""
@@ -70,18 +81,26 @@ class LinePointSearch:
             return {'targets': branch, 'peaks': peaks,
                     'n_peaks': len(peaks.peaks_V)}
 
+        # A paired search needs a choice of geometries on each side to find
+        # two that agree; an unpaired one reports what it searched.
+        if self.paired:
+            searched = {**search, 'maxsol': max(int(search['maxsol']),
+                                                PAIRED_SEARCH_MIN)}
+        else:
+            searched = search
+
         def _candidates(targets, carrier):
             # Every mass from one search where the masses allow it —
             # see Designer.shares_mass_search. Each candidate carries its
             # own mass, so the alias test runs at that mass.
             carrier = {**carrier, 'Et': np.asarray(targets, dtype=float)}
             found = designer.search_masses(
-                search, carrier,
+                searched, carrier,
                 lambda pm, _label: designer.find_solutions(
                     pm, should_cancel=should_cancel),
                 should_cancel=should_cancel)
             return [designer.primary_alias(
-                        sol, {**search, 'Et': carrier['Et'],
+                        sol, {**searched, 'Et': carrier['Et'],
                               'meff': sol['meff'],
                               'carrier': carrier['carrier']})
                     for sol in found]
