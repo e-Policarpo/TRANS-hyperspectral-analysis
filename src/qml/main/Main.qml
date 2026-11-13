@@ -693,6 +693,13 @@ ApplicationWindow {
                 onTriggered: openLazyDialog(loadWorkflowLoader)
             }
 
+            // A .flow from anywhere on disk: copied into the project's
+            // workflows (the original is left alone) and opened in the editor.
+            MenuItem {
+                text: "Import Workflow (.flow)..."
+                onTriggered: importWorkflowDialog.open()
+            }
+
             MenuItem {
                 text: "Refresh List"
                 onTriggered: refreshProjectWorkflows()
@@ -1999,6 +2006,27 @@ ApplicationWindow {
             var name = backend.importDidvCsv(file.toString())
             if (name) console.log("Imported CSV as dI/dV:", name)
         }
+    }
+
+    Platform.FileDialog {
+        id: importWorkflowDialog
+        title: "Import a workflow"
+        nameFilters: ["Workflow files (*.flow)", "All files (*)"]
+        fileMode: Platform.FileDialog.OpenFile
+        onAccepted: importWorkflowFile(file.toString())
+    }
+
+    // Import a .flow and open it in a workflow window. Returns the window,
+    // or null when the file could not be read (the backend says why).
+    function importWorkflowFile(fileUrl) {
+        if (!backend || !backend.workflowManager) return null
+        var wm = backend.workflowManager
+        var workflowId = wm.importWorkflow(fileUrl)
+        if (!workflowId) return null
+        var data = wm.getWorkflowData(workflowId)
+        refreshProjectWorkflows()
+        return openWorkflowWindowFromId(workflowId,
+                                        (data && data.name) ? data.name : "Workflow")
     }
 
     // Import Image Dialog

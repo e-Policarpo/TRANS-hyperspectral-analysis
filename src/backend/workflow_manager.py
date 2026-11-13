@@ -1644,6 +1644,10 @@ class WorkflowManager(QObject):
     workflowCreated = Signal(str, str)  # id, name
     workflowSaved = Signal(str)  # path
     workflowLoaded = Signal(str)  # name
+    # title, message — a load or save the user asked for that did not work.
+    # Returning "" alone left the QML to say "Error loading workflow" with
+    # no reason.
+    workflowError = Signal(str, str)
     workflowExecutionStarted = Signal(str)  # workflow name
     workflowExecutionCompleted = Signal(str, bool, list)  # name, success, errors
     workflowExecutionProgress = Signal(int, int, str)  # current, total, message
@@ -1800,6 +1804,63 @@ class WorkflowManager(QObject):
             logger.warning(f"Could not serialize value of type {type(data)}, using None")
             return None
 
+    @staticmethod
+    def _local_path(file_path) -> Path:
+        """A filesystem path from whatever QML handed over.
+
+        A file dialog gives a ``file://`` URL, percent-encoded. Cutting the
+        scheme off by hand (what the Load dialog did) leaves ``%20`` for
+        every space, so any .flow under a folder with a space in its name
+        failed to open.
+        """
+        text = str(file_path or '').strip()
+        if text.startswith('file:'):
+            from PySide6.QtCore import QUrl
+            text = QUrl(text).toLocalFile()
+        return Path(text).expanduser()
+
+    def _report(self, title: str, message: str):
+        logger.error("%s: %s", title, message)
+        self.workflowError.emit(title, message)
+        # The main window already shows the backend's errors in a dialog.
+        signal = getattr(self.app_backend, 'errorOccurred', None)
+        if signal is not None and hasattr(signal, 'emit'):
+            try:
+                signal.emit(title, message)
+            except Exception:                      # noqa: BLE001
+                logger.debug("could not forward workflow error", exc_info=True)
+
+    @staticmethod
+    def _safe_stem(name: str) -> str:
+        stem = "".join(c for c in (name or '') if c.isalnum() or c in (' ', '-', '_', '(', ')')).strip()
+        return stem or "Untitled Workflow"
+
+    @staticmethod
+    def _file_workflow_id(path: Path) -> Optional[str]:
+        """The id stored in an existing .flow, or None if unreadable."""
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                return str(json.load(f).get('id') or '') or None
+        except Exception:
+            return None
+
+    def _target_path(self, workflow: Workflow, workflows_dir: Path) -> Path:
+        """Where this workflow is saved: ``<name>.flow``, unless that file
+        holds a DIFFERENT workflow, in which case ``<name> (2).flow`` etc.
+        Two workflows with the same name used to overwrite each other."""
+        stem = self._safe_stem(workflow.name)
+        current = self._workflow_paths.get(workflow.id)
+        candidate = workflows_dir / f"{stem}.flow"
+        n = 2
+        while candidate.exists():
+            if current and Path(current) == candidate:
+                break
+            if self._file_workflow_id(candidate) == workflow.id:
+                break
+            candidate = workflows_dir / f"{stem} ({n}).flow"
+            n += 1
+        return candidate
+
     @Slot(str, result=str)
     def saveWorkflow(self, workflow_id: str) -> str:
         """Save workflow to file in the current project's workflows directory."""
@@ -1810,28 +1871,38 @@ class WorkflowManager(QObject):
         # Update modified timestamp
         workflow.modified = datetime.now().isoformat()
 
-        # Create safe filename
-        safe_name = "".join(c for c in workflow.name if c.isalnum() or c in (' ', '-', '_')).rstrip()
         workflows_dir = self._get_workflows_dir()
-        file_path = workflows_dir / f"{safe_name}.flow"
+        file_path = self._target_path(workflow, workflows_dir)
 
         try:
             # Sanitize workflow data to ensure JSON serializability
             workflow_data = self._sanitize_for_json(workflow.to_dict())
 
-            with open(file_path, 'w', encoding='utf-8') as f:
+            # Write beside the target and swap it in, so an interrupted save
+            # never leaves a half-written .flow where a good one was.
+            tmp = file_path.with_name(file_path.name + '.tmp')
+            with open(tmp, 'w', encoding='utf-8') as f:
                 json.dump(workflow_data, f, indent=2)
+            tmp.replace(file_path)
 
             # If the workflow was renamed, remove the file saved under the
-            # old name so the saved list stays stable (no stale duplicates)
+            # old name so the saved list stays stable (no stale duplicates).
+            # Only a file in THIS workflows folder: a workflow opened from
+            # anywhere else is saved as a copy here, and the file it came
+            # from belongs to the user -- this used to delete it.
             old_path = self._workflow_paths.get(workflow_id)
             if old_path and Path(old_path) != file_path:
+                old = Path(old_path)
                 try:
-                    if Path(old_path).exists():
-                        Path(old_path).unlink()
+                    inside = old.resolve().parent == workflows_dir.resolve()
+                except OSError:
+                    inside = False
+                if inside and old.exists() and self._file_workflow_id(old) == workflow.id:
+                    try:
+                        old.unlink()
                         logger.info(f"Removed stale workflow file after rename: {old_path}")
-                except Exception as e:
-                    logger.warning(f"Could not remove old workflow file {old_path}: {e}")
+                    except Exception as e:
+                        logger.warning(f"Could not remove old workflow file {old_path}: {e}")
             self._workflow_paths[workflow_id] = str(file_path)
 
             self.workflowSaved.emit(str(file_path))
@@ -1839,7 +1910,7 @@ class WorkflowManager(QObject):
             return str(file_path)
 
         except Exception as e:
-            logger.error(f"Error saving workflow: {e}")
+            self._report("Save Workflow", f"Could not save {file_path}: {e}")
             return ""
 
     def clear_workflows(self):
@@ -1872,22 +1943,77 @@ class WorkflowManager(QObject):
 
     @Slot(str, result=str)
     def loadWorkflow(self, file_path: str) -> str:
-        """Load workflow from file"""
+        """Load a .flow (a path or a ``file://`` URL); returns its id or "".
+
+        The file is opened in place: saving it later writes into the
+        project's workflows folder and never back over (or deletes) a file
+        that lives elsewhere -- see :meth:`importWorkflow`.
+        """
+        path = self._local_path(file_path)
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
+            with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-
+            if not isinstance(data, dict) or 'nodes' not in data:
+                raise ValueError("not a TRANS workflow (no 'nodes')")
             workflow = Workflow.from_dict(data)
-            self.workflows[workflow.id] = workflow
-            self.current_workflow = workflow
-            self._workflow_paths[workflow.id] = str(Path(file_path))
-            self.workflowLoaded.emit(workflow.name)
-            logger.info(f"Loaded workflow: {workflow.name}")
-            return workflow.id
-
-        except Exception as e:
-            logger.error(f"Error loading workflow: {e}")
+        except FileNotFoundError:
+            self._report("Open Workflow", f"File not found: {path}")
             return ""
+        except Exception as e:
+            self._report("Open Workflow", f"Could not read {path.name}: {e}")
+            return ""
+
+        # Two copies of one .flow carry the same id. Without a fresh id the
+        # second replaced the first in memory, and saving either overwrote
+        # the other.
+        known = self._workflow_paths.get(workflow.id)
+        if workflow.id in self.workflows and known and Path(known) != path:
+            workflow.id = uuid.uuid4().hex[:8]
+
+        self.workflows[workflow.id] = workflow
+        self.current_workflow = workflow
+        self._workflow_paths[workflow.id] = str(path)
+        self.workflowLoaded.emit(workflow.name)
+        logger.info(f"Loaded workflow: {workflow.name} ({len(workflow.nodes)} nodes) from {path}")
+        return workflow.id
+
+    @Slot(str, result=str)
+    def importWorkflow(self, file_path: str) -> str:
+        """Bring a .flow from anywhere into the project; returns its id.
+
+        A file outside the project's workflows folder is loaded and saved
+        there as a copy (under a unique name), so it is listed with the
+        project's workflows and travels with it. The original is left
+        untouched. A file already in the folder is simply opened.
+        """
+        path = self._local_path(file_path)
+        workflows_dir = self._get_workflows_dir()
+        workflow_id = self.loadWorkflow(str(path))
+        if not workflow_id:
+            return ""
+        try:
+            inside = path.resolve().parent == workflows_dir.resolve()
+        except OSError:
+            inside = False
+        if inside:
+            return workflow_id
+        workflow = self.workflows[workflow_id]
+        # Any id already used by a project workflow is replaced, so the copy
+        # can never be mistaken for (and overwrite) one that is already here.
+        project_ids = {self._file_workflow_id(p) for p in workflows_dir.glob("*.flow")}
+        if workflow.id in project_ids:
+            del self.workflows[workflow_id]
+            self._workflow_paths.pop(workflow_id, None)
+            workflow.id = uuid.uuid4().hex[:8]
+            self.workflows[workflow.id] = workflow
+            workflow_id = workflow.id
+        # Forget the external path: the copy is the file from now on.
+        self._workflow_paths.pop(workflow_id, None)
+        saved = self.saveWorkflow(workflow_id)
+        if not saved:
+            return ""
+        logger.info(f"Imported workflow {workflow.name} from {path} as {saved}")
+        return workflow_id
 
     @Slot(result='QVariantList')
     def getSavedWorkflows(self) -> List[Dict]:

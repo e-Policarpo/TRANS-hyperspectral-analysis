@@ -269,32 +269,42 @@ Dialog {
         }
 
         onAccepted: {
-            var path = file.toString()
-            // Remove file:// prefix
-            if (path.startsWith("file://")) {
-                path = path.substring(7)
-            }
-            console.log("Loading workflow from file:", path)
-            loadWorkflowFromFile(path)
+            // Hand the URL over as it is: the backend decodes it. Cutting
+            // "file://" off here left %20 for every space, and the file
+            // never opened. A file from outside the project is imported (a
+            // copy saved with the project; the original is not touched).
+            importWorkflowFromFile(file.toString())
         }
     }
 
-    function loadWorkflowFromFile(filePath) {
-        if (backend && backend.workflowManager) {
-            var workflowId = backend.workflowManager.loadWorkflow(filePath)
-            if (workflowId) {
-                // Extract name from path
-                var parts = filePath.split("/")
-                var fileName = parts[parts.length - 1]
-                var workflowName = fileName.replace(".flow", "")
+    // The name stored in the workflow, not the file name -- they differ
+    // after a rename or for a "Name (2).flow".
+    function _workflowName(workflowId, fallback) {
+        var data = backend.workflowManager.getWorkflowData(workflowId)
+        return (data && data.name) ? data.name : fallback
+    }
 
-                console.log("Workflow loaded with ID:", workflowId, "Name:", workflowName)
-                openWorkflowFromId(workflowId, workflowName)
-                dialog.close()
-            } else {
-                statusLabel.text = "Error loading workflow file"
-            }
+    function _opened(workflowId, filePath) {
+        if (workflowId) {
+            var parts = String(filePath).split("/")
+            var fallback = decodeURIComponent(parts[parts.length - 1]).replace(/\.flow$/, "")
+            openWorkflowFromId(workflowId, _workflowName(workflowId, fallback))
+            dialog.close()
+        } else {
+            statusLabel.text = "Could not open this workflow — see the error message"
         }
+    }
+
+    // A workflow from the project's own list.
+    function loadWorkflowFromFile(filePath) {
+        if (backend && backend.workflowManager)
+            _opened(backend.workflowManager.loadWorkflow(filePath), filePath)
+    }
+
+    // A .flow picked from anywhere on disk.
+    function importWorkflowFromFile(fileUrl) {
+        if (backend && backend.workflowManager)
+            _opened(backend.workflowManager.importWorkflow(fileUrl), fileUrl)
     }
 
     onAccepted: {
@@ -306,11 +316,9 @@ Dialog {
         if (backend && backend.workflowManager) {
             var workflowId = backend.workflowManager.loadWorkflow(dialog.selectedWorkflowPath)
             if (workflowId) {
-                console.log("Workflow loaded with ID:", workflowId)
-                // Open the workflow window
-                openWorkflowFromId(workflowId, dialog.selectedWorkflow)
+                openWorkflowFromId(workflowId, _workflowName(workflowId, dialog.selectedWorkflow))
             } else {
-                statusLabel.text = "Error loading workflow"
+                statusLabel.text = "Could not open this workflow — see the error message"
             }
         }
     }

@@ -100,9 +100,19 @@ class WorkflowNode:
 
     @classmethod
     def from_dict(cls, data: Dict) -> 'WorkflowNode':
-        # Merge saved parameters with defaults from tool definition
+        """Rebuild a node from a saved ``.flow``.
+
+        The ports and display name come from the CURRENT tool definition,
+        not from the file: a ``.flow`` stores every port as it was when it
+        was saved, and nodes have since been reworked (FFT1D grew
+        magnitude/phase outputs, MapGenerator a dataset input, several
+        displays were renamed). Taking the saved copy reopened old
+        workflows with ports that no longer exist and without the ones that
+        do. A saved port the definition no longer has is kept, after the
+        current ones, so a connection made to it still has an end.
+        """
         tool_name = data['tool_name']
-        saved_params = data.get('parameters', {})
+        saved_params = data.get('parameters', {}) or {}
 
         # Get default parameters from TOOL_DEFINITIONS
         default_params = {}
@@ -115,14 +125,29 @@ class WorkflowNode:
         # Merge: defaults first, then override with saved values
         merged_params = {**default_params, **saved_params}
 
+        saved_inputs = _ports_from_saved(data.get('inputs', []), tool_name)
+        saved_outputs = _ports_from_saved(data.get('outputs', []), tool_name)
+        display_name = data.get('display_name') or tool_name
+        if tool_name in TOOL_DEFINITIONS:
+            fresh = create_node_from_tool(tool_name)
+            inputs = fresh.inputs + [p for p in saved_inputs
+                                     if p.id not in {q.id for q in fresh.inputs}]
+            outputs = fresh.outputs + [p for p in saved_outputs
+                                       if p.id not in {q.id for q in fresh.outputs}]
+            display_name = fresh.display_name
+        else:
+            logger.warning("Workflow node %s: unknown tool %r, kept as saved",
+                           data.get('id'), tool_name)
+            inputs, outputs = saved_inputs, saved_outputs
+
         return cls(
-            id=data['id'],
+            id=str(data.get('id') or uuid.uuid4().hex[:8]),
             tool_name=tool_name,
-            display_name=data['display_name'],
-            x=data.get('x', 100),
-            y=data.get('y', 100),
-            inputs=[Port.from_dict(p) for p in data.get('inputs', [])],
-            outputs=[Port.from_dict(p) for p in data.get('outputs', [])],
+            display_name=display_name,
+            x=float(data.get('x', 100) or 0),
+            y=float(data.get('y', 100) or 0),
+            inputs=inputs,
+            outputs=outputs,
             parameters=merged_params
         )
 
@@ -137,6 +162,19 @@ class WorkflowNode:
             if port.id == port_id:
                 return port
         return None
+
+
+def _ports_from_saved(entries, tool_name: str) -> List[Port]:
+    """Saved ports, skipping any the current code cannot represent (an
+    unknown port type would otherwise fail the whole load)."""
+    ports = []
+    for entry in entries or []:
+        try:
+            ports.append(Port.from_dict(entry))
+        except (KeyError, ValueError, TypeError) as exc:
+            logger.warning("Workflow node %s: dropped unreadable port %r (%s)",
+                           tool_name, entry, exc)
+    return ports
 
 
 @dataclass
@@ -180,12 +218,33 @@ class Workflow:
 
     @classmethod
     def from_dict(cls, data: Dict) -> 'Workflow':
+        nodes = [WorkflowNode.from_dict(n) for n in data.get('nodes', [])]
+        by_id = {n.id: n for n in nodes}
+        connections = []
+        for entry in data.get('connections', []):
+            try:
+                conn = Connection.from_dict(entry)
+            except TypeError as exc:
+                logger.warning("Workflow: dropped unreadable connection %r (%s)",
+                               entry, exc)
+                continue
+            src = by_id.get(conn.source_node_id)
+            dst = by_id.get(conn.target_node_id)
+            # A wire whose end is gone would make validation and execution
+            # trip over a node or port that does not exist.
+            if (src is None or dst is None
+                    or src.get_output_port(conn.source_port_id) is None
+                    or dst.get_input_port(conn.target_port_id) is None):
+                logger.warning("Workflow: dropped connection %s, an end no "
+                               "longer exists", conn.id)
+                continue
+            connections.append(conn)
         return cls(
-            id=data['id'],
-            name=data['name'],
+            id=str(data.get('id') or uuid.uuid4().hex[:8]),
+            name=data.get('name') or 'Untitled Workflow',
             description=data.get('description', ''),
-            nodes=[WorkflowNode.from_dict(n) for n in data.get('nodes', [])],
-            connections=[Connection.from_dict(c) for c in data.get('connections', [])],
+            nodes=nodes,
+            connections=connections,
             created=data.get('created', datetime.now().isoformat()),
             modified=data.get('modified', datetime.now().isoformat())
         )
