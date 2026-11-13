@@ -453,6 +453,52 @@ def detect_featureless(x: np.ndarray, spectrum: np.ndarray,
     return float(max(amplitude_score, coherence_score))
 
 
+#: A spectrum whose signal span is this far below the dataset's median
+#: scores 0 (WEAK_SIGNAL_SAFE) or 1 (WEAK_SIGNAL_DEAD) on detect_weak_signal,
+#: log-linearly in between, so the default threshold of 0.5 sits at 1/31.6.
+#: Measured on Omicron line scans (2026Jul07 lines 1-9, Jul21 line3): the
+#: spans are bimodal -- the fraction below 1/10 of the median is nearly the
+#: fraction below 1/100 -- and what sits below is the preamp's floor (median
+#: max|I| 2e-11 A against 1e-8 A for the line), not a quieter spot.
+WEAK_SIGNAL_SAFE = 0.1
+WEAK_SIGNAL_DEAD = 0.01
+
+
+def signal_span(spectrum: np.ndarray) -> float:
+    """Robust peak-to-peak of one curve (99th minus 1st percentile of its
+    finite samples), or nan when it has none."""
+    y = np.asarray(spectrum, dtype=float)
+    y = y[np.isfinite(y)]
+    if y.size < 2:
+        return float('nan')
+    return float(np.percentile(y, 99) - np.percentile(y, 1))
+
+
+def detect_weak_signal(span: float, reference_span: float) -> float:
+    """Score how far a curve's signal falls below the rest of its dataset.
+
+    A spectroscopy run holds the current at the setpoint before every
+    sweep, so the curves of one dataset share an amplitude scale; one that
+    is two or three decades below its neighbours was not taken in tunnelling
+    -- the tip lost the surface, or the feedback lost the setpoint -- and
+    what remains is the preamplifier's offset and noise. Its derivative is
+    flat and clean, so every single-curve test passes it, and averaged into
+    a point it replaces the measurement with noise. Only the population can
+    tell: ``reference_span`` is the median :func:`signal_span` of the
+    dataset's measurable curves.
+
+    Returns 0 at or above ``WEAK_SIGNAL_SAFE`` of the reference, 1 at or
+    below ``WEAK_SIGNAL_DEAD``, log-linear in between.
+    """
+    if not (np.isfinite(span) and np.isfinite(reference_span)) or reference_span <= 0:
+        return 0.0
+    if span <= 0:
+        return 1.0
+    frac = span / reference_span
+    lo, hi = np.log10(WEAK_SIGNAL_DEAD), np.log10(WEAK_SIGNAL_SAFE)
+    return float(np.clip((hi - np.log10(frac)) / (hi - lo), 0.0, 1.0))
+
+
 def detect_saturation(spectrum: np.ndarray, threshold: float = 0.95) -> float:
     """
     Check if a spectrum clips at its min/max value (saturation artifact).

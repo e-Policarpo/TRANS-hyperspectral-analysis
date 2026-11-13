@@ -1338,6 +1338,8 @@ TOOL_DEFINITIONS = {
             "weight_periodic": {"type": "float", "default": 1.0, "min": 0.0, "max": 1.0, "label": "Periodic Noise Weight"},
             "weight_partial_noise": {"type": "float", "default": 1.0, "min": 0.0, "max": 1.0, "label": "Partial Noise Weight"},
             "weight_featureless": {"type": "float", "default": 1.0, "min": 0.0, "max": 1.0, "label": "Featureless Weight"},
+            "weight_weak_signal": {"type": "float", "default": 1.0, "min": 0.0, "max": 1.0, "label": "Weak Signal Weight",
+                                   "description": "Curves two or more decades below the dataset's median amplitude: no tunnelling, only the preamp floor"},
             "threshold": {"type": "float", "default": 0.5, "min": 0.0, "max": 1.0, "label": "Quality Threshold"},
             "min_structure_ratio": {"type": "float", "default": 3.0, "min": 1.0, "max": 20.0, "label": "Min Structure Ratio"},
             "min_coherence": {"type": "float", "default": 0.12, "min": 0.01, "max": 1.0, "label": "Min Coherence"},

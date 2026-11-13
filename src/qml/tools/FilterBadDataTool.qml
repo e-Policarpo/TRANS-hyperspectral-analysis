@@ -183,6 +183,13 @@ Item {
                         Label { text: "Featureless:"; color: accentBlue }
                         ToolSlider { id: featurelessSlider; Layout.fillWidth: true; from: 0.0; to: 1.0; value: 1.0; stepSize: 0.05 }
                         Label { text: featurelessSlider.value.toFixed(2); color: textMuted; Layout.preferredWidth: 32 }
+
+                        // Compared with the rest of the dataset, not judged
+                        // alone: a curve decades below its neighbours was not
+                        // taken in tunnelling, however clean it looks.
+                        Label { text: "Weak signal:"; color: accentBlue }
+                        ToolSlider { id: weakSignalSlider; Layout.fillWidth: true; from: 0.0; to: 1.0; value: 1.0; stepSize: 0.05 }
+                        Label { text: weakSignalSlider.value.toFixed(2); color: textMuted; Layout.preferredWidth: 32 }
                     }
                 }
 
@@ -551,6 +558,7 @@ Item {
             "weight_periodic": periodicSlider.value,
             "weight_partial_noise": partialNoiseSlider.value,
             "weight_featureless": featurelessSlider.value,
+            "weight_weak_signal": weakSignalSlider.value,
             "threshold": thresholdSlider.value,
             "min_structure_ratio": structureRatioSpin.realValue,
             "min_coherence": coherenceSpin.realValue,

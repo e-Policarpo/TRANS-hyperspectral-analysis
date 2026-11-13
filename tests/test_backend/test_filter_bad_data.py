@@ -976,3 +976,57 @@ class TestPerPointAverages(TestOutlierRemoval):
             np.testing.assert_allclose(
                 averaged[point].values,
                 np.nanmean(good[members].values, axis=1), equal_nan=True)
+
+
+class TestWeakSignal(TestFilterBadDataSetup):
+    """A curve decades below its dataset's amplitude was not taken in
+    tunnelling: line6 of 2026Jul07 kept 3e-11 A preamp-floor repetitions
+    and dropped the railed real ones, so whole point averages were noise."""
+
+    def test_the_score_is_a_ramp_between_a_tenth_and_a_hundredth(self):
+        from src.backend.sts_algorithms import detect_weak_signal
+        assert detect_weak_signal(1.0, 1.0) == 0.0
+        assert detect_weak_signal(0.1, 1.0) == 0.0
+        assert detect_weak_signal(0.01, 1.0) == 1.0
+        assert detect_weak_signal(1 / 31.6, 1.0) == pytest.approx(0.5, abs=0.01)
+        assert detect_weak_signal(float('nan'), 1.0) == 0.0
+        assert detect_weak_signal(0.5, float('nan')) == 0.0
+
+    def _band_edge_set(self, n_real=12, n_dead=3, dead_scale=1e-3, quiet_scale=0.15):
+        rng = np.random.default_rng(3)
+        x = np.linspace(-0.3, 0.3, 256)
+        cols = {}
+        for i in range(n_real):
+            # One quieter-but-real curve: an order of magnitude down is still
+            # tunnelling and must stay.
+            scale = quiet_scale if i == 0 else 1.0
+            y = scale * (np.exp((-x - 0.2) / 0.03) + np.exp((x - 0.2) / 0.03)
+                         + 0.3 * np.exp(-(x - 0.05) ** 2 / 2e-4))
+            cols[f"R{i:02d}"] = y + rng.normal(0, 0.002 * scale, x.size)
+        for j in range(n_dead):
+            cols[f"D{j:02d}"] = dead_scale * (np.exp((-x - 0.28) / 0.01)
+                                              + rng.normal(0, 0.02, x.size))
+        df = pd.DataFrame({'V': x, **cols})
+        return SpectralData(data=df, metadata=SpectralMetadata(
+            source_type='test', dimensions=(len(cols), 1), scan_mode='line',
+            units={'independent': 'V', 'dependent': 'A/V'}))
+
+    def _run(self, tool_impl, **kw):
+        tool_impl._datasets['d'] = self._band_edge_set()
+        tool_impl.filter_bad_data(MockTask(), 'd', weight_featureless=0.0, **kw)
+        good = tool_impl._datasets.get('d - Good Data')
+        return set(good.spectra.columns) if good is not None else set()
+
+    def test_preamp_floor_curves_are_rejected_and_quiet_real_ones_kept(self, tool_impl):
+        kept = self._run(tool_impl)
+        assert not any(c.startswith('D') for c in kept), kept
+        assert 'R00' in kept
+
+    def test_a_zero_weight_switches_it_off(self, tool_impl):
+        kept = self._run(tool_impl, weight_weak_signal=0.0)
+        assert {'D00', 'D01', 'D02'} <= kept
+
+    def test_the_report_names_the_trigger(self, tool_impl, tmp_path):
+        path = (tool_impl._datasets.__setitem__('d', self._band_edge_set())
+                or tool_impl.filter_bad_data(MockTask(), 'd', weight_featureless=0.0))
+        assert 'weak_signal' in Path(path).read_text()

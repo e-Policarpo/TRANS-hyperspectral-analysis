@@ -7381,6 +7381,7 @@ class ToolImplementations:
                         weight_featureless: float = 1.0,
                         threshold: float = 0.5,
                         correct_periodic: bool = False,
+                        weight_weak_signal: float = 1.0,
                         min_structure_ratio: float = 3.0,
                         min_coherence: float = 0.12,
                         min_finite_fraction: float = 0.5,
@@ -7429,7 +7430,8 @@ class ToolImplementations:
         from src.backend.sts_algorithms import (
             detect_saturation, detect_noise, detect_linear_artifact,
             detect_periodic_noise, correct_periodic_noise,
-            detect_partial_noise, detect_featureless, structure_metrics
+            detect_partial_noise, detect_featureless, structure_metrics,
+            signal_span, detect_weak_signal,
         )
         try:
             if dataset_name not in self._datasets:
@@ -7452,6 +7454,15 @@ class ToolImplementations:
             min_finite = max(8, int(math.ceil(min_finite_fraction * len(independent_var))))
             empty_indices = []
 
+            # Weak signal is a population test: each curve's span against
+            # the median of the dataset's measurable curves (empty ones
+            # left out, so they cannot drag the reference down).
+            values = spectra.values
+            spans = np.array([signal_span(values[:, i]) for i in range(num_spectra)])
+            measurable = np.count_nonzero(np.isfinite(values), axis=0) >= min_finite
+            ref_spans = spans[measurable & np.isfinite(spans)]
+            reference_span = float(np.median(ref_spans)) if ref_spans.size else float('nan')
+
             good_indices = []
             bad_indices = []
             fft_magnitudes = {}
@@ -7466,15 +7477,18 @@ class ToolImplementations:
                 f"Combination: max(weighted scores) — each detector independently triggers",
                 f"Weights: saturation={weight_saturation}, noise={weight_noise}, "
                 f"linear={weight_linear}, periodic={weight_periodic}, "
-                f"partial_noise={weight_partial_noise}, featureless={weight_featureless}",
+                f"partial_noise={weight_partial_noise}, featureless={weight_featureless}, "
+                f"weak_signal={weight_weak_signal}",
+                f"Weak signal: span vs the dataset median {reference_span:.3e} — "
+                f"0 above 1/10 of it, 1 below 1/100 (no tunnelling: the preamp floor)",
                 f"Threshold: {threshold}{correction_note}",
                 f"Featureless: structure ratio < {min_structure_ratio} or coherence < {min_coherence}",
                 f"Rejected outright: fewer than {min_finite} finite samples of {len(independent_var)}",
                 "",
                 f"{'Index':>6} {'Sat':>8} {'Noise':>8} {'Linear':>8} {'Periodic':>10} {'Partial':>10} "
-                f"{'Featless':>10} {'Combined':>10} {'Trigger':>12} {'Status':>8} "
-                f"{'Ratio':>10} {'Cohere':>8} {'Sigma':>11}",
-                "-" * 130,
+                f"{'Featless':>10} {'Weak':>8} {'Combined':>10} {'Trigger':>12} {'Status':>8} "
+                f"{'Ratio':>10} {'Cohere':>8} {'Sigma':>11} {'Signal':>9}",
+                "-" * 150,
             ]
 
             for i in range(num_spectra):
@@ -7493,8 +7507,8 @@ class ToolImplementations:
                     bad_indices.append(i)
                     report_lines.append(
                         f"{i:>6} {'—':>8} {'—':>8} {'—':>8} {'—':>10} {'—':>10} "
-                        f"{'—':>10} {1.0:>10.3f} {'empty':>12} {'BAD':>8} "
-                        f"{'—':>10} {'—':>8} {'—':>11}"
+                        f"{'—':>10} {'—':>8} {1.0:>10.3f} {'empty':>12} {'BAD':>8} "
+                        f"{'—':>10} {'—':>8} {'—':>11} {'—':>9}"
                         f"   ({n_finite} finite samples)"
                     )
                     continue
@@ -7508,6 +7522,7 @@ class ToolImplementations:
                     independent_var, spectrum,
                     min_ratio=min_structure_ratio, min_coherence=min_coherence)
                 metrics = structure_metrics(spectrum)
+                weak_score = detect_weak_signal(spans[i], reference_span)
 
                 # Store FFT magnitude for output dataset
                 fft_magnitudes[col_name] = fft_mag
@@ -7544,6 +7559,9 @@ class ToolImplementations:
                 if weight_featureless > 0:
                     weighted_scores.append(weight_featureless * featureless_score)
                     score_labels.append("featureless")
+                if weight_weak_signal > 0:
+                    weighted_scores.append(weight_weak_signal * weak_score)
+                    score_labels.append("weak_signal")
 
                 if weighted_scores:
                     max_idx = int(np.argmax(weighted_scores))
@@ -7563,8 +7581,9 @@ class ToolImplementations:
                 report_lines.append(
                     f"{i:>6} {sat_score:>8.3f} {noise_score:>8.3f} {lin_score:>8.3f} "
                     f"{periodic_score:>10.3f} {partial_score:>10.3f} "
-                    f"{featureless_score:>10.3f} {combined:>10.3f} {trigger:>12} {status:>8} "
-                    f"{ratio:>10.1f} {metrics['coherence']:>8.3f} {metrics['sigma']:>11.3e}"
+                    f"{featureless_score:>10.3f} {weak_score:>8.3f} {combined:>10.3f} {trigger:>12} {status:>8} "
+                    f"{ratio:>10.1f} {metrics['coherence']:>8.3f} {metrics['sigma']:>11.3e} "
+                    f"{(spans[i] / reference_span) if reference_span > 0 else float('nan'):>9.3g}"
                 )
 
             # ---------------------------------------------------------------
