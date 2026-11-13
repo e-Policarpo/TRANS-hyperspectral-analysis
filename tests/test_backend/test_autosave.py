@@ -344,12 +344,14 @@ class TestSaveSnapshotsLiveState:
             _window_id_counter=0, output_files=['x.csv'], maps=[],
             _maps_inmem={}, _images={}, _notes={}, _naming_convention=None,
             _browser_tree={'folders': {'f': ['a']}},
+            workflow_manager=SimpleNamespace(export_workflows=lambda: [{'id': 'w'}]),
             project_manager=SimpleNamespace(save_project=save_project))
         task = SimpleNamespace(cancelled=False)
 
         AppBackend._do_save_project(fake, task, tmp_path / 'p.hrt', fast=True)
 
         assert captured['datasets'] == fake._datasets
+        assert captured['workflows'] == [{'id': 'w'}]
         for key, live in (('datasets', fake._datasets),
                           ('output_files', fake.output_files),
                           ('maps_inmem', fake._maps_inmem),

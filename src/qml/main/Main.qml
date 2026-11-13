@@ -646,6 +646,8 @@ ApplicationWindow {
                     required property int index
                     required property string name
                     required property string path
+                    required property string wid
+                    required property bool loaded
                     text: name
                     contentItem: Text {
                         text: workflowMenuItem.name  // Use the required property directly
@@ -658,14 +660,10 @@ ApplicationWindow {
                         color: workflowMenuItem.highlighted ? accentBlue : "transparent"
                         opacity: workflowMenuItem.highlighted ? 0.3 : 1
                     }
-                    onTriggered: {
-                        if (loadWorkflowLoader.item) {
-                            loadWorkflowLoader.item.loadWorkflowFromFile(workflowMenuItem.path)
-                        } else {
-                            loadWorkflowLoader.pendingPath = workflowMenuItem.path
-                            loadWorkflowLoader.active = true
-                        }
-                    }
+                    onTriggered: openProjectWorkflow(workflowMenuItem.wid,
+                                                     workflowMenuItem.path,
+                                                     workflowMenuItem.name,
+                                                     workflowMenuItem.loaded)
                 }
                 onObjectAdded: function(index, object) {
                     workflowsMenu.insertItem(workflowsMenu.count - 2, object)
@@ -1875,24 +1873,55 @@ ApplicationWindow {
         })
     }
 
+    // Every workflow the project has: the ones already loaded (restored
+    // from the .hrt, imported, opened) and the .flow files not loaded yet.
     function refreshProjectWorkflows() {
         projectWorkflowsModel.clear()
         savedWorkflowsModel.clear()
         if (backend && backend.workflowManager) {
-            var workflows = backend.workflowManager.getSavedWorkflows()
+            var workflows = backend.workflowManager.getProjectWorkflows()
             for (var i = 0; i < workflows.length; i++) {
                 projectWorkflowsModel.append({
                     name: workflows[i].name,
-                    path: workflows[i].path
+                    path: workflows[i].path || "",
+                    wid: workflows[i].id || "",
+                    loaded: !!workflows[i].loaded
                 })
                 // The same list under Tools, where clicking one runs it over
-                // a dataset selection instead of opening the editor.
-                savedWorkflowsModel.append({
-                    name: workflows[i].name,
-                    path: workflows[i].path
-                })
+                // a dataset selection instead of opening the editor. The
+                // runner reads the file, so only saved ones are offered.
+                if (workflows[i].path)
+                    savedWorkflowsModel.append({
+                        name: workflows[i].name,
+                        path: workflows[i].path
+                    })
             }
         }
+    }
+
+    // Open a project workflow in a workflow window. A loaded one opens on
+    // the workflow in memory (unsaved edits included); one known only as a
+    // file is loaded first. If a window already shows it, that window comes
+    // forward instead: two editors on one workflow would each overwrite the
+    // other's changes.
+    function openProjectWorkflow(wid, path, name, loaded) {
+        if (!backend || !backend.workflowManager) return null
+        var wm = backend.workflowManager
+        var data = wid ? wm.getWorkflowData(wid) : null
+        if (!loaded || !data || !data.id) {
+            if (!path) return null
+            wid = wm.loadWorkflow(path)
+            if (!wid) return null
+            data = wm.getWorkflowData(wid)
+        }
+        for (var i = 0; i < openWorkflowWindows.length; i++) {
+            var w = openWorkflowWindows[i]
+            if (w && w.workflowId === wid) {
+                w.show(); w.raise(); w.requestActivate()
+                return w
+            }
+        }
+        return openWorkflowWindowFromId(wid, (data && data.name) ? data.name : name)
     }
 
     // A saved workflow is a composite tool nobody had to code: the runner

@@ -2048,6 +2048,73 @@ class WorkflowManager(QObject):
         logger.info(f"Imported workflow {workflow.name} from {path} as {saved}")
         return workflow_id
 
+    def export_workflows(self) -> List[Dict]:
+        """Every workflow with nodes, as plain dicts for the project file.
+
+        Runs on the save worker: the dict is copied before iterating, so a
+        workflow opened meanwhile cannot resize it under the loop.
+        """
+        out = []
+        for workflow in list(self.workflows.values()):
+            if workflow.nodes:
+                out.append(self._sanitize_for_json(workflow.to_dict()))
+        return out
+
+    def restore_workflows(self, entries) -> int:
+        """Put the project file's workflows back in memory on open.
+
+        Each one is matched to its .flow in the workflows folder by id; a
+        workflow whose file is missing (a moved or copied project, a
+        deleted folder) gets it written again, so the menu, the runner and
+        the Load dialog all see it. Returns how many were restored.
+        """
+        restored = 0
+        workflows_dir = self._get_workflows_dir()
+        on_disk = {}
+        for path in workflows_dir.glob("*.flow"):
+            wid = self._file_workflow_id(path)
+            if wid:
+                on_disk.setdefault(wid, path)
+        for entry in entries or []:
+            try:
+                workflow = Workflow.from_dict(entry)
+            except Exception as e:                       # noqa: BLE001
+                logger.warning("Project workflow could not be restored: %s", e)
+                continue
+            self.workflows[workflow.id] = workflow
+            if workflow.id in on_disk:
+                self._workflow_paths[workflow.id] = str(on_disk[workflow.id])
+            else:
+                self.saveWorkflow(workflow.id)
+            restored += 1
+        if restored:
+            logger.info(f"Restored {restored} workflow(s) from the project file")
+        return restored
+
+    @Slot(result='QVariantList')
+    def getProjectWorkflows(self) -> List[Dict]:
+        """What the Workflows menu lists: every workflow the project has.
+
+        Loaded ones first (``loaded`` True -- clicking opens a window on the
+        workflow in memory, unsaved edits included), then .flow files in
+        the workflows folder that are not loaded yet. Empty placeholders
+        ("New Workflow" with no nodes) are left out.
+        """
+        items, seen = [], set()
+        for wid, workflow in list(self.workflows.items()):
+            if not workflow.nodes:
+                continue
+            seen.add(wid)
+            items.append({'id': wid, 'name': workflow.name,
+                          'path': self._workflow_paths.get(wid, ''), 'loaded': True})
+        for entry in sorted(self.getSavedWorkflows(), key=lambda e: e['name'].lower()):
+            wid = self._file_workflow_id(Path(entry['path'])) or ''
+            if wid in seen or entry['path'] in {i['path'] for i in items}:
+                continue
+            items.append({'id': wid, 'name': entry['name'],
+                          'path': entry['path'], 'loaded': False})
+        return items
+
     @Slot(result='QVariantList')
     def getSavedWorkflows(self) -> List[Dict]:
         """Get list of saved workflows from the current project's workflows directory."""

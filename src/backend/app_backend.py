@@ -1457,6 +1457,14 @@ class AppBackend(ToolImplementations, QObject):
                 self.noteAdded.emit(note_id, note.get('name', 'Note'))
             logger.info(f"Restored {len(loaded_notes)} notes from project")
 
+            # Workflows travel inside the .hrt; put them back in memory (and
+            # rewrite any .flow the workflows folder lost) so the Workflows
+            # menu lists them straight away.
+            try:
+                self.workflow_manager.restore_workflows(project_data.get('workflows') or [])
+            except Exception as e:                        # noqa: BLE001
+                logger.warning(f"Could not restore the project's workflows: {e}")
+
             # Scan for additional outputs in the outputs directory
             if self._outputs_created:
                 self._scan_existing_outputs()
@@ -5561,6 +5569,7 @@ class AppBackend(ToolImplementations, QObject):
             'naming_convention': self._naming_convention,
             'map_editor': map_editor_state,
             'browser_tree': _snapshot_nested(self._browser_tree),
+            'workflows': self.workflow_manager.export_workflows(),
         }
 
         success = self.project_manager.save_project(project_path, project_data,

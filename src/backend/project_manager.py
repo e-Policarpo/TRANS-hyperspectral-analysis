@@ -239,6 +239,11 @@ class ProjectManager:
                 'notes': self._serialize_notes(project_data.get('notes', {})),
                 'naming_convention': project_data.get('naming_convention'),
                 'browser_tree': project_data.get('browser_tree', {}),
+                # Every workflow with nodes, whole: the .flow files in
+                # <project>/workflows are a working copy, and a project that
+                # was moved, copied or saved-as without that folder used to
+                # come back with no workflows at all.
+                'workflows': project_data.get('workflows', []),
             }
 
             # Save to file (compressed). The JSON is streamed straight into a
@@ -378,6 +383,7 @@ class ProjectManager:
                 'notes': notes,
                 'naming_convention': project_json.get('naming_convention'),
                 'browser_tree': project_json.get('browser_tree', {}),
+                'workflows': project_json.get('workflows', []) or [],
             }
 
             if recovered_from:

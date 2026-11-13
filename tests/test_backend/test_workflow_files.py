@@ -185,3 +185,53 @@ class TestImport:
         manager._workflow_paths.clear()
         assert manager.importWorkflow(path)
         assert len(manager.getSavedWorkflows()) == 1
+
+
+class TestProjectPermanence:
+    """Workflows live in the .hrt as well as in <project>/workflows."""
+
+    def test_the_project_file_round_trips_every_workflow(self, manager, project):
+        from src.backend.project_manager import ProjectManager
+
+        wid = _two_node_flow(manager, "Kept")
+        manager.createWorkflow("Empty placeholder")          # no nodes: not kept
+        pm = ProjectManager()
+        hrt = project / "p.hrt"
+        assert pm.save_project(hrt, {'datasets': {}, 'workflows': manager.export_workflows()})
+
+        loaded = pm.load_project(hrt)
+        assert [w['name'] for w in loaded['workflows']] == ["Kept"]
+        assert loaded['workflows'][0]['id'] == wid
+
+    def test_reopening_restores_them_and_rewrites_a_lost_flow(self, manager, project):
+        _two_node_flow(manager, "Lost file")
+        entries = manager.export_workflows()
+
+        # The project moved without its workflows folder.
+        fresh = WorkflowManager(SimpleNamespace(_project_path=project / "moved", _datasets={}))
+        (project / "moved").mkdir()
+        assert fresh.restore_workflows(entries) == 1
+
+        listed = fresh.getProjectWorkflows()
+        assert [(w['name'], w['loaded']) for w in listed] == [("Lost file", True)]
+        assert Path(listed[0]['path']).exists()
+        assert len(fresh.workflows[listed[0]['id']].connections) == 1
+
+    def test_restoring_does_not_duplicate_an_existing_flow(self, manager, project):
+        wid = _two_node_flow(manager, "On disk")
+        manager.saveWorkflow(wid)
+        entries = manager.export_workflows()
+        fresh = WorkflowManager(SimpleNamespace(_project_path=project, _datasets={}))
+        fresh.restore_workflows(entries)
+        assert len(list((project / "workflows").glob("*.flow"))) == 1
+
+    def test_the_menu_lists_loaded_workflows_and_unloaded_files(self, manager, project):
+        on_disk = manager.saveWorkflow(_two_node_flow(manager, "File only"))
+        manager.workflows.clear()
+        manager._workflow_paths.clear()
+        live = _two_node_flow(manager, "Loaded, never saved")
+
+        listed = manager.getProjectWorkflows()
+        assert [(w['name'], w['loaded']) for w in listed] == [
+            ("Loaded, never saved", True), ("File only", False)]
+        assert listed[0]['id'] == live and listed[1]['path'] == on_disk
