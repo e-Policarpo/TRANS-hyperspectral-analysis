@@ -168,7 +168,10 @@ class TestTheMenuMatchesTheCode:
 class TestTheSavedWorkflowsGroup:
     def test_the_group_is_filled_from_the_saved_workflows(self, main_qml):
         assert "savedWorkflowsModel" in main_qml
-        assert "getSavedWorkflows()" in main_qml
+        # getProjectWorkflows lists the saved .flow files plus the loaded
+        # workflows (restored from the .hrt); the runner takes only the
+        # ones with a file.
+        assert "getProjectWorkflows()" in main_qml
 
     def test_clicking_one_opens_the_runner(self, main_qml, tools_menu):
         assert "openSavedWorkflowRunner" in tools_menu
