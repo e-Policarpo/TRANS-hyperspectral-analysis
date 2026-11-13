@@ -215,6 +215,16 @@ BATCH_TOOLS: Dict[str, BatchToolSpec] = {
         # Returns the candidates (for the panel's list), not a path.
         completion="_on_designer_completed",
     ),
+    'spectral_features': BatchToolSpec(
+        label="Spectral Features",
+        method="extract_spectral_features",
+        takes_task=True,
+        # Any FeatureConfig field; the tool builds and validates the config
+        # itself and ignores keys it does not know.
+        params_as_dict=True,
+        # Returns a dict (table, dataset name, path, counts), not a path.
+        completion="_on_spectral_features_completed",
+    ),
     'derivative': BatchToolSpec(
         label="Derivative Calculator",
         method="calculate_derivative",

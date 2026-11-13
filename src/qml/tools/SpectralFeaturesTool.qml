@@ -24,6 +24,19 @@ Item {
     id: root
     property var closeWindow: null
 
+    // Dropping datasets from the project browser adds them to the selection;
+    // declaring these two makes the window a drop target.
+    property bool datasetDropActive: false
+    function acceptDatasetDrop(names) {
+        datasetList.addToSelection(names)
+        updateSpectrumRange()
+    }
+
+    // The preview shows one dataset: the first one picked. Extraction runs
+    // over every picked dataset, one after another, one table each.
+    readonly property string previewDataset:
+        datasetList.selectedDatasets.length > 0 ? datasetList.selectedDatasets[0] : ""
+
     property var parentWindow: Window.window
     // Each colour is resolved explicitly, and the property is named as a
     // literal rather than looked up by string.
@@ -191,10 +204,10 @@ Item {
     ListModel { id: readoutModel }
 
     function updatePreview() {
-        if (datasetCombo.currentIndex < 0 || !datasetCombo.currentText) return
+        if (!root.previewDataset) return
 
         var r = backend.previewSpectralFeatures(
-            datasetCombo.currentText, spectrumSpin.value, collectParams())
+            root.previewDataset, spectrumSpin.value, collectParams())
 
         previewCanvas.clearCurves()
         previewCanvas.clearInfiniteLines()
@@ -242,26 +255,34 @@ Item {
     }
 
     function refreshDatasets() {
-        var all = backend.getDatasetList()
-        datasetCombo.model = all.length > 0 ? all : ["No datasets loaded"]
+        datasetList.model = backend.getDatasetList()
+        datasetList.pruneSelection()
         updateSpectrumRange()
     }
 
     function updateSpectrumRange() {
-        if (datasetCombo.currentIndex < 0) return
-        var info = backend.getDatasetInfo ? backend.getDatasetInfo(datasetCombo.currentText) : null
+        if (!root.previewDataset) { spectrumCount = 0; return }
+        var info = backend.getDatasetInfo ? backend.getDatasetInfo(root.previewDataset) : null
         spectrumCount = (info && info.num_spectra) ? info.num_spectra : 1
         spectrumSpin.to = Math.max(0, spectrumCount - 1)
         queuePreview()
     }
 
     function runExtraction() {
-        if (datasetCombo.currentIndex < 0) return
+        var picked = datasetList.selectedDatasets
+        if (!picked || picked.length === 0) return
         running = true
-        statusLabel.text = "Extracting features from all " + spectrumCount + " spectra..."
+        root.pendingResults = picked.length
+        statusLabel.text = picked.length === 1
+            ? "Extracting features from all " + spectrumCount + " spectra..."
+            : "Extracting features from " + picked.length + " datasets, one after another..."
         statusLabel.color = accentBlue
-        backend.extractSpectralFeatures(datasetCombo.currentText, collectParams())
+        backend.runToolOnDatasets("spectral_features", picked, collectParams())
     }
+
+    // Results still expected from the run in flight; the run is over when
+    // every dataset has reported or the batch failed.
+    property int pendingResults: 0
 
     Component.onCompleted: refreshDatasets()
 
@@ -269,12 +290,28 @@ Item {
         target: backend
         function onDataLoaded(name) { refreshDatasets() }
         function onToolCompleted(toolName, path) {
-            if (toolName === "Spectral Features") {
-                running = false
-                statusLabel.text = "Done — the feature table is in the project browser. " +
-                                   "Every column can be mapped with the Map Generator."
-                statusLabel.color = accentBlue
+            if (toolName !== "Spectral Features" || !running) return
+            root.pendingResults = Math.max(0, root.pendingResults - 1)
+            if (root.pendingResults > 0) {
+                statusLabel.text = "Extracting features… " + root.pendingResults +
+                                   " dataset(s) to go"
+                return
             }
+            running = false
+            statusLabel.text = "Done — the feature table" +
+                               (datasetList.selectedDatasets.length > 1 ? "s are" : " is") +
+                               " in the project browser. " +
+                               "Every column can be mapped with the Map Generator."
+            statusLabel.color = accentBlue
+        }
+        // A failed dataset never reports a table, so the run would otherwise
+        // stay "Running..." forever.
+        function onErrorOccurred(title, message) {
+            if (!running || String(title).indexOf("Spectral Features") !== 0) return
+            running = false
+            root.pendingResults = 0
+            statusLabel.text = message
+            statusLabel.color = accentPink
         }
     }
 
@@ -316,10 +353,33 @@ Item {
                     title: "Dataset"
                     ColumnLayout {
                         anchors.fill: parent
-                        DatasetComboBox {
-                            id: datasetCombo
+                        DatasetMultiSelect {
+                            id: datasetList
                             Layout.fillWidth: true
-                            onCurrentTextChanged: updateSpectrumRange()
+                            Layout.preferredHeight: 118
+                            visibleRows: 4
+                            model: []
+                            bgColor: root.bgDark
+                            borderColorNormal: root.datasetDropActive ? root.accentBlue
+                                                                      : root.bgLight
+                            borderColorFocus: root.accentPink
+                            textColor: root.textLight
+                            textMutedColor: root.textMuted
+                            selectionColor: root.accentPink
+                            onSelectionChanged: updateSpectrumRange()
+                        }
+                        Label {
+                            Layout.fillWidth: true
+                            Layout.minimumWidth: 0
+                            wrapMode: Text.Wrap
+                            font.pixelSize: 10
+                            color: root.datasetDropActive ? root.accentBlue : root.textMuted
+                            text: root.datasetDropActive
+                                  ? "Drop to add to the selection"
+                                  : datasetList.selectedDatasets.length > 1
+                                    ? datasetList.selectedDatasets.length +
+                                      " datasets — one feature table each. Previewing the first."
+                                    : "Ctrl/Cmd-click or Shift-click to pick several."
                         }
                         RowLayout {
                             Layout.fillWidth: true
@@ -701,7 +761,7 @@ Item {
                 Button {
                     id: runButton
                     text: running ? "Running..." : "Extract features"
-                    enabled: !running && datasetCombo.currentIndex >= 0
+                    enabled: !running && datasetList.selectedDatasets.length > 0
                     onClicked: runExtraction()
                     contentItem: Text {
                         text: runButton.text

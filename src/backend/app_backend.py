@@ -7131,6 +7131,17 @@ class AppBackend(ToolImplementations, QObject):
         self.toolCompleted.emit("Unit Converter", str(output))
         self._route_derived_datasets()
 
+    def _on_spectral_features_completed(self, output):
+        """One Spectral Features result: ``output`` is the tool's result dict.
+
+        Only the CSV path goes on to the generic registration -- a dict
+        reaching a Signal(str) arrives as "". A run that produced no table
+        still emits, with an empty path, so the panel counting its datasets
+        down is never left waiting.
+        """
+        path = output.get('features_path', '') if isinstance(output, dict) else str(output or '')
+        self._on_tool_completed("Spectral Features", path)
+
     def _on_dimensionality_completed(self, output):
         """Register one Confinement Dimensionality run.
 
