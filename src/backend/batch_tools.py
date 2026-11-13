@@ -104,7 +104,7 @@ BATCH_TOOLS: Dict[str, BatchToolSpec] = {
         params={'weight_saturation': float, 'weight_noise': float,
                 'weight_linear': float, 'weight_periodic': float,
                 'weight_partial_noise': float, 'weight_featureless': float,
-                'weight_weak_signal': float,
+                'weight_weak_signal': float, 'weight_negative': float,
                 'threshold': float, 'correct_periodic': _as_bool,
                 'min_structure_ratio': float, 'min_coherence': float,
                 'filter_offset_outliers': _as_bool,
@@ -118,7 +118,7 @@ BATCH_TOOLS: Dict[str, BatchToolSpec] = {
         defaults={'weight_saturation': 1.0, 'weight_noise': 1.0,
                   'weight_linear': 1.0, 'weight_periodic': 1.0,
                   'weight_partial_noise': 1.0, 'weight_featureless': 1.0,
-                  'weight_weak_signal': 1.0,
+                  'weight_weak_signal': 1.0, 'weight_negative': 0.0,
                   'threshold': 0.5, 'correct_periodic': False,
                   'min_structure_ratio': 3.0, 'min_coherence': 0.12,
                   # Outlier removal is opt-in: it deletes curves that are

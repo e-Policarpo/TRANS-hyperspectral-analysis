@@ -190,6 +190,17 @@ Item {
                         Label { text: "Weak signal:"; color: accentBlue }
                         ToolSlider { id: weakSignalSlider; Layout.fillWidth: true; from: 0.0; to: 1.0; value: 1.0; stepSize: 0.05 }
                         Label { text: weakSignalSlider.value.toFixed(2); color: textMuted; Layout.preferredWidth: 32 }
+
+                        // dI/dV only, so off by default: an I(V) sweep or a
+                        // difference curve is negative for real.
+                        Label {
+                            text: "Negative dI/dV:"; color: accentBlue
+                            ToolTip.visible: negHover.hovered
+                            ToolTip.text: "dI/dV only. Rejects curves whose negative lobe is half as deep as their peak or more. Leave at 0 for I(V) or difference curves."
+                            HoverHandler { id: negHover }
+                        }
+                        ToolSlider { id: negativeSlider; Layout.fillWidth: true; from: 0.0; to: 1.0; value: 0.0; stepSize: 0.05 }
+                        Label { text: negativeSlider.value.toFixed(2); color: textMuted; Layout.preferredWidth: 32 }
                     }
                 }
 
@@ -559,6 +570,7 @@ Item {
             "weight_partial_noise": partialNoiseSlider.value,
             "weight_featureless": featurelessSlider.value,
             "weight_weak_signal": weakSignalSlider.value,
+            "weight_negative": negativeSlider.value,
             "threshold": thresholdSlider.value,
             "min_structure_ratio": structureRatioSpin.realValue,
             "min_coherence": coherenceSpin.realValue,

@@ -474,6 +474,48 @@ def signal_span(spectrum: np.ndarray) -> float:
     return float(np.percentile(y, 99) - np.percentile(y, 1))
 
 
+#: detect_negative_dips scores 0 while a curve's negative lobe is at most
+#: NEGATIVE_SAFE of its positive peak and 1 from NEGATIVE_DEAD on, linearly
+#: in between -- so the default threshold of 0.5 rejects a dip half as deep
+#: as the peak. Opt-in (weight 0 by default): on real dI/dV line scans 20-40%
+#: of every line dips that far, the good ones included (2026-11-13).
+NEGATIVE_SAFE = 0.25
+NEGATIVE_DEAD = 0.75
+
+
+def negative_depth(spectrum: np.ndarray) -> float:
+    """How deep a curve goes below zero against how high it goes above:
+    -p1 / p99 of its finite samples (0 when it never goes negative, inf when
+    it never goes positive), or nan when it has no samples."""
+    y = np.asarray(spectrum, dtype=float)
+    y = y[np.isfinite(y)]
+    if y.size < 2:
+        return float('nan')
+    low, high = np.percentile(y, 1), np.percentile(y, 99)
+    if low >= 0:
+        return 0.0
+    if high <= 0:
+        return float('inf')
+    return float(-low / high)
+
+
+def detect_negative_dips(spectrum: np.ndarray) -> float:
+    """Score a dI/dV curve on how far it goes negative.
+
+    A density of states cannot be negative (see src/processing/positivity.py),
+    so a deep negative lobe in a dI/dV curve is a lock-in phase error, a
+    background subtracted too hard, or a tip change mid-sweep. It is NOT
+    meaningful for I(V), difference or derivative curves, which really are
+    signed -- hence opt-in.
+
+    Returns 0 at or below ``NEGATIVE_SAFE``, 1 at or above ``NEGATIVE_DEAD``.
+    """
+    depth = negative_depth(spectrum)
+    if not np.isfinite(depth):
+        return 0.0 if np.isnan(depth) else 1.0
+    return float(np.clip((depth - NEGATIVE_SAFE) / (NEGATIVE_DEAD - NEGATIVE_SAFE), 0.0, 1.0))
+
+
 def detect_weak_signal(span: float, reference_span: float) -> float:
     """Score how far a curve's signal falls below the rest of its dataset.
 

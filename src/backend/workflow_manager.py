@@ -1404,6 +1404,7 @@ class WorkflowExecutor:
                     weight_partial_noise=params.get('weight_partial_noise', 1.0),
                     weight_featureless=params.get('weight_featureless', 1.0),
                     weight_weak_signal=params.get('weight_weak_signal', 1.0),
+                    weight_negative=params.get('weight_negative', 0.0),
                     threshold=params.get('threshold', 0.5),
                     correct_periodic=params.get('correct_periodic', False),
                     min_structure_ratio=params.get('min_structure_ratio', 3.0),

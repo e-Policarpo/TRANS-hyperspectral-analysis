@@ -1030,3 +1030,52 @@ class TestWeakSignal(TestFilterBadDataSetup):
         path = (tool_impl._datasets.__setitem__('d', self._band_edge_set())
                 or tool_impl.filter_bad_data(MockTask(), 'd', weight_featureless=0.0))
         assert 'weak_signal' in Path(path).read_text()
+
+
+class TestNegativeDips(TestFilterBadDataSetup):
+    """dI/dV is a density of states and cannot be deeply negative; this
+    detector is opt-in because I(V) and difference curves really are."""
+
+    def test_the_score_is_a_ramp_on_depth(self):
+        from src.backend.sts_algorithms import detect_negative_dips
+        x = np.linspace(-1, 1, 201)
+        peak = np.exp(-x ** 2 / 0.02)
+        assert detect_negative_dips(peak) == 0.0
+        assert detect_negative_dips(peak - 0.5 * np.exp(-(x - 0.5) ** 2 / 0.02)) == pytest.approx(0.5, abs=0.05)
+        assert detect_negative_dips(peak - np.exp(-(x - 0.5) ** 2 / 0.02)) == 1.0
+        assert detect_negative_dips(-peak) == 1.0
+        assert detect_negative_dips(np.full(10, np.nan)) == 0.0
+
+    def _set(self):
+        x = np.linspace(-1, 1, 256)
+        rng = np.random.default_rng(5)
+        cols = {}
+        for i in range(6):
+            cols[f"G{i}"] = (np.exp((x - 0.6) / 0.1) + np.exp((-x - 0.6) / 0.1)
+                             + 0.2 * np.exp(-x ** 2 / 0.01) + rng.normal(0, 0.002, x.size))
+        # Phase error: the same curve with a deep negative lobe.
+        cols["N0"] = cols["G0"] - 0.9 * cols["G0"].max() * np.exp(-(x + 0.3) ** 2 / 0.005)
+        df = pd.DataFrame({'V': x, **cols})
+        return SpectralData(data=df, metadata=SpectralMetadata(
+            source_type='test', dimensions=(len(cols), 1), scan_mode='line',
+            units={'independent': 'V', 'dependent': 'A/V'}))
+
+    def _kept(self, tool_impl, **kw):
+        tool_impl._datasets['n'] = self._set()
+        tool_impl.filter_bad_data(MockTask(), 'n', weight_featureless=0.0, **kw)
+        return set(tool_impl._datasets['n - Good Data'].spectra.columns)
+
+    def test_off_by_default(self, tool_impl):
+        assert 'N0' in self._kept(tool_impl)
+
+    def test_when_weighted_it_rejects_the_deep_dip_only(self, tool_impl):
+        kept = self._kept(tool_impl, weight_negative=1.0)
+        assert 'N0' not in kept
+        assert {f"G{i}" for i in range(6)} <= kept
+
+    def test_the_batch_and_the_node_default_to_off(self):
+        from src.backend.batch_tools import BATCH_TOOLS
+        from src.backend.workflow_engine import TOOL_DEFINITIONS
+        assert BATCH_TOOLS['filter_bad_data'].defaults['weight_negative'] == 0.0
+        node = TOOL_DEFINITIONS['FilterBadData']['parameters']['weight_negative']
+        assert node['default'] == 0.0
