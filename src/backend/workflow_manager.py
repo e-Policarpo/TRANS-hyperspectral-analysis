@@ -1091,8 +1091,18 @@ class WorkflowExecutor:
         elif tool_name == "ConfinementDesigner":
             dataset_name = self._stage_dataset(inputs.get('dataset'), "designer")
             if dataset_name:
+                run = dict(params or {})
+                # A node field cannot be empty the way the panel's can: 0
+                # (or a blank seed) stands for "use the engine's own value",
+                # which the tool spells None. Passing 0 on would cap the
+                # lattice at no nodes and call everything a duplicate.
+                for key in ('enum_max_nodes', 'dup_rel', 'resolution_meV'):
+                    if not run.get(key):
+                        run[key] = None
+                if str(run.get('seed', '')).strip() == '':
+                    run['seed'] = None
                 result = self.app_backend.design_confinement(
-                    self._Task(), dataset_name, params=dict(params or {}))
+                    self._Task(), dataset_name, params=run)
                 tables = result.get('tables') or []
                 cand = next((t for t in tables if "Designer Candidates" in t), None)
                 outputs['candidates'] = self.app_backend._datasets.get(cand) if cand else None

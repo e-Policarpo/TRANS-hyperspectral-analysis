@@ -1120,12 +1120,16 @@ class TestConfinementDefaultsAgree:
         for name, value in CONFINEMENT_DEFAULTS.items():
             assert params[name]["default"] == value, name
 
-    def test_smoothing_is_on_by_default(self):
-        """An unsmoothed search over-detects badly on noisy spectra, and a
-        hyperspectral run has nobody watching the preview."""
+    def test_smoothing_is_decided_by_the_threshold_by_default(self):
+        """-1 = smooth only as much as the noise threshold needs (none at
+        7 sigma and above, three samples at 5, five at 3 and below) — a
+        fixed 2 smoothed clean curves that did not need it (f8a85c3). The
+        node must offer the same, or a workflow searches differently from
+        the tool it reproduces."""
         from src.backend.tool_implementations import CONFINEMENT_DEFAULTS
-        assert CONFINEMENT_DEFAULTS["smooth_points"] == 2
-        assert TOOL_DEFINITIONS["ConfinementAnalysis"]["parameters"]["smooth_points"]["default"] == 2
+        assert CONFINEMENT_DEFAULTS["smooth_points"] == -1
+        spec = TOOL_DEFINITIONS["ConfinementAnalysis"]["parameters"]["smooth_points"]
+        assert spec["default"] == -1 and spec["min"] == -1
 
 
 class TestSpectralFeaturesNode:

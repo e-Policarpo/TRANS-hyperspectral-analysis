@@ -776,8 +776,11 @@ TOOL_DEFINITIONS = {
         "parameters": {
             "fit_type": {"type": "select", "label": "Method",
                         "options": ["endpoints", "als", "rubberband", "polynomial", "linear", "exponential"],
-                        "default": "endpoints"},
-            "degree": {"type": "int", "label": "Degree (poly/endpoints)", "default": 1, "min": 1, "max": 10},
+                        # The Curve Background Flattening panel's defaults:
+                        # a node that starts elsewhere silently flattens
+                        # differently from the tool it stands for.
+                        "default": "polynomial"},
+            "degree": {"type": "int", "label": "Degree (poly/endpoints)", "default": 2, "min": 1, "max": 10},
             "basis": {"type": "select", "label": "Coefficient basis",
                       "options": ["power", "legendre", "chebyshev"], "default": "power",
                       "description": "Basis for the polynomial/endpoints fit. The orthogonal bases fit the same curve but return decorrelated coefficients on a normalised axis — comparable between spectra, and usable as classification features."},
@@ -933,8 +936,8 @@ TOOL_DEFINITIONS = {
             "height_mode": {"type": "select", "label": "Measured as",
                             "options": ["range", "prominence", "max", "noise"], "default": "noise",
                             "description": "noise compares each peak with the spectrum's own noise (height is then a multiple of sigma) — scale-free, so weak states survive; range and prominence scale with the curve's span, which the band edges set"},
-            "smooth_points": {"type": "int", "label": "Smooth (half-width)", "default": 2, "min": 0, "max": 500,
-                              "description": "0 disables it. An unsmoothed search over-detects badly on noisy spectra."},
+            "smooth_points": {"type": "int", "label": "Smooth (half-width, -1 = auto)", "default": -1, "min": -1, "max": 500,
+                              "description": "-1 decides from the threshold (none at 7 sigma and above, three samples at 5, five at 3 and below); 0 disables it."},
             "smooth_type": {"type": "select", "label": "Smoother", "options": ["average", "savgol"], "default": "average"},
             "deriv_smooth_type": {"type": "select", "label": "Derivative smoothing", "options": ["none", "average", "savgol"], "default": "none"},
             "deriv_smooth_points": {"type": "int", "label": "Derivative points", "default": 2, "min": 0, "max": 500},
@@ -1519,18 +1522,55 @@ TOOL_DEFINITIONS = {
             {"id": "candidates", "name": "Candidates", "port_type": "flat_data", "description": "Ranked candidate geometries with size, error and levels"}
         ],
         "parameters": {
+            # Every knob the Confinement Designer panel sends, with the
+            # panel's choices and the tool's own defaults
+            # (ToolImplementations.DESIGNER_DEFAULTS) -- the node offered
+            # 12 of them, with no 0D, no disc and no delta_e_ratios, so the
+            # geometry most runs use could not be built in a workflow.
             "spectrum_index": {"type": "int", "label": "Spectrum", "default": 0, "min": 0, "max": 100000},
+            "all_spectra": {"type": "bool", "label": "Every spectrum", "default": False,
+                            "description": "Search each spectrum of the dataset, not just the one above"},
             "carrier": {"type": "select", "label": "Carriers", "options": ["electrons", "holes", "both"], "default": "electrons"},
             "meff_e": {"type": "string", "label": "m* electron", "default": "0.067"},
             "meff_h": {"type": "string", "label": "m* hole", "default": "0.45"},
-            "ndim": {"type": "select", "label": "Dimensions", "options": ["1D", "2D", "3D"], "default": "1D"},
-            "coords": {"type": "select", "label": "Shape", "options": ["cartesian", "polar", "cylindrical", "spherical"], "default": "cartesian"},
-            "sym": {"type": "select", "label": "Symmetry", "options": ["orthorhombic", "tetragonal", "cubic"], "default": "orthorhombic"},
+            "ndim": {"type": "select", "label": "Dimensions", "options": ["0D", "1D", "2D", "3D"], "default": "1D"},
+            "coords": {"type": "select", "label": "Shape",
+                       "options": ["cartesian", "circular", "cylindrical", "spherical", "disc", "parabolic"],
+                       "default": "cartesian",
+                       "description": "0D: spherical / disc / parabolic. 1D: cartesian. 2D: cartesian / circular. 3D: cartesian / cylindrical"},
+            "sym": {"type": "select", "label": "Symmetry",
+                    "options": ["", "square", "rectangular", "cubic", "tetragonal", "orthorhombic"],
+                    "default": "orthorhombic",
+                    "description": "Cartesian only — 2D: square / rectangular; 3D: cubic / tetragonal / orthorhombic"},
             "Lmin": {"type": "float", "label": "Smallest (nm)", "default": 1.0, "min": 0.01},
             "Lmax": {"type": "float", "label": "Largest (nm)", "default": 20.0, "min": 0.02},
-            "match": {"type": "select", "label": "Match by", "options": ["delta_e", "absolute"], "default": "delta_e"},
-            "maxsol": {"type": "int", "label": "Candidates", "default": 5, "min": 1, "max": 50},
-            "height": {"type": "float", "label": "Peak threshold (sigma)", "default": 3.0, "min": 0.1, "max": 50.0}
+            "match": {"type": "select", "label": "Match by", "options": ["absolute", "delta_e", "delta_e_ratios"], "default": "delta_e"},
+            "tol": {"type": "float", "label": "Tolerance (%)", "default": 5.0, "min": 0.01, "max": 1000.0},
+            "maxsol": {"type": "int", "label": "Candidates", "default": 6, "min": 1, "max": 50},
+            "priority": {"type": "select", "label": "Priority", "options": ["uniform", "ground_state", "low_quantum_numbers"], "default": "uniform"},
+            "assign": {"type": "select", "label": "Level assignment", "options": ["energy", "sequential", "low_quantum_numbers", "mixed"], "default": "energy"},
+            "sort": {"type": "select", "label": "Sort by",
+                     "options": ["rrmse", "rrmse_delta_e", "size_asc", "size_desc", "anisotropy", "ground_state"], "default": "rrmse"},
+            "search_mode": {"type": "select", "label": "Search", "options": ["sample", "enumerate"], "default": "sample"},
+            "enum_per_octave": {"type": "int", "label": "Lattice points / octave", "default": 8, "min": 1, "max": 1000},
+            "enum_polish": {"type": "int", "label": "Polish steps", "default": 40, "min": 0, "max": 100000},
+            "enum_reuse": {"type": "bool", "label": "Reuse the lattice", "default": True},
+            "enum_max_nodes": {"type": "int", "label": "Node cap (0 = engine default)", "default": 0, "min": 0, "max": 100000000},
+            "dup_rel": {"type": "float", "label": "Duplicate tolerance (fraction, 0 = 0.1 nm)", "default": 0.0, "min": 0.0, "max": 1.0},
+            "pair_tol_nm": {"type": "float", "label": "Pair tolerance (nm)", "default": 1.0, "min": 0.0},
+            "group_tol_nm": {"type": "float", "label": "Group tolerance (nm)", "default": 0.0, "min": 0.0},
+            "split_e": {"type": "float", "label": "Electron split (V)", "default": 0.0},
+            "split_h": {"type": "float", "label": "Hole split (V)", "default": 0.0},
+            "min_abs_V": {"type": "float", "label": "Ignore |V| below", "default": 0.0, "min": 0.0},
+            "admissible_abs_pct": {"type": "float", "label": "Admissible (abs. %)", "default": 0.05, "min": 0.0},
+            "admissible_rel": {"type": "float", "label": "Admissible (rel.)", "default": 0.1, "min": 0.0},
+            "min_support_frac": {"type": "float", "label": "Min. support", "default": 0.15, "min": 0.0, "max": 1.0},
+            "temperature_K": {"type": "float", "label": "Temperature (K, 0 = unknown)", "default": 0.0, "min": 0.0},
+            "resolution_meV": {"type": "float", "label": "Resolution (meV, 0 = from T)", "default": 0.0, "min": 0.0},
+            "height": {"type": "float", "label": "Peak threshold (sigma)", "default": 3.0, "min": 0.1, "max": 50.0},
+            "smooth_points": {"type": "int", "label": "Smooth (half-width, -1 = auto)", "default": -1, "min": -1, "max": 500},
+            "seed": {"type": "string", "label": "Seed (blank = drawn)", "default": ""},
+            "workers": {"type": "int", "label": "Workers (0 = all but one)", "default": 0, "min": 0, "max": 256}
         }
     },
 
