@@ -1214,8 +1214,16 @@ class WorkflowExecutor:
                 self.app_backend._datasets[output_name] = flat_data
                 # NOTE: dataLoaded emission deferred to after cleanup in execute()
 
-                # Optionally save as CSV
-                if params.get('save_csv', True):
+                # Optionally save as CSV -- unless the tool that made the
+                # table already wrote it. Every table-producing tool saves
+                # its own CSV, and writing it again here left two copies of
+                # one result on disk (peaks/<base> - Features.csv and
+                # integrated/<base>___features.csv, and the same for Map
+                # Values, Peak Fit, Dimensionality, Fit Coefficients...).
+                already = self._saved_by_tool(flat_data)
+                if already and params.get('save_csv', True):
+                    logger.info(f"Flat data {output_name}: already saved by the tool at {already}")
+                if params.get('save_csv', True) and not already:
                     try:
                         # Use safe filename (no special chars)
                         safe_filename = output_name.replace(" ", "_").replace("(", "").replace(")", "").replace("-", "_")
@@ -1621,6 +1629,21 @@ class WorkflowExecutor:
         kwargs = spec.coerce(params)
         return method(task, dataset_name, **kwargs) if spec.takes_task \
             else method(dataset_name, **kwargs)
+
+    #: additional_info keys under which a tool records the CSV it wrote.
+    _SAVED_PATH_KEYS = ('saved_path', 'features_path', 'table_path',
+                        'integrated_path', 'peaks_path')
+
+    @classmethod
+    def _saved_by_tool(cls, dataset) -> str:
+        """The file a tool already wrote this table to, or "" if none
+        (or if that file is gone)."""
+        info = getattr(getattr(dataset, 'metadata', None), 'additional_info', None) or {}
+        for key in cls._SAVED_PATH_KEYS:
+            path = info.get(key)
+            if path and Path(str(path)).is_file():
+                return str(path)
+        return ""
 
     def _derived(self, dataset_name: str, suffix: str):
         """The dataset a tool registered as ``<base> - <suffix>`` for the

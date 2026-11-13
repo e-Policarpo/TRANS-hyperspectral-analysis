@@ -4491,8 +4491,12 @@ class AppBackend(ToolImplementations, QObject):
 
         out_name = new_dataset_name or f"{dataset_name} ({target.value})"
         self._datasets[out_name] = new_sd
-        self._active_dataset = out_name
-        self.dataLoaded.emit(out_name)
+        # Inside a workflow this is an intermediate the executor removes
+        # afterwards: announcing it (or making it active) put a dataset in
+        # the browser that then vanished, beside the real output.
+        if not getattr(self, '_workflow_mode', False):
+            self._active_dataset = out_name
+            self.dataLoaded.emit(out_name)
         logger.info(
             "Converted %s (%s) → %s (%s) — excitation=%s nm",
             dataset_name, source.value, out_name, target.value,
@@ -4553,7 +4557,10 @@ class AppBackend(ToolImplementations, QObject):
                 if x_name and x_name != sd.independent_var_name:
                     sd.data.rename(columns={sd.independent_var_name: x_name}, inplace=True)
                 changed += 1
-                self.dataLoaded.emit(name)
+                # The SetUnits node relabels the executor's own temporary
+                # copy; its name must never reach the browser.
+                if not getattr(self, '_workflow_mode', False):
+                    self.dataLoaded.emit(name)
             except Exception as exc:                        # noqa: BLE001
                 logger.error("Relabel failed on %r: %s", name, exc, exc_info=True)
                 self.errorOccurred.emit("Unit Converter", f"{name}: {exc}")
@@ -6646,7 +6653,8 @@ class AppBackend(ToolImplementations, QObject):
             phase_name = f"{base_name} - FFT Phase"
             self._datasets[mag_name] = SpectralData(mag_df, mag_metadata)
             self._datasets[phase_name] = SpectralData(phase_df, phase_metadata)
-            self.dataLoaded.emit(phase_name)
+            if not getattr(self, '_workflow_mode', False):
+                self.dataLoaded.emit(phase_name)
 
             # Status update will be handled by callback in main thread
             logger.info(f"FFT results saved to {mag_path} and {phase_path}")

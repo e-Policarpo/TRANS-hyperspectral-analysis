@@ -1335,6 +1335,9 @@ class ToolImplementations:
                             'degree': degree,
                             'basis': basis,
                             'coefficient_columns': coeff_cols,
+                            # The FitParams CSV already holds this table, so
+                            # a workflow output node need not write it again.
+                            'saved_path': str(params_path),
                         },
                         data_type='flat',
                     )
@@ -5820,6 +5823,7 @@ class ToolImplementations:
         path = self._unique_path(self._ensure_output_dir('confinement') / (
             self._sanitize_filename(table_name) + '.csv'))
         frame.to_csv(path, index=False)
+        metadata.additional_info['saved_path'] = str(path)
         logger.info("Line Scan Designer: %d position(s) -> %s", len(frame), path)
 
         if not self._workflow_mode:
@@ -8301,7 +8305,8 @@ class ToolImplementations:
                     'left_range': (left_min, left_max),
                     'right_range': (right_min, right_max),
                     'smoothing': smoothing,
-                    'auto_detect': auto_detect
+                    'auto_detect': auto_detect,
+                    'saved_path': str(output_path),
                 },
                 data_type='flat'
             )
