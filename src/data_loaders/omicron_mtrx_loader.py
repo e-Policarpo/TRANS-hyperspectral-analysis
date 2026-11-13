@@ -194,7 +194,38 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
         """
         md = _a2m.MtrxData()
         md._get_ref_by = lambda *args, **kwargs: (None, None)
+        md._transfer = OmicronMatrixSTSLoader._cached_transfer(md)
         return md
+
+    @staticmethod
+    def _cached_transfer(md):
+        """a2m's ``_transfer`` with its channel lookup cached.
+
+        The original regex-matches every key of the parameter tree to find
+        the ``DICT::`` entries -- per curve: 25 s of a 93 s, 98,686-curve
+        session import (2026-11-13). Those entries are only ever added, so
+        the lookup is redone only when the tree grows or the channel changes.
+        Same result: the highest-numbered ``DICT::n`` naming this channel.
+        """
+        cache = {'key': None, 'nr': None}
+
+        def transfer(data):
+            param = md.param
+            key = (id(param), len(param), md.channel_name)
+            if cache['key'] != key:
+                numbers = [int(k[6:]) for k in param
+                           if k.startswith('DICT::') and param[k][0] == md.channel_name]
+                cache['key'], cache['nr'] = key, str(sorted(numbers)[-1])
+            key_nr = cache['nr']
+            md.channel_name_and_unit = param['DICT::' + key_nr][:2]
+            name, _, p = param['XFER::' + key_nr][:3]
+            if name == 'TFF_Linear1D':
+                return (data - p['Offset']) / p['Factor']
+            if name == 'TFF_MultiLinear1D':
+                return (p['Raw_1'] - p['PreOffset']) * (data - p['Offset']) / \
+                    (p['NeutralFactor'] * p['PreFactor'])
+            return data
+        return transfer
 
     # ------------------------------------------------------------------
     # Public entry points
@@ -617,7 +648,8 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
         # (Width/Height/Points/Lines) does not match these bricklets, so the
         # maps would be mis-scaled or reshaped wrongly. Spectra still load.
         if header_is_own:
-            maps, images = self._build_images(md, image_files, label, ordered)
+            maps, images = self._build_images(md, image_files, label, ordered,
+                                              raw_param=raw_param if header_ok else b'')
         else:
             maps, images = [], []
 
@@ -1213,6 +1245,26 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
     _LOCKIN_AMPLITUDE_HINTS = ('amplitude', 'ampl', 'deviation')
     _LOCKIN_FREQUENCY_HINTS = ('frequency', 'freq')
 
+    # The lock-in candidates of the last parameter tree seen: (id, size, keys).
+    _lockin_key_cache: Tuple[int, int, List[Any]] = (0, -1, [])
+
+    @classmethod
+    def _lockin_keys(cls, param: dict) -> List[Any]:
+        """The keys of ``param`` naming a lock-in device, in dict order.
+
+        A session's parser keeps ONE parameter tree and only ever adds keys
+        to it, so the candidates change only when the tree grows. Matching
+        every key of it for every curve was 40 million string comparisons
+        on a 98,686-spectrum session -- 12% of the import (2026-11-13).
+        """
+        ident, size, keys = cls._lockin_key_cache
+        if ident == id(param) and size == len(param) and all(k in param for k in keys):
+            return keys
+        keys = [k for k in param
+                if any(h in str(k).lower() for h in cls._LOCKIN_DEVICE_HINTS)]
+        cls._lockin_key_cache = (id(param), len(param), keys)
+        return keys
+
     @classmethod
     def _lockin_settings(cls, param: dict) -> dict:
         """Lock-in amplitude and frequency out of the MATRIX parameter tree.
@@ -1249,11 +1301,9 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
             return None
 
         found = {}
-        for key, value in param.items():
+        for key in cls._lockin_keys(param):
             low = str(key).lower()
-            if not any(h in low for h in cls._LOCKIN_DEVICE_HINTS):
-                continue
-            number = _number(value)
+            number = _number(param[key])
             if number is None:
                 continue
             if any(h in low for h in cls._LOCKIN_AMPLITUDE_HINTS):
@@ -1419,7 +1469,7 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
         return area_of_rs, by_area
 
     def _build_images(self, md, image_files: List[Path], label: str,
-                      batches: List[dict]
+                      batches: List[dict], raw_param: bytes = b''
                       ) -> Tuple[List[dict], List[Tuple[str, Any]]]:
         """Read .Z_mtrx/.I_mtrx scans as map dicts and ImageData pictures.
 
@@ -1432,9 +1482,23 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
         from ..models.image_data import ImageData, ImageMetadata, ImageMode
 
         # Group scan files by (run, scan): one physical scan, several channels.
+        # Read in header order with one forward pass over the session header
+        # (see _image_incremental); grouped below in (run, scan) order, which
+        # decides each map's first channel, exactly as before.
+        infos: Dict[Path, Optional[dict]] = {}
+        if raw_param[:len(self.MAGIC_NUMBER)] == self.MAGIC_NUMBER:
+            inc = self._new_md()
+            inc.raw_param = raw_param
+            inc.param = {'BREF': ''}
+            inc.channel_id = {}
+            cursor = [12]
+            for f in self._header_order(raw_param, image_files):
+                infos[f] = self._image_incremental(inc, raw_param, cursor, f)
         groups: Dict[Tuple[int, int], Dict[str, Tuple[Path, dict]]] = {}
         for f in sorted(image_files, key=lambda p: _parse_run_scan(p.name)):
-            info = self._image_via_a2m(md, f)
+            info = infos.get(f)
+            if info is None:
+                info = self._image_via_a2m(md, f)
             if info is None:
                 continue
             groups.setdefault(_parse_run_scan(f.name), {})[info['channel_name']] = (f, info)
@@ -1622,6 +1686,70 @@ class OmicronMatrixSTSLoader(BaseDataLoader):
         except Exception as exc:
             logger.warning("a2m could not open image %s: %s", filepath.name, exc)
             return None
+        return self._image_from_md(md, filepath, avail)
+
+    def _image_incremental(self, md, raw_param: bytes, cursor: list,
+                           filepath: Path) -> Optional[dict]:
+        """Read a scan image by advancing a shared header-parse cursor to
+        its entry, as :meth:`_curve_incremental` does for curves.
+
+        a2m's ``open()`` re-reads the session header chain and replays it
+        from the start up to the file's ``BREF`` for every image. Drift
+        compensation writes ~10^6 entries into a session log, so that cost
+        ~2 s per image -- 60% of a 110-image folder import (2026-11-13).
+        Replaying once, in header order, leaves ``md.param`` in exactly the
+        state ``open()`` would have reached. None when the file is not ahead
+        of the cursor, so the caller falls back to ``open()``.
+        """
+        fn = filepath.name
+        n = len(raw_param)
+        dp = cursor[0]
+        while dp < n and md.param.get('BREF') != fn:
+            dp = md._scan_raw_param(dp, raw_param)
+        cursor[0] = dp
+        if md.param.get('BREF') != fn:
+            return None
+        try:
+            md.raw_data = filepath.read_bytes()
+        except Exception:
+            return None
+        if md.raw_data[:len(self.MAGIC_NUMBER)] != self.MAGIC_NUMBER:
+            return None
+        # What open() resets before reading a bricklet.
+        md.data = np.array([])
+        md.data_item_count = 0
+        md.bricklet_size = 0
+        md.channel_name_and_unit = ['', '']
+        md.volume_scan = None
+        md.result_data_file = str(filepath)
+        md.channel_name = self._ext_channel(filepath)
+        for name in ('curve_mode', 'ref_by', 'x_data_name_and_unit',
+                     'z_data_name_and_unit'):
+            if hasattr(md, name):
+                delattr(md, name)
+        try:
+            md._scan_raw_data(len(self.MAGIC_NUMBER), md.raw_data)
+            scan, axis = md._im_data()
+        except Exception:
+            return None
+        if scan is None or not all(scan.shape) or not axis:
+            return None
+        md.scan, md.axis = scan, axis
+        mask = np.array([True, axis[2][0], axis[2][1], axis[2][0] and axis[2][1]])
+        md.traces = list(np.array(md.ALL_2D_TRACES)[mask])
+        return self._image_from_md(md, filepath, dict(enumerate(md.traces)))
+
+    @staticmethod
+    def _header_order(raw_param: bytes, files: List[Path]) -> List[Path]:
+        """``files`` in the order the session header references them (its
+        BREF entries hold the file name in UTF-16); unreferenced ones last."""
+        def offset(f):
+            at = raw_param.find(f.name.encode('utf-16-le'))
+            return at if at >= 0 else len(raw_param)
+        return sorted(files, key=offset)
+
+    def _image_from_md(self, md, filepath: Path, avail) -> Optional[dict]:
+        """The image dict of an ``MtrxData`` already opened on ``filepath``."""
         if not avail or md.axis is None:
             return None
 
