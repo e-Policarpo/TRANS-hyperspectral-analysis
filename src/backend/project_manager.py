@@ -2,10 +2,10 @@
 Project Manager for .HRT (Hyperspectral Research Tool) project files
 Handles save/load of complete project state including datasets and window configurations.
 
-File Format v2.0 (QtiPlot-inspired):
-- JSON header with metadata, window configurations, and small data
-- Binary sections for large numpy arrays (base64 encoded for JSON compatibility)
-- Efficient compression for repeated data patterns
+File format v3.0 (HRT3, written by every save): a zip holding project.json
+plus one raw .npy member per array — see the HRT3 notes below.
+Still read: v2.0 (b'HRT2' + one gzipped JSON with base64 arrays) and v1.0
+(plain JSON).
 T.R.A.N.S. - Tools for Research and Analysis for Nano Spectroscopy
 Made by Eduarda Policarpo, with love 🩵🩷🤍🩷🩵
 Contact: eduardapolicarpo.fisica@gmail.com
@@ -29,7 +29,7 @@ import base64
 logger = logging.getLogger(__name__)
 
 # File format version
-FORMAT_VERSION = "2.0"
+FORMAT_VERSION = "2.0"   # the last single-JSON format; new saves are HRT3_VERSION
 
 
 def _inflate_as_far_as_possible(compressed: bytes) -> str:
@@ -136,6 +136,159 @@ def salvage_project_json(compressed: bytes) -> Optional[Dict[str, Any]]:
         return None
 
 
+# ---------------------------------------------------------------------------
+# HRT3: a zip container
+# ---------------------------------------------------------------------------
+# HRT2 put every array, base64-encoded, inside one gzipped JSON document. A
+# 2.5 GB project unpacked to 3.8 GB of text that json.load had to hold as one
+# string, then again as the base64 strings it parsed out, then as the decoded
+# arrays: ~10 GB at the peak, minutes of swapping on a 16 GB Mac, and all on
+# the GUI thread.
+#
+# HRT3 is an ordinary zip:
+#   project.json        everything but the arrays (small)
+#   arrays/<n>.npy      one member per array, raw numpy format
+#   datasets/<n>.json   each dataset's entry, written as soon as its arrays
+#                       are, so a save cut short still names what it holds
+# A field that held base64 now holds "npy:arrays/<n>.npy". Loading reads each
+# array straight into its final buffer, one at a time.
+
+ZIP_MAGIC = b'PK\x03\x04'
+HRT3_VERSION = "3.0"
+ARRAY_REF = 'npy:'
+PROJECT_MEMBER = 'project.json'
+DATASET_MEMBER_DIR = 'datasets/'
+
+
+def _is_array_ref(value) -> bool:
+    return isinstance(value, str) and value.startswith(ARRAY_REF)
+
+
+class _ZipArrays:
+    """Arrays read from an intact HRT3 file."""
+
+    def __init__(self, zf):
+        self._zf = zf
+
+    def names(self):
+        return self._zf.namelist()
+
+    def read_bytes(self, member: str) -> bytes:
+        return self._zf.read(member)
+
+    def read_array(self, member: str) -> np.ndarray:
+        with self._zf.open(member) as fh:
+            return np.lib.format.read_array(fh, allow_pickle=False)
+
+    def close(self):
+        self._zf.close()
+
+
+class _SalvagedArrays:
+    """The complete members of an HRT3 file whose end (and so its central
+    directory) never reached the disk, found by walking the local headers."""
+
+    def __init__(self, path: Path):
+        import struct
+        self._path = path
+        self._members: Dict[str, tuple] = {}
+        size = path.stat().st_size
+        with open(path, 'rb') as f:
+            offset = 0
+            while offset + 30 <= size:
+                f.seek(offset)
+                header = f.read(30)
+                if header[:4] != ZIP_MAGIC:
+                    break
+                (_, flags, method, _, _, _, csize, usize, nlen, xlen) = struct.unpack(
+                    '<HHHHHIIIHH', header[4:30])
+                name = f.read(nlen).decode('utf-8', errors='replace')
+                extra = f.read(xlen)
+                if csize == 0xFFFFFFFF or usize == 0xFFFFFFFF:
+                    csize = self._zip64_csize(extra, usize, csize)
+                    if csize is None:
+                        break
+                if flags & 0x08 and csize == 0:
+                    break          # sizes only in a trailing descriptor: unknowable
+                data_start = offset + 30 + nlen + xlen
+                if data_start + csize > size:
+                    break          # this member was still being written
+                self._members[name] = (data_start, csize, method)
+                offset = data_start + csize + (16 if flags & 0x08 else 0)
+
+    @staticmethod
+    def _zip64_csize(extra: bytes, usize: int, csize: int):
+        import struct
+        i = 0
+        while i + 4 <= len(extra):
+            tag, length = struct.unpack('<HH', extra[i:i + 4])
+            if tag == 0x0001:
+                body = extra[i + 4:i + 4 + length]
+                values = list(struct.unpack('<%dQ' % (len(body) // 8), body[:len(body) // 8 * 8]))
+                if usize == 0xFFFFFFFF:
+                    values.pop(0)
+                return values[0] if values and csize == 0xFFFFFFFF else csize
+            i += 4 + length
+        return None
+
+    def names(self):
+        return list(self._members)
+
+    def read_bytes(self, member: str) -> bytes:
+        start, csize, method = self._members[member]
+        with open(self._path, 'rb') as f:
+            f.seek(start)
+            raw = f.read(csize)
+        if method == 0:
+            return raw
+        if method == 8:
+            return zlib.decompress(raw, -15)
+        raise ValueError(f"unsupported zip method {method} for {member}")
+
+    def read_array(self, member: str) -> np.ndarray:
+        return np.load(io.BytesIO(self.read_bytes(member)), allow_pickle=False)
+
+    def close(self):
+        pass
+
+
+def _open_hrt3(path: Path):
+    """(project_json, arrays) of an intact HRT3 file. Raises if it is not."""
+    import zipfile
+    zf = zipfile.ZipFile(path, 'r')
+    try:
+        project_json = json.loads(zf.read(PROJECT_MEMBER).decode('utf-8'))
+    except Exception:
+        zf.close()
+        raise
+    return project_json, _ZipArrays(zf)
+
+
+def _salvage_hrt3(path: Path):
+    """(project_json, arrays) rebuilt from the datasets a cut-short HRT3 save
+    finished writing, or (None, None)."""
+    try:
+        arrays = _SalvagedArrays(path)
+    except Exception as exc:
+        logger.error("Could not walk the damaged project %s: %s", path.name, exc)
+        return None, None
+    datasets = {}
+    for member in arrays.names():
+        if not (member.startswith(DATASET_MEMBER_DIR) and member.endswith('.json')):
+            continue
+        try:
+            entry = json.loads(arrays.read_bytes(member).decode('utf-8'))
+        except Exception:
+            continue
+        refs = [entry['entry'].get(k) for k in ('data_binary', 'independent_var_binary')]
+        if all(r is None or r[len(ARRAY_REF):] in arrays._members
+               for r in refs if _is_array_ref(r)):
+            datasets[entry['name']] = entry['entry']
+    if not datasets:
+        return None, None
+    return {'format_version': HRT3_VERSION, 'datasets': datasets}, arrays
+
+
 class ProjectManager:
     """
     Manages .HRT project files with save/load functionality.
@@ -171,6 +324,11 @@ class ProjectManager:
         self.project_modified: bool = False
         # Gzip level for the save in progress (set per-save by save_project)
         self._save_compresslevel: int = 1
+        # The zip an HRT3 save is writing arrays into / a load is reading
+        # them from. None outside a save or load.
+        self._zip_out = None
+        self._array_count = 0
+        self._arrays_in = None
 
     def save_project(self, project_path: Path, project_data: Dict[str, Any],
                      fast: bool = False) -> bool:
@@ -213,61 +371,36 @@ class ProjectManager:
             # not yet exist on disk.
             project_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # Create project structure
-            project_json = {
-                'format_version': FORMAT_VERSION,
-                'application': 'TRANS-QML',
-                'created': project_data.get('created', datetime.now().isoformat()),
-                'modified': datetime.now().isoformat(),
-                'metadata': project_data.get('metadata', {
-                    'name': project_path.stem,
-                    'description': ''
-                }),
-                'datasets': self._serialize_datasets(project_data.get('datasets', {})),
-                'windows': {
-                    'tables': project_data.get('tables', []),
-                    'graphs': project_data.get('graphs', []),
-                    'image_windows': project_data.get('image_windows', []),
-                    'map_editor': project_data.get('map_editor', None)
-                },
-                'workspace': project_data.get('workspace', {}),
-                'output_files': project_data.get('output_files', []),
-                'maps': project_data.get('maps', []),
-                'maps_inmem': self._serialize_maps_inmem(
-                    project_data.get('maps_inmem', {})),
-                'images': self._serialize_images(project_data.get('images', {})),
-                'notes': self._serialize_notes(project_data.get('notes', {})),
-                'naming_convention': project_data.get('naming_convention'),
-                'browser_tree': project_data.get('browser_tree', {}),
-                # Every workflow with nodes, whole: the .flow files in
-                # <project>/workflows are a working copy, and a project that
-                # was moved, copied or saved-as without that folder used to
-                # come back with no workflows at all.
-                'workflows': project_data.get('workflows', []),
-            }
-
-            # Save to file (compressed). The JSON is streamed straight into a
-            # gzip stream instead of building one multi-GB string and
-            # gzip.compress()-ing it: the bulk of the payload is base64 of
-            # already-compressed arrays, so a high outer compression level
-            # only burns minutes of CPU for zero size gain (this froze the
-            # app on GB-scale projects). Level 1 + streaming keeps peak
-            # memory flat and the byte format identical for the load path.
-            #
             # Written to a temporary file in the same directory and moved into
             # place only once it is complete and on disk. Writing straight to
             # the project truncated it the instant the save began, so anything
             # that interrupted the write — a crash, a kill, a full disk, a
             # sync client — destroyed the project outright.
+            #
+            # HRT3 (see the module notes): arrays stream into their own zip
+            # members while the datasets are serialized, so nothing GB-sized
+            # is ever built in memory, and project.json stays small.
+            import zipfile
             temp_path = project_path.with_name(project_path.name + '.tmp')
             try:
                 with open(temp_path, 'wb') as f:
-                    # Write magic header for format detection
-                    f.write(b'HRT2')  # Magic bytes for v2.0
-                    with gzip.GzipFile(fileobj=f, mode='wb',
-                                       compresslevel=self._save_compresslevel) as gz:
-                        with io.TextIOWrapper(gz, encoding='utf-8') as text_stream:
-                            json.dump(project_json, text_stream, ensure_ascii=False)
+                    # Fast (autosave) saves store; a full save deflates at
+                    # level 1, which costs little and pays off on NaN- and
+                    # zero-padded blocks.
+                    compression = (zipfile.ZIP_DEFLATED if self._save_compresslevel > 0
+                                   else zipfile.ZIP_STORED)
+                    with zipfile.ZipFile(f, 'w', compression=compression,
+                                         compresslevel=self._save_compresslevel or None,
+                                         allowZip64=True) as zf:
+                        self._zip_out = zf
+                        self._array_count = 0
+                        try:
+                            project_json = self._build_project_json(project_path, project_data)
+                        finally:
+                            self._zip_out = None
+                        with zf.open(PROJECT_MEMBER, 'w', force_zip64=True) as member:
+                            with io.TextIOWrapper(member, encoding='utf-8') as text_stream:
+                                json.dump(project_json, text_stream, ensure_ascii=False)
                     f.flush()
                     os.fsync(f.fileno())   # the bytes must be durable BEFORE the swap
 
@@ -300,6 +433,41 @@ class ProjectManager:
             logger.error(f"Error saving project: {e}", exc_info=True)
             return False
 
+    def _build_project_json(self, project_path: Path, project_data: Dict[str, Any]) -> Dict[str, Any]:
+        """The project document; arrays go to the open zip as a side effect."""
+        project_json = {
+            'format_version': HRT3_VERSION,
+            'application': 'TRANS-QML',
+            'created': project_data.get('created', datetime.now().isoformat()),
+            'modified': datetime.now().isoformat(),
+            'metadata': project_data.get('metadata', {
+                'name': project_path.stem,
+                'description': ''
+            }),
+            'datasets': self._serialize_datasets(project_data.get('datasets', {})),
+            'windows': {
+                'tables': project_data.get('tables', []),
+                'graphs': project_data.get('graphs', []),
+                'image_windows': project_data.get('image_windows', []),
+                'map_editor': project_data.get('map_editor', None)
+            },
+            'workspace': project_data.get('workspace', {}),
+            'output_files': project_data.get('output_files', []),
+            'maps': project_data.get('maps', []),
+            'maps_inmem': self._serialize_maps_inmem(
+                project_data.get('maps_inmem', {})),
+            'images': self._serialize_images(project_data.get('images', {})),
+            'notes': self._serialize_notes(project_data.get('notes', {})),
+            'naming_convention': project_data.get('naming_convention'),
+            'browser_tree': project_data.get('browser_tree', {}),
+            # Every workflow with nodes, whole: the .flow files in
+            # <project>/workflows are a working copy, and a project that
+            # was moved, copied or saved-as without that folder used to
+            # come back with no workflows at all.
+            'workflows': project_data.get('workflows', []),
+        }
+        return project_json
+
     def load_project(self, project_path: Path) -> Optional[Dict[str, Any]]:
         """
         Load project from .HRT file.
@@ -325,7 +493,9 @@ class ProjectManager:
                 # Check magic header
                 magic = f.read(4)
 
-                if magic == b'HRT2':
+                if magic == ZIP_MAGIC:
+                    project_json, recovered_from = self._load_hrt3(project_path)
+                elif magic == b'HRT2':
                     # v2.0 format - compressed. Decoded as a stream: these
                     # projects reach several GB, and holding the compressed
                     # bytes and the decompressed text at once doubled the
@@ -359,7 +529,14 @@ class ProjectManager:
             logger.info(f"Loading project format version: {version}")
 
             # Deserialize datasets
-            datasets = self._deserialize_datasets(project_json.get('datasets', {}))
+            try:
+                datasets = self._deserialize_datasets(project_json.get('datasets', {}))
+                maps_inmem = self._deserialize_maps_inmem(
+                    project_json.get('maps_inmem', []))
+            finally:
+                if self._arrays_in is not None:
+                    self._arrays_in.close()
+                    self._arrays_in = None
 
             # Build project data
             windows = project_json.get('windows', {})
@@ -377,8 +554,7 @@ class ProjectManager:
                 'workspace': project_json.get('workspace', {}),
                 'output_files': project_json.get('output_files', []),
                 'maps': project_json.get('maps', []),
-                'maps_inmem': self._deserialize_maps_inmem(
-                    project_json.get('maps_inmem', [])),
+                'maps_inmem': maps_inmem,
                 'images': images,
                 'notes': notes,
                 'naming_convention': project_json.get('naming_convention'),
@@ -407,7 +583,28 @@ class ProjectManager:
 
         except Exception as e:
             logger.error(f"Error loading project: {e}", exc_info=True)
+            if self._arrays_in is not None:
+                self._arrays_in.close()
+                self._arrays_in = None
             return None
+
+    def _load_hrt3(self, project_path: Path):
+        """(project_json, recovered_from) of an HRT3 file, with its arrays
+        left open in ``self._arrays_in`` for the deserializers."""
+        try:
+            project_json, self._arrays_in = _open_hrt3(project_path)
+            return project_json, ''
+        except Exception as exc:
+            logger.error("Project file is truncated or damaged (%s); "
+                         "attempting recovery", exc)
+        project_json, recovered_from = self._load_fallback(project_path)
+        if project_json is not None:
+            return project_json, recovered_from
+        project_json, self._arrays_in = _salvage_hrt3(project_path)
+        if project_json is None:
+            raise ValueError(f"{project_path.name} is damaged and nothing in it "
+                             "could be recovered")
+        return project_json, 'partial'
 
     @staticmethod
     def backup_path(project_path: Path) -> Path:
@@ -425,7 +622,14 @@ class ProjectManager:
             return None
         try:
             with open(path, 'rb') as f:
-                if f.read(4) != b'HRT2':
+                magic = f.read(4)
+                if magic == ZIP_MAGIC:
+                    project_json, arrays = _open_hrt3(path)
+                    if self._arrays_in is not None:
+                        self._arrays_in.close()
+                    self._arrays_in = arrays
+                    return project_json
+                if magic != b'HRT2':
                     f.seek(0)
                     return json.load(f)
                 with gzip.GzipFile(fileobj=f, mode='rb') as gz:
@@ -531,6 +735,7 @@ class ProjectManager:
                             'data_type': getattr(dataset.metadata, 'data_type', 'spectral')
                         }
                     }
+                    self._write_dataset_member(name, serialized[name])
                     logger.debug(f"Serialized dataset {name}: shape={spectra_array.shape}")
 
                 elif hasattr(dataset, 'to_dict'):
@@ -544,6 +749,7 @@ class ProjectManager:
                             'columns': dataset.columns.tolist(),
                             'data_binary': self._numpy_to_base64(values)
                         }
+                        self._write_dataset_member(name, serialized[name])
                     else:
                         serialized[name] = {
                             'type': 'DataFrame',
@@ -658,7 +864,8 @@ class ProjectManager:
                                     'value', 'custom')
                     channels[name] = {
                         'shape': list(arr.shape),
-                        'b64': base64.b64encode(arr.tobytes()).decode('ascii'),
+                        **({'npy': self._numpy_to_base64(arr)} if self._zip_out is not None
+                           else {'b64': base64.b64encode(arr.tobytes()).decode('ascii')}),
                         'units': getattr(ch.metadata, 'units', 'a.u.'),
                         'channel_type': ctype,
                     }
@@ -691,9 +898,13 @@ class ProjectManager:
             try:
                 mcm = MultiChannelMap()
                 for name, cd in p.get('channels', {}).items():
-                    arr = np.frombuffer(
-                        base64.b64decode(cd['b64']), dtype=np.float32,
-                    ).reshape(cd['shape']).astype(np.float64)
+                    if 'npy' in cd:
+                        arr = self._base64_to_numpy(cd['npy']).reshape(
+                            cd['shape']).astype(np.float64)
+                    else:
+                        arr = np.frombuffer(
+                            base64.b64decode(cd['b64']), dtype=np.float32,
+                        ).reshape(cd['shape']).astype(np.float64)
                     ctype = (ChannelType.HEIGHT if name.upper().startswith('Z')
                              else ChannelType.CUSTOM)
                     mcm.add_channel(name, arr, channel_type=ctype,
@@ -820,14 +1031,38 @@ class ProjectManager:
         ANY gzip level — the mantissa bits are effectively noise — so high
         levels just burn minutes at GB scale for no size gain.
         """
+        if self._zip_out is not None:
+            return self._write_array_member(arr)
         buffer = io.BytesIO()
         np.save(buffer, arr, allow_pickle=False)
         compressed = gzip.compress(buffer.getvalue(),
                                    compresslevel=self._save_compresslevel)
         return base64.b64encode(compressed).decode('ascii')
 
+    def _write_array_member(self, arr: np.ndarray) -> str:
+        """Stream one array into the HRT3 zip; returns its reference."""
+        member = f"arrays/{self._array_count:06d}.npy"
+        self._array_count += 1
+        arr = np.asarray(arr)
+        with self._zip_out.open(member, 'w', force_zip64=True) as fh:
+            np.lib.format.write_array(fh, arr, allow_pickle=False)
+        return ARRAY_REF + member
+
+    def _write_dataset_member(self, name: str, entry: Dict[str, Any]) -> None:
+        """A dataset's entry beside its arrays, for recovering a cut-short save."""
+        if self._zip_out is None:
+            return
+        member = f"{DATASET_MEMBER_DIR}{self._array_count:06d}.json"
+        self._zip_out.writestr(member, json.dumps(
+            {'name': name, 'entry': entry}, ensure_ascii=False).encode('utf-8'))
+
     def _base64_to_numpy(self, b64_str: str) -> np.ndarray:
-        """Convert base64 string back to numpy array."""
+        """Convert a base64 string (HRT2) or an array reference (HRT3) back
+        to a numpy array."""
+        if _is_array_ref(b64_str):
+            if self._arrays_in is None:
+                raise ValueError("array reference outside an HRT3 load")
+            return self._arrays_in.read_array(b64_str[len(ARRAY_REF):])
         compressed = base64.b64decode(b64_str)
         decompressed = gzip.decompress(compressed)
         buffer = io.BytesIO(decompressed)
