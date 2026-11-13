@@ -242,6 +242,7 @@ ApplicationWindow {
 
     // Menu bar
     menuBar: MenuBar {
+        id: mainMenuBar
         background: Rectangle {
             color: bgDarker
             Rectangle {
@@ -270,8 +271,17 @@ ApplicationWindow {
 
         // T.R.A.N.S. application menu (macOS only - on Windows/Linux, items move to Help)
         Menu {
+            id: appMenu
             title: "T.R.A.N.S."
-            visible: Qt.platform.os === "osx"
+            // NOT `visible:` -- on a Menu that means "pop up". Evaluated
+            // before the menu is attached to the native menu bar, the
+            // binding opened it as a modal popup and the app hung at launch
+            // (QQuickMenu::setVisible -> NSMenu popUpMenu, 2026-11-13).
+            // Off macOS the menu is simply taken out of the bar.
+            Component.onCompleted: {
+                if (Qt.platform.os !== "osx")
+                    Qt.callLater(function() { mainMenuBar.removeMenu(appMenu) })
+            }
             background: Rectangle {
                 color: bgMedium
                 border.color: borderColor
